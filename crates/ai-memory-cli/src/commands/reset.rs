@@ -5,14 +5,12 @@
 //! inode caused phantom search results after a reset).
 
 use anyhow::{Result, bail};
-use std::ffi::OsStr;
-use sysinfo::System;
 
 use crate::cli::ResetArgs;
 use crate::config::Config;
+use crate::process_guard::{busy_message, sibling_processes};
 
 const SUBDIRS: &[&str] = &["wiki", "db", "raw"];
-const BIN_NAME: &str = "ai-memory";
 
 /// Run the `reset` subcommand.
 ///
@@ -22,13 +20,7 @@ const BIN_NAME: &str = "ai-memory";
 pub fn run(config: &Config, args: ResetArgs) -> Result<()> {
     let siblings = sibling_processes();
     if !siblings.is_empty() {
-        let pids: Vec<u32> = siblings.iter().map(|p| p.as_u32()).collect();
-        bail!(
-            "refusing to reset: {} other ai-memory process(es) running (pids: {:?}). \
-             Stop them first, then re-run.",
-            pids.len(),
-            pids,
-        );
+        bail!(busy_message("reset", &siblings));
     }
 
     if !args.confirm {
@@ -53,19 +45,4 @@ pub fn run(config: &Config, args: ResetArgs) -> Result<()> {
     }
     tracing::info!("reset complete");
     Ok(())
-}
-
-fn sibling_processes() -> Vec<sysinfo::Pid> {
-    let mut sys = System::new();
-    sys.refresh_processes(sysinfo::ProcessesToUpdate::All, true);
-    let me = sysinfo::Pid::from_u32(std::process::id());
-    let bin_os: &OsStr = OsStr::new(BIN_NAME);
-    sys.processes_by_exact_name(bin_os)
-        // On Linux, sysinfo lists tokio worker threads alongside the main
-        // process under the same comm name. thread_kind() == None means
-        // we're looking at the process leader, not one of its threads.
-        .filter(|p| p.thread_kind().is_none())
-        .map(sysinfo::Process::pid)
-        .filter(|pid| *pid != me)
-        .collect()
 }

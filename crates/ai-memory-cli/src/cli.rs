@@ -41,6 +41,10 @@ pub enum Command {
     Serve(ServeArgs),
     /// Wipe the data directory's wiki/, db/, raw/ contents.
     Reset(ResetArgs),
+    /// Snapshot wiki/, db/, and config.toml into a gzipped tarball.
+    Backup(BackupArgs),
+    /// Restore a backup tarball into the data directory.
+    Restore(RestoreArgs),
 }
 
 /// Arguments for `init`.
@@ -89,6 +93,25 @@ pub struct ResetArgs {
     /// Required to actually wipe data. Without this we just dry-run.
     #[arg(long)]
     pub confirm: bool,
+}
+
+/// Arguments for `backup`.
+#[derive(Debug, Args)]
+pub struct BackupArgs {
+    /// Destination tarball (`.tar.gz`).
+    #[arg(long, short = 'o')]
+    pub to: PathBuf,
+}
+
+/// Arguments for `restore`.
+#[derive(Debug, Args)]
+pub struct RestoreArgs {
+    /// Source tarball.
+    #[arg(long, short = 'i')]
+    pub from: PathBuf,
+    /// Overwrite an existing non-empty data dir.
+    #[arg(long)]
+    pub force: bool,
 }
 
 /// Transport for the MCP server.

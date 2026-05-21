@@ -17,6 +17,7 @@ mod cli;
 mod commands;
 mod config;
 mod logging;
+mod process_guard;
 
 use cli::{Cli, Command};
 use config::Config;
@@ -43,5 +44,7 @@ async fn main() -> Result<()> {
         Command::Watch(args) => commands::watch::run(&config, args).await,
         Command::Serve(args) => commands::serve::run(&config, args).await,
         Command::Reset(args) => commands::reset::run(&config, args),
+        Command::Backup(args) => commands::backup::run(&config, args).await,
+        Command::Restore(args) => commands::restore::run(&config, args),
     }
 }

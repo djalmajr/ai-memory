@@ -181,6 +181,19 @@ impl ReaderPool {
         .await
     }
 
+    /// Snapshot the database to `dest_path` using SQLite's online backup
+    /// API. The source DB stays writable for the duration of the copy.
+    ///
+    /// # Errors
+    /// Propagates any SQL or pool error.
+    pub async fn snapshot_to(&self, dest_path: PathBuf) -> StoreResult<()> {
+        self.with_conn(move |conn| {
+            conn.backup(rusqlite::DatabaseName::Main, &dest_path, None)
+                .map_err(StoreError::from)
+        })
+        .await
+    }
+
     /// Return aggregate counts for the `status` view.
     ///
     /// # Errors
