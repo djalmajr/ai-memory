@@ -7,7 +7,7 @@
 #          owns /data. CA certificates included for outgoing HTTPS (LLM
 #          providers in M6+).
 
-FROM rust:1.95-slim AS builder
+FROM rust:1.95-slim-bookworm AS builder
 WORKDIR /work
 RUN apt-get update \
  && apt-get install -y --no-install-recommends pkg-config build-essential \
