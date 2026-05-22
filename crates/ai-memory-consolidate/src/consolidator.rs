@@ -306,7 +306,11 @@ const fn tier_as_str(t: Tier) -> &'static str {
     }
 }
 
-fn build_batch_request(session_id: SessionId, observations: &[Observation]) -> ChatRequest {
+/// Build the exact ChatRequest the consolidator sends for batch
+/// multi-page consolidation. Exposed so off-tree A/B harnesses
+/// (e.g. `evals/`) can exercise the same workload against
+/// alternative providers without duplicating the prompt.
+pub fn build_batch_request(session_id: SessionId, observations: &[Observation]) -> ChatRequest {
     let mut buf = String::new();
     buf.push_str(
         "You are compiling a Karpathy-style multi-page wiki update. Given the \
@@ -351,7 +355,9 @@ fn build_batch_request(session_id: SessionId, observations: &[Observation]) -> C
     }
 }
 
-const BATCH_SYSTEM_PROMPT: &str = "You are the maintainer of a Karpathy-style LLM wiki \
+/// System prompt for batch consolidation. Public for the same
+/// reason as [`build_batch_request`].
+pub const BATCH_SYSTEM_PROMPT: &str = "You are the maintainer of a Karpathy-style LLM wiki \
 for a software engineer. Your job is to compile *durable* knowledge -- not just \
 restate the session log. Produce a ConsolidatedBatch with 1-5 page updates. Favour \
 extracting concept / decision / gotcha pages alongside the session summary when the \

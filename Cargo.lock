@@ -100,6 +100,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "ai-memory-eval"
+version = "0.1.0"
+dependencies = [
+ "ai-memory-consolidate",
+ "ai-memory-core",
+ "ai-memory-llm",
+ "anyhow",
+ "clap",
+ "jiff",
+ "secrecy",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+ "uuid",
+]
+
+[[package]]
 name = "ai-memory-hooks"
 version = "0.1.0"
 dependencies = [

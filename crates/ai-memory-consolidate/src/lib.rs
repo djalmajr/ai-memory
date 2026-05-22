@@ -15,7 +15,9 @@ pub mod sweep;
 pub mod types;
 
 pub use bootstrap::{Bootstrap, BootstrapConfig, BootstrapError, BootstrapOutcome};
-pub use consolidator::{Consolidator, ConsolidatorError, ConsolidatorResult};
+pub use consolidator::{
+    BATCH_SYSTEM_PROMPT, Consolidator, ConsolidatorError, ConsolidatorResult, build_batch_request,
+};
 pub use lint::{LintError, LintFinding, LintReport, run_lint};
 pub use sweep::{EvictedPage, SweepError, SweepReport, run_sweep};
 pub use types::{

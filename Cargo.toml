@@ -9,6 +9,9 @@ members = [
     "crates/ai-memory-llm",
     "crates/ai-memory-consolidate",
     "crates/ai-memory-cli",
+    # Live A/B harness — not part of the shipped binary, but in
+    # the workspace so it shares deps + builds with the rest.
+    "evals",
 ]
 
 [workspace.package]

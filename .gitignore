@@ -29,3 +29,4 @@ perf.data*
 # Sandbox marker (not project content).
 .ai-jail
 .claude/
+evals/runs/
