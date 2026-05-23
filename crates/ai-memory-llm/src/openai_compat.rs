@@ -69,7 +69,20 @@ impl LlmProvider for OpenAiCompatProvider {
             Ok(v) if v.is_object() => Ok(v),
             _ => {
                 let Some(slice) = first_json_object(&res.text) else {
-                    debug!(text = %truncate(&res.text, 200), "no balanced JSON object found");
+                    // Dump enough text to actually see what the model
+                    // returned. 200 chars truncates inside code fences;
+                    // 4 KB tells the full story for any reasonable
+                    // structured-output response. Includes head + tail
+                    // because some failures truncate the closing brace.
+                    let head = truncate(&res.text, 2000);
+                    let tail_start = res.text.len().saturating_sub(2000);
+                    let tail = &res.text[tail_start..];
+                    debug!(
+                        head = %head,
+                        tail = %tail,
+                        total_len = res.text.len(),
+                        "no balanced JSON object found"
+                    );
                     return Err(LlmError::UnexpectedShape(
                         "openai-compat response did not contain a JSON object".into(),
                     ));
@@ -80,12 +93,35 @@ impl LlmProvider for OpenAiCompatProvider {
     }
 }
 
+/// Find the first balanced `{...}` object in a string, skipping
+/// braces that appear inside JSON string literals.
+///
+/// The naive implementation (only count `{` / `}`) breaks when the
+/// model returns markdown content inside a JSON string value — the
+/// content commonly contains `{` and `}` in code examples,
+/// JSON-as-prose, etc. That throws the depth counter off and
+/// either truncates the object early or never closes it. This
+/// version tracks whether we're inside a `"..."` literal and
+/// honours backslash escapes the JSON spec defines.
 fn first_json_object(s: &str) -> Option<&str> {
     let start = s.find('{')?;
     let mut depth = 0_i32;
+    let mut in_string = false;
+    let mut escape = false;
     let bytes = s.as_bytes();
     for (i, &b) in bytes[start..].iter().enumerate() {
+        if in_string {
+            if escape {
+                escape = false;
+            } else if b == b'\\' {
+                escape = true;
+            } else if b == b'"' {
+                in_string = false;
+            }
+            continue;
+        }
         match b {
+            b'"' => in_string = true,
             b'{' => depth += 1,
             b'}' => {
                 depth -= 1;

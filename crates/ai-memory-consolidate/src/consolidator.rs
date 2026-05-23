@@ -383,64 +383,19 @@ pub fn build_batch_request(session_id: SessionId, observations: &[Observation]) 
             role: Role::User,
             content: buf,
         }],
-        max_tokens: 4000,
+        // Generous: 32K covers a multi-page consolidation comfortably.
+        // Cheaper to over-allocate than to truncate JSON mid-response.
+        max_tokens: 32_000,
         temperature: Some(0.2),
     }
 }
 
-/// System prompt for batch consolidation. Public for the same
-/// reason as [`build_batch_request`].
-pub const BATCH_SYSTEM_PROMPT: &str = "\
-You are the maintainer of a Karpathy-style LLM wiki for a software \
-engineer. Your job is to compile *durable* knowledge from one \
-session's observations into 1-5 wiki page updates.\n\
-\n\
-## FAITHFULNESS — the most important rule\n\
-\n\
-The wiki records *what happened in this project*, not what you \
-know about the topic in general. You are NOT writing tutorials, \
-documentation, or reference material. You are extracting and \
-restating the durable signal that exists in the observations \
-provided. Every claim in every page MUST be grounded in the \
-observations.\n\
-\n\
-Do NOT:\n\
-- Invent dates, timestamps, version numbers, commit hashes, \
-  author names, file paths, function names, line numbers, error \
-  codes, or any other concrete detail not present in the \
-  observations.\n\
-- Add 'When to use' / 'When NOT to use' / 'Gotchas' / 'Best \
-  practices' / 'Alternative approaches' / 'See also' sections \
-  that weren't grounded in the session — these are reference- \
-  material patterns, not memory.\n\
-- Enumerate alternatives that weren't actually considered in the \
-  session (e.g. don't list other GGUF quants, other databases, \
-  other libraries the user didn't bring up).\n\
-- Expand terse user comments into long explanations. If the user \
-  said 'we use a single-writer actor', record that; don't write \
-  an essay about actor patterns.\n\
-- Fabricate code examples that didn't appear in the session.\n\
-- Speculate about consequences ('this could cause...', 'one \
-  potential issue...') unless the speculation appeared in the \
-  observations themselves.\n\
-\n\
-Do:\n\
-- Compress and restructure the observations into well-titled \
-  pages with the right `kind` classification.\n\
-- Preserve the user's actual phrasing for decisions and rules — \
-  these are load-bearing.\n\
-- Keep page bodies short. A good consolidated page is 100-400 \
-  words of dense fact, not 1500 words of tutorial.\n\
-- If a session yields no durable insight, return only the \
-  episodic session page. Resist the urge to manufacture content.\n\
-\n\
-## Output\n\
-\n\
-Produce a ConsolidatedBatch JSON object with 1-5 page updates. \
-Extract concept / decision / gotcha / rule pages alongside the \
-session summary when the session yields reusable insight; \
-otherwise return only the session page. Schema and required \
-keys are enumerated in the user message.";
+/// System prompt for batch consolidation. Loaded at compile time
+/// from `prompts/batch_consolidate_system.md` so the prompt itself
+/// is plain-text-editable + version-controlled as a Markdown file
+/// alongside the code. Public so off-tree harnesses (`evals/`) can
+/// inspect the exact prompt without duplicating it.
+pub const BATCH_SYSTEM_PROMPT: &str = include_str!("../prompts/batch_consolidate_system.md");
 
 fn build_request(
     session_id: SessionId,
@@ -475,7 +430,9 @@ fn build_request(
         // actual ConsolidatedPage JSON, which is plenty for our
         // ~5 KB max body_markdown. Non-reasoning models stop early
         // and don't pay extra for the higher cap.
-        max_tokens: 4000,
+        // Generous: 32K covers a multi-page consolidation comfortably.
+        // Cheaper to over-allocate than to truncate JSON mid-response.
+        max_tokens: 32_000,
         temperature: Some(0.2),
     }
 }
@@ -553,17 +510,9 @@ fn short_id(s: &str) -> String {
 /// [`ObservationKind`] via the observations parameter.
 const _OBSERVATION_KIND: Option<ObservationKind> = None;
 
-const SYSTEM_PROMPT: &str = "You are the maintainer of a Karpathy-style LLM wiki for a \
-software engineer. You receive the chronological observation log of one coding-agent \
-session plus the current heuristic page body. Compile a clean, durable markdown page \
-that future agents and the user can read to recover context.\n\nRules:\n\
-1. Title: short, descriptive (<= 80 chars). No filler.\n\
-2. Body: well-formed markdown. Use sections (## Heading) when useful.\n\
-3. Focus on decisions made, problems encountered, code/file references, and open \
-   questions.\n\
-4. Do NOT include redundant per-tool-call detail. Aggregate.\n\
-5. Do NOT echo timestamps or session ids (frontmatter already has them).\n\
-6. Tags: 0-5 short kebab-case tags surfaced to frontmatter.\n";
+/// System prompt for single-page consolidation. Loaded at compile
+/// time from `prompts/single_consolidate_system.md`.
+const SYSTEM_PROMPT: &str = include_str!("../prompts/single_consolidate_system.md");
 
 #[cfg(test)]
 mod tests {

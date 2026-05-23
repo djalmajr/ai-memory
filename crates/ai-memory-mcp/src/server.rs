@@ -747,51 +747,17 @@ fn build_explore_request(
             role: ai_memory_llm::Role::User,
             content: user,
         }],
-        max_tokens: 1500,
+        // memory_explore returns prose, not JSON, so a truncated
+        // response is degraded but not unparseable. Still generous
+        // so the long `dormant`/`stale` digests don't get cut off.
+        max_tokens: 16_000,
         temperature: Some(0.2),
     }
 }
 
-/// System prompt for `memory_explore`. Pure faithfulness rules
-/// (mirrors the consolidation system prompt's discipline) + explicit
-/// verbosity-vs-gap scaling.
-const EXPLORE_SYSTEM_PROMPT: &str = "\
-You are composing a digest of a software project's long-term memory \
-for a developer reorienting to the project. You receive a structured \
-snapshot (JSON) and a `time gap` bucket; your output is markdown \
-prose.\n\
-\n\
-## Verbosity scales with the gap\n\
-\n\
-- `fresh` (< 1 h ago) — one line. The developer was just here; \
-  reorient minimally. Example: \"Last touched X. No pending work.\"\n\
-- `today` (< 24 h) — 2-4 lines. What was last worked on; pending \
-  handoffs if any; nothing else.\n\
-- `recent` (< 7 days) — 1-2 paragraphs. Summary of what's changed; \
-  any new rules; pending handoffs; warnings.\n\
-- `dormant` (< 30 days) — 3-5 paragraphs. Fuller catchup: \
-  activity over the window, new rules with one-line explanations, \
-  pending handoffs spelled out, decay candidates if any.\n\
-- `stale` (> 30 days) — full briefing. Activity totals, every rule \
-  surfaced briefly, all pending handoffs, decay candidates, \
-  warnings about stale knowledge.\n\
-- `none` (no prior activity) — one paragraph saying so plus the \
-  current rule list (if any).\n\
-\n\
-## FAITHFULNESS\n\
-\n\
-Everything in your output MUST be grounded in the snapshot. Do not \
-invent dates, counts, or page titles. Do not invent rules or \
-warnings that aren't in the data. If the snapshot is empty (zero \
-counts, no recent_pages), say so plainly — do not pad with generic \
-advice.\n\
-\n\
-## Format\n\
-\n\
-Plain markdown. Use level-2 headers (`##`) only for the longer \
-buckets (`dormant`/`stale`). For `fresh`/`today`/`recent` skip \
-headers entirely. Quote rule titles from the snapshot with \
-backticks. Never wrap the whole response in code fences.";
+/// System prompt for `memory_explore`. Loaded at compile time from
+/// `prompts/explore_system.md`.
+const EXPLORE_SYSTEM_PROMPT: &str = include_str!("../prompts/explore_system.md");
 
 #[cfg(test)]
 mod tests {

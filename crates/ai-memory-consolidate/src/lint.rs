@@ -13,6 +13,10 @@
 //! Findings are written to `wiki/_lint/<YYYY-MM-DD>.md` so they're
 //! grep-able and tracked in git.
 
+/// System prompt for the contradiction-detection lint pass. Loaded
+/// at compile time from `prompts/lint_system.md`.
+const LINT_SYSTEM_PROMPT: &str = include_str!("../prompts/lint_system.md");
+
 use ai_memory_core::{PagePath, ProjectId, Tier, WorkspaceId};
 use ai_memory_llm::{ChatMessage, ChatRequest, LlmProvider, Role, complete_structured};
 use ai_memory_store::{DecayCandidate, ReaderPool};
@@ -209,19 +213,14 @@ async fn contradiction_pass(
     }
 
     let request = ChatRequest {
-        system: Some(
-            "You audit a personal coding-knowledge wiki for contradictions across pages. \
-             Return findings only when there's a real conflict; do not invent issues."
-                .into(),
-        ),
+        system: Some(LINT_SYSTEM_PROMPT.into()),
         messages: vec![ChatMessage {
             role: Role::User,
             content: prompt,
         }],
-        // Same reasoning-model headroom rule as the consolidator —
-        // reasoning models can spend ~2k tokens before any visible
-        // findings JSON appears.
-        max_tokens: 4000,
+        // Generous output budget so multi-finding reports don't
+        // truncate mid-JSON. Same rationale as consolidator/bootstrap.
+        max_tokens: 32_000,
         temperature: Some(0.1),
     };
     let report: LintReport = complete_structured(&*provider, request).await?;

@@ -119,9 +119,12 @@ pub struct BootstrapArgs {
     /// Maximum total tokens of source text sent to the LLM in one
     /// run. When the collected sources exceed this, lower-priority
     /// inputs (older git commits, then code module headers, then
-    /// docs) are dropped first. At Kimi's ~$3.49/M completion price
-    /// a 50000-token cap caps the worst-case run at ~$0.20.
-    #[arg(long, default_value_t = 50_000)]
+    /// docs) are dropped first. Default is 150K — comfortably under
+    /// Haiku/Sonnet 4.5's 200K context (leaves room for the ~64K
+    /// output budget) — so the model sees as much of your project
+    /// as possible. Lower it explicitly only if you're cost-
+    /// sensitive or running against a smaller-context provider.
+    #[arg(long, default_value_t = 150_000)]
     pub max_input_tokens: usize,
     /// Skip git-commit history ingestion.
     #[arg(long)]

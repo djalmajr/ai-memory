@@ -636,21 +636,9 @@ fn prune_to_budget(
 // LLM prompt
 // --------------------------------------------------------------------
 
-const SYSTEM_PROMPT: &str = "You are seeding a Karpathy-style \"LLM Wiki\" for \
-    a software project that has existed for a while. The user has supplied the \
-    project's git log, README, docs, and module headers. Your job is to produce \
-    a compact set of wiki pages — concepts, decisions, gotchas — that capture \
-    what a new collaborator would benefit from knowing on day one. \
-    \n\nRules:\n\
-    - Prefer 5–15 substantive pages over many thin ones.\n\
-    - Use `concepts/<slug>.md` for evergreen architectural notes, \
-      `decisions/0001-<slug>.md` for ADR-shaped commits (incrementing IDs), \
-      `gotchas/<slug>.md` for failure modes.\n\
-    - Cite the source briefly (e.g. \"From commit abc1234: ...\") so future \
-      readers can audit.\n\
-    - Do NOT invent details. If a source is ambiguous, note that in the body.\n\
-    - Cap each body at ~1500 words; ai-memory's wiki is meant to be skimmed, \
-      not exhaustive.";
+/// System prompt for bootstrap. Loaded at compile time from
+/// `prompts/bootstrap_system.md`.
+const SYSTEM_PROMPT: &str = include_str!("../prompts/bootstrap_system.md");
 
 fn build_request(sources: &[BootstrapSource]) -> ChatRequest {
     let mut buf = String::with_capacity(8_192);
@@ -666,10 +654,13 @@ fn build_request(sources: &[BootstrapSource]) -> ChatRequest {
             role: Role::User,
             content: buf,
         }],
-        // Reasoning models (Kimi 2.6 et al.) burn 1-2k on reasoning;
-        // leave headroom for the actual output. 6000 = generous cap
-        // for a multi-page bootstrap.
-        max_tokens: 6_000,
+        // Generous budget so the model never runs out mid-response.
+        // Truncated JSON is unrecoverable (no balanced `}`) — better
+        // to over-allocate than to retry. 64K is Haiku/Sonnet 4.5's
+        // max output; smaller hosted models clamp this server-side
+        // to whatever they support, so the constant is safe to leave
+        // generous for the headline providers.
+        max_tokens: 64_000,
         temperature: Some(0.2),
     }
 }
