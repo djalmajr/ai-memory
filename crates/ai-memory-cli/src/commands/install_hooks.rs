@@ -1114,6 +1114,8 @@ fn render_claude_code(hooks_dir: &Path, server_url: &str, auth_token: Option<&st
 mod tests {
     use super::*;
     use std::fs;
+    #[cfg(unix)]
+    use std::process::Command;
     use tempfile::TempDir;
 
     fn stub_scripts(dir: &Path, names: &[&str]) {
@@ -1220,6 +1222,44 @@ mod tests {
                 .and_then(|s| s.to_str()),
             Some("extensions")
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn curl_installer_accepts_pi_aliases_as_omp_extension() {
+        let script = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("..")
+            .join("scripts")
+            .join("install-hooks.sh");
+
+        for alias in ["pi", "oh-my-pi"] {
+            let output = Command::new("bash")
+                .arg(&script)
+                .arg("--agent")
+                .arg(alias)
+                .output()
+                .unwrap_or_else(|e| {
+                    panic!("failed to run {} for alias {alias}: {e}", script.display())
+                });
+
+            assert!(
+                output.status.success(),
+                "script rejected alias {alias}: stdout={}, stderr={}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            assert!(
+                stdout.contains("install-hooks --agent omp --apply"),
+                "script should route alias {alias} to the generated OMP extension path; stdout={stdout}"
+            );
+            assert!(
+                stdout.contains("~/.omp/agent/extensions/ai-memory.ts"),
+                "script should describe the OMP extension file for alias {alias}; stdout={stdout}"
+            );
+        }
     }
 
     // ----------------------------------------------------------------

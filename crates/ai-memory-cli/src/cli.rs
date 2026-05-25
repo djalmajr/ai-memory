@@ -624,3 +624,55 @@ pub struct WritePageArgs {
     #[arg(long, default_value_t = crate::config::DEFAULT_PROJECT.to_string())]
     pub project: String,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::Parser;
+
+    #[test]
+    fn pi_mcp_client_aliases_parse_to_same_variant() {
+        for alias in ["pi", "omp", "oh-my-pi"] {
+            let cli = Cli::try_parse_from([
+                "ai-memory",
+                "install-mcp",
+                "--client",
+                alias,
+                "--server-url",
+                "http://example.test:49374/mcp",
+            ])
+            .unwrap_or_else(|e| panic!("failed to parse install-mcp alias {alias}: {e}"));
+
+            let Command::InstallMcp(args) = cli.command else {
+                panic!("expected install-mcp command for alias {alias}");
+            };
+            assert!(
+                matches!(args.client, McpClient::Pi),
+                "alias {alias} must resolve to the Pi/OMP MCP client"
+            );
+        }
+    }
+
+    #[test]
+    fn pi_hook_agent_aliases_parse_to_same_variant() {
+        for alias in ["omp", "pi", "oh-my-pi"] {
+            let cli = Cli::try_parse_from([
+                "ai-memory",
+                "install-hooks",
+                "--agent",
+                alias,
+                "--server-url",
+                "http://example.test:49374",
+            ])
+            .unwrap_or_else(|e| panic!("failed to parse install-hooks alias {alias}: {e}"));
+
+            let Command::InstallHooks(args) = cli.command else {
+                panic!("expected install-hooks command for alias {alias}");
+            };
+            assert!(
+                matches!(args.agent, AgentChoice::Omp),
+                "alias {alias} must resolve to the OMP hook agent"
+            );
+        }
+    }
+}
