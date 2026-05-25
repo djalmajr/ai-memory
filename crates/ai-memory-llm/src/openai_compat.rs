@@ -14,7 +14,7 @@ use secrecy::SecretString;
 use tracing::debug;
 
 use crate::error::{LlmError, LlmResult};
-use crate::openai::OpenAiProvider;
+use crate::openai::{OpenAiProvider, RequestDialect};
 use crate::provider::LlmProvider;
 use crate::text::{suffix_within_bytes, truncate_with_ellipsis};
 use crate::types::{ChatRequest, ChatResponse};
@@ -71,7 +71,13 @@ impl OpenAiCompatProvider {
         model: impl Into<String>,
     ) -> LlmResult<Self> {
         let key = api_key.unwrap_or_else(|| SecretString::from("dummy"));
-        let inner = OpenAiProvider::new(key, model)?.with_base_url(base_url);
+        // Local / proxy engines speak the legacy OpenAI wire format
+        // only — no `max_completion_tokens`, no model-family caps, no
+        // temperature massaging. Swap dialect so the inner provider's
+        // per-request quirks don't leak into Ollama / vLLM setups.
+        let inner = OpenAiProvider::new(key, model)?
+            .with_base_url(base_url)
+            .with_dialect(RequestDialect::Compat);
         Ok(Self {
             inner,
             name_tag: "openai-compat",

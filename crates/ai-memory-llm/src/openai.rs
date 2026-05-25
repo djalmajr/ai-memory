@@ -47,16 +47,44 @@ fn last_segment_is_version(url: &str) -> bool {
     })
 }
 
+/// Request dialect — picks which OpenAI quirks the provider applies.
+///
+/// `Official` targets `api.openai.com` and honours the model-family
+/// rules that the real OpenAI Chat Completions endpoint enforces:
+/// `max_completion_tokens` for gpt-5 / o-series, model-family output
+/// caps, omitted `temperature` for reasoning models, strict-mode JSON
+/// schema normalisation.
+///
+/// `Compat` targets the OpenAI-compatible wire format spoken by
+/// Ollama, vLLM, LM Studio, llama.cpp, and the long tail of local /
+/// proxy backends. Those backends almost universally implement the
+/// legacy `max_tokens` dialect, ignore OpenAI-specific output caps,
+/// and accept any temperature value — so we keep the request shape
+/// stable and let the engine clamp / coerce as it sees fit. Forcing
+/// the official dialect onto compat backends would break working
+/// Ollama / vLLM setups (issue raised in PR review).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RequestDialect {
+    /// Official `api.openai.com`. Apply per-model quirks.
+    Official,
+    /// Local / proxy `openai-compat` (Ollama, vLLM, LM Studio, …).
+    /// Legacy `max_tokens` only, no caps, no temperature massaging.
+    Compat,
+}
+
 /// OpenAI Chat Completions-backed provider.
 pub struct OpenAiProvider {
     client: reqwest::Client,
     api_key: SecretString,
     base_url: String,
     model: String,
+    dialect: RequestDialect,
 }
 
 impl OpenAiProvider {
-    /// Construct a provider given an API key + model id.
+    /// Construct a provider given an API key + model id. Defaults to
+    /// the `Official` dialect (targeting `api.openai.com`). Override
+    /// with [`with_dialect`] when wrapping for `openai-compat`.
     ///
     /// # Errors
     /// Returns a `reqwest::Error` if the HTTP client cannot be built.
@@ -73,6 +101,7 @@ impl OpenAiProvider {
             api_key,
             base_url: DEFAULT_BASE_URL.to_string(),
             model: model.into(),
+            dialect: RequestDialect::Official,
         })
     }
 
@@ -81,6 +110,13 @@ impl OpenAiProvider {
     #[must_use]
     pub fn with_base_url(mut self, url: impl Into<String>) -> Self {
         self.base_url = url.into();
+        self
+    }
+
+    /// Switch request dialect. See [`RequestDialect`].
+    #[must_use]
+    pub fn with_dialect(mut self, dialect: RequestDialect) -> Self {
+        self.dialect = dialect;
         self
     }
 }
@@ -162,7 +198,12 @@ impl LlmProvider for OpenAiProvider {
         request: ChatRequest,
         mut schema: serde_json::Value,
     ) -> LlmResult<serde_json::Value> {
-        enforce_strict_object_schemas(&mut schema);
+        // Strict-mode normalisation is an `Official` concern — compat
+        // backends typically ignore `response_format` entirely and fall
+        // back to "parse the first JSON object out of the text".
+        if self.dialect == RequestDialect::Official {
+            enforce_strict_object_schemas(&mut schema);
+        }
         let response_format = OpenAiResponseFormat::JsonSchema {
             json_schema: OpenAiJsonSchema {
                 name: "Result".into(),
@@ -204,19 +245,40 @@ impl OpenAiProvider {
                 content: &m.content,
             });
         }
-        let capped = request.max_tokens.min(max_output_tokens_for(&self.model));
-        let (max_tokens, max_completion_tokens) =
-            if model_requires_max_completion_tokens(&self.model) {
-                (None, Some(capped))
-            } else {
-                (Some(capped), None)
-            };
+        // `Compat` backends (Ollama, vLLM, LM Studio, …) speak the
+        // legacy OpenAI wire format only: always `max_tokens`, never
+        // OpenAI-side caps, never temperature-omission. The engine
+        // itself clamps oversized requests; forcing the official
+        // dialect onto them is the regression Akita flagged in review.
+        let (max_tokens, max_completion_tokens, temperature) = match self.dialect {
+            RequestDialect::Compat => (Some(request.max_tokens), None, request.temperature),
+            RequestDialect::Official => {
+                let capped = request.max_tokens.min(max_output_tokens_for(&self.model));
+                let (mt, mct) = if model_requires_max_completion_tokens(&self.model) {
+                    (None, Some(capped))
+                } else {
+                    (Some(capped), None)
+                };
+                // gpt-5 and o-series reject any non-default temperature
+                // with `Unsupported value: temperature does not support
+                // 0.2 with this model. Only the default (1) is
+                // supported.` The lint / consolidate / bootstrap call
+                // sites all pass 0.1-0.2; omit the field entirely so
+                // the API uses its model-specific default.
+                let temp = if model_requires_default_temperature(&self.model) {
+                    None
+                } else {
+                    request.temperature
+                };
+                (mt, mct, temp)
+            }
+        };
         OpenAiRequest {
             model: &self.model,
             messages,
             max_tokens,
             max_completion_tokens,
-            temperature: request.temperature,
+            temperature,
             response_format,
         }
     }
@@ -262,7 +324,7 @@ impl OpenAiProvider {
 }
 
 /// Recursively normalise a JSON schema for OpenAI Structured Outputs
-/// (`strict: true`). The API rejects schemas missing either:
+/// (`strict: true`). The endpoint rejects schemas missing either:
 ///
 /// 1. `additionalProperties: false` on every object node — without it:
 ///    `'additionalProperties' is required to be supplied and to be false`.
@@ -273,12 +335,14 @@ impl OpenAiProvider {
 ///    a complete `required` array: `'required' is required to be supplied
 ///    and to be an array including every key in properties`.
 ///
-/// Callers can hand us schemas authored elsewhere (or generated by
-/// `schemars`, which marks `#[serde(default)]` fields as non-required)
-/// that don't bother — this normalisation hides both constraints from
-/// the rest of the codebase. Caller-set values are preserved: if a
-/// caller deliberately set `additionalProperties: true` or supplied a
-/// trimmed `required`, we don't second-guess them.
+/// Both rules are unconditional here: this normalisation only runs on
+/// the `Official` request dialect, which targets `api.openai.com`
+/// where strict mode is mandatory. Any caller-supplied
+/// `additionalProperties: true` or trimmed `required` array is
+/// overwritten — preserving them would let invalid schemas through
+/// and re-introduce the 400 this function exists to prevent. Callers
+/// that need looser schemas should use the `Compat` dialect (which
+/// skips this normalisation entirely) or a non-strict path.
 fn enforce_strict_object_schemas(value: &mut serde_json::Value) {
     match value {
         serde_json::Value::Object(map) => {
@@ -288,9 +352,9 @@ fn enforce_strict_object_schemas(value: &mut serde_json::Value) {
                 .is_some_and(|t| t == "object")
                 || map.contains_key("properties");
             if is_object {
-                if !map.contains_key("additionalProperties") {
-                    map.insert("additionalProperties".to_string(), serde_json::json!(false));
-                }
+                // Force-set both: a caller-supplied `true` would defeat
+                // the entire purpose of the strict-mode normalisation.
+                map.insert("additionalProperties".to_string(), serde_json::json!(false));
                 // OpenAI strict mode rejects ANY incomplete `required` —
                 // even an explicit subset. The only way to express
                 // optionality is via a nullable type at the value site
@@ -326,25 +390,45 @@ fn model_requires_max_completion_tokens(model: &str) -> bool {
     m.starts_with("gpt-5") || m.starts_with("o1") || m.starts_with("o3") || m.starts_with("o4")
 }
 
-/// Per-model output-token ceiling.
+/// Models that reject any non-default `temperature` value.
 ///
-/// OpenAI clamps requests above the model's published limit by returning
-/// `400 max_tokens is too large`, instead of silently truncating. Callers
-/// (e.g. bootstrap) deliberately ask for very large budgets (64K) so
-/// Anthropic / Haiku-class models don't truncate mid-JSON; the same
-/// request blows up on gpt-4o-mini (cap 16384) without this defensive
-/// cap. Reasoning models in the gpt-5 / o-series have much larger caps,
-/// so we leave their requests untouched.
+/// gpt-5 and the o-series reasoning models accept only the model
+/// default (1.0). Any caller-supplied value — including the 0.1-0.2
+/// passed by lint / bootstrap / consolidation — returns a 400:
+/// `Unsupported value: 'temperature' does not support 0.2 with this
+/// model. Only the default (1) is supported.` Omitting the field
+/// entirely lets the API apply its own default and unblocks those
+/// models without forcing every call site to be model-aware.
+fn model_requires_default_temperature(model: &str) -> bool {
+    // Same family as `max_completion_tokens` — keep aligned: any future
+    // family that adopts the new rename also tends to lock temperature.
+    model_requires_max_completion_tokens(model)
+}
+
+/// Per-model output-token ceiling for the `Official` dialect.
+///
+/// OpenAI rejects requests above the model's published limit with
+/// `400 max_tokens is too large`, instead of silently truncating.
+/// Callers (e.g. bootstrap) deliberately ask for very large budgets
+/// (64K) so Anthropic / Haiku-class models don't truncate mid-JSON;
+/// the same request blows up on gpt-4o-mini without this defensive
+/// cap. The cap is informed but conservative: gpt-4-turbo's real
+/// limit is 4096 (smaller than what we use here), so a max-budget
+/// bootstrap call to gpt-4-turbo will still 400 with the same
+/// model-specific message — at which point the operator can lower
+/// `max_tokens` or switch model. The cap exists to unblock the
+/// common case (gpt-4o family at 16384), not to paper over every
+/// model. Reasoning models in the gpt-5 / o-series have much larger
+/// caps (128K+), so we leave their requests untouched.
 fn max_output_tokens_for(model: &str) -> u32 {
     if model_requires_max_completion_tokens(model) {
         // gpt-5 / o-series: documented at 128K output. Leave the
         // caller's value alone — they know what they're asking for.
         u32::MAX
     } else {
-        // gpt-4o family, gpt-4-turbo, gpt-3.5: the conservative 16384
-        // is the published cap of gpt-4o / gpt-4o-mini. gpt-4-turbo
-        // is even smaller (4096) but rejects with the same 400, so
-        // the user gets a clear "lower max_tokens" signal there too.
+        // gpt-4o family published cap. gpt-4-turbo / gpt-3.5 have a
+        // lower cap (4096) and will still 400 — this is intentional;
+        // they're outside the strict-mode target audience.
         16_384
     }
 }
@@ -352,8 +436,8 @@ fn max_output_tokens_for(model: &str) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::{
-        OpenAiProvider, enforce_strict_object_schemas, model_requires_max_completion_tokens,
-        normalize_openai_base,
+        OpenAiProvider, RequestDialect, enforce_strict_object_schemas,
+        model_requires_max_completion_tokens, normalize_openai_base,
     };
     use crate::types::{ChatMessage, ChatRequest, Role};
     use secrecy::SecretString;
@@ -457,7 +541,12 @@ mod tests {
     }
 
     #[test]
-    fn enforce_strict_preserves_existing_additional_properties() {
+    fn enforce_strict_overwrites_caller_additional_properties_true() {
+        // OpenAI strict mode requires `additionalProperties: false` on
+        // every object node — preserving an explicit `true` would
+        // re-introduce the 400 this function exists to prevent. The
+        // PR-review version of this test had the opposite assertion
+        // and was incompatible with the function's own contract.
         let mut schema = json!({
             "type": "object",
             "properties": { "anything": { "type": "string" } },
@@ -466,8 +555,8 @@ mod tests {
         enforce_strict_object_schemas(&mut schema);
         assert_eq!(
             schema["additionalProperties"],
-            json!(true),
-            "caller-set value must not be overwritten"
+            json!(false),
+            "strict mode requires false; caller's true must be overwritten"
         );
     }
 
@@ -536,6 +625,88 @@ mod tests {
         let req = p.build_request(&req_input, None);
         let json = serde_json::to_value(&req).unwrap();
         assert_eq!(json["max_tokens"], json!(16_384));
+    }
+
+    #[test]
+    fn build_request_omits_temperature_for_gpt5() {
+        // gpt-5 / o-series reject any non-default temperature. The
+        // `Official` dialect must omit the field so the API uses its
+        // model-specific default.
+        let p = provider_for("gpt-5.4-nano");
+        let req_input = ChatRequest {
+            system: None,
+            messages: vec![ChatMessage {
+                role: Role::User,
+                content: "x".into(),
+            }],
+            max_tokens: 256,
+            temperature: Some(0.2),
+        };
+        let req = p.build_request(&req_input, None);
+        let json = serde_json::to_value(&req).unwrap();
+        assert!(
+            json.get("temperature").is_none(),
+            "temperature must be omitted for gpt-5/o-series under the Official dialect"
+        );
+    }
+
+    #[test]
+    fn build_request_keeps_temperature_for_gpt4() {
+        // gpt-4 family accepts any temperature; forwarding the
+        // caller's value is the legacy behaviour and stays.
+        let p = provider_for("gpt-4o-mini");
+        let req_input = ChatRequest {
+            system: None,
+            messages: vec![ChatMessage {
+                role: Role::User,
+                content: "x".into(),
+            }],
+            max_tokens: 256,
+            temperature: Some(0.2),
+        };
+        let req = p.build_request(&req_input, None);
+        let json = serde_json::to_value(&req).unwrap();
+        let temp = json["temperature"].as_f64().unwrap();
+        assert!(
+            (temp - 0.2).abs() < 1e-6,
+            "temperature must be ~0.2, got {temp}"
+        );
+    }
+
+    #[test]
+    fn build_request_compat_dialect_keeps_max_tokens_and_temperature() {
+        // `Compat` (Ollama / vLLM / LM Studio) speaks the legacy
+        // wire format only — even when the model id starts with
+        // `gpt-5*`, because the local engine doesn't implement the
+        // new dialect. Akita flagged this regression in PR review.
+        let p = OpenAiProvider::new(SecretString::new("dummy".into()), "gpt-5-mini")
+            .unwrap()
+            .with_dialect(RequestDialect::Compat);
+        let req_input = ChatRequest {
+            system: None,
+            messages: vec![ChatMessage {
+                role: Role::User,
+                content: "x".into(),
+            }],
+            max_tokens: 64_000,
+            temperature: Some(0.2),
+        };
+        let req = p.build_request(&req_input, None);
+        let json = serde_json::to_value(&req).unwrap();
+        assert_eq!(
+            json["max_tokens"],
+            json!(64_000),
+            "compat dialect must use legacy max_tokens, uncapped"
+        );
+        assert!(
+            json.get("max_completion_tokens").is_none(),
+            "compat dialect must not emit max_completion_tokens"
+        );
+        let temp = json["temperature"].as_f64().unwrap();
+        assert!(
+            (temp - 0.2).abs() < 1e-6,
+            "compat dialect must forward temperature unchanged, got {temp}"
+        );
     }
 
     #[test]
