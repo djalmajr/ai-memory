@@ -83,7 +83,8 @@ blocking issue:**
 3. Indexes commit in the same transaction as the data. No
    background-task-indexing-after-return.
 4. Typed `(WorkspaceId, ProjectId, PagePath)` identity in every layer.
-5. Hooks are fire-and-forget. Sub-second timeouts. Return 202 immediately.
+5. Hooks are fire-and-forget. Sub-second timeouts. Return 202 immediately,
+   or 429 when saturated.
 6. Privacy strip is a typed boundary (`RawHookPayload → Sanitized<Observation>`).
 7. JSON-schema structured outputs only. No XML, no `instructor`-style wrapping.
 8. `{provider, model, dim}` stored next to every embedding. Refuse on mismatch.

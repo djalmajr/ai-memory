@@ -98,7 +98,8 @@ Three capture surfaces, in priority order:
 1. **Lifecycle hooks/extensions** (Claude Code, Codex, OpenCode, OMP). These are fast, reliable, structured. We ship hook scripts or generated TypeScript integrations the user installs once. Lessons from agentmemory:
   - Hooks must be **fire-and-forget** (#221). No `await fetch()` blocking session start.
   - Sub-second hard timeouts on the writer side (`tokio::time::timeout`).
-  - All hooks → single HTTP/Unix-socket POST → server queues → returns 202 immediately.
+  - All hooks → single HTTP/Unix-socket POST → server queues → returns 202
+    immediately, or 429 when saturated.
   - Privacy strip at the hook boundary, not later (agentmemory `stripPrivateData`).
 
 2. **Transcript tail** (universal fallback). Watch `~/.claude/projects/`, `~/.codex/`, `~/.config/opencode/sessions/`. Lossier but works for any agent. Required for the basic-memory #669/#687/#730 demand the tracker has been asking for.
@@ -182,7 +183,10 @@ Project resolution chain: explicit param → server's default → cwd-based heur
 
 - **Single binary**, statically-linked where possible. Distroless Docker image. **Absolute data path** by default (`dirs::data_local_dir().join("ai-memory")`); log it loudly on startup (agentmemory #303 lesson).
 - **Atomic config**: one `Config::load()` → typed struct, every reader takes `&Config`. No `process.env` double-read paths (agentmemory #456/#469).
-- **Write durability**: every observation lands in SQLite *and* is appended to a `log.md` line *before* the hook gets its 202. No background-task indexing-after-return (basic-memory #763/#578/#839).
+- **Write durability**: accepted hook work awaits the SQLite write and appends a
+  `log.md` line before that background task finishes. Indexes still commit in
+  the same transaction as the data; no detached indexing task runs after the
+  write ack (basic-memory #763/#578/#839).
 - **Migrations**: `sqlx::migrate!` runs on startup; never inline DDL (basic-memory #727).
 - **Schema versioning**: one source of truth for the schema; derived clients/docs. No "update 7 files" checklists (agentmemory AGENTS.md smell).
 - **Backup/move**: `ai-memory export <dir>` dumps wiki/ + sqlite snapshot. `ai-memory import <dir>` consumes. Default data dir is portable. Optional: `auto_git_commit = true` config flag → commits the wiki directory on every `memory_lint` run.

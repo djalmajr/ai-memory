@@ -35,6 +35,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   one SQL query instead of issuing incoming/outgoing lookups per seed.
 - Embedding backfill stores embeddings in chunks instead of one writer
   command and SQLite transaction per page.
+- Hook ingestion now bounds in-flight processing and returns HTTP 429 when
+  saturated instead of spawning unbounded background tasks.
 - Documented the vector backend policy and the measured criteria required
   before adding `sqlite-vec`.
 - Clarified Gemini CLI support docs: MCP registration, lifecycle hooks,

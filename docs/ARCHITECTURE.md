@@ -76,7 +76,8 @@ markdown stays the source of truth.
 
 1. Agent CLI emits a lifecycle hook (SessionStart, UserPromptSubmit,
    PostToolUse, …) → vendored shell script `curl`s the event JSON to
-   `POST /hook` with a sub-second timeout. Agent never blocks.
+   `POST /hook` with a sub-second timeout. Agent never blocks; saturated
+   servers return HTTP 429 instead of queueing unbounded work.
 2. Server's hook router sanitises the payload (the only path from
    untrusted text into the store), assigns an [`ObservationKind`], and
    enqueues a `WriteCmd` to the writer actor. `log.md` gets an
@@ -210,7 +211,8 @@ that touch the relevant area.
 4. **Typed 3-tuple identity** (`workspace_id`, `project_id`, path)
    in every domain row from day one. (basic-memory #783 / #834.)
 5. **Hooks are fire-and-forget.** Hook scripts hard-timeout at
-   ≤200 ms; server returns 202 immediately. (agentmemory #221 / #143.)
+   ≤200 ms; server returns 202 immediately or 429 when saturated.
+   (agentmemory #221 / #143.)
 6. **Privacy strip is a typed boundary.** `Sanitized<NewObservation>`
    has no other constructor than `sanitize()`. (design-decisions §14.)
 7. **JSON-schema structured outputs only.** Native provider JSON

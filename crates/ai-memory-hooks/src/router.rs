@@ -1,11 +1,12 @@
 //! axum router exposing `POST /hook`.
 //!
-//! Always returns 202 immediately. Heavy work (DB writes, session-page
-//! synthesis) happens *after* the response is sent — but we still
-//! `await` the writer ack to honour the cross-cutting invariant that
-//! "indexes commit in the same transaction as the data" (no
-//! background-task-indexing-after-return, basic-memory #763). The agent
-//! never blocks on us thanks to the fire-and-forget client side.
+//! Returns 202 immediately unless the in-flight hook limit is saturated,
+//! in which case it returns 429. Heavy work (DB writes, session-page
+//! synthesis) happens *after* the response is sent — but we still `await`
+//! the writer ack to honour the cross-cutting invariant that "indexes commit
+//! in the same transaction as the data" (no background-task-indexing-after-return,
+//! basic-memory #763). The agent never blocks on us thanks to the
+//! fire-and-forget client side.
 
 use std::collections::HashMap;
 use std::str::FromStr;
@@ -32,6 +33,13 @@ use uuid::Uuid;
 use crate::log;
 use crate::payload::{HookEnvelope, HookEvent, HookQuery, parse_agent};
 use crate::synth::synthesize_session_page;
+
+/// Default maximum number of hook events allowed to be processing at once.
+///
+/// This matches the writer queue order of magnitude and prevents unbounded
+/// background tasks during tool-heavy bursts. Saturated servers return 429 so
+/// callers can drop or retry instead of growing memory without bound.
+pub const DEFAULT_HOOK_INGEST_MAX_IN_FLIGHT: usize = 1024;
 
 /// Shared state passed to the hook handler.
 #[derive(Clone)]
@@ -65,6 +73,9 @@ pub struct HookState {
     /// of their own) default to the project the user is actually in
     /// rather than the server's static `--project` (issue #2).
     pub active_project: ActiveProject,
+    /// In-flight hook processing limiter. Requests acquire one permit before
+    /// spawning work and return 429 immediately when saturated.
+    pub ingest_semaphore: Arc<tokio::sync::Semaphore>,
 }
 
 /// Build a router with `POST /hook` (event ingress) and `GET /handoff`
@@ -82,7 +93,14 @@ async fn handle_hook(
     Json(body): Json<serde_json::Value>,
 ) -> impl IntoResponse {
     let env = HookEnvelope::from_query_and_body(query, body);
-    tokio::spawn(process_envelope(state.clone(), env));
+    let Ok(permit) = state.ingest_semaphore.clone().try_acquire_owned() else {
+        warn!("hook ingest saturated; dropping event with 429");
+        return (StatusCode::TOO_MANY_REQUESTS, "hook queue full");
+    };
+    tokio::spawn(async move {
+        let _permit = permit;
+        process_envelope(state, env).await;
+    });
     (StatusCode::ACCEPTED, "queued")
 }
 
@@ -576,6 +594,9 @@ mod tests {
             sanitizer,
             project_cache: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             active_project: ActiveProject::new(),
+            ingest_semaphore: Arc::new(tokio::sync::Semaphore::new(
+                DEFAULT_HOOK_INGEST_MAX_IN_FLIGHT,
+            )),
         }
     }
 
@@ -605,6 +626,26 @@ mod tests {
         // The MCP-shared pointer reflects the most recently resolved
         // project (issue #2) — here, project-beta.
         assert_eq!(state.active_project.get(), Some((ws_b, proj_b)));
+    }
+
+    #[tokio::test]
+    async fn handle_hook_returns_429_when_ingest_saturated() {
+        let tmp = TempDir::new().unwrap();
+        let mut state = make_state(&tmp).await;
+        state.ingest_semaphore = Arc::new(tokio::sync::Semaphore::new(0));
+
+        let response = handle_hook(
+            State(Arc::new(state)),
+            Query(HookQuery {
+                event: "session-start".into(),
+                agent: Some("claude-code".into()),
+            }),
+            Json(serde_json::json!({})),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
     }
 
     /// An event without a cwd must fall back to the server defaults.

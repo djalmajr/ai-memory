@@ -72,11 +72,12 @@ documented in basic-memory's tracker.
 
 ### Capture And Handoff
 
-The hook router accepts lifecycle events over HTTP, returns `202` fast,
-and does the writer work outside the agent's critical path. `SessionEnd`
-creates a deterministic session page, ends the session, opens a typed
-handoff, and commits the wiki. `PreCompact` checkpoints state, using the
-LLM consolidator if configured and deterministic synthesis otherwise.
+The hook router accepts lifecycle events over HTTP, returns `202` fast
+unless saturated (`429`), and does the writer work outside the agent's
+critical path. `SessionEnd` creates a deterministic session page, ends the
+session, opens a typed handoff, and commits the wiki. `PreCompact`
+checkpoints state, using the LLM consolidator if configured and deterministic
+synthesis otherwise.
 
 The explicit `memory_handoff_begin` / `memory_handoff_accept` model is a
 cleaner version of agentmemory's informal handoff behavior.

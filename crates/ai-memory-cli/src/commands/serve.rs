@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use ai_memory_consolidate::{Consolidator, run_lint, run_sweep};
 use ai_memory_core::{ActiveProject, ProjectId, Sanitizer, WorkspaceId};
-use ai_memory_hooks::{HookState, hook_router};
+use ai_memory_hooks::{DEFAULT_HOOK_INGEST_MAX_IN_FLIGHT, HookState, hook_router};
 use ai_memory_llm::{Embedder, LlmProvider, build_embedder, build_provider};
 use ai_memory_mcp::{AdminState, AiMemoryServer, admin_router};
 use ai_memory_store::{EmbeddingWrite, ReaderPool, Store, WriterHandle, f32_vec_to_bytes};
@@ -168,6 +168,9 @@ pub async fn run(config: &Config, args: ServeArgs) -> Result<()> {
                     std::collections::HashMap::new(),
                 )),
                 active_project: active_project.clone(),
+                ingest_semaphore: std::sync::Arc::new(tokio::sync::Semaphore::new(
+                    DEFAULT_HOOK_INGEST_MAX_IN_FLIGHT,
+                )),
             });
             let admin = admin_router(AdminState {
                 writer: store.writer.clone(),
