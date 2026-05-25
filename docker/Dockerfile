@@ -10,7 +10,7 @@
 FROM rust:1.95-slim-bookworm AS builder
 WORKDIR /work
 RUN apt-get update \
- && apt-get install -y --no-install-recommends pkg-config build-essential \
+ && apt-get install -y --no-install-recommends pkg-config build-essential curl \
  && rm -rf /var/lib/apt/lists/*
 COPY Cargo.toml Cargo.lock rust-toolchain.toml deny.toml ./
 COPY crates ./crates
