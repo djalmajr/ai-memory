@@ -93,7 +93,13 @@ pub async fn run(config: &Config, args: BootstrapArgs) -> Result<()> {
     // local preview and (b) exploded with 413 on repos large enough
     // to exceed the server's 10 MB body limit. We now compute the
     // dry-run summary entirely client-side and skip the round-trip.
+    //
+    // Server parity: `process_sources` returns `NoSources` when the
+    // collected bundle is empty, so the operator catches a wrong
+    // repo path or over-broad `--exclude-*` flag before they think
+    // they bootstrapped something. Mirror that here.
     if args.dry_run {
+        ensure_sources_for_dry_run(&sources)?;
         let outcome = local_dry_run(sources, args.max_input_tokens);
         print_human_report(&outcome, &args.workspace, &project);
         let report = serde_json::to_string_pretty(&outcome)?;
@@ -115,6 +121,23 @@ pub async fn run(config: &Config, args: BootstrapArgs) -> Result<()> {
     print_human_report(&outcome, &args.workspace, &project);
     let report = serde_json::to_string_pretty(&outcome)?;
     println!("\n--- machine-readable ---\n{report}");
+    Ok(())
+}
+
+/// Mirror the server's `process_sources` `NoSources` check so a local
+/// dry-run on an empty bundle fails the same way a real bootstrap
+/// would. Catches the operator who pointed at a wrong path, a folder
+/// without a git repo / README / docs, or who combined `--exclude-*`
+/// flags so aggressively that every source dropped — before they
+/// think they bootstrapped something and waste tokens against a real
+/// run later.
+fn ensure_sources_for_dry_run(sources: &[BootstrapSource]) -> Result<()> {
+    anyhow::ensure!(
+        !sources.is_empty(),
+        "no input sources collected (matches server `NoSources`): wrong repo path, or every \
+         --exclude-* flag combined to drop everything. Remove at least one --exclude-* flag \
+         or point --repo-path at a directory with a README, docs/, or commits.",
+    );
     Ok(())
 }
 
@@ -234,7 +257,7 @@ fn print_human_report(outcome: &BootstrapOutcome, workspace: &str, project: &str
 
 #[cfg(test)]
 mod tests {
-    use super::local_dry_run;
+    use super::{ensure_sources_for_dry_run, local_dry_run};
     use ai_memory_consolidate::{BootstrapSource, SourceKind};
 
     fn source(kind: SourceKind, label: &str, body_len: usize) -> BootstrapSource {
@@ -247,10 +270,13 @@ mod tests {
 
     #[test]
     fn local_dry_run_marks_outcome_as_dry_run() {
-        let outcome = local_dry_run(vec![], 150_000);
+        // The CLI handler refuses to call `local_dry_run` with zero
+        // sources (server parity — see `anyhow::ensure!` in `run`),
+        // so the lowest input we can hand the helper is one source.
+        let outcome = local_dry_run(vec![source(SourceKind::Readme, "README", 50)], 150_000);
         assert!(outcome.dry_run);
-        assert_eq!(outcome.sources_collected, 0);
-        assert_eq!(outcome.sources_sent, 0);
+        assert_eq!(outcome.sources_collected, 1);
+        assert_eq!(outcome.sources_sent, 1);
         assert!(outcome.pages_written.is_empty());
         assert!(outcome.rationale.contains("dry-run"));
     }
@@ -271,6 +297,29 @@ mod tests {
         assert_eq!(outcome.sources_by_kind.git_commits, 2);
         assert_eq!(outcome.sources_by_kind.doc_files, 1);
         assert!(outcome.estimated_input_tokens > 0);
+    }
+
+    #[test]
+    fn ensure_sources_for_dry_run_rejects_empty() {
+        // Server's `process_sources` returns `BootstrapError::NoSources`
+        // on an empty bundle (status 422). The client-side dry-run path
+        // must do the same so wrong repo paths / over-broad excludes
+        // don't get silently glossed over.
+        let err = ensure_sources_for_dry_run(&[])
+            .expect_err("empty bundle must fail in dry-run, matching server NoSources");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("no input sources collected") && msg.contains("NoSources"),
+            "error message should reference both the user-facing cause and the server parity: {msg}",
+        );
+    }
+
+    #[test]
+    fn ensure_sources_for_dry_run_accepts_non_empty() {
+        // A single source is enough — paridade with the server's check,
+        // which gates on emptiness alone (budget pruning happens later).
+        ensure_sources_for_dry_run(&[source(SourceKind::Readme, "README", 50)])
+            .expect("non-empty bundle must pass");
     }
 
     #[test]
