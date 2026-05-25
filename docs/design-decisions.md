@@ -8,8 +8,8 @@
 
 A self-contained Rust binary that:
 
-1. Runs as an **MCP server** (stdio + HTTP/SSE) for coding-agent CLIs (Claude Code, OpenAI Codex, OpenCode, OMP, and MCP-capable clients).
-2. Captures the agent's session **automatically** - no `write_note` ceremony - via hook scripts or generated extensions that the agent CLIs invoke (Claude Code lifecycle hooks, Codex hooks, OpenCode/OMP TypeScript integrations). Optional transcript-tail fallback for agents without hook APIs.
+1. Runs as an **MCP server** (stdio + HTTP/SSE) for coding-agent CLIs (Claude Code, OpenAI Codex, Cursor, Gemini CLI, OpenCode, OMP, and MCP-capable clients).
+2. Captures the agent's session **automatically** - no `write_note` ceremony - via hook scripts or generated extensions that the agent CLIs invoke (Claude Code / Codex / Cursor / Gemini CLI lifecycle hooks, OpenCode/OMP TypeScript integrations). Optional transcript-tail fallback for agents without hook APIs.
 3. Maintains a **Karpathy-style wiki**: incrementally-compiled markdown pages with cross-links, supersession, an `index.md` and a `log.md`.
 4. Serves retrieval via the MCP `tools/list` to coding agents: a handful of *narrow* tools, not 50.
 5. Ships a **Docker image** (`docker run -v ai-memory-data:/data -p 49374:49374 ai-memory`) so it can move between desktop and homelab.

@@ -17,12 +17,12 @@
 > --http-stateful` to restore rmcp's session mode.
 
 This page documents how to register ai-memory as an MCP server with
-the agent CLIs **that are not covered inline in the README**.
+agent CLIs beyond the README quick start.
 
-Claude Code, OpenAI Codex, OpenCode, and OMP have automatic capture
-integrations (shell hooks for Claude Code / Codex, TypeScript
-plugin/extension files for OpenCode / OMP) and are covered in the
-[main README](../README.md#configure-your-agent-cli).
+Claude Code, OpenAI Codex, Cursor, Gemini CLI, OpenCode, and OMP have
+automatic capture integrations (shell/PowerShell hooks for Claude Code /
+Codex / Cursor / Gemini CLI, TypeScript plugin/extension files for
+OpenCode / OMP) and are covered in the [main README](../README.md#quick-start).
 
 Some clients on this page are **MCP-only**: they expose long-term
 memory to their LLM via ai-memory's MCP tools (`memory_query`,
@@ -41,7 +41,7 @@ asking the LLM to call `memory_handoff_begin` manually before quitting.
 > **One-shot tip:** every snippet below is also reachable from the
 > CLI:
 > ```bash
-> ai-memory install-mcp --client cursor       # or claude-desktop / gemini-cli / openclaw / pi|omp
+> ai-memory install-mcp --client gemini-cli   # or cursor / claude-desktop / openclaw / pi|omp
 > ```
 
 ---
@@ -134,9 +134,23 @@ endpoints. The `timeout` is in milliseconds.
 }
 ```
 
+**Hooks:**
+
+```bash
+ai-memory install-hooks --agent gemini-cli --apply
+```
+
+Gemini CLI's lifecycle event names differ from Claude Code's, so use
+`install-hooks --agent gemini-cli` rather than copying another agent's
+settings. ai-memory maps Gemini's `SessionStart`, `SessionEnd`,
+`BeforeTool`, `AfterTool`, and `PreCompress` events to the shared hook
+capture path; `SessionStart` also fetches pending handoffs.
+
 **Gotchas:**
 - Gemini supports stdio too via `command`/`args`, plus SSE via `url`.
   Only `httpUrl` covers streamable HTTP. Don't mix them in one entry.
+- Restart the CLI session after changing `~/.gemini/settings.json` so
+  both MCP servers and hooks are reloaded.
 - Source: <https://github.com/google-gemini/gemini-cli/blob/main/docs/tools/mcp-server.md>
 
 ---
@@ -270,8 +284,8 @@ that *starts* the next one - to play nicely with ai-memory:
 
 | Side | What's needed | Covered by |
 |---|---|---|
-| **Ending side** | The agent must create a handoff, either through a true session-end hook or by calling `memory_handoff_begin`. | Built-in for Claude Code, Codex, and OMP. OpenCode has no true session-end event, so ask it to call `memory_handoff_begin` before quitting when you need a handoff. |
-| **Starting side** | Either (a) the session-start/plugin path injects the handoff via `/handoff`, OR (b) the model proactively calls `memory_handoff_accept` on first turn. | (a) is built-in for Claude Code / Codex / OpenCode / OMP. (b) works for any MCP-capable client if you nudge the model - see [the CLAUDE.md snippet](../README.md#nudging-the-agent-to-use-memory-proactively). |
+| **Ending side** | The agent must create a handoff, either through a true session-end hook or by calling `memory_handoff_begin`. | Built-in for Claude Code, Codex, Cursor, Gemini CLI, and OMP. OpenCode has no true session-end event, so ask it to call `memory_handoff_begin` before quitting when you need a handoff. |
+| **Starting side** | Either (a) the session-start/plugin path injects the handoff via `/handoff`, OR (b) the model proactively calls `memory_handoff_accept` on first turn. | (a) is built-in for Claude Code / Codex / Cursor / Gemini CLI / OpenCode / OMP. (b) works for any MCP-capable client if you nudge the model - see [the CLAUDE.md snippet](../README.md#nudging-the-agent-to-use-memory-proactively). |
 
 So a typical mixed workflow looks like:
 

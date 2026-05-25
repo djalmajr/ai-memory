@@ -31,6 +31,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Changed
 - Documented the vector backend policy and the measured criteria required
   before adding `sqlite-vec`.
+- Clarified Gemini CLI support docs: MCP registration, lifecycle hooks,
+  SessionStart handoff injection, and SessionEnd capture are now called out
+  consistently across README and install guides.
 - Docker images now bundle both POSIX and PowerShell hook scripts.
 
 ### Fixed

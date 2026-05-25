@@ -149,8 +149,8 @@ docker run -d --name ai-memory \
 
 # 3. Wire your agent CLI in two commands. The wrapper takes care of
 #    mounts + auto-detecting ~/.claude/settings.json. Re-run with
-#    `--agent codex`, `--agent opencode`, `--agent omp`/`pi`,
-#    `--client cursor`, `--client pi`/`omp`, etc.
+#    `--agent codex`, `--agent opencode`, `--agent gemini-cli`,
+#    `--agent omp`/`pi`, `--client cursor`, `--client gemini-cli`, etc.
 #    for additional agents; full list in docs/install.md.
 ai-memory install-mcp   --client claude-code --apply
 ai-memory install-hooks --agent  claude-code --apply

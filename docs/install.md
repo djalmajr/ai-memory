@@ -85,9 +85,10 @@ Claude Desktop and OpenClaw are MCP-only today. Claude Code, Codex,
 OpenCode, OMP, Cursor, and Gemini CLI have lifecycle capture paths
 through `install-hooks`.
 
-> **Two-step hook install pattern.** Claude Code and Codex use shell
-> hook scripts: (1) `docker cp` the bundled scripts to your home dir,
-> (2) `docker run --rm install-hooks` to render the config snippet.
+> **Two-step hook install pattern.** Claude Code, Codex, Cursor, and
+> Gemini CLI use shell/PowerShell hook scripts: (1) `docker cp` the
+> bundled scripts to your home dir, (2) `docker run --rm install-hooks`
+> to render the config snippet.
 > OpenCode and OMP are different: they use generated TypeScript
 > plugin/extension files, so no shell-script extraction is needed for
 > those clients.
@@ -179,7 +180,7 @@ files owned by the user running the command. Prefer it as the
 default; reach for `setup-agent` only when your docker setup is
 known not to remap UIDs.
 
-### Cursor, Claude Desktop, Gemini CLI, OpenClaw
+### Cursor, Gemini CLI, Claude Desktop, OpenClaw
 
 See [**`docs/mcp-install.md`**](mcp-install.md) for the per-client MCP
 config file path and snippet, or one-shot it via:
@@ -198,14 +199,19 @@ docker run --rm akitaonrails/ai-memory:latest \
     --server-url "http://homelab:49374/mcp"
 
 docker run --rm akitaonrails/ai-memory:latest \
+    install-hooks --agent gemini-cli     --auth-token "$TOKEN" \
+    --server-url "http://homelab:49374"
+
+docker run --rm akitaonrails/ai-memory:latest \
     install-mcp --client openclaw        --auth-token "$TOKEN" \
     --server-url "http://homelab:49374/mcp"
 ```
 
-For MCP-only clients you'll need to nudge the model to call
-`memory_query` / `memory_handoff_accept` itself. For clients with
-`install-hooks` support, the capture path handles handoff injection at
-session start.
+Cursor and Gemini CLI support both `install-mcp` and `install-hooks`.
+Claude Desktop and OpenClaw are MCP-only here, so you'll need to nudge
+the model to call `memory_query` / `memory_handoff_accept` itself. For
+clients with `install-hooks` support, the capture path handles handoff
+injection at session start.
 
 ---
 
