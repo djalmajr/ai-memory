@@ -269,10 +269,11 @@ OPENAI_API_KEY / VOYAGE_API_KEY
   ready, just needs the `OrtBgeSmallEmbedder` impl + tokenizer wiring.
 * **`sqlite-vec` integration.** Brute-force cosine works fine to a few
   thousand pages; past that, the `sqlite-vec` extension is the next
-  step. Deferred behind workaround for rusqlite-compat (issue #206).
-* **Scheduled forget-sweep / lint.** Currently manual / on-demand via
-  the MCP tools or CLI. The next iteration runs both on a 6-hour
-  `tokio::interval` inside `serve`.
+  step. See [`docs/vector-backend-policy.md`](vector-backend-policy.md)
+  for the criteria that should justify adding it.
+* **Scheduled consolidation queue.** Forget sweep and lint already run
+  on the server's maintenance schedule; a future queue can compile
+  session summaries outside hook latency.
 * **Multi-workspace UI / web dashboard.** Out of scope for v1; revisit
   once the headless server has been load-tested.
 * **Real LongMemEval-S harness.** The recall-eval framework exists
