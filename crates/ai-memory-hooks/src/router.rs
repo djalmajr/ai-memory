@@ -350,10 +350,16 @@ async fn resolve_project_ids(
     }
 
     fn basename(path: &std::path::Path) -> Option<String> {
-        path.file_name()
-            .and_then(|s| s.to_str())
-            .map(str::to_string)
-            .filter(|s| !s.is_empty())
+        // Split on both `/` and `\` so Windows paths sent to a Linux
+        // server still resolve to the final component.
+        let s = path.to_str()?;
+        let name = s
+            .rsplit(['/', '\\'])
+            .find(|seg| !seg.is_empty())?;
+        if name.is_empty() {
+            return None;
+        }
+        Some(name.to_string())
     }
 
     let ws = state
@@ -1703,6 +1709,43 @@ mod tests {
         assert_ne!(
             proj, proj2,
             "different bare repo basenames → different projects"
+        );
+    }
+
+    /// Windows-style backslash paths sent to a Linux server must
+    /// still resolve to `basename(cwd)`, not the full path string.
+    #[tokio::test]
+    async fn windows_backslash_path_resolves_to_basename() {
+        let tmp = TempDir::new().unwrap();
+        let state = make_state(&tmp).await;
+
+        let (_, proj_a) = resolve_project_ids(
+            &state,
+            Some(r"E:\source\ai-memory"),
+            None,
+            None,
+            ProjectStrategy::Basename,
+        )
+        .await
+        .unwrap();
+
+        let (_, proj_b) = resolve_project_ids(
+            &state,
+            Some(r"C:\Users\dev\projects\ai-memory"),
+            None,
+            None,
+            ProjectStrategy::Basename,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            proj_a, proj_b,
+            "different Windows paths with same basename must resolve to same project"
+        );
+        assert_ne!(
+            proj_a, state.project_id,
+            "Windows path must not fall back to the server-default project"
         );
     }
 }
