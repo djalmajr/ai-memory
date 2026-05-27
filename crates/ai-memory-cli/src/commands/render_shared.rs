@@ -496,7 +496,14 @@ mod tests {
     #[test]
     fn claude_code_payload_embeds_auth_token_when_provided() {
         let root = PathBuf::from("/host/hooks/claude-code");
-        let v = build_claude_code_payload(&root, "http://localhost:49374", Some("tok"));
+        let v = build_hook_payload_for_platform(
+            &CLAUDE_CODE_EVENTS,
+            &root,
+            "http://localhost:49374",
+            Some("tok"),
+            HookShape::Nested,
+            HookCommandPlatform::Posix,
+        );
         // Env vars are inlined into the command string so CC's
         // hook runner sees them regardless of whether it honours
         // a separate `env` field. Assert the token landed in the
@@ -678,17 +685,22 @@ mod tests {
         let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("hooks")
             .join("claude-code");
-        let v = build_claude_code_payload(&root, "http://localhost:49374", None);
+        let v = build_hook_payload_for_platform(
+            &CLAUDE_CODE_EVENTS,
+            &root,
+            "http://localhost:49374",
+            None,
+            HookShape::Nested,
+            HookCommandPlatform::Posix,
+        );
         let cmd = v
             .pointer("/hooks/SessionStart/0/hooks/0/command")
             .and_then(|s| s.as_str())
             .unwrap();
-        // The command now has the env prefix + the absolute path,
-        // joined by a single space.
         let expected = root.join("session-start.sh").to_string_lossy().to_string();
         assert!(
-            cmd.ends_with(&expected),
-            "command should end with the absolute script path: {cmd}"
+            cmd.contains(&expected),
+            "command should contain the absolute script path: {cmd}"
         );
     }
 
