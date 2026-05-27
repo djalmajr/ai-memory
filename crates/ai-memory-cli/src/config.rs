@@ -59,6 +59,13 @@ pub struct Config {
     pub llm_model: Option<String>,
     /// Optional LLM base URL override.
     pub llm_base_url: Option<String>,
+    /// Opt-in: run LLM consolidation on SessionEnd (in addition to the
+    /// always-written heuristic session page), when an LLM provider is
+    /// configured. Off by default — SessionEnd stays cheap and
+    /// fire-and-forget; the LLM checkpoint otherwise happens on PreCompact
+    /// and via manual `memory_consolidate`. Set with
+    /// `AI_MEMORY_CONSOLIDATE_ON_SESSION_END=true`.
+    pub consolidate_on_session_end: bool,
     /// Optional embedding provider (`openai`, `voyage`, `google` / `gemini`).
     pub embedding_provider: Option<String>,
     /// Optional embedding model override.
@@ -215,6 +222,7 @@ impl Default for Config {
             llm_provider: None,
             llm_model: None,
             llm_base_url: None,
+            consolidate_on_session_end: false,
             embedding_provider: None,
             embedding_model: None,
             embedding_dim: None,

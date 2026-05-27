@@ -306,7 +306,10 @@ inspection commands. CLI URL/auth configuration lives in
 
 ai-memory runs without an LLM: hooks still capture sessions, search uses
 FTS5, and summaries fall back to rule-based output. Add an LLM provider
-when you want session-end consolidation, richer linting, and bootstrap.
+when you want LLM consolidation (on PreCompact, on demand via
+`memory_consolidate`, or opt-in at session end with
+`AI_MEMORY_CONSOLIDATE_ON_SESSION_END`), richer linting, and bootstrap.
+Session end always writes a rule-based summary page + handoff either way.
 
 Recommended defaults:
 
