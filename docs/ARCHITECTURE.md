@@ -207,7 +207,7 @@ invariants below.
 
 | Tool | Hint | Purpose |
 |---|---|---|
-| `memory_query` | read-only | FTS5 + graph RRF + optional vector RRF search, with raw fallback. Bumps access counters for page hits. |
+| `memory_query` | read-only | FTS5 + graph RRF + optional vector RRF search, with raw fallback. Bumps access counters for page hits. Defaults to the current project; `scopes` searches named sibling projects; `global=true` searches every project at once (each hit annotated with its workspace + project). |
 | `memory_recent` | read-only | Most-recently-updated `is_latest=1` pages. |
 | `memory_read_page` | read-only | Fetch the FULL body of a single wiki page by `path` or by top FTS5 hit for a `query`. Use when an agent needs more than the 24-word snippets from `memory_query`. |
 | `memory_status` | read-only | Counts, paths, version. |

@@ -60,7 +60,7 @@ match the intent to the tool. They do not need to name the tool.
 
 | User says / situation | Tool |
 |---|---|
-| "have we discussed X?" / "search memory for Y" / before proposing architecture | `memory_query` |
+| "have we discussed X?" / "search memory for Y" / before proposing architecture | `memory_query` (current project; `scopes` for named siblings; `global=true` to search every project) |
 | "what's been going on" / "show recent activity" (light) | `memory_recent` |
 | "is ai-memory healthy?" / "how big is the wiki?" | `memory_status` |
 | "give me the stats" / structured snapshot for the agent to consume | `memory_briefing` |
