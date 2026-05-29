@@ -79,6 +79,22 @@ going on" use case — it returns a prose digest whose verbosity
 scales automatically to how long it's been since the last activity
 (< 1 h → one line; > 30 days → full catchup).
 
+### When the current project comes up empty — broaden the search
+
+`memory_query` searches only the **current** project; there is **no
+global "search everything" mode**. If a search comes back empty or
+thin, the knowledge may live in a **sibling project** — shared `infra`,
+`ops`, or a related app. Re-run `memory_query` with explicit `scopes`
+naming those projects, e.g. `scopes: [{ "workspace": "default",
+"project": "infra" }]`. Don't conclude "we never recorded it" after a
+single project misses.
+
+`memory_query` returns **snippets, not full page bodies** — an empty or
+short snippet does **not** mean the page is empty (a large page can
+match outside the snippet window). To read the whole page, use
+`memory_read_page` (by `path`, or pass a `query` to fetch the top hit's
+full body).
+
 ### When you write a project rule, write it here
 
 If you're about to write a durable project rule ("always X", "never

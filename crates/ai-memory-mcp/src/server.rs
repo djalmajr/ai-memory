@@ -91,6 +91,18 @@ the conversation calls for them:\n\
   in the right rules file (Claude Code → CLAUDE.md, Codex / \
   OpenCode / Cursor / Gemini → AGENTS.md).\n\
 \n\
+**When the current project comes up empty, broaden — don't stop.** \
+`memory_query` searches only ONE project (the current one); there is \
+NO global 'search everything' mode. If a query returns nothing useful, \
+the knowledge may live in a SIBLING project — shared `infra`, `ops`, \
+or a related app. Re-run `memory_query` with explicit \
+`scopes: [{workspace, project}]` naming those projects; don't conclude \
+'we never recorded it' after one project misses. Note also that \
+`memory_query` returns SNIPPETS, not full page bodies — an empty or \
+short snippet does NOT mean the page is empty (a large page can match \
+outside the snippet window); to read the whole page use \
+`memory_read_page` (by `path`, or a `query` for the top hit's body).\n\
+\n\
 The routing snippet this very text comes from can also be installed \
 into the project's CLAUDE.md / AGENTS.md so the guidance survives \
 across sessions. From the agent: ask 'install ai-memory routing'. \
@@ -1401,6 +1413,28 @@ mod tests {
             assert!(
                 routing.contains(tool),
                 "routing snippet omit {tool}; update ai_memory_core::SNIPPET_BODY"
+            );
+        }
+    }
+
+    #[test]
+    fn prompts_teach_cross_project_search_strategy() {
+        // Regression: a single-project miss must not read as "never recorded".
+        // Both surfaces must point the agent at `scopes` and warn that query
+        // returns snippets, not full page bodies. (Learned the hard way when
+        // cluster-access info lived in a sibling `infra` project.)
+        for prompt in [MEMORY_INSTRUCTIONS, ai_memory_core::SNIPPET_BODY] {
+            assert!(
+                prompt.contains("scopes"),
+                "prompt must teach broadening the search via `scopes`"
+            );
+            assert!(
+                prompt.contains("sibling") || prompt.contains("SIBLING"),
+                "prompt must mention knowledge can live in a sibling project"
+            );
+            assert!(
+                prompt.contains("snippet"),
+                "prompt must warn that query returns snippets, not full bodies"
             );
         }
     }
