@@ -87,6 +87,10 @@ fn default_timeout_ms() -> u64 {
     2_000
 }
 
+fn default_blocking() -> bool {
+    true
+}
+
 /// One webhook entry in the chain. Loaded from operator config
 /// (`[[admission_webhooks]]`).
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -104,6 +108,15 @@ pub struct WebhookConfig {
     /// Subset of [`AdmissionOp`] this webhook subscribes to. If empty,
     /// the webhook is effectively disabled (it'll never fire).
     pub events: Vec<AdmissionOp>,
+    /// When `true` (default), the webhook runs **synchronously** inside the
+    /// write path — it can mutate the page (`run`) and a `Reject` failure
+    /// aborts the write. When `false`, it's dispatched **fire-and-forget**
+    /// AFTER the page has landed: the engine doesn't wait for it and ignores
+    /// its response (so it can't mutate or reject). Use `false` for pure
+    /// observers/mirrors (e.g. `git-mirror`) so a slow/down backup never adds
+    /// latency to writes.
+    #[serde(default = "default_blocking")]
+    pub blocking: bool,
 }
 
 /// Per-write context passed to each webhook. Cheap to construct
@@ -243,6 +256,12 @@ impl AdmissionChain {
             if !hook.events.contains(&ctx.op) {
                 continue;
             }
+            // Non-blocking webhooks are fired fire-and-forget after the write
+            // (see `dispatch_async`); they never run in the synchronous,
+            // mutation-capable path.
+            if !hook.blocking {
+                continue;
+            }
 
             let payload = WebhookRequestBody {
                 page: WebhookPagePayload {
@@ -356,6 +375,9 @@ impl AdmissionChain {
             if !hook.events.contains(&ctx.op) {
                 continue;
             }
+            if !hook.blocking {
+                continue;
+            }
             let payload = WebhookRequestBody {
                 page: WebhookPagePayload {
                     path: page_path.unwrap_or(""),
@@ -399,6 +421,69 @@ impl AdmissionChain {
             }
         }
         Ok(())
+    }
+
+    /// Fire the chain's **non-blocking** webhooks for this op WITHOUT awaiting
+    /// them. Called AFTER the page has landed on disk + in the index, so these
+    /// are pure observers/mirrors: each is spawned fire-and-forget and its
+    /// response is ignored (a non-blocking webhook can't mutate or reject).
+    /// Honours the skip-list and op-subscription. For a write the caller passes
+    /// the FINAL (post-mutation) page; for a delete/purge, an empty body.
+    pub fn dispatch_async(
+        &self,
+        page_path: Option<&str>,
+        frontmatter: &serde_json::Value,
+        body: &str,
+        ctx: &AdmissionContext,
+    ) {
+        for hook in self.webhooks.iter() {
+            if hook.blocking {
+                continue;
+            }
+            if ctx.skip_webhooks.iter().any(|n| n == &hook.name) {
+                continue;
+            }
+            if !hook.events.contains(&ctx.op) {
+                continue;
+            }
+            let client = self.client.clone();
+            let url = hook.url.clone();
+            let name = hook.name.clone();
+            let timeout = hook.timeout_ms;
+            let op = ctx.op;
+            let owned_ctx = ctx.clone();
+            let path = page_path.map(str::to_string);
+            let frontmatter = frontmatter.clone();
+            let body = body.to_string();
+            tokio::spawn(async move {
+                let payload = WebhookRequestBody {
+                    page: WebhookPagePayload {
+                        path: path.as_deref().unwrap_or(""),
+                        frontmatter: &frontmatter,
+                        body: &body,
+                    },
+                    ctx: &owned_ctx,
+                };
+                match client
+                    .post(&url)
+                    .header("X-Memory-Op", op.as_header_value())
+                    .timeout(Duration::from_millis(timeout))
+                    .json(&payload)
+                    .send()
+                    .await
+                {
+                    Ok(resp) if resp.status().is_success() => {
+                        tracing::debug!(webhook = %name, op = op.as_header_value(), "admission async ok");
+                    }
+                    Ok(resp) => {
+                        tracing::warn!(webhook = %name, status = %resp.status(), "admission async error response");
+                    }
+                    Err(e) => {
+                        tracing::warn!(webhook = %name, error = %e, "admission async request failed");
+                    }
+                }
+            });
+        }
     }
 }
 

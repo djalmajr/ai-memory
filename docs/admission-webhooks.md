@@ -187,14 +187,33 @@ url  = "http://contributors.memory.svc.cluster.local:8080/enrich"
 timeout_ms = 2000                                        # per request
 failure_policy = "ignore"                                # ignore | reject
 events = ["write_page", "consolidate"]
+blocking = true                                          # runs synchronously; may mutate / reject
 
 [[admission_webhooks]]
 name = "git-mirror"
 url  = "http://git-mirror.memory.svc.cluster.local:8080/sync"
 timeout_ms = 2000
 failure_policy = "ignore"
-events = ["write_page", "consolidate"]
+events = ["write_page", "consolidate", "delete", "purge_project"]
+blocking = false                                         # fire-and-forget after the write; never blocks it
 ```
+
+### `blocking` (default `true`)
+
+A webhook is either **blocking** or **non-blocking**:
+
+- **`blocking = true`** (default) — runs *synchronously* inside the write path.
+  It can mutate the page (`write_page`/`consolidate`), and a `reject` failure
+  aborts the write. The write waits for it (up to `timeout_ms`). Use for
+  enrichers/validators (e.g. `contributors`, `validate-no-secrets`).
+- **`blocking = false`** — dispatched *fire-and-forget* **after** the page has
+  landed on disk. The engine does not wait for it and ignores its response, so
+  it **cannot mutate or reject** — it only observes/mirrors the final page. Use
+  for pure backups/mirrors (e.g. `git-mirror`) so a slow or down sink never adds
+  latency to writes. Still honours `events` and the skip list.
+
+Since the blocking chain is sequential, total worst-case write latency is
+`Σ timeout_ms` over the **blocking** webhooks only; non-blocking ones add none.
 
 Env override (figment env layer):
 

@@ -2166,6 +2166,7 @@ mod tests {
             timeout_ms: 2_000,
             failure_policy: FailurePolicy::Ignore,
             events: vec![AdmissionOp::WritePage, AdmissionOp::PurgeProject],
+            blocking: true,
         }])
         .unwrap();
         let wiki = Wiki::new(tmp.path(), store.writer.clone())

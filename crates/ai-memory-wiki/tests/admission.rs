@@ -71,6 +71,7 @@ async fn webhook_mutating_frontmatter_is_applied() {
         timeout_ms: 2_000,
         failure_policy: FailurePolicy::Ignore,
         events: vec![AdmissionOp::WritePage],
+        blocking: true,
     }])
     .unwrap();
 
@@ -96,6 +97,7 @@ async fn webhook_204_is_noop() {
         timeout_ms: 1_000,
         failure_policy: FailurePolicy::Ignore,
         events: vec![AdmissionOp::WritePage],
+        blocking: true,
     }])
     .unwrap();
 
@@ -123,6 +125,7 @@ async fn failure_policy_ignore_swallows_error() {
         timeout_ms: 1_000,
         failure_policy: FailurePolicy::Ignore,
         events: vec![AdmissionOp::WritePage],
+        blocking: true,
     }])
     .unwrap();
 
@@ -150,6 +153,7 @@ async fn failure_policy_reject_aborts_write() {
         timeout_ms: 1_000,
         failure_policy: FailurePolicy::Reject,
         events: vec![AdmissionOp::WritePage],
+        blocking: true,
     }])
     .unwrap();
 
@@ -184,6 +188,7 @@ async fn skip_webhooks_short_circuits_named_hook() {
         timeout_ms: 1_000,
         failure_policy: FailurePolicy::Ignore,
         events: vec![AdmissionOp::WritePage],
+        blocking: true,
     }])
     .unwrap();
 
@@ -221,6 +226,7 @@ async fn op_filter_skips_webhook_not_subscribed_to_event() {
         timeout_ms: 1_000,
         failure_policy: FailurePolicy::Ignore,
         events: vec![AdmissionOp::Consolidate],
+        blocking: true,
     }])
     .unwrap();
 
@@ -274,6 +280,7 @@ async fn chain_runs_in_order_each_sees_previous_mutation() {
             timeout_ms: 1_000,
             failure_policy: FailurePolicy::Ignore,
             events: vec![AdmissionOp::WritePage],
+            blocking: true,
         },
         WebhookConfig {
             name: "second".into(),
@@ -281,6 +288,7 @@ async fn chain_runs_in_order_each_sees_previous_mutation() {
             timeout_ms: 1_000,
             failure_policy: FailurePolicy::Ignore,
             events: vec![AdmissionOp::WritePage],
+            blocking: true,
         },
     ])
     .unwrap();
@@ -324,6 +332,7 @@ async fn x_memory_op_header_is_sent() {
         timeout_ms: 1_000,
         failure_policy: FailurePolicy::Ignore,
         events: vec![AdmissionOp::Consolidate],
+        blocking: true,
     }])
     .unwrap();
 
@@ -358,6 +367,7 @@ async fn actor_context_is_propagated_in_payload() {
         timeout_ms: 1_000,
         failure_policy: FailurePolicy::Ignore,
         events: vec![AdmissionOp::WritePage],
+        blocking: true,
     }])
     .unwrap();
 
@@ -401,6 +411,7 @@ async fn webhook_can_mutate_body_too() {
         timeout_ms: 1_000,
         failure_policy: FailurePolicy::Ignore,
         events: vec![AdmissionOp::WritePage],
+        blocking: true,
     }])
     .unwrap();
 
@@ -426,6 +437,7 @@ async fn chain_rejects_more_than_max_admission_webhooks() {
             timeout_ms: 100,
             failure_policy: FailurePolicy::Ignore,
             events: vec![AdmissionOp::WritePage],
+            blocking: true,
         })
         .collect();
     let err = AdmissionChain::new(too_many).expect_err("should refuse");
@@ -456,6 +468,7 @@ async fn oversized_response_is_treated_as_noop() {
         timeout_ms: 5_000,
         failure_policy: FailurePolicy::Ignore,
         events: vec![AdmissionOp::WritePage],
+        blocking: true,
     }])
     .unwrap();
 
@@ -494,6 +507,7 @@ async fn workspace_and_project_names_propagate_in_payload() {
         timeout_ms: 1_000,
         failure_policy: FailurePolicy::Ignore,
         events: vec![AdmissionOp::WritePage],
+        blocking: true,
     }])
     .unwrap();
 
@@ -540,6 +554,7 @@ async fn notify_delete_sends_op_and_path() {
         timeout_ms: 2_000,
         failure_policy: FailurePolicy::Ignore,
         events: vec![AdmissionOp::Delete],
+        blocking: true,
     }])
     .unwrap();
 
@@ -565,6 +580,7 @@ async fn notify_purge_has_op_and_no_path() {
         timeout_ms: 2_000,
         failure_policy: FailurePolicy::Ignore,
         events: vec![AdmissionOp::PurgeProject],
+        blocking: true,
     }])
     .unwrap();
 
@@ -592,6 +608,7 @@ async fn notify_respects_op_subscription() {
         timeout_ms: 2_000,
         failure_policy: FailurePolicy::Ignore,
         events: vec![AdmissionOp::WritePage],
+        blocking: true,
     }])
     .unwrap();
 
@@ -604,5 +621,65 @@ async fn notify_respects_op_subscription() {
     assert!(
         seen.lock().unwrap().is_empty(),
         "delete must not reach a write-only webhook"
+    );
+}
+
+#[tokio::test]
+async fn non_blocking_webhook_skipped_by_run_but_dispatched_async() {
+    // A `blocking: false` webhook must NOT run in the synchronous `run`
+    // path (it can't mutate/reject and shouldn't add write latency), and
+    // MUST fire via `dispatch_async` after the page has landed.
+    let fired = Arc::new(AtomicBool::new(false));
+    let fired_in_handler = fired.clone();
+    let app = Router::new().route(
+        "/sync",
+        post(move || {
+            let fired = fired_in_handler.clone();
+            async move {
+                fired.store(true, Ordering::SeqCst);
+                StatusCode::NO_CONTENT
+            }
+        }),
+    );
+    let base = spawn_server(app).await;
+    let chain = AdmissionChain::new(vec![WebhookConfig {
+        name: "mirror".into(),
+        url: format!("{base}/sync"),
+        timeout_ms: 1_000,
+        failure_policy: FailurePolicy::Ignore,
+        events: vec![AdmissionOp::WritePage],
+        blocking: false,
+    }])
+    .unwrap();
+
+    let (path, mut md) = page();
+
+    // run() must NOT fire a non-blocking webhook.
+    chain
+        .run(&path, &mut md, &AdmissionContext::default())
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert!(
+        !fired.load(Ordering::SeqCst),
+        "run() must skip a non-blocking webhook"
+    );
+
+    // dispatch_async fires it (fire-and-forget; poll for the spawned task).
+    chain.dispatch_async(
+        Some(path.as_str()),
+        &md.frontmatter,
+        &md.body,
+        &AdmissionContext::default(),
+    );
+    for _ in 0..40 {
+        if fired.load(Ordering::SeqCst) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert!(
+        fired.load(Ordering::SeqCst),
+        "dispatch_async must fire the non-blocking webhook"
     );
 }

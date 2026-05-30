@@ -238,6 +238,7 @@ impl Wiki {
             self.resolve_admission_names(workspace_id, project_id, &mut ctx)
                 .await;
             chain.notify(Some(path.as_str()), &ctx).await?;
+            chain.dispatch_async(Some(path.as_str()), &serde_json::Value::Null, "", &ctx);
         }
         let abs = self.abs_path(workspace_id, project_id, path);
         match std::fs::remove_file(&abs) {
@@ -274,6 +275,7 @@ impl Wiki {
             self.resolve_admission_names(workspace_id, project_id, &mut ctx)
                 .await;
             chain.notify(None, &ctx).await?;
+            chain.dispatch_async(None, &serde_json::Value::Null, "", &ctx);
         }
         let root = self.project_root(workspace_id, project_id);
         match std::fs::remove_dir_all(&root) {
@@ -447,7 +449,7 @@ impl Wiki {
         // frontmatter/body here propagate to both the on-disk markdown
         // (via emit below) and the store's `frontmatter_json` / `body`
         // (via the upsert below) atomically. See `crate::admission`.
-        if let Some(chain) = &self.admission_chain {
+        let resolved_ctx = if let Some(chain) = &self.admission_chain {
             let mut ctx = admission_ctx.unwrap_or_default();
             // Single identity source: the webhook actor is the same
             // `ActorContext` used for on-disk attribution (req.actor),
@@ -471,8 +473,12 @@ impl Wiki {
                     ctx.project = name;
                 }
             }
+            // Blocking webhooks run synchronously (they may mutate / reject).
             chain.run(&path, &mut markdown, &ctx).await?;
-        }
+            Some(ctx)
+        } else {
+            None
+        };
 
         // Re-derive title + links from the (possibly mutated) markdown.
         // We do this after the chain so explicit title overrides survive
@@ -490,6 +496,18 @@ impl Wiki {
             std::fs::create_dir_all(parent)?;
         }
         atomic::write_atomic(&abs, emitted.as_bytes())?;
+
+        // Non-blocking webhooks fire-and-forget AFTER the page has landed on
+        // disk (the markdown-in-git source of truth). They only observe/mirror
+        // the final page — never block the write or mutate it.
+        if let (Some(chain), Some(ctx)) = (&self.admission_chain, &resolved_ctx) {
+            chain.dispatch_async(
+                Some(path.as_str()),
+                &markdown.frontmatter,
+                &markdown.body,
+                ctx,
+            );
+        }
 
         let Markdown {
             frontmatter: final_frontmatter,
@@ -1030,6 +1048,7 @@ mod tests {
             timeout_ms: 1_000,
             failure_policy: FailurePolicy::Ignore,
             events: vec![AdmissionOp::WritePage],
+            blocking: true,
         }])
         .unwrap();
 
