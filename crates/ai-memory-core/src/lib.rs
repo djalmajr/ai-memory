@@ -6,6 +6,7 @@
 //! trivially unit-testable and free of platform concerns.
 
 pub mod active_project;
+pub mod actor;
 pub mod error;
 pub mod handoff;
 pub mod ids;
@@ -21,10 +22,12 @@ pub const DEFAULT_WORKSPACE_NAME: &str = "default";
 pub const DEFAULT_PROJECT_NAME: &str = "scratch";
 
 pub use active_project::ActiveProject;
+pub use actor::ActorContext;
 pub use error::{MemoryError, MemoryResult};
 pub use handoff::{Handoff, HandoffState, NewHandoff};
 pub use ids::{
-    AgentKind, HandoffId, ObservationId, PageId, PagePath, ProjectId, SessionId, WorkspaceId,
+    AgentKind, HandoffId, ObservationId, PageId, PagePath, ProjectId, SessionId, UserId,
+    WorkspaceId,
 };
 pub use observation::{NewObservation, NewSession, Observation, ObservationKind};
 pub use page::{LinkTarget, NewPage, Page, Tier};
