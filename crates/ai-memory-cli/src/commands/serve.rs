@@ -277,6 +277,22 @@ pub async fn run(config: &Config, args: ServeArgs) -> Result<()> {
                      Generate a token with `ai-memory generate-auth-token` and set \
                      AI_MEMORY_AUTH_TOKEN in the server's environment."
                 );
+            } else if auth_enabled && !bind.starts_with("127.") {
+                // Auth IS configured but the server is reachable from
+                // the network on plain HTTP. The bearer token (and
+                // multi-user per-user tokens from `ai-memory user
+                // add`) ride cleartext — sniffable on the LAN. Advise
+                // the operator to front with a TLS proxy. One-shot
+                // log at startup, not refusal to serve (operators may
+                // be testing, behind their own proxy already, etc.).
+                tracing::warn!(
+                    %bind,
+                    "AI_MEMORY_AUTH_TOKEN is set but the server is bound to a \
+                     non-loopback address on plain HTTP — bearer tokens travel \
+                     cleartext on the network. Front ai-memory with a TLS-terminating \
+                     reverse proxy (Caddy, Cloudflare Tunnel, nginx). See \
+                     docs/https-via-proxy.md for copy-paste templates."
+                );
             }
             axum::serve(listener, router)
                 .with_graceful_shutdown(async move {

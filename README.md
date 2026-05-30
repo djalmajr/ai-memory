@@ -288,6 +288,19 @@ Bearer auth protects `/mcp`, `/hook`, `/handoff`, `/admin/*`, and
 as the password. Non-loopback binds should also set
 `AI_MEMORY_ALLOWED_HOSTS` to guard against DNS rebinding.
 
+**Want HTTPS?** ai-memory deliberately does not terminate TLS itself —
+the right answer is a battle-tested reverse proxy in front of it.
+[`docs/https-via-proxy.md`](docs/https-via-proxy.md) is the deployment
+guide, with copy-paste docker compose templates in
+[`docker/compose.tls.caddy.yml`](docker/compose.tls.caddy.yml) (Caddy
+with Let's Encrypt or internal CA) and
+[`docker/compose.tls.cloudflared.yml`](docker/compose.tls.cloudflared.yml)
+(Cloudflare Tunnel — no open ports). Both are recommended once you
+turn on multi-user or bind beyond loopback. The Quick Start happy
+path of single-user on loopback doesn't need TLS — that case is
+called out explicitly in the guide so you don't add ceremony where
+it doesn't earn its keep.
+
 **Multi-user attribution (v0.8, optional).** When more than one human
 shares a server, ai-memory can attribute each write to a named user.
 The bearer token continues to authenticate at the wire level; users
@@ -455,8 +468,9 @@ diagram, crate breakdown, schema notes, and invariants.
 | [`docs/marker-file.md`](docs/marker-file.md) | `.ai-memory.toml` workspace/project routing for multi-client trees, mono-repos, worktrees, and work/personal separation. |
 | [`docs/windows.md`](docs/windows.md) | Windows install modes: full WSL2, native Windows with Docker Desktop, native source builds, and current hook/MCP harness caveats. |
 | [`docs/mcp-install.md`](docs/mcp-install.md) | Per-client MCP and lifecycle notes (Cursor, Claude Desktop, Gemini CLI, Antigravity CLI, OpenClaw, OMP). |
-| [`docs/deploy.md`](docs/deploy.md) | Homelab deploy: bin/deploy, bearer-token auth, TLS via cloudflared. |
+| [`docs/deploy.md`](docs/deploy.md) | Homelab deploy: bin/deploy, bearer-token auth, pointers to the TLS guide. |
 | [`docs/users.md`](docs/users.md) | **Multi-user attribution (v0.8).** Four-rung auth ladder, `ai-memory user add/list/expire/revive/rotate-token` walkthrough, backward-compat migration for pre-v0.8 installs, token storage rationale. |
+| [`docs/https-via-proxy.md`](docs/https-via-proxy.md) | **HTTPS via a reverse proxy.** When you need TLS (multi-user, non-loopback) and when you don't (loopback / stdio). Copy-paste docker compose templates for Caddy + Let's Encrypt, Caddy + internal CA (LAN-only), Cloudflare Tunnel (no open ports), and external cert files; plus native-Caddy + nginx recipes. The "thinking you're secure when you're not" failure modes explicitly called out. |
 | [`docs/lifecycle-ops.md`](docs/lifecycle-ops.md) | **Read before running purge / rename / backup / restore / reset.** Safety matrix for the state-touching commands, per-project disk layout (how isolation actually works), and operator workflows for "fresh start", "snapshot before risky op", "drop one project". |
 | [`docs/llm-provider-comparison.md`](docs/llm-provider-comparison.md) | Empirical notes behind the recommended LLM defaults. |
 | [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) | Operational summary: data flow, crate layout, cross-cutting invariants, schema. |
