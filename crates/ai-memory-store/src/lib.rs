@@ -18,6 +18,7 @@ mod fts_query;
 mod migrations;
 mod ops;
 mod reader;
+pub mod users;
 mod writer;
 
 pub use fts_query::prepare_fts5_query;
@@ -27,10 +28,11 @@ pub use error::{StoreError, StoreResult};
 pub use ops::{EmbeddingWrite, PurgeSummary, ReorgSummary};
 pub use reader::{
     ActivityWindow, BriefingPage, BriefingSnapshot, DecayCandidate, DerivedIndexStatus,
-    EmbeddingTripleCount, HealthDetail, HealthPage, ObservationHit, PageHit, PageHitWithMeta,
-    PageLinks, PageMeta, PageSummary, ProjectSummary, ReaderPool, RelatedPage, StatusCounts,
-    StoredEmbedding, WorkspaceSummary, f32_vec_to_bytes,
+    EmbeddingTripleCount, HealthDetail, HealthPage, ObservationHit, PageAuthor, PageHit,
+    PageHitWithMeta, PageLinks, PageMeta, PageSummary, ProjectSummary, ReaderPool, RelatedPage,
+    StatusCounts, StoredEmbedding, WorkspaceSummary, f32_vec_to_bytes,
 };
+pub use users::{TOKEN_HASH_LEN, TOKEN_RAW_LEN, TokenPepper, generate_token, hash_token};
 pub use writer::WriterHandle;
 
 /// Filename used inside the data dir's `db/` subdirectory.
@@ -93,8 +95,8 @@ impl Store {
 mod tests {
     use super::*;
     use ai_memory_core::{
-        AgentKind, NewObservation, NewPage, NewSession, ObservationId, ObservationKind, PagePath,
-        ProjectId, SessionId, Tier, WorkspaceId,
+        AgentKind, LinkTarget, NewObservation, NewPage, NewSession, ObservationId, ObservationKind,
+        PagePath, ProjectId, SessionId, Tier, WorkspaceId,
     };
     use rusqlite::{Connection, params};
     use tempfile::TempDir;
@@ -110,7 +112,78 @@ mod tests {
             frontmatter_json: serde_json::json!({}),
             pinned: false,
             links: Vec::new(),
+            author_id: None,
         }
+    }
+
+    #[tokio::test]
+    async fn cross_project_links_surface_in_graph_briefing_and_lint() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let ws = store
+            .writer
+            .get_or_create_workspace("default")
+            .await
+            .unwrap();
+        let app = store
+            .writer
+            .get_or_create_project(ws, "app", None)
+            .await
+            .unwrap();
+        let infra = store
+            .writer
+            .get_or_create_project(ws, "infra", None)
+            .await
+            .unwrap();
+
+        // Target page in `infra`, then a page in `app` that depends on it
+        // plus a dangling link to a non-existent project.
+        store
+            .writer
+            .upsert_page(sample_page(ws, infra, "runbooks/02.md", "the runbook"))
+            .await
+            .unwrap();
+        let mut dep = sample_page(ws, app, "concepts/dep.md", "needs infra + a typo");
+        dep.links = vec![
+            LinkTarget {
+                workspace: None,
+                project: Some("infra".into()),
+                path: PagePath::new("runbooks/02.md").unwrap(),
+            },
+            LinkTarget {
+                workspace: None,
+                project: Some("nope".into()),
+                path: PagePath::new("ghost.md").unwrap(),
+            },
+        ];
+        store.writer.upsert_page(dep).await.unwrap();
+
+        // Graph: exactly one resolved cross-project edge, app -> infra.
+        let edges = store.reader.cross_project_edges(None).await.unwrap();
+        assert_eq!(edges.len(), 1, "one resolved cross-project edge");
+        assert_eq!(edges[0].from_project, "app");
+        assert_eq!(edges[0].to_project, "infra");
+
+        // Briefing degree: app depends on 1 project; infra has 1 dependent.
+        let app_brief = store.reader.briefing_for_project(ws, app, 5).await.unwrap();
+        assert_eq!(app_brief.cross_project_dependencies, 1);
+        assert_eq!(app_brief.cross_project_dependents, 0);
+        let infra_brief = store
+            .reader
+            .briefing_for_project(ws, infra, 5)
+            .await
+            .unwrap();
+        assert_eq!(infra_brief.cross_project_dependents, 1);
+
+        // Lint: the dangling link to project `nope` is reported as unknown.
+        let dangling = store
+            .reader
+            .dangling_cross_project_links(ws, app)
+            .await
+            .unwrap();
+        assert_eq!(dangling.len(), 1, "only the unresolved `nope` link");
+        assert_eq!(dangling[0].project, "nope");
+        assert!(!dangling[0].project_exists);
     }
 
     #[tokio::test]
@@ -415,6 +488,43 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn search_is_accent_insensitive() {
+        // V13: an accent-free query matches accented stored text (PT-friendly).
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let ws = store
+            .writer
+            .get_or_create_workspace("default")
+            .await
+            .unwrap();
+        let proj = store
+            .writer
+            .get_or_create_project(ws, "scratch", None)
+            .await
+            .unwrap();
+        store
+            .writer
+            .upsert_page(sample_page(
+                ws,
+                proj,
+                "notes/decisao.md",
+                "a descrição da sessão e a consolidação dos commits",
+            ))
+            .await
+            .unwrap();
+
+        let hits = store
+            .reader
+            .search_pages("descricao sessao".into(), 10)
+            .await
+            .unwrap();
+        assert!(
+            !hits.is_empty(),
+            "accent-free query must match accented stored text"
+        );
+    }
+
+    #[tokio::test]
     async fn search_boolean_or_still_works() {
         let tmp = TempDir::new().unwrap();
         let store = Store::open(tmp.path()).unwrap();
@@ -498,7 +608,7 @@ mod tests {
             .await
             .unwrap();
         let mut source = sample_page(ws, proj, "source.md", "needle source content");
-        source.links = vec![PagePath::new("target.md").unwrap()];
+        source.links = vec![PagePath::new("target.md").unwrap().into()];
         store.writer.upsert_page(source).await.unwrap();
 
         let hits = store
@@ -671,6 +781,7 @@ mod tests {
             frontmatter_json: serde_json::json!({"kind": "decision"}),
             pinned: true,
             links: Vec::new(),
+            author_id: None,
         };
         store.writer.upsert_page(page).await.unwrap();
 

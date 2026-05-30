@@ -35,6 +35,7 @@ async fn make_state(tmp: &TempDir) -> (AdminState, Store) {
         db_path,
         bind: "127.0.0.1:0".to_string(),
         bootstrap_lock: std::sync::Arc::new(tokio::sync::Mutex::new(())),
+        token_pepper: None,
     };
     (state, store)
 }
@@ -64,6 +65,9 @@ async fn seed_page(state: &AdminState, store: &Store, path: &str, body: &str) {
             tier: Tier::Semantic,
             pinned: false,
             title: Some("Test".into()),
+            admission_ctx: None,
+            author_id: None,
+            actor: ai_memory_core::ActorContext::anonymous(),
         })
         .await
         .unwrap();

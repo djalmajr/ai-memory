@@ -105,17 +105,24 @@ Desktop, Gemini CLI, OpenClaw, OMP/Pi, Antigravity CLI). The agent CLI sends an
 middleware validates with a constant-time comparison.
 
 **Encrypted transport.** Plain HTTP on the LAN means anyone with a
-packet capture on the network can read the bearer token and the wiki
-content in transit. Two pragmatic ways to add TLS:
+packet capture can read the bearer token (and per-user tokens once
+multi-user mode is on) in transit. Add a TLS-terminating reverse
+proxy in front of ai-memory — Caddy with Let's Encrypt, Caddy with
+its internal CA, Cloudflare Tunnel, nginx, or external cert files —
+when you bind beyond loopback or turn on multi-user.
 
-| Option | When it fits |
-|---|---|
-| **Front with cloudflared** (your existing homelab tunnel) | You want to access ai-memory from outside the LAN too. cloudflared terminates TLS at Cloudflare's edge and tunnels to the container over HTTP. The bearer token still applies; Cloudflare provides the encryption + DDoS shield. Configure a new `--hostname ai-memory.your-domain.tld --url http://localhost:49374` route on the existing cloudflared instance. |
-| **Caddy reverse proxy** in a sibling container | You want LAN-only TLS without public DNS. Caddy auto-issues a self-signed cert with a tofu prompt the first time each client connects. Mount your homelab's CA cert into the container running each MCP client. |
+**See [`docs/https-via-proxy.md`](https-via-proxy.md)** for the full
+deployment guide, including:
 
-For most homelab use cases the bearer token alone over plain HTTP on
-a trusted LAN is acceptable. The token is what stops the LAN
-neighbour; TLS is what stops a packet-capture-with-a-laptop-on-the-WiFi.
+- When to add TLS and when to skip it (the loopback + stdio cases honestly don't need it).
+- Copy-paste docker compose templates in [`docker/compose.tls.caddy.yml`](../docker/compose.tls.caddy.yml) and [`docker/compose.tls.cloudflared.yml`](../docker/compose.tls.cloudflared.yml).
+- Per-OS trust-store install for the internal-CA path (the load-bearing manual step).
+- The explicit "what can go wrong" sections so you don't ship security theatre by accident.
+
+For the single-user-on-loopback Quick Start, the bearer token alone
+remains acceptable — the token is what stops the LAN neighbour, and
+loopback is what stops the packet capture. TLS earns its keep once
+the deployment shape stops being "single user, single machine."
 
 ## Routine deploys
 

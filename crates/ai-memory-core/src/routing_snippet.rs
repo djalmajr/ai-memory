@@ -60,7 +60,7 @@ match the intent to the tool. They do not need to name the tool.
 
 | User says / situation | Tool |
 |---|---|
-| "have we discussed X?" / "search memory for Y" / before proposing architecture | `memory_query` |
+| "have we discussed X?" / "search memory for Y" / before proposing architecture | `memory_query` (current project; `scopes` for named siblings; `global=true` to search every project) |
 | "what's been going on" / "show recent activity" (light) | `memory_recent` |
 | "is ai-memory healthy?" / "how big is the wiki?" | `memory_status` |
 | "give me the stats" / structured snapshot for the agent to consume | `memory_briefing` |
@@ -71,6 +71,7 @@ match the intent to the tool. They do not need to name the tool.
 | "consolidate this session" / "compile what we learned" (also runs on PreCompact; at session end only if `AI_MEMORY_CONSOLIDATE_ON_SESSION_END` is set) | `memory_consolidate` |
 | "remember this permanently" / "save a note" / "add an annotation" / durable project knowledge | `memory_write_page` (write a wiki page; do **not** use handoff for permanent notes) |
 | "read the page about X" / "show me the full content of Y" / "open the page on Z" | `memory_read_page` (full body; pass a query to search or `path` for a direct lookup) |
+| "delete the page X" / "remove that note" | `memory_delete_page` (by exact `path`; idempotent) |
 | "audit the wiki" / "find contradictions" / "what rules should we add?" | `memory_lint` |
 | "prune old pages" / "memory cleanup" | `memory_forget_sweep` |
 
@@ -78,6 +79,26 @@ match the intent to the tool. They do not need to name the tool.
 going on" use case — it returns a prose digest whose verbosity
 scales automatically to how long it's been since the last activity
 (< 1 h → one line; > 30 days → full catchup).
+
+### When the current project comes up empty — broaden the search
+
+`memory_query` searches only the **current** project by default. If a
+search comes back empty or thin, the knowledge may live in a **sibling
+project** — shared `infra`, `ops`, or a related app. Don't conclude
+"we never recorded it" after a single project misses; broaden instead:
+
+- **Know which projects to check?** Re-run with explicit `scopes`, e.g.
+  `scopes: [{ "workspace": "default", "project": "infra" }]`.
+- **Don't know where it lives?** Pass `global=true` to search every
+  project in every workspace at once. Each hit is annotated with its
+  workspace + project so you can tell where it came from. `global=true`
+  cannot be combined with `scopes`/`project`/`workspace`.
+
+`memory_query` returns **snippets, not full page bodies** — an empty or
+short snippet does **not** mean the page is empty (a large page can
+match outside the snippet window). To read the whole page, use
+`memory_read_page` (by `path`, or pass a `query` to fetch the top hit's
+full body).
 
 ### When you write a project rule, write it here
 

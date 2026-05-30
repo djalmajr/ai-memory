@@ -12,7 +12,7 @@ use std::sync::Arc;
 
 use ai_memory_core::{
     AgentKind, Handoff, HandoffId, HandoffState, Observation, ObservationId, ObservationKind,
-    PageId, PagePath, ProjectId, SessionId, WorkspaceId,
+    PageId, PagePath, ProjectId, SessionId, User, UserId, WorkspaceId,
 };
 use parking_lot::Mutex;
 use rusqlite::types::Value;
@@ -24,6 +24,7 @@ use serde::Serialize;
 
 use crate::error::{StoreError, StoreResult};
 use crate::fts_query::prepare_fts5_query;
+use crate::users::TOKEN_HASH_LEN;
 
 /// One hit returned by [`ReaderPool::search_pages`].
 #[derive(Debug, Clone, Serialize)]
@@ -172,6 +173,13 @@ pub struct BriefingSnapshot {
     pub slots: Vec<BriefingPage>,
     /// Top-N most-recently-updated `is_latest = 1` pages.
     pub recent_pages: Vec<BriefingPage>,
+    /// Distinct other projects whose pages link INTO this project (who
+    /// depends on us). Project-scoped briefings only; `0` for
+    /// workspace/global snapshots.
+    pub cross_project_dependents: u64,
+    /// Distinct other projects this project's pages link OUT to (what we
+    /// depend on). Project-scoped briefings only; `0` otherwise.
+    pub cross_project_dependencies: u64,
 }
 
 /// Trimmed page view for the briefing — path, title, kind, updated_at
@@ -235,6 +243,27 @@ pub struct PageSummary {
     pub updated_at: String,
 }
 
+/// Page author surfaced alongside read responses (P1.7).
+/// JOINed from the `users` table when `pages.author_id IS NOT NULL`;
+/// `None` for anonymous + root writes (where attribution lives only in
+/// the on-disk frontmatter `last_modified_by` block from P1.6).
+///
+/// Repeated here rather than reused from `ai_memory_core::User` because
+/// the response shape intentionally omits internal fields (id,
+/// created_at, last_seen_at, token_expired_at) — only the human-facing
+/// identity is part of the API contract.
+#[derive(Debug, Clone, Serialize)]
+pub struct PageAuthor {
+    /// Stable username (the attribution key recorded on writes).
+    pub username: String,
+    /// Optional display name (`Alice Smith`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    /// Optional email surfaced alongside the username in UIs.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub email: Option<String>,
+}
+
 /// Full page metadata for the page-view template.
 /// Returned by [`ReaderPool::page_meta`].
 #[derive(Debug, Clone, Serialize)]
@@ -263,6 +292,48 @@ pub struct PageMeta {
     pub updated_at: String,
     /// Path of the page this one supersedes, if any.
     pub supersedes: Option<String>,
+    /// Multi-user attribution (P1.7). `None` for pre-multi-user pages
+    /// and for root / anonymous writes (where `pages.author_id IS
+    /// NULL`); `Some` when JOIN resolves a `users` row.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub author: Option<PageAuthor>,
+}
+
+/// One resolved cross-project edge (a link whose endpoints live in
+/// different projects). The `/api/v1/graph` endpoint returns these; the UI
+/// builds nodes from the endpoints and can aggregate to a project graph.
+#[derive(Debug, Clone, Serialize)]
+pub struct CrossProjectEdge {
+    /// Source page workspace.
+    pub from_workspace: String,
+    /// Source page project.
+    pub from_project: String,
+    /// Source page path.
+    pub from_path: String,
+    /// Target page workspace.
+    pub to_workspace: String,
+    /// Target page project.
+    pub to_project: String,
+    /// Target page path.
+    pub to_path: String,
+}
+
+/// An unresolved cross-project link — a declared dependency on another
+/// project's page that does not resolve. Surfaced by `memory_lint`.
+#[derive(Debug, Clone, Serialize)]
+pub struct DanglingCrossLink {
+    /// Path of the page that authored the link (in the queried project).
+    pub from_path: String,
+    /// Target workspace name (`None` = the source page's own workspace).
+    pub workspace: Option<String>,
+    /// Target project name.
+    pub project: String,
+    /// Target page path within that project.
+    pub path: String,
+    /// Whether the named target project exists at all. `false` →
+    /// likely a typo / wrong name; `true` → the page is missing or was
+    /// renamed/deleted in an existing project (a broken dependency).
+    pub project_exists: bool,
 }
 
 /// A page related to another through the link graph — used by the
@@ -276,6 +347,11 @@ pub struct RelatedPage {
     pub title: String,
     /// Semantic kind of the related page.
     pub kind: String,
+    /// Workspace the related page lives in. Lets a backlink from another
+    /// project be labelled / navigated (the cross-project dependency signal).
+    pub workspace: String,
+    /// Project the related page lives in.
+    pub project: String,
 }
 
 /// Resolved outgoing links and incoming back-links for one page.
@@ -1411,6 +1487,8 @@ impl ReaderPool {
                 rules,
                 slots,
                 recent_pages,
+                cross_project_dependents: 0,
+                cross_project_dependencies: 0,
             })
         })
         .await
@@ -1542,6 +1620,8 @@ impl ReaderPool {
                 .into_iter()
                 .collect::<Result<Vec<_>, _>>()?;
 
+            let (cross_project_dependents, cross_project_dependencies) =
+                cross_project_degree(conn, workspace_id, project_id)?;
             Ok(BriefingSnapshot {
                 counts,
                 activity_7d,
@@ -1551,6 +1631,8 @@ impl ReaderPool {
                 rules,
                 slots,
                 recent_pages,
+                cross_project_dependents,
+                cross_project_dependencies,
             })
         })
         .await
@@ -1579,6 +1661,32 @@ impl ReaderPool {
                 )
                 .optional()?;
             row_opt.transpose()
+        })
+        .await
+    }
+
+    /// Look up a workspace name by id.
+    ///
+    /// Returns `None` when no matching workspace exists. Used by the
+    /// admission webhook chain to populate `AdmissionContext.workspace`
+    /// so external webhooks can address the page by human name without
+    /// re-implementing UUID→name lookup against the engine's store.
+    ///
+    /// # Errors
+    /// Propagates any SQL or pool error.
+    pub async fn workspace_name_by_id(
+        &self,
+        workspace_id: WorkspaceId,
+    ) -> StoreResult<Option<String>> {
+        self.with_conn(move |conn| {
+            let row_opt = conn
+                .query_row(
+                    "SELECT name FROM workspaces WHERE id = ?1",
+                    params![workspace_id.as_bytes()],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()?;
+            Ok(row_opt)
         })
         .await
     }
@@ -1742,6 +1850,8 @@ impl ReaderPool {
                 rules,
                 slots,
                 recent_pages,
+                cross_project_dependents: 0,
+                cross_project_dependencies: 0,
             })
         })
         .await
@@ -2012,11 +2122,13 @@ impl ReaderPool {
                                 END \
                             ), \
                             pg.tier, pg.pinned, pg.created_at, pg.updated_at, \
-                            sp.path AS supersedes_path \
+                            sp.path AS supersedes_path, \
+                            au.username, au.name, au.email \
                      FROM pages pg \
                      JOIN projects p ON p.id = pg.project_id \
                      JOIN workspaces w ON w.id = pg.workspace_id \
                      LEFT JOIN pages sp ON sp.id = pg.supersedes \
+                     LEFT JOIN users au ON au.id = pg.author_id \
                      WHERE pg.id = ?1 AND pg.is_latest = 1",
                     params![page_id.as_bytes()],
                     page_meta_from_row,
@@ -2051,13 +2163,15 @@ impl ReaderPool {
                                 END \
                             ), \
                             pg.tier, pg.pinned, pg.created_at, pg.updated_at, \
-                            sp.path AS supersedes_path \
+                            sp.path AS supersedes_path, \
+                            au.username, au.name, au.email \
                      FROM pages pg \
                      JOIN projects p ON p.id = pg.project_id \
                      JOIN workspaces w ON w.id = pg.workspace_id \
                      LEFT JOIN pages sp ON sp.id = pg.supersedes \
-                      WHERE pg.path = ?1 AND pg.is_latest = 1 \
-                      LIMIT 1",
+                     LEFT JOIN users au ON au.id = pg.author_id \
+                     WHERE pg.path = ?1 AND pg.is_latest = 1 \
+                     LIMIT 1",
                     params![path],
                     page_meta_from_row,
                 )
@@ -2108,11 +2222,14 @@ impl ReaderPool {
                                     WHEN pg.path LIKE 'gotchas/%' THEN 'gotcha' \
                                     ELSE 'fact' \
                                 END \
-                            ) \
+                            ), \
+                            ws.name, pr.name \
                      FROM links l \
                      JOIN pages pg ON pg.id = l.to_page_id \
+                     JOIN projects pr ON pr.id = pg.project_id \
+                     JOIN workspaces ws ON ws.id = pg.workspace_id \
                      WHERE l.from_page_id = ?1 AND pg.is_latest = 1 \
-                     ORDER BY pg.path";
+                     ORDER BY ws.name, pr.name, pg.path";
             let incoming = "SELECT DISTINCT pg.path, pg.title, \
                             COALESCE( \
                                 json_extract(pg.frontmatter_json, '$.kind'), \
@@ -2122,11 +2239,14 @@ impl ReaderPool {
                                     WHEN pg.path LIKE 'gotchas/%' THEN 'gotcha' \
                                     ELSE 'fact' \
                                 END \
-                            ) \
+                            ), \
+                            ws.name, pr.name \
                      FROM links l \
                      JOIN pages pg ON pg.id = l.from_page_id \
+                     JOIN projects pr ON pr.id = pg.project_id \
+                     JOIN workspaces ws ON ws.id = pg.workspace_id \
                      WHERE l.to_page_id = ?1 AND pg.is_latest = 1 \
-                     ORDER BY pg.path";
+                     ORDER BY ws.name, pr.name, pg.path";
 
             let collect = |sql: &str| -> StoreResult<Vec<RelatedPage>> {
                 let mut stmt = conn.prepare(sql)?;
@@ -2135,6 +2255,8 @@ impl ReaderPool {
                         path: row.get(0)?,
                         title: row.get(1)?,
                         kind: row.get(2)?,
+                        workspace: row.get(3)?,
+                        project: row.get(4)?,
                     })
                 })?;
                 let mut out = Vec::new();
@@ -2148,6 +2270,111 @@ impl ReaderPool {
                 links: collect(outgoing)?,
                 backlinks: collect(incoming)?,
             })
+        })
+        .await
+    }
+
+    /// List unresolved cross-project links authored by pages in this project
+    /// — declared dependencies on another project's page that don't resolve.
+    /// Each row says whether the named target project exists, so the lint can
+    /// tell a typo'd project name from a missing / renamed target page.
+    ///
+    /// # Errors
+    /// Propagates any SQL or pool error.
+    pub async fn dangling_cross_project_links(
+        &self,
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+    ) -> StoreResult<Vec<DanglingCrossLink>> {
+        self.with_conn(move |conn| {
+            let mut stmt = conn.prepare(
+                "SELECT fp.path, l.to_workspace, l.to_project, l.to_path, \
+                        EXISTS ( \
+                            SELECT 1 FROM projects pr \
+                            JOIN workspaces ws ON ws.id = pr.workspace_id \
+                            WHERE pr.name = l.to_project \
+                              AND ws.name = COALESCE( \
+                                  l.to_workspace, \
+                                  (SELECT name FROM workspaces WHERE id = ?1) \
+                              ) \
+                        ) AS project_exists \
+                 FROM links l \
+                 JOIN pages fp ON fp.id = l.from_page_id \
+                     AND fp.workspace_id = ?1 AND fp.project_id = ?2 AND fp.is_latest = 1 \
+                 WHERE l.to_page_id IS NULL AND l.to_project IS NOT NULL \
+                 ORDER BY fp.path, l.to_project, l.to_path",
+            )?;
+            let rows = stmt.query_map(
+                params![workspace_id.as_bytes(), project_id.as_bytes()],
+                |row| {
+                    let exists: i64 = row.get(4)?;
+                    Ok(DanglingCrossLink {
+                        from_path: row.get(0)?,
+                        workspace: row.get(1)?,
+                        project: row.get(2)?,
+                        path: row.get(3)?,
+                        project_exists: exists != 0,
+                    })
+                },
+            )?;
+            let mut out = Vec::new();
+            for r in rows {
+                out.push(r?);
+            }
+            Ok(out)
+        })
+        .await
+    }
+
+    /// Resolved cross-project edges (links whose endpoints are in different
+    /// projects). When `scope` is `Some((ws, proj))`, only edges that touch
+    /// that project (as source or target) are returned; `None` returns the
+    /// whole cross-project graph. Powers `/api/v1/graph`.
+    ///
+    /// # Errors
+    /// Propagates any SQL or pool error.
+    pub async fn cross_project_edges(
+        &self,
+        scope: Option<(WorkspaceId, ProjectId)>,
+    ) -> StoreResult<Vec<CrossProjectEdge>> {
+        self.with_conn(move |conn| {
+            let base = "SELECT fw.name, fpr.name, fp.path, tw.name, tpr.name, tp.path \
+                 FROM links l \
+                 JOIN pages fp ON fp.id = l.from_page_id AND fp.is_latest = 1 \
+                 JOIN pages tp ON tp.id = l.to_page_id AND tp.is_latest = 1 \
+                 JOIN projects fpr ON fpr.id = fp.project_id \
+                 JOIN workspaces fw ON fw.id = fp.workspace_id \
+                 JOIN projects tpr ON tpr.id = tp.project_id \
+                 JOIN workspaces tw ON tw.id = tp.workspace_id \
+                 WHERE fp.project_id != tp.project_id";
+            let map_row = |row: &rusqlite::Row<'_>| {
+                Ok(CrossProjectEdge {
+                    from_workspace: row.get(0)?,
+                    from_project: row.get(1)?,
+                    from_path: row.get(2)?,
+                    to_workspace: row.get(3)?,
+                    to_project: row.get(4)?,
+                    to_path: row.get(5)?,
+                })
+            };
+            let mut out = Vec::new();
+            if let Some((_ws, proj)) = scope {
+                let sql =
+                    format!("{base} AND (fp.project_id = ?1 OR tp.project_id = ?1) ORDER BY fw.name, fpr.name, fp.path");
+                let mut stmt = conn.prepare(&sql)?;
+                let rows = stmt.query_map(params![proj.as_bytes()], map_row)?;
+                for r in rows {
+                    out.push(r?);
+                }
+            } else {
+                let sql = format!("{base} ORDER BY fw.name, fpr.name, fp.path");
+                let mut stmt = conn.prepare(&sql)?;
+                let rows = stmt.query_map([], map_row)?;
+                for r in rows {
+                    out.push(r?);
+                }
+            }
+            Ok(out)
         })
         .await
     }
@@ -2354,12 +2581,14 @@ impl ReaderPool {
                                 END \
                             ), \
                             pg.tier, pg.pinned, pg.created_at, pg.updated_at, \
-                            sp.path AS supersedes_path \
+                            sp.path AS supersedes_path, \
+                            au.username, au.name, au.email \
                      FROM pages pg \
                      JOIN projects p ON p.id = pg.project_id \
                      JOIN workspaces w ON w.id = pg.workspace_id \
-                      LEFT JOIN pages sp ON sp.id = pg.supersedes \
-                      WHERE w.name = ?1 AND p.name = ?2 AND pg.path = ?3 AND pg.is_latest = 1",
+                     LEFT JOIN pages sp ON sp.id = pg.supersedes \
+                     LEFT JOIN users au ON au.id = pg.author_id \
+                     WHERE w.name = ?1 AND p.name = ?2 AND pg.path = ?3 AND pg.is_latest = 1",
                     params![workspace, project, page_path],
                     page_meta_from_row,
                 )
@@ -2578,6 +2807,55 @@ impl ReaderPool {
         })
         .await
     }
+
+    // ── user lookups ────────────────────────────────────────────────
+
+    /// Hot path for the auth middleware: hash the incoming bearer token,
+    /// look up the matching row, and return the user iff their token is
+    /// active (`token_expired_at IS NULL`).
+    ///
+    /// # Errors
+    /// Propagates any SQL or pool error. Returns `Ok(None)` when no row
+    /// matches the hash (either no such user, or the token was expired).
+    pub async fn find_active_user_by_token_hash(
+        &self,
+        token_hash: [u8; TOKEN_HASH_LEN],
+    ) -> StoreResult<Option<User>> {
+        self.with_conn(move |conn| crate::users::find_active_user_by_token_hash(conn, &token_hash))
+            .await
+    }
+
+    /// Look up a user by exact-match username. Used by admin endpoints
+    /// that accept username on the wire (`expire`, `revive`,
+    /// `rotate-token`).
+    ///
+    /// # Errors
+    /// Propagates any SQL or pool error.
+    pub async fn find_user_by_username(&self, username: String) -> StoreResult<Option<User>> {
+        self.with_conn(move |conn| crate::users::find_user_by_username(conn, &username))
+            .await
+    }
+
+    /// Look up a user by id. **Returns even users whose token is expired**
+    /// — this is the attribution-display path (a page authored by alice
+    /// must still render "alice" after her token has been expired).
+    ///
+    /// # Errors
+    /// Propagates any SQL or pool error.
+    pub async fn find_user_by_id(&self, id: UserId) -> StoreResult<Option<User>> {
+        self.with_conn(move |conn| crate::users::find_user_by_id(conn, id))
+            .await
+    }
+
+    /// All registered users, ordered by `created_at` ascending. Includes
+    /// users whose token is expired (the CLI surfaces the active/expired
+    /// flag from `token_expired_at`).
+    ///
+    /// # Errors
+    /// Propagates any SQL or pool error.
+    pub async fn list_users(&self) -> StoreResult<Vec<User>> {
+        self.with_conn(crate::users::list_users).await
+    }
 }
 
 /// Map a `(workspace, project, path, title, kind)` row to a [`HealthPage`].
@@ -2604,6 +2882,17 @@ fn page_meta_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoreResult<P
     let created_us: i64 = row.get(9)?;
     let updated_us: i64 = row.get(10)?;
     let supersedes: Option<String> = row.get(11)?;
+    // P1.7: author columns LEFT JOIN'd from `users`. NULL when the
+    // page was written anonymously / by root, or when the user row
+    // has been hard-deleted (FK `ON DELETE SET NULL`).
+    let author_username: Option<String> = row.get(12)?;
+    let author_name: Option<String> = row.get(13)?;
+    let author_email: Option<String> = row.get(14)?;
+    let author = author_username.map(|username| PageAuthor {
+        username,
+        name: author_name,
+        email: author_email,
+    });
 
     let workspace_id = WorkspaceId::from_slice(&ws_id_bytes)
         .map_err(|_| rusqlite::Error::IntegralValueOutOfRange(2, 0))?;
@@ -2630,6 +2919,7 @@ fn page_meta_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoreResult<P
         created_at,
         updated_at,
         supersedes,
+        author,
     }))
 }
 
@@ -2959,6 +3249,46 @@ fn count_project(
         )
         .optional()?;
     Ok(u64::try_from(n.unwrap_or(0)).unwrap_or(0))
+}
+
+/// Cross-project link degree for a project: `(dependents, dependencies)`.
+/// `dependents` = distinct other projects whose pages link into this one;
+/// `dependencies` = distinct other projects this one links out to. Counts
+/// resolved links only (`to_page_id` is set); project ids are globally
+/// unique, so a bare `!= project_id` excludes self across all workspaces.
+fn cross_project_degree(
+    conn: &Connection,
+    workspace_id: WorkspaceId,
+    project_id: ProjectId,
+) -> StoreResult<(u64, u64)> {
+    let dependents: Option<i64> = conn
+        .query_row(
+            "SELECT COUNT(DISTINCT fp.project_id) \
+             FROM links l \
+             JOIN pages tp ON tp.id = l.to_page_id \
+                 AND tp.workspace_id = ?1 AND tp.project_id = ?2 AND tp.is_latest = 1 \
+             JOIN pages fp ON fp.id = l.from_page_id AND fp.is_latest = 1 \
+             WHERE fp.project_id != ?2",
+            params![workspace_id.as_bytes(), project_id.as_bytes()],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let dependencies: Option<i64> = conn
+        .query_row(
+            "SELECT COUNT(DISTINCT tp.project_id) \
+             FROM links l \
+             JOIN pages fp ON fp.id = l.from_page_id \
+                 AND fp.workspace_id = ?1 AND fp.project_id = ?2 AND fp.is_latest = 1 \
+             JOIN pages tp ON tp.id = l.to_page_id AND tp.is_latest = 1 \
+             WHERE tp.project_id != ?2",
+            params![workspace_id.as_bytes(), project_id.as_bytes()],
+            |row| row.get(0),
+        )
+        .optional()?;
+    Ok((
+        u64::try_from(dependents.unwrap_or(0)).unwrap_or(0),
+        u64::try_from(dependencies.unwrap_or(0)).unwrap_or(0),
+    ))
 }
 
 fn count_workspace(conn: &Connection, sql: &str, workspace_id: WorkspaceId) -> StoreResult<u64> {

@@ -47,4 +47,17 @@ pub enum StoreError {
     /// The supplied project name failed validation (empty, slash, etc.).
     #[error("invalid project name: {0}")]
     InvalidProjectName(String),
+
+    /// A UNIQUE constraint was violated by an insert (e.g. duplicate
+    /// `users.username` / `users.email`). The string carries a
+    /// human-readable explanation the CLI / admin endpoint surfaces
+    /// verbatim.
+    #[error("duplicate: {0}")]
+    Duplicate(String),
+
+    /// An OS primitive failed (e.g. the CSPRNG read inside
+    /// [`crate::users::generate_token`]). Carries the OS error
+    /// description.
+    #[error("os error: {0}")]
+    Os(String),
 }

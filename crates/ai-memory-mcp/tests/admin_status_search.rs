@@ -29,6 +29,7 @@ async fn make_admin_state(tmp: &TempDir) -> (AdminState, Store) {
         db_path,
         bind: "127.0.0.1:49374".to_string(),
         bootstrap_lock: std::sync::Arc::new(tokio::sync::Mutex::new(())),
+        token_pepper: None,
     };
     (state, store)
 }
@@ -54,6 +55,7 @@ async fn seed_page(store: &Store, title: &str, path: &str, body: &str) {
         frontmatter_json: serde_json::json!({}),
         pinned: false,
         links: Vec::new(),
+        author_id: None,
     };
     store.writer.upsert_page(page).await.unwrap();
 }

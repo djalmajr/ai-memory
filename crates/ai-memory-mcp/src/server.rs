@@ -12,6 +12,7 @@ use ai_memory_llm::{Embedder, LlmProvider};
 use ai_memory_store::{DecayParams, PageHit, ReaderPool, WriterHandle};
 use ai_memory_wiki::{Wiki, WritePageRequest};
 use rmcp::handler::server::router::tool::ToolRouter;
+use rmcp::handler::server::tool::Extension;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{
     CallToolResult, Content, Implementation, ProtocolVersion, ServerCapabilities, ServerInfo,
@@ -46,7 +47,10 @@ the conversation calls for them:\n\
 \n\
 - `memory_query` — when the user references prior work you don't \
   recognise, or asks 'have we done / discussed X', or you're about \
-  to propose architecture (always check first).\n\
+  to propose architecture (always check first). Defaults to the \
+  current project; pass `scopes` to search named sibling projects, \
+  or `global=true` to search EVERY project at once when you don't \
+  know where the knowledge lives.\n\
 - `memory_recent` — at session start, or when the user asks 'what's \
   been going on lately'. Returns the N most-recent pages.\n\
 - `memory_status` — when the user asks 'is ai-memory healthy' or \
@@ -80,6 +84,9 @@ the conversation calls for them:\n\
   returns the top hit's full body) or a `path` (direct lookup). Use \
   this instead of memory_query when the user wants the complete text, \
   not just snippets.\n\
+- `memory_delete_page` — when the user explicitly asks to delete or \
+  remove a specific page (by exact path). Idempotent; fires the \
+  admission chain so mirrors/backups stay consistent.\n\
 - `memory_lint` — when the user asks to audit the wiki for stale \
   pages, contradictions, or rule suggestions.\n\
 - `memory_forget_sweep` — when the user wants to prune old / cold \
@@ -90,6 +97,22 @@ the conversation calls for them:\n\
   filename hints; you then use your own Write/Edit tool to land it \
   in the right rules file (Claude Code → CLAUDE.md, Codex / \
   OpenCode / Cursor / Gemini → AGENTS.md).\n\
+\n\
+**When the current project comes up empty, broaden — don't stop.** \
+`memory_query` searches only ONE project (the current one) by default. \
+If a query returns nothing useful, the knowledge may live in a SIBLING \
+project — shared `infra`, `ops`, or a related app. Two ways to \
+broaden: (a) re-run with explicit `scopes: [{workspace, project}]` \
+when you know which projects to check; (b) pass `global=true` to \
+search EVERY project in EVERY workspace at once when you don't know \
+where the knowledge lives — each hit then carries its workspace + \
+project name. `global=true` cannot be combined with \
+`scopes`/`project`/`workspace`. Don't conclude 'we never recorded \
+it' after one project misses. Note also that `memory_query` returns \
+SNIPPETS, not full page bodies — an empty or short snippet does NOT \
+mean the page is empty (a large page can match outside the snippet \
+window); to read the whole page use `memory_read_page` (by `path`, \
+or a `query` for the top hit's body).\n\
 \n\
 The routing snippet this very text comes from can also be installed \
 into the project's CLAUDE.md / AGENTS.md so the guidance survives \
@@ -170,6 +193,13 @@ struct QueryArgs {
     /// knowledge. Cannot be combined with `workspace`/`project`.
     #[serde(default)]
     scopes: Vec<MemoryScopeArg>,
+    /// Search EVERY project in every workspace in one call (cross-project
+    /// global search). Use when you don't know which project holds the
+    /// knowledge — e.g. shared infra/ops notes. When true, omit
+    /// `project`/`workspace`/`scopes`; each hit is annotated with its
+    /// workspace + project so you can tell where it came from.
+    #[serde(default)]
+    global: Option<bool>,
 }
 
 #[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
@@ -209,6 +239,10 @@ struct MemoryQueryResponse {
     hits: Vec<ai_memory_store::PageHit>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     raw_hits: Vec<ai_memory_store::ObservationHit>,
+    /// Populated only by a `global=true` query: cross-project hits, each
+    /// carrying its workspace + project name.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    global_hits: Vec<ai_memory_store::PageHitWithMeta>,
 }
 
 #[derive(Debug, Serialize)]
@@ -221,6 +255,14 @@ struct SweepArgs {
     /// If true, preview only. Default false.
     #[serde(default)]
     dry_run: Option<bool>,
+    /// Project to sweep. Omit to target the project you're currently working
+    /// in (resolved from recent hook activity). **Omit unless the user
+    /// explicitly names a *different* project.**
+    #[serde(default)]
+    project: Option<String>,
+    /// Workspace the project lives in. Omit for the current workspace.
+    #[serde(default)]
+    workspace: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
@@ -233,6 +275,14 @@ struct LintArgs {
     /// fast rule-based checks. Default false.
     #[serde(default)]
     no_llm: Option<bool>,
+    /// Project to audit. Omit to target the project you're currently working
+    /// in (resolved from recent hook activity). **Omit unless the user
+    /// explicitly names a *different* project.**
+    #[serde(default)]
+    project: Option<String>,
+    /// Workspace the project lives in. Omit for the current workspace.
+    #[serde(default)]
+    workspace: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
@@ -336,6 +386,17 @@ struct ReadPageArgs {
 }
 
 #[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
+struct DeletePageArgs {
+    /// Exact wiki path to delete (e.g. `notes/foo.md`).
+    path: String,
+    /// Project to delete from. Omit to target the project you're currently
+    /// working in (resolved from recent hook activity). **Omit unless the
+    /// user explicitly names a *different* project.**
+    #[serde(default)]
+    project: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
 struct WritePageArgs {
     /// Relative wiki path to write, for example `notes/santander-2025.md`.
     path: String,
@@ -354,9 +415,16 @@ struct WritePageArgs {
     #[serde(default)]
     pinned: bool,
     /// Project to write into. Omit to target the project you're currently
-    /// working in (resolved from recent hook activity). **Omit unless the user explicitly names a *different* project.**
+    /// working in (resolved from recent hook activity). When set to a name
+    /// that doesn't exist yet, the project is **created** — so writes always
+    /// land where you asked, never silently in the current project. **Omit
+    /// unless the user explicitly names a *different* project.**
     #[serde(default)]
     project: Option<String>,
+    /// Workspace to write into. Only honoured together with an explicit
+    /// `project`; created if it doesn't exist. Omit for the current workspace.
+    #[serde(default)]
+    workspace: Option<String>,
 }
 
 #[tool_router]
@@ -473,6 +541,40 @@ impl AiMemoryServer {
             .ok_or_else(|| {
                 McpError::internal_error(format!("project '{project}' not found"), None)
             })?;
+        Ok((workspace_id, project_id))
+    }
+
+    /// Resolve the target for a WRITE, **creating** the workspace/project when
+    /// an explicit name doesn't exist yet. Distinct from [`Self::effective_ids`]
+    /// (find-only, for reads): a write to a named project must land there, not
+    /// silently fall back to the current project. With no explicit `project`,
+    /// the active-project-wins behaviour is preserved (issue #2).
+    async fn write_target_ids(
+        &self,
+        explicit_workspace: Option<&str>,
+        explicit_project: Option<&str>,
+    ) -> Result<(WorkspaceId, ProjectId), McpError> {
+        let Some(project) = trimmed_opt(explicit_project) else {
+            // No explicit project → current project (hook-published active, or
+            // the baked default). Explicit workspace alone has nothing to scope.
+            return Ok(self
+                .active_project
+                .get()
+                .unwrap_or((self.workspace_id, self.project_id)));
+        };
+        let workspace_id = match trimmed_opt(explicit_workspace) {
+            Some(name) => self
+                .writer
+                .get_or_create_workspace(name.to_string())
+                .await
+                .map_err(|e| McpError::internal_error(e.to_string(), None))?,
+            None => self.workspace_id,
+        };
+        let project_id = self
+            .writer
+            .get_or_create_project(workspace_id, project.to_string(), None)
+            .await
+            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
         Ok((workspace_id, project_id))
     }
 
@@ -611,12 +713,42 @@ impl AiMemoryServer {
         Returns up to `limit` pages with HTML-marked snippets and a rank \
         score (lower rank = better match). Only latest page versions. \
         If compiled wiki search misses, `raw_hits` contains bounded raw \
-        observation fallback matches.")]
+        observation fallback matches. Set `global=true` to search EVERY \
+        project at once (cross-project) when you don't know which project \
+        holds the knowledge — each hit then carries its workspace + \
+        project name.")]
     async fn memory_query(
         &self,
         Parameters(args): Parameters<QueryArgs>,
     ) -> Result<CallToolResult, McpError> {
         let limit = args.limit.unwrap_or(self.default_limit).clamp(1, 100);
+        if args.global.unwrap_or(false) {
+            if !args.scopes.is_empty()
+                || args
+                    .workspace
+                    .as_deref()
+                    .is_some_and(|s| !s.trim().is_empty())
+                || args
+                    .project
+                    .as_deref()
+                    .is_some_and(|s| !s.trim().is_empty())
+            {
+                return Err(McpError::internal_error(
+                    "global cannot be combined with workspace/project/scopes",
+                    None,
+                ));
+            }
+            let global_hits = self
+                .reader
+                .search_pages_with_meta(args.query.clone(), limit)
+                .await
+                .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+            return ok_json(&MemoryQueryResponse {
+                hits: Vec::new(),
+                raw_hits: Vec::new(),
+                global_hits,
+            });
+        }
         if !args.scopes.is_empty()
             && (args
                 .workspace
@@ -684,7 +816,11 @@ impl AiMemoryServer {
         } else {
             Vec::new()
         };
-        let response = MemoryQueryResponse { hits, raw_hits };
+        let response = MemoryQueryResponse {
+            hits,
+            raw_hits,
+            global_hits: Vec::new(),
+        };
         ok_json(&response)
     }
 
@@ -724,11 +860,14 @@ impl AiMemoryServer {
         &self,
         Parameters(args): Parameters<SweepArgs>,
     ) -> Result<CallToolResult, McpError> {
+        let (ws, proj) = self
+            .effective_ids_for_read_args(args.workspace.as_deref(), args.project.as_deref())
+            .await?;
         let report = run_sweep(
             &self.reader,
             &self.writer,
-            self.workspace_id,
-            self.project_id,
+            ws,
+            proj,
             &self.decay_params,
             args.dry_run.unwrap_or(false),
         )
@@ -752,12 +891,15 @@ impl AiMemoryServer {
                 None,
             ));
         };
+        let (ws, proj) = self
+            .effective_ids_for_read_args(args.workspace.as_deref(), args.project.as_deref())
+            .await?;
         let report = run_lint(
             &self.reader,
             wiki,
             self.llm.as_ref(),
-            self.workspace_id,
-            self.project_id,
+            ws,
+            proj,
             args.dry_run.unwrap_or(false),
             !args.no_llm.unwrap_or(false),
         )
@@ -814,6 +956,7 @@ impl AiMemoryServer {
     async fn memory_write_page(
         &self,
         Parameters(args): Parameters<WritePageArgs>,
+        Extension(parts): Extension<axum::http::request::Parts>,
     ) -> Result<CallToolResult, McpError> {
         let Some(wiki) = self.wiki.as_ref() else {
             return Err(McpError::internal_error(
@@ -827,7 +970,9 @@ impl AiMemoryServer {
             .map_err(|_| McpError::internal_error(format!("unknown tier '{tier_name}'"), None))?;
         let path = PagePath::new(args.path.clone())
             .map_err(|e| McpError::internal_error(format!("invalid path: {e}"), None))?;
-        let (ws, proj) = self.effective_ids(args.project.as_deref()).await;
+        let (ws, proj) = self
+            .write_target_ids(args.workspace.as_deref(), args.project.as_deref())
+            .await?;
 
         let mut fm = serde_json::Map::new();
         if let Some(title) = &args.title {
@@ -854,6 +999,30 @@ impl AiMemoryServer {
             serde_json::Value::Object(fm)
         };
 
+        // Populate the admission context from the request's `X-Memory-Actor-*`
+        // headers (set by the `mcp-auth` sidecar after JWT validation). rmcp 1.7
+        // exposes the original HTTP `Parts` via the `Extension<Parts>` extractor —
+        // task-locals can't be used because StreamableHttpService dispatches the
+        // tool handler in a `tokio::spawn`-ed task that doesn't inherit them.
+        // See `crate::actor::actor_from_headers` for the JWT-claim → header map.
+        let actor = crate::actor::actor_from_headers(&parts.headers);
+        // Loop prevention: a webhook that writes back into the engine sets
+        // `X-Memory-Skip-Admission-Chain` so the chain doesn't re-invoke it
+        // on the recursive write. Build the ctx when either the actor OR the
+        // skip list is present (a skip-only write still needs to carry it).
+        let skip_webhooks = crate::actor::skip_webhooks_from_headers(&parts.headers);
+        let admission_ctx = if actor.has_any() || !skip_webhooks.is_empty() {
+            // Actor is NOT carried here — `write_page` fills the webhook
+            // context from `req.actor` (single identity source).
+            Some(ai_memory_wiki::AdmissionContext {
+                op: ai_memory_wiki::AdmissionOp::WritePage,
+                skip_webhooks,
+                ..ai_memory_wiki::AdmissionContext::default()
+            })
+        } else {
+            None
+        };
+
         let page_id = wiki
             .write_page(WritePageRequest {
                 workspace_id: ws,
@@ -864,6 +1033,9 @@ impl AiMemoryServer {
                 tier,
                 pinned: args.pinned,
                 title: args.title,
+                admission_ctx,
+                author_id: None,
+                actor,
             })
             .await
             .map_err(|e| McpError::internal_error(e.to_string(), None))?;
@@ -940,6 +1112,50 @@ impl AiMemoryServer {
             "body": md.body,
             "frontmatter": md.frontmatter,
         }))
+    }
+
+    /// Delete a single wiki page by exact path.
+    #[tool(description = "Delete a single wiki page by its exact relative \
+        path (e.g. `notes/foo.md`). Use when the user explicitly asks to \
+        delete or remove a page. Fires the admission chain (op=delete) \
+        before the file is removed so backups/mirrors stay consistent. \
+        Idempotent — deleting a page that is already gone is a no-op. \
+        Returns `{ path, deleted }`.")]
+    async fn memory_delete_page(
+        &self,
+        Parameters(args): Parameters<DeletePageArgs>,
+        Extension(parts): Extension<axum::http::request::Parts>,
+    ) -> Result<CallToolResult, McpError> {
+        let Some(wiki) = self.wiki.as_ref() else {
+            return Err(McpError::internal_error(
+                "memory_delete_page requires the server to be built with a wiki handle",
+                None,
+            ));
+        };
+        let path = PagePath::new(args.path.clone())
+            .map_err(|e| McpError::internal_error(format!("invalid path: {e}"), None))?;
+        let (ws, proj) = self.effective_ids(args.project.as_deref()).await;
+
+        // Carry actor identity + loop-prevention skip list (same as write_page).
+        // `Wiki::delete_page` stamps `op = Delete` regardless of what we pass.
+        let actor = crate::actor::actor_from_headers(&parts.headers);
+        let skip_webhooks = crate::actor::skip_webhooks_from_headers(&parts.headers);
+        let admission_ctx = if actor.has_any() || !skip_webhooks.is_empty() {
+            Some(ai_memory_wiki::AdmissionContext {
+                actor,
+                op: ai_memory_wiki::AdmissionOp::Delete,
+                skip_webhooks,
+                ..ai_memory_wiki::AdmissionContext::default()
+            })
+        } else {
+            None
+        };
+
+        wiki.delete_page(ws, proj, &path, admission_ctx)
+            .await
+            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+
+        ok_json(&serde_json::json!({ "path": path.to_string(), "deleted": true }))
     }
 
     /// Create a handoff snapshot for the next agent CLI.
@@ -1362,6 +1578,7 @@ mod tests {
                 frontmatter_json: serde_json::json!({}),
                 pinned: false,
                 links: Vec::new(),
+                author_id: None,
             })
             .await
             .unwrap();
@@ -1388,6 +1605,7 @@ mod tests {
             "memory_consolidate",
             "memory_write_page",
             "memory_read_page",
+            "memory_delete_page",
             "memory_lint",
             "memory_forget_sweep",
             "memory_install_self_routing",
@@ -1402,6 +1620,50 @@ mod tests {
                 routing.contains(tool),
                 "routing snippet omit {tool}; update ai_memory_core::SNIPPET_BODY"
             );
+        }
+    }
+
+    #[test]
+    fn prompts_teach_cross_project_search_strategy() {
+        // Regression: a single-project miss must not read as "never recorded".
+        // Both surfaces must point the agent at `scopes` **and** at
+        // `global=true` (the two broadening modes), warn that query returns
+        // snippets (not full page bodies), and NOT contain the contradictory
+        // legacy "no global mode" phrasing that briefly shipped in #56.
+        // (Learned the hard way when cluster-access info lived in a sibling
+        // `infra` project.)
+        for prompt in [MEMORY_INSTRUCTIONS, ai_memory_core::SNIPPET_BODY] {
+            assert!(
+                prompt.contains("scopes"),
+                "prompt must teach broadening via `scopes`"
+            );
+            assert!(
+                prompt.contains("global=true") || prompt.contains("global = true"),
+                "prompt must also teach broadening via `global=true`"
+            );
+            assert!(
+                prompt.contains("sibling") || prompt.contains("SIBLING"),
+                "prompt must mention knowledge can live in a sibling project"
+            );
+            assert!(
+                prompt.contains("snippet") || prompt.contains("SNIPPET"),
+                "prompt must warn that query returns snippets, not full bodies"
+            );
+            // Guard against the contradiction: standalone prose must not say
+            // a global mode doesn't exist when the bullet/table-row above it
+            // advertises `global=true`.
+            let no_global_phrases = [
+                "no global \"search everything\" mode",
+                "NO global 'search everything' mode",
+                "no global 'search everything' mode",
+                "NO global \"search everything\" mode",
+            ];
+            for phrase in no_global_phrases {
+                assert!(
+                    !prompt.contains(phrase),
+                    "prompt must not contain the contradictory phrase {phrase:?}"
+                );
+            }
         }
     }
 
@@ -1473,6 +1735,7 @@ mod tests {
                 project: None,
                 scopes: Vec::new(),
                 workspace: None,
+                global: None,
             }))
             .await
             .unwrap();
@@ -1521,6 +1784,7 @@ mod tests {
                 project: None,
                 scopes: Vec::new(),
                 workspace: None,
+                global: None,
             }))
             .await
             .unwrap();
@@ -1564,6 +1828,7 @@ mod tests {
                 frontmatter_json: serde_json::json!({}),
                 pinned: false,
                 links: Vec::new(),
+                author_id: None,
             })
             .await
             .unwrap();
@@ -1575,6 +1840,7 @@ mod tests {
                 project: Some("unit-testing".into()),
                 scopes: Vec::new(),
                 workspace: Some("practice".into()),
+                global: None,
             }))
             .await
             .unwrap();
@@ -1622,6 +1888,7 @@ mod tests {
                 frontmatter_json: serde_json::json!({}),
                 pinned: false,
                 links: Vec::new(),
+                author_id: None,
             })
             .await
             .unwrap();
@@ -1637,6 +1904,7 @@ mod tests {
                 frontmatter_json: serde_json::json!({}),
                 pinned: false,
                 links: Vec::new(),
+                author_id: None,
             })
             .await
             .unwrap();
@@ -1652,6 +1920,7 @@ mod tests {
                 frontmatter_json: serde_json::json!({}),
                 pinned: false,
                 links: Vec::new(),
+                author_id: None,
             })
             .await
             .unwrap();
@@ -1672,6 +1941,7 @@ mod tests {
                     },
                 ],
                 workspace: None,
+                global: None,
             }))
             .await
             .unwrap();
@@ -1687,6 +1957,94 @@ mod tests {
             "expected practice hit: {text}"
         );
         assert!(!text.contains("hidden.md"), "unexpected hidden hit: {text}");
+    }
+
+    #[tokio::test]
+    async fn memory_query_global_searches_all_projects() {
+        let (_tmp, store, server, ws, _pj) = setup_server().await;
+        let other = store
+            .writer
+            .get_or_create_project(ws, "infra", None)
+            .await
+            .unwrap();
+        let other_ws = store.writer.get_or_create_workspace("ops").await.unwrap();
+        let third = store
+            .writer
+            .get_or_create_project(other_ws, "runbooks", None)
+            .await
+            .unwrap();
+        for (w, p, path, body) in [
+            (ws, other, "cluster.md", "global_token lives in infra"),
+            (
+                other_ws,
+                third,
+                "deploy.md",
+                "global_token lives in ops runbooks",
+            ),
+        ] {
+            store
+                .writer
+                .upsert_page(NewPage {
+                    workspace_id: w,
+                    project_id: p,
+                    path: PagePath::new(path).unwrap(),
+                    title: path.into(),
+                    body: body.into(),
+                    tier: Tier::Semantic,
+                    frontmatter_json: serde_json::json!({}),
+                    pinned: false,
+                    links: Vec::new(),
+                    author_id: None,
+                })
+                .await
+                .unwrap();
+        }
+
+        let result = server
+            .memory_query(Parameters(QueryArgs {
+                query: "global_token".into(),
+                limit: Some(10),
+                project: None,
+                scopes: Vec::new(),
+                workspace: None,
+                global: Some(true),
+            }))
+            .await
+            .unwrap();
+        let text = result
+            .content
+            .first()
+            .and_then(|c| c.as_text())
+            .map(|t| t.text.clone())
+            .unwrap();
+        // Both projects (across two workspaces) surface in one global call,
+        // each annotated with its project name.
+        assert!(text.contains("cluster.md"), "expected infra hit: {text}");
+        assert!(text.contains("deploy.md"), "expected ops hit: {text}");
+        assert!(
+            text.contains("infra"),
+            "hit must carry project name: {text}"
+        );
+        assert!(text.contains("global_hits"), "global hits field: {text}");
+    }
+
+    #[tokio::test]
+    async fn memory_query_global_rejects_explicit_scope() {
+        let (_tmp, _store, server, _ws, _pj) = setup_server().await;
+        let err = server
+            .memory_query(Parameters(QueryArgs {
+                query: "x".into(),
+                limit: Some(5),
+                project: Some("product".into()),
+                scopes: Vec::new(),
+                workspace: None,
+                global: Some(true),
+            }))
+            .await;
+        assert!(
+            err.is_err(),
+            "global must not combine with project/workspace/scopes"
+        );
     }
 
     #[tokio::test]
@@ -1851,16 +2209,30 @@ mod tests {
         let server = AiMemoryServer::new(store.reader.clone(), store.writer.clone(), ws, proj)
             .with_wiki(wiki);
 
+        // Build a synthetic `Parts` so the new `Extension<Parts>` extractor
+        // can be satisfied — no actor headers, so the admission chain
+        // gets a default (anonymous) context, same as a stdio caller.
+        let parts = axum::http::Request::builder()
+            .uri("/mcp")
+            .method("POST")
+            .body(())
+            .unwrap()
+            .into_parts()
+            .0;
         let result = server
-            .memory_write_page(Parameters(WritePageArgs {
-                path: "notes/santander-2025.md".into(),
-                body: "# Santander 2025\n\nDurable tax annotation.".into(),
-                title: Some("Santander 2025".into()),
-                tier: Some("semantic".into()),
-                tags: vec!["finance".into()],
-                pinned: true,
-                project: None,
-            }))
+            .memory_write_page(
+                Parameters(WritePageArgs {
+                    path: "notes/santander-2025.md".into(),
+                    body: "# Santander 2025\n\nDurable tax annotation.".into(),
+                    title: Some("Santander 2025".into()),
+                    tier: Some("semantic".into()),
+                    tags: vec!["finance".into()],
+                    pinned: true,
+                    project: None,
+                    workspace: None,
+                }),
+                rmcp::handler::server::tool::Extension(parts),
+            )
             .await
             .unwrap();
         let text = result
@@ -1888,6 +2260,180 @@ mod tests {
         assert!(
             recent_text.contains("notes/santander-2025.md"),
             "write-page result must be visible to read tools; got {recent_text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn memory_delete_page_removes_the_page() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let ws = store
+            .writer
+            .get_or_create_workspace("default")
+            .await
+            .unwrap();
+        let proj = store
+            .writer
+            .get_or_create_project(ws, "scratch", None)
+            .await
+            .unwrap();
+        let wiki = Wiki::new(tmp.path(), store.writer.clone()).unwrap();
+        let server = AiMemoryServer::new(store.reader.clone(), store.writer.clone(), ws, proj)
+            .with_wiki(wiki);
+        let parts = || {
+            axum::http::Request::builder()
+                .uri("/mcp")
+                .method("POST")
+                .body(())
+                .unwrap()
+                .into_parts()
+                .0
+        };
+
+        server
+            .memory_write_page(
+                Parameters(WritePageArgs {
+                    path: "notes/temp.md".into(),
+                    body: "# Temp\n\nthrowaway".into(),
+                    title: Some("Temp".into()),
+                    tier: Some("semantic".into()),
+                    tags: vec![],
+                    pinned: false,
+                    project: None,
+                    workspace: None,
+                }),
+                rmcp::handler::server::tool::Extension(parts()),
+            )
+            .await
+            .unwrap();
+
+        server
+            .memory_delete_page(
+                Parameters(DeletePageArgs {
+                    path: "notes/temp.md".into(),
+                    project: None,
+                }),
+                rmcp::handler::server::tool::Extension(parts()),
+            )
+            .await
+            .unwrap();
+
+        // The on-disk file is gone; reading it back errors (file not found).
+        let read = server
+            .memory_read_page(Parameters(ReadPageArgs {
+                query: None,
+                path: Some("notes/temp.md".into()),
+                project: None,
+            }))
+            .await;
+        assert!(read.is_err(), "deleted page must not be readable");
+
+        // Regression: the derived index row must also be gone — the watcher
+        // does not reconcile deletions, so a file-only delete would leave the
+        // page surfacing in recent/search with stale content.
+        let recent = server
+            .memory_recent(Parameters(RecentArgs {
+                limit: Some(10),
+                project: None,
+                workspace: None,
+            }))
+            .await
+            .unwrap();
+        let recent_text = recent
+            .content
+            .first()
+            .and_then(|c| c.as_text())
+            .map(|t| t.text.clone())
+            .unwrap();
+        assert!(
+            !recent_text.contains("notes/temp.md"),
+            "deleted page must not linger in the index; got {recent_text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn memory_write_page_creates_explicit_project() {
+        // Bug B regression: an explicit `project` that doesn't exist yet must
+        // be created and written to — NOT silently land in the current project.
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let ws = store
+            .writer
+            .get_or_create_workspace("default")
+            .await
+            .unwrap();
+        let baked = store
+            .writer
+            .get_or_create_project(ws, "scratch", None)
+            .await
+            .unwrap();
+        let wiki = Wiki::new(tmp.path(), store.writer.clone()).unwrap();
+        let server = AiMemoryServer::new(store.reader.clone(), store.writer.clone(), ws, baked)
+            .with_wiki(wiki);
+        let parts = || {
+            axum::http::Request::builder()
+                .uri("/mcp")
+                .method("POST")
+                .body(())
+                .unwrap()
+                .into_parts()
+                .0
+        };
+
+        server
+            .memory_write_page(
+                Parameters(WritePageArgs {
+                    path: "notes/elsewhere.md".into(),
+                    body: "lands in `other`, not `scratch`".into(),
+                    title: None,
+                    tier: Some("semantic".into()),
+                    tags: vec![],
+                    pinned: false,
+                    project: Some("other".into()),
+                    workspace: None,
+                }),
+                rmcp::handler::server::tool::Extension(parts()),
+            )
+            .await
+            .unwrap();
+
+        // Visible in `other` (created), absent from the baked `scratch`.
+        let in_other = server
+            .memory_recent(Parameters(RecentArgs {
+                limit: Some(5),
+                project: Some("other".into()),
+                workspace: None,
+            }))
+            .await
+            .unwrap();
+        let other_text = in_other
+            .content
+            .first()
+            .and_then(|c| c.as_text())
+            .map(|t| t.text.clone())
+            .unwrap();
+        assert!(
+            other_text.contains("notes/elsewhere.md"),
+            "explicit project must be created + written; got {other_text}"
+        );
+
+        let in_scratch = server
+            .memory_recent(Parameters(RecentArgs {
+                limit: Some(5),
+                project: None,
+                workspace: None,
+            }))
+            .await
+            .unwrap();
+        let scratch_text = in_scratch
+            .content
+            .first()
+            .and_then(|c| c.as_text())
+            .map(|t| t.text.clone())
+            .unwrap();
+        assert!(
+            !scratch_text.contains("notes/elsewhere.md"),
+            "write must not leak into the current project; got {scratch_text}"
         );
     }
 
@@ -2027,6 +2573,8 @@ mod tests {
             .memory_lint(Parameters(LintArgs {
                 dry_run: Some(true),
                 no_llm: None,
+                project: None,
+                workspace: None,
             }))
             .await
             .expect_err("must reject when wiki is not attached");
@@ -2037,6 +2585,93 @@ mod tests {
         assert!(
             msg.contains("wiki") || msg.contains("not configured"),
             "error should explain the missing wiki: {msg}",
+        );
+    }
+
+    #[tokio::test]
+    async fn memory_forget_sweep_targets_the_explicit_project() {
+        // Bug C regression: sweep must evaluate the project named in args (or
+        // the session's active project), NOT the baked default. An episodic
+        // page in `audited` is a sweep candidate only when the sweep points
+        // there — never when it runs against the baked `scratch`.
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let ws = store
+            .writer
+            .get_or_create_workspace("default")
+            .await
+            .unwrap();
+        let baked = store
+            .writer
+            .get_or_create_project(ws, "scratch", None)
+            .await
+            .unwrap();
+        let wiki = Wiki::new(tmp.path(), store.writer.clone()).unwrap();
+        let server = AiMemoryServer::new(store.reader.clone(), store.writer.clone(), ws, baked)
+            .with_wiki(wiki);
+        let parts = || {
+            axum::http::Request::builder()
+                .uri("/mcp")
+                .method("POST")
+                .body(())
+                .unwrap()
+                .into_parts()
+                .0
+        };
+
+        server
+            .memory_write_page(
+                Parameters(WritePageArgs {
+                    path: "log/ep.md".into(),
+                    body: "episodic note".into(),
+                    title: None,
+                    tier: Some("episodic".into()),
+                    tags: vec![],
+                    pinned: false,
+                    project: Some("audited".into()),
+                    workspace: None,
+                }),
+                rmcp::handler::server::tool::Extension(parts()),
+            )
+            .await
+            .unwrap();
+
+        let sweep_count = |args: SweepArgs| {
+            let server = &server;
+            async move {
+                let out = server.memory_forget_sweep(Parameters(args)).await.unwrap();
+                let text = out
+                    .content
+                    .first()
+                    .and_then(|c| c.as_text())
+                    .map(|t| t.text.clone())
+                    .unwrap();
+                serde_json::from_str::<serde_json::Value>(&text).unwrap()["candidates_evaluated"]
+                    .as_u64()
+                    .unwrap()
+            }
+        };
+
+        let audited = sweep_count(SweepArgs {
+            dry_run: Some(true),
+            project: Some("audited".into()),
+            workspace: None,
+        })
+        .await;
+        assert!(
+            audited >= 1,
+            "sweep of the named project must evaluate its episodic page, got {audited}"
+        );
+
+        let baked = sweep_count(SweepArgs {
+            dry_run: Some(true),
+            project: None,
+            workspace: None,
+        })
+        .await;
+        assert_eq!(
+            baked, 0,
+            "sweep of the baked project must not see another project's page, got {baked}"
         );
     }
 
@@ -2082,6 +2717,7 @@ mod tests {
                 project: None,
                 scopes: Vec::new(),
                 workspace: None,
+                global: None,
             }))
             .await
             .expect("oversized limit should be clamped, not refused");
@@ -2109,6 +2745,7 @@ mod tests {
                 project: None,
                 scopes: Vec::new(),
                 workspace: None,
+                global: None,
             }))
             .await;
         // Either a tidy 0-hit Ok (FTS5 is occasionally lenient) or

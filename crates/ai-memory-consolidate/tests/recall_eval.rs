@@ -133,6 +133,9 @@ async fn recall_at_5_baseline() {
             tier: Tier::Semantic,
             pinned: false,
             title: None,
+            admission_ctx: None,
+            author_id: None,
+            actor: ai_memory_core::ActorContext::anonymous(),
         })
         .await
         .expect("write page");
@@ -189,6 +192,9 @@ async fn graph_neighbor_expansion_recovers_linked_page() {
         tier: Tier::Semantic,
         pinned: false,
         title: None,
+        admission_ctx: None,
+        author_id: None,
+        actor: ai_memory_core::ActorContext::anonymous(),
     })
     .await
     .expect("write target");
@@ -201,6 +207,9 @@ async fn graph_neighbor_expansion_recovers_linked_page() {
         tier: Tier::Semantic,
         pinned: false,
         title: None,
+        admission_ctx: None,
+        author_id: None,
+        actor: ai_memory_core::ActorContext::anonymous(),
     })
     .await
     .expect("write source");

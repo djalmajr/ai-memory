@@ -54,6 +54,7 @@ pub(crate) fn build(state: Arc<WebState>) -> Router {
             "/workspaces/{workspace}/projects/{project}/overview",
             axum::routing::get(project_overview_handler),
         )
+        .route("/graph", axum::routing::get(graph_handler))
         .with_state(state)
 }
 
@@ -69,16 +70,6 @@ fn with_cache(resp: Response, max_age: u32) -> Response {
     resp
 }
 
-/// Lowercase hex encoding of a SHA-256 digest.
-fn sha256_hex(data: &[u8]) -> String {
-    let digest = Sha256::digest(data);
-    digest.iter().fold(String::with_capacity(64), |mut s, b| {
-        use std::fmt::Write as _;
-        let _ = write!(s, "{b:02x}");
-        s
-    })
-}
-
 async fn workspaces_handler(State(state): State<Arc<WebState>>) -> Result<Response, Response> {
     let workspaces = state
         .reader
@@ -87,6 +78,23 @@ async fn workspaces_handler(State(state): State<Arc<WebState>>) -> Result<Respon
         .map_err(internal_error)?;
     Ok(with_cache(
         Json(workspaces).into_response(),
+        LIST_CACHE_MAX_AGE,
+    ))
+}
+
+/// Cross-project dependency graph: every resolved link whose endpoints are
+/// in different projects, each carrying both endpoints' workspace/project/
+/// path. The UI builds nodes from the endpoints (and may aggregate to a
+/// project-level dependency graph). Global for now; project scoping is a
+/// follow-up query param.
+async fn graph_handler(State(state): State<Arc<WebState>>) -> Result<Response, Response> {
+    let edges = state
+        .reader
+        .cross_project_edges(None)
+        .await
+        .map_err(internal_error)?;
+    Ok(with_cache(
+        Json(serde_json::json!({ "edges": edges })).into_response(),
         LIST_CACHE_MAX_AGE,
     ))
 }
@@ -150,9 +158,31 @@ async fn page_handler(
         .read_page(meta.workspace_id, meta.project_id, &page_path)
         .map_err(|_| not_found("page file not found"))?;
 
-    // ETag is computed over the markdown body bytes so a client can skip
-    // the JSON serialisation round-trip when content hasn't changed.
-    let etag_value = format!("\"{}\"", sha256_hex(markdown.body.as_bytes()));
+    // ETag is computed over the markdown body PLUS the resolved author
+    // identity (P1.7). Author change without body change (e.g. operator
+    // rotates a token then user A re-writes a previously-anonymous page)
+    // must invalidate the cached response. SHA-256 over a stable
+    // concatenation: body || "\n--\n" || username || "\n" || email.
+    // The "\n--\n" separator prevents `body=foo, user=bar` from hashing
+    // the same as `body=foobar, user=` if either ever happened to slide
+    // empty.
+    let mut hasher = Sha256::new();
+    hasher.update(markdown.body.as_bytes());
+    if let Some(author) = meta.author.as_ref() {
+        hasher.update(b"\n--\n");
+        hasher.update(author.username.as_bytes());
+        hasher.update(b"\n");
+        if let Some(email) = author.email.as_deref() {
+            hasher.update(email.as_bytes());
+        }
+    }
+    let digest = hasher.finalize();
+    let etag_hex = digest.iter().fold(String::with_capacity(64), |mut s, b| {
+        use std::fmt::Write as _;
+        let _ = write!(s, "{b:02x}");
+        s
+    });
+    let etag_value = format!("\"{etag_hex}\"");
     let etag_header = HeaderValue::from_str(&etag_value).expect("sha256 hex is always valid ASCII");
 
     // If-None-Match: if the client sends back the exact ETag we issued,
@@ -195,6 +225,7 @@ async fn page_handler(
             title: meta.title,
             updated_at: meta.updated_at,
             workspace: meta.workspace_name,
+            author: meta.author,
         })
         .into_response(),
         PAGE_CACHE_MAX_AGE,
@@ -713,6 +744,13 @@ struct ApiPage {
     links: Vec<RelatedPage>,
     /// Latest pages that reference this page (incoming back-links).
     backlinks: Vec<RelatedPage>,
+    /// Multi-user attribution (P1.7). `None` for pre-multi-user pages
+    /// and root / anonymous writes; `Some` when JOIN against the
+    /// `users` table resolved a row at read time. Omitted from the
+    /// serialised payload when `None` so the response shape stays
+    /// backward-compatible with consumers that pre-date v0.8.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    author: Option<ai_memory_store::PageAuthor>,
 }
 
 #[derive(Debug, Serialize)]

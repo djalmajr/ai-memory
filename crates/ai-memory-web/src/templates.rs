@@ -188,6 +188,18 @@ pub(crate) struct PageView {
     pub supersedes_href: String,
     /// Rendered markdown body (HTML, trusted).
     pub body_html: String,
+    /// Username of the page's last author. Empty string when the page
+    /// was authored anonymously / by root / pre-multi-user — the
+    /// template uses the empty check to omit the "Last edited by"
+    /// chip entirely, so legacy pages render with the exact same
+    /// chrome they had before v0.8.
+    pub author_username: String,
+    /// Optional display name shown in parens after the username
+    /// (e.g. `alice (Alice Smith)`). Empty when not set on the user row.
+    pub author_name: String,
+    /// Optional email rendered as a `mailto:` link after the username.
+    /// Empty when not set on the user row.
+    pub author_email: String,
 }
 
 // ---------------------------------------------------------------------------

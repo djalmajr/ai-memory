@@ -11,14 +11,15 @@ use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 
 use ai_memory_core::{
-    AgentKind, HandoffId, NewHandoff, NewObservation, NewPage, NewSession, ObservationId, PageId,
-    ProjectId, SessionId, WorkspaceId,
+    AgentKind, HandoffId, NewHandoff, NewObservation, NewPage, NewSession, NewUser, ObservationId,
+    PageId, PagePath, ProjectId, SessionId, UserId, WorkspaceId,
 };
 use rusqlite::Connection;
 use tokio::sync::{mpsc, oneshot};
 
 use crate::error::{StoreError, StoreResult};
 use crate::ops::{self, EmbeddingWrite, PurgeSummary, ReorgSummary};
+use crate::users::{self, TOKEN_HASH_LEN};
 
 /// Commands accepted by the writer thread.
 pub(crate) enum WriteCmd {
@@ -39,6 +40,12 @@ pub(crate) enum WriteCmd {
     UpsertPageBatch {
         pages: Vec<NewPage>,
         reply: oneshot::Sender<StoreResult<Vec<PageId>>>,
+    },
+    DeletePage {
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+        path: PagePath,
+        reply: oneshot::Sender<StoreResult<()>>,
     },
     BeginSession {
         session: NewSession,
@@ -127,6 +134,28 @@ pub(crate) enum WriteCmd {
         /// Unix microseconds UTC.
         applied_at: i64,
         reply: oneshot::Sender<StoreResult<()>>,
+    },
+    CreateUser {
+        new_user: NewUser,
+        token_hash: [u8; TOKEN_HASH_LEN],
+        reply: oneshot::Sender<StoreResult<UserId>>,
+    },
+    RotateUserToken {
+        user_id: UserId,
+        new_token_hash: [u8; TOKEN_HASH_LEN],
+        reply: oneshot::Sender<StoreResult<bool>>,
+    },
+    ExpireUserToken {
+        user_id: UserId,
+        reply: oneshot::Sender<StoreResult<bool>>,
+    },
+    ReviveUserToken {
+        user_id: UserId,
+        reply: oneshot::Sender<StoreResult<bool>>,
+    },
+    TouchUserLastSeen {
+        user_id: UserId,
+        reply: oneshot::Sender<StoreResult<bool>>,
     },
     Shutdown,
 }
@@ -494,6 +523,119 @@ impl WriterHandle {
         rx.await.map_err(|_| StoreError::WriterClosed)?
     }
 
+    /// Delete every version of a page (by path) from the index. The wiki file
+    /// removal is the caller's concern; this drops the derived rows so the
+    /// page stops appearing in search/recent (the watcher does NOT reconcile
+    /// file deletions — it only handles create/modify events).
+    ///
+    /// # Errors
+    /// Returns [`StoreError::WriterClosed`] if the actor has shut down, or a
+    /// SQL error from the delete.
+    pub async fn delete_page(
+        &self,
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+        path: PagePath,
+    ) -> StoreResult<()> {
+        let (tx, rx) = oneshot::channel();
+        self.send(WriteCmd::DeletePage {
+            workspace_id,
+            project_id,
+            path,
+            reply: tx,
+        })
+        .await?;
+        rx.await.map_err(|_| StoreError::WriterClosed)?
+    }
+
+    /// Insert a new user. `new_user` MUST already have been validated by
+    /// [`NewUser::validate`](ai_memory_core::NewUser::validate); the
+    /// caller (CLI or admin handler) generates the plaintext token,
+    /// hashes it with the per-server pepper via
+    /// [`crate::users::hash_token`], and passes only the digest in.
+    ///
+    /// # Errors
+    /// - [`StoreError::WriterClosed`] if the writer has shut down.
+    /// - [`StoreError::Duplicate`] when the username or email collides.
+    /// - [`StoreError::Sqlite`] for any other SQL failure.
+    pub async fn create_user(
+        &self,
+        new_user: NewUser,
+        token_hash: [u8; TOKEN_HASH_LEN],
+    ) -> StoreResult<UserId> {
+        let (tx, rx) = oneshot::channel();
+        self.send(WriteCmd::CreateUser {
+            new_user,
+            token_hash,
+            reply: tx,
+        })
+        .await?;
+        rx.await.map_err(|_| StoreError::WriterClosed)?
+    }
+
+    /// Replace a user's token hash with a freshly-generated digest.
+    /// Implicitly clears `token_expired_at` — rotating an expired
+    /// token only makes sense to make it usable again. Returns `false`
+    /// when the user id doesn't exist; `true` on successful update.
+    ///
+    /// # Errors
+    /// Returns [`StoreError::WriterClosed`] / [`StoreError::Sqlite`]
+    /// per the usual writer-actor flow.
+    pub async fn rotate_user_token(
+        &self,
+        user_id: UserId,
+        new_token_hash: [u8; TOKEN_HASH_LEN],
+    ) -> StoreResult<bool> {
+        let (tx, rx) = oneshot::channel();
+        self.send(WriteCmd::RotateUserToken {
+            user_id,
+            new_token_hash,
+            reply: tx,
+        })
+        .await?;
+        rx.await.map_err(|_| StoreError::WriterClosed)?
+    }
+
+    /// Stamp `token_expired_at = now()` so the user's current token stops
+    /// authenticating. Idempotent — repeating the call leaves the original
+    /// expiry timestamp untouched. Returns `false` when the user doesn't exist.
+    ///
+    /// # Errors
+    /// Returns [`StoreError::WriterClosed`] / [`StoreError::Sqlite`].
+    pub async fn expire_user_token(&self, user_id: UserId) -> StoreResult<bool> {
+        let (tx, rx) = oneshot::channel();
+        self.send(WriteCmd::ExpireUserToken { user_id, reply: tx })
+            .await?;
+        rx.await.map_err(|_| StoreError::WriterClosed)?
+    }
+
+    /// Clear `token_expired_at`, re-activating the user's existing token.
+    /// Idempotent. Returns `false` when the user doesn't exist.
+    ///
+    /// # Errors
+    /// Returns [`StoreError::WriterClosed`] / [`StoreError::Sqlite`].
+    pub async fn revive_user_token(&self, user_id: UserId) -> StoreResult<bool> {
+        let (tx, rx) = oneshot::channel();
+        self.send(WriteCmd::ReviveUserToken { user_id, reply: tx })
+            .await?;
+        rx.await.map_err(|_| StoreError::WriterClosed)?
+    }
+
+    /// Update `last_seen_at = now()` for the user. Called fire-and-forget
+    /// by the auth middleware on every authenticated request. Returns
+    /// `false` when the user doesn't exist (caller authenticated against
+    /// a token whose user vanished mid-request — already a logic error
+    /// elsewhere).
+    ///
+    /// # Errors
+    /// Returns [`StoreError::WriterClosed`] / [`StoreError::Sqlite`].
+    pub async fn touch_user_last_seen(&self, user_id: UserId) -> StoreResult<bool> {
+        let (tx, rx) = oneshot::channel();
+        self.send(WriteCmd::TouchUserLastSeen { user_id, reply: tx })
+            .await?;
+        rx.await.map_err(|_| StoreError::WriterClosed)?
+    }
+
     async fn send(&self, cmd: WriteCmd) -> StoreResult<()> {
         self.inner
             .tx
@@ -552,6 +694,15 @@ fn worker_loop(mut conn: Connection, mut rx: mpsc::Receiver<WriteCmd>) {
             WriteCmd::UpsertPage { page, reply } => {
                 let result = ops::upsert_page(&mut conn, &page);
                 send_or_warn(reply, result, "upsert_page");
+            }
+            WriteCmd::DeletePage {
+                workspace_id,
+                project_id,
+                path,
+                reply,
+            } => {
+                let result = ops::delete_page(&conn, workspace_id, project_id, &path);
+                send_or_warn(reply, result, "delete_page");
             }
             WriteCmd::UpsertPageBatch { pages, reply } => {
                 let result = ops::upsert_pages_batch(&mut conn, &pages);
@@ -675,6 +826,34 @@ fn worker_loop(mut conn: Connection, mut rx: mpsc::Receiver<WriteCmd>) {
             } => {
                 let result = ops::insert_wiki_migration(&mut conn, &name, applied_at);
                 send_or_warn(reply, result, "insert_wiki_migration");
+            }
+            WriteCmd::CreateUser {
+                new_user,
+                token_hash,
+                reply,
+            } => {
+                let result = users::insert_user(&conn, &new_user, &token_hash);
+                send_or_warn(reply, result, "create_user");
+            }
+            WriteCmd::RotateUserToken {
+                user_id,
+                new_token_hash,
+                reply,
+            } => {
+                let result = users::rotate_user_token(&conn, user_id, &new_token_hash);
+                send_or_warn(reply, result, "rotate_user_token");
+            }
+            WriteCmd::ExpireUserToken { user_id, reply } => {
+                let result = users::expire_user_token(&conn, user_id);
+                send_or_warn(reply, result, "expire_user_token");
+            }
+            WriteCmd::ReviveUserToken { user_id, reply } => {
+                let result = users::revive_user_token(&conn, user_id);
+                send_or_warn(reply, result, "revive_user_token");
+            }
+            WriteCmd::TouchUserLastSeen { user_id, reply } => {
+                let result = users::touch_user_last_seen(&conn, user_id);
+                send_or_warn(reply, result, "touch_user_last_seen");
             }
         }
     }

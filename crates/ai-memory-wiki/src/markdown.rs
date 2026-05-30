@@ -8,7 +8,7 @@
 
 use std::collections::BTreeSet;
 
-use ai_memory_core::PagePath;
+use ai_memory_core::{LinkTarget, PagePath};
 use serde::{Deserialize, Serialize};
 
 use crate::error::WikiResult;
@@ -102,15 +102,21 @@ pub fn derive_title(frontmatter: &serde_json::Value, body: &str, path: &PagePath
     stem.strip_suffix(".md").unwrap_or(stem).to_string()
 }
 
+/// A normalised link key: `(workspace, project, path)`. `workspace` and
+/// `project` are `None` for a link that resolves within the source page's
+/// own project. Collected in a `BTreeSet` so output is deduped + stable.
+type LinkKey = (Option<String>, Option<String>, String);
+
 /// Extract internal wiki links from a markdown body.
 ///
-/// Supports `[[wiki links]]`, `[[wiki links|labels]]`, and ordinary
-/// markdown links such as `[label](../decisions/foo.md#anchor)`. External
-/// URLs, anchors, images, and non-markdown assets are ignored. Returned
-/// paths are normalised to wiki-root-relative [`PagePath`] values.
+/// Supports `[[wiki links]]`, `[[wiki links|labels]]`, cross-project
+/// `[[project:path]]` / `[[workspace/project:path]]` wikilinks, and
+/// ordinary markdown links such as `[label](../decisions/foo.md#anchor)`.
+/// External URLs, anchors, images, and non-markdown assets are ignored.
+/// Returned values are normalised to wiki-root-relative [`LinkTarget`]s.
 #[must_use]
-pub fn extract_links(body: &str, page_path: &PagePath) -> Vec<PagePath> {
-    let mut out = BTreeSet::new();
+pub fn extract_links(body: &str, page_path: &PagePath) -> Vec<LinkTarget> {
+    let mut out: BTreeSet<LinkKey> = BTreeSet::new();
     let mut in_fence = false;
 
     for line in body.lines() {
@@ -127,11 +133,54 @@ pub fn extract_links(body: &str, page_path: &PagePath) -> Vec<PagePath> {
     }
 
     out.into_iter()
-        .filter_map(|path| PagePath::new(path).ok())
+        .filter_map(|(workspace, project, path)| {
+            PagePath::new(path).ok().map(|path| LinkTarget {
+                workspace,
+                project,
+                path,
+            })
+        })
         .collect()
 }
 
-fn extract_wikilinks(line: &str, page_path: &PagePath, out: &mut BTreeSet<String>) {
+/// Split an optional `[workspace/]project:` scope qualifier off the front
+/// of a wikilink target. Returns `(workspace, project, path_part)`. URL and
+/// scheme-prefixed targets carry no scope (the `:` belongs to the scheme);
+/// [`normalize_link_target`] rejects those downstream.
+fn split_scope(target: &str) -> LinkKey {
+    let lower = target.to_ascii_lowercase();
+    if target.contains("://")
+        || lower.starts_with("mailto:")
+        || lower.starts_with("data:")
+        || lower.starts_with("javascript:")
+        || lower.starts_with("tel:")
+    {
+        return (None, None, target.to_string());
+    }
+    if let Some((scope, rest)) = target.split_once(':') {
+        let scope = scope.trim();
+        let scope_ok = !scope.is_empty()
+            && scope
+                .chars()
+                .all(|c| c.is_alphanumeric() || matches!(c, '-' | '_' | '/' | '.'));
+        if scope_ok {
+            let (workspace, project) = match scope.split_once('/') {
+                Some((ws, proj)) => (Some(ws.trim().to_string()), proj.trim()),
+                None => (None, scope),
+            };
+            if !project.is_empty() {
+                return (
+                    workspace,
+                    Some(project.to_string()),
+                    rest.trim().to_string(),
+                );
+            }
+        }
+    }
+    (None, None, target.to_string())
+}
+
+fn extract_wikilinks(line: &str, page_path: &PagePath, out: &mut BTreeSet<LinkKey>) {
     let mut rest = line;
     while let Some(start) = rest.find("[[") {
         let after_start = &rest[start + 2..];
@@ -139,14 +188,18 @@ fn extract_wikilinks(line: &str, page_path: &PagePath, out: &mut BTreeSet<String
             break;
         };
         let raw = &after_start[..end];
-        if let Some(path) = normalize_link_target(raw, page_path, true) {
-            out.insert(path);
+        // Strip the `|label` first, then peel any cross-project scope so the
+        // remaining path normalises the same way a bare wikilink does.
+        let unlabelled = raw.split_once('|').map_or(raw, |(target, _)| target).trim();
+        let (workspace, project, path_part) = split_scope(unlabelled);
+        if let Some(path) = normalize_link_target(&path_part, page_path, true) {
+            out.insert((workspace, project, path));
         }
         rest = &after_start[end + 2..];
     }
 }
 
-fn extract_markdown_links(line: &str, page_path: &PagePath, out: &mut BTreeSet<String>) {
+fn extract_markdown_links(line: &str, page_path: &PagePath, out: &mut BTreeSet<LinkKey>) {
     let mut start_at = 0;
     while let Some(rel_start) = line[start_at..].find('[') {
         let start = start_at + rel_start;
@@ -170,7 +223,7 @@ fn extract_markdown_links(line: &str, page_path: &PagePath, out: &mut BTreeSet<S
         let target_end = target_start + rel_end;
         let raw = &line[target_start..target_end];
         if let Some(path) = normalize_link_target(raw, page_path, false) {
-            out.insert(path);
+            out.insert((None, None, path));
         }
         start_at = target_end + 1;
     }
@@ -249,6 +302,48 @@ fn resolve_relative(page_path: &PagePath, target: &str, root_relative: bool) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn page() -> PagePath {
+        PagePath::new("notes/here.md").unwrap()
+    }
+
+    #[test]
+    fn extract_links_bare_wikilink_is_local() {
+        let links = extract_links("see [[decisions/0001.md]] and [[other]]", &page());
+        assert!(links.iter().all(|l| !l.is_cross_project()));
+        assert!(
+            links
+                .iter()
+                .any(|l| l.path.as_str() == "decisions/0001.md" && l.project.is_none())
+        );
+        // bare name gets `.md` appended, still local
+        assert!(links.iter().any(|l| l.path.as_str() == "other.md"));
+    }
+
+    #[test]
+    fn extract_links_cross_project_wikilink() {
+        let links = extract_links("dep on [[infra:runbooks/02.md]]", &page());
+        let l = links.iter().find(|l| l.is_cross_project()).expect("xproj");
+        assert_eq!(l.workspace, None);
+        assert_eq!(l.project.as_deref(), Some("infra"));
+        assert_eq!(l.path.as_str(), "runbooks/02.md");
+    }
+
+    #[test]
+    fn extract_links_cross_workspace_wikilink_with_label() {
+        let links = extract_links("[[zommehq/zomme:decisions/adr-1.md|the ADR]]", &page());
+        let l = links.iter().find(|l| l.is_cross_project()).expect("xws");
+        assert_eq!(l.workspace.as_deref(), Some("zommehq"));
+        assert_eq!(l.project.as_deref(), Some("zomme"));
+        assert_eq!(l.path.as_str(), "decisions/adr-1.md");
+    }
+
+    #[test]
+    fn extract_links_url_wikilink_is_not_a_scope() {
+        // `https://...` must not be parsed as project "https".
+        let links = extract_links("[[https://example.com]] [[mailto:a@b.com]]", &page());
+        assert!(links.is_empty(), "URLs/schemes are not links: {links:?}");
+    }
 
     #[test]
     fn parses_frontmatter_and_body() {
@@ -350,7 +445,7 @@ mod tests {
                     [gotcha](../gotchas/hooks.md#details). Also \
                     [external](https://example.com) and ![image](../img/logo.png).";
         let links = extract_links(body, &path);
-        let paths: Vec<&str> = links.iter().map(PagePath::as_str).collect();
+        let paths: Vec<&str> = links.iter().map(|l| l.path.as_str()).collect();
         assert_eq!(
             paths,
             vec!["decisions/0001-single-sqlite-file.md", "gotchas/hooks.md"]
@@ -362,7 +457,7 @@ mod tests {
         let path = PagePath::new("notes/a.md").unwrap();
         let body = "```\n[[notes/ignored]]\n```\n[[notes/kept]]\n";
         let links = extract_links(body, &path);
-        let paths: Vec<&str> = links.iter().map(PagePath::as_str).collect();
+        let paths: Vec<&str> = links.iter().map(|l| l.path.as_str()).collect();
         assert_eq!(paths, vec!["notes/kept.md"]);
     }
 }

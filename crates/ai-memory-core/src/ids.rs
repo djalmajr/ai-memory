@@ -83,13 +83,14 @@ id_newtype!(pub SessionId, "Identifier for a single agent run.");
 id_newtype!(pub ObservationId, "Identifier for a single observation captured during a session.");
 id_newtype!(pub PageId, "Identifier for a single wiki page version.");
 id_newtype!(pub HandoffId, "Identifier for a cross-agent handoff record.");
+id_newtype!(pub UserId, "Identifier for a registered user (multi-user attribution; see [`crate::actor`]).");
 
 /// Relative path of a page within the wiki tree.
 ///
 /// Always uses `/` as the separator (POSIX-style), normalised on construction.
 /// Never starts with a slash; never contains `..` or `.` components. This
 /// invariant lets the store treat paths as flat keys without re-validating.
-#[derive(Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct PagePath(String);
 

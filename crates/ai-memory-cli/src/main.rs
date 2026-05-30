@@ -65,5 +65,6 @@ async fn main() -> Result<()> {
         Command::RenameProject(args) => commands::rename_project::run(&config, args).await,
         Command::Uninstall(args) => commands::uninstall::run(&config, args),
         Command::Auth(args) => commands::auth::run(&config, args).await,
+        Command::User(args) => commands::user::run(&config, args).await,
     }
 }

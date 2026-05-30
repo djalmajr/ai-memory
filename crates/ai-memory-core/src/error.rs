@@ -23,6 +23,18 @@ pub enum MemoryError {
     #[error("malformed record in store: {0}")]
     MalformedRecord(String),
 
+    /// A username failed the validation rules in
+    /// [`crate::user::validate_username`] (empty, too long, contains
+    /// whitespace / control / separator characters).
+    #[error("invalid username: {0}")]
+    InvalidUsername(String),
+
+    /// An email failed the basic format check in
+    /// [`crate::user::validate_email`] (missing `@`, whitespace in
+    /// local or domain part, empty parts, …).
+    #[error("invalid email: {0}")]
+    InvalidEmail(String),
+
     /// Wraps any underlying I/O failure.
     #[error(transparent)]
     Io(#[from] std::io::Error),

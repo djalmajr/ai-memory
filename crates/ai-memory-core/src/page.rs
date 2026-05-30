@@ -52,9 +52,64 @@ pub struct NewPage {
     pub pinned: bool,
     /// Outgoing links discovered in the page body.
     ///
-    /// The store resolves these against the latest page rows in the same
-    /// project and keeps unresolved forward links as `to_page_id = NULL`.
-    pub links: Vec<PagePath>,
+    /// The store resolves these against the latest page rows in the target
+    /// project (the source's own project for bare links, or the named
+    /// project for a cross-project `[[project:path]]` link) and keeps
+    /// unresolved forward links as `to_page_id = NULL`.
+    pub links: Vec<LinkTarget>,
+    /// Multi-user attribution: the registered user (v0.8 `users` table)
+    /// that made this write, when resolved by the auth middleware.
+    /// `None` for rung-0 (anonymous) and rung-1 (root token — root
+    /// isn't a `users` row; the human-readable identity goes into the
+    /// frontmatter `last_modified_by` block instead). `Some` for
+    /// rung-2 (DB user) writes; persists to `pages.author_id`
+    /// via V15. Defaults to `None` for backward compat — every existing
+    /// call site that constructs `NewPage` without filling this field
+    /// gets the pre-multi-user behaviour.
+    #[serde(default)]
+    pub author_id: Option<crate::UserId>,
+}
+
+/// A link target discovered in a page body.
+///
+/// A bare `[[path]]` / `[label](path)` resolves within the source page's
+/// own project (`workspace`/`project` both `None`). A `[[project:path]]`
+/// link names a sibling project in the same workspace; a
+/// `[[workspace/project:path]]` link crosses workspaces. Making
+/// cross-project dependencies explicit edges is what turns the per-project
+/// wikis into one graph.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct LinkTarget {
+    /// Cross-workspace qualifier. `None` = same workspace as the source.
+    pub workspace: Option<String>,
+    /// Cross-project qualifier. `None` = same project as the source.
+    pub project: Option<String>,
+    /// Wiki path within the target project (root-relative).
+    pub path: PagePath,
+}
+
+impl LinkTarget {
+    /// A link resolving within the source page's own project.
+    #[must_use]
+    pub fn local(path: PagePath) -> Self {
+        Self {
+            workspace: None,
+            project: None,
+            path,
+        }
+    }
+
+    /// Whether this link names a different project than its source.
+    #[must_use]
+    pub fn is_cross_project(&self) -> bool {
+        self.project.is_some()
+    }
+}
+
+impl From<PagePath> for LinkTarget {
+    fn from(path: PagePath) -> Self {
+        Self::local(path)
+    }
 }
 
 /// Materialised view of a page row.

@@ -43,6 +43,7 @@ async fn make_state(tmp: &TempDir) -> (AdminState, Store) {
         db_path,
         bind: "127.0.0.1:0".to_string(),
         bootstrap_lock: std::sync::Arc::new(tokio::sync::Mutex::new(())),
+        token_pepper: None,
     };
     (state, store)
 }
@@ -233,6 +234,7 @@ async fn lint_dry_run_returns_lint_report_shape() {
             frontmatter_json: serde_json::json!({}),
             pinned: false,
             links: Vec::new(),
+            author_id: None,
         })
         .await
         .unwrap();
@@ -360,6 +362,9 @@ async fn embed_all_projects_rebuilds_workspace_projects() {
             tier: Tier::Semantic,
             pinned: false,
             title: Some("A".into()),
+            admission_ctx: None,
+            author_id: None,
+            actor: ai_memory_core::ActorContext::anonymous(),
         })
         .await
         .unwrap();
@@ -374,6 +379,9 @@ async fn embed_all_projects_rebuilds_workspace_projects() {
             tier: Tier::Semantic,
             pinned: false,
             title: Some("B".into()),
+            admission_ctx: None,
+            author_id: None,
+            actor: ai_memory_core::ActorContext::anonymous(),
         })
         .await
         .unwrap();
@@ -463,6 +471,9 @@ async fn commit_with_new_page_returns_committed_true_and_40char_oid() {
             tier: Tier::Semantic,
             pinned: false,
             title: Some("Commit test".into()),
+            admission_ctx: None,
+            author_id: None,
+            actor: ai_memory_core::ActorContext::anonymous(),
         })
         .await
         .unwrap();

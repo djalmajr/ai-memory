@@ -7,6 +7,147 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.0] - 2026-05-30
+
+### Added
+- **Multi-user attribution (v0.8 Phase 1, rolling out across milestones
+  P1.1–P1.8).** ai-memory's data model stays single-tenant — every
+  authenticated request sees every page — but writes can now be
+  attributed to a named user. Five `ai-memory user` subcommands
+  (`add`, `list`, `expire`, `revive`, `rotate-token`) manage a `users`
+  table; the auth middleware resolves every request to one of four
+  tiers (Anonymous, Root, DB user, 401), injects an
+  `Extension<ActorContext>` + `Extension<AuthLevel>` for downstream
+  consumers, and gates the root-only admin user-management endpoints.
+  Tokens are 32 bytes of OS CSPRNG, stored only as
+  `SHA-256(token || ":" || token_pepper)` (per-server pepper from
+  `[auth].token_pepper`, auto-generated on `ai-memory init`); see
+  [`docs/users.md`](docs/users.md) for the SHA-256-not-argon2id
+  rationale, the four-rung auth ladder, and the backward-compat
+  migration for pre-v0.8 installs. New v0.8 fields on `[auth]`:
+  `root_username` / `root_email` / `root_name` (label for the bearer
+  token's writes) and `token_pepper`. Per-page `author_id` + web UI
+  surfacing lands in P1.6/P1.7; this milestone set ships P1.1
+  (`ActorContext` + `UserId` in core), P1.2 (table + writer/reader
+  ops + V14 migration), P1.3 (auth middleware), P1.4 (root-gated
+  `POST/GET /admin/users` + `…/expire|revive|rotate-token`), and P1.5
+  (CLI subcommands). **No behaviour change for existing single-user
+  installs**: without `[auth].token_pepper` the multi-user lookup
+  stays dormant, user-management endpoints 503 with a clear
+  `multi-user not enabled` message pointing at `ai-memory init`,
+  and the existing `bearer_token`-only flow keeps authenticating
+  exactly as before.
+- **`memory_query { global: true }` — cross-project global search** that
+  reaches every project in every workspace in one call, with each hit
+  annotated by its workspace + project so the agent can tell where it
+  came from. Use when the agent doesn't know which project holds a
+  cross-cutting note (shared infra/ops, a sibling app). Mutually
+  exclusive with `scopes`/`project`/`workspace`. Routing snippet +
+  `MEMORY_INSTRUCTIONS` now teach both broadening modes (`scopes` for
+  named siblings, `global=true` for unknown locations) and explicitly
+  warn that `memory_query` returns snippets — use `memory_read_page`
+  for full bodies. The prompt-surface contradiction the original PR
+  shipped ("there is no global 'search everything' mode" right after
+  the bullet advertising `global=true`) was caught in the post-merge
+  audit and rewritten; the prompt regression test now refuses any
+  variant of that legacy phrasing
+  ([#56], thanks @djalmajr).
+- **Cross-project wiki links + dependency graph.** Wikilinks gain an
+  explicit scope qualifier: `[[project:path.md]]` for a sibling project
+  in the same workspace, `[[workspace/project:path.md]]` for another
+  workspace. Bare links are unchanged (resolve within the source's own
+  project). `links.to_workspace` / `links.to_project` join the primary
+  key so the same `to_path` can land in two different projects without
+  colliding. `memory_lint` now reports dangling cross-project refs
+  (typo'd project vs missing/renamed target page), `memory_briefing`
+  exposes `cross_project_dependents` / `cross_project_dependencies`
+  per project, and `GET /api/v1/graph` returns the resolved cross-
+  project edges for a graph view. Migration V13 rebuilds the `links`
+  table preserving existing rows as `(to_workspace=NULL,
+  to_project=NULL)` — same "local" semantics as before
+  ([#57], thanks @djalmajr).
+
+### Changed
+- **FTS5 queries OR-join bare multi-word inputs** instead of the
+  pre-existing AND default. A natural-language query like
+  `"have we discussed cross project search strategy"` previously
+  required every word to co-occur in one page — near-zero recall for
+  multi-word queries, which the caller silently mistook for "never
+  recorded". OR + BM25 ranking (callers already `ORDER BY rank`) keeps
+  the best-matching pages at the top of the list, so the user-visible
+  top-N is still AND-ish; OR just adds a relevant tail instead of
+  returning nothing. Explicit FTS5 syntax (`OR`/`AND`/`NOT`/`NEAR`,
+  quoted phrases, parens) is detected and preserved verbatim so the
+  exact-match escape hatch stays available. 5 new unit tests guard the
+  preservation contract (post-merge audit). Migration V12 rebuilds the
+  FTS tables with `unicode61 remove_diacritics 2` so accent-free
+  Portuguese queries (`"descricao da sessao"`) match accented stored
+  text (`"descrição da sessão"`); contentless FTS — source rows
+  untouched ([#58], thanks @djalmajr).
+- **MCP write tools now honour the session's project (and create
+  named projects on demand).** Three correctness fixes on
+  `memory_write_page` / `memory_lint` / `memory_forget_sweep`:
+  - A `memory_write_page { project: "X" }` for a project name that
+    doesn't exist used to silently fall through to the session's
+    active project (find-only resolution); writes meant for a fresh
+    project polluted the current one. A new `write_target_ids`
+    helper uses **get-or-create** for an explicit project name, so
+    a named write always lands where the agent asked.
+  - `memory_lint` + `memory_forget_sweep` previously always targeted
+    the server's baked `--project` regardless of the session, so a
+    cross-project lint or retention sweep could never reach the
+    project the user was actually working in. Both now resolve
+    through the same find-only `effective_ids_for_read_args` path
+    the read tools use, with the hook-published active project as
+    the fallback.
+  - Both `lint` / `sweep` and the new `write_page` add explicit
+    `workspace` + `project` args (defaulted to current session,
+    documented with the v0.5.2 "**Omit unless the user explicitly
+    names a *different* project.**" tail). 2 regression tests cover
+    "Bug B" (explicit-project write must create + land) and
+    "Bug C" (sweep must evaluate the named project, not the baked
+    default) ([#59], thanks @djalmajr).
+
+## [0.7.1] - 2026-05-29
+
+### Fixed
+- **`install-hooks --agent codex` no longer panics with `index not found`**
+  when `~/.codex/config.toml` carries an `[mcp_servers]` table that has other
+  MCP servers (context7, node_repl, …) but no `ai-memory` entry — a
+  perfectly valid setup since ai-memory can integrate via hooks alone.
+  `infer_codex_mcp_config` used `toml_edit`'s panicking `Index` impl with
+  bare `[]` chains; it now walks the table via `.get()` and returns `None`
+  on any missing key. Mirrors the safe pattern the JSON variant has used
+  all along. Adds 4 regression tests covering missing-entry,
+  missing-table, empty-doc, and bare-entry inputs
+  ([#53], thanks @Otavio-Machado-Santos).
+- **`install-hooks --agent claude-code` no longer silently stages 0 scripts
+  and points `settings.json` at an empty directory.** On macOS — and any
+  install where the binary lives outside the repo and the system package
+  paths (`/usr/local/share`, `/usr/share`) are absent — `resolve_hooks_dir`
+  fell through to the data-local candidate, which was *also* the staging
+  destination. The wipe-then-copy flow inside `stage_hook_scripts_in` then
+  deleted the very scripts it was about to read, leaving 0 copied; the
+  caller proceeded to rewrite `settings.json` anyway, disabling capture
+  with no error. The function now (a) canonicalizes source and destination
+  paths, skips the wipe + copy when they match and verifies in-place,
+  preserving any scripts a prior `setup-agent` run extracted there, and
+  (b) bails with an actionable error pointing at `--hooks-dir` or
+  `ai-memory setup-agent` whenever zero scripts are present in either
+  branch. Adds 3 regression tests
+  ([#52], thanks @Otavio-Machado-Santos).
+- **macOS thin-client wrapper no longer crashes with "Permission denied" in
+  the log file appender.** The `bin/ai-memory` wrapper passed
+  `-u $(id -u):$(id -g)` to the one-shot helper container, which on macOS
+  collides with the data volume owner (uid 1000 inside the container vs
+  uid 501/502 on the host). The wrapper now skips `-u` on Darwin so the
+  container runs as its default uid 1000 — Docker Desktop's file-sharing
+  layer handles host ownership transparently — while Linux and other
+  Unix systems continue to receive `-u`. Same change also hardens the
+  `${TTY_ARGS[@]}` / `${NETWORK_ARGS[@]}` / `${ENV_ARGS[@]}` /
+  `${USER_ARGS[@]}` expansions for `set -u` compatibility on macOS's
+  default bash 3.2 ([#51], thanks @abnersajr; supersedes [#50]).
+
 ## [0.7.0] - 2026-05-29
 
 ### Added
@@ -453,7 +594,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Consolidator used server startup default project instead of the
   session's actual project.
 
-[Unreleased]: https://github.com/akitaonrails/ai-memory/compare/v0.7.0...HEAD
+[Unreleased]: https://github.com/akitaonrails/ai-memory/compare/v0.8.0...HEAD
+[0.8.0]: https://github.com/akitaonrails/ai-memory/releases/tag/v0.8.0
+[0.7.1]: https://github.com/akitaonrails/ai-memory/releases/tag/v0.7.1
 [0.7.0]: https://github.com/akitaonrails/ai-memory/releases/tag/v0.7.0
 [0.6.1]: https://github.com/akitaonrails/ai-memory/releases/tag/v0.6.1
 [0.6.0]: https://github.com/akitaonrails/ai-memory/releases/tag/v0.6.0

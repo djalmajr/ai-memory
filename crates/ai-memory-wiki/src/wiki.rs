@@ -5,8 +5,9 @@ use std::sync::Arc;
 
 use ai_memory_core::{NewPage, PageId, PagePath, ProjectId, Sanitizer, Tier, WorkspaceId};
 use ai_memory_llm::Embedder;
-use ai_memory_store::{WriterHandle, f32_vec_to_bytes};
+use ai_memory_store::{ReaderPool, WriterHandle, f32_vec_to_bytes};
 
+use crate::admission::{AdmissionChain, AdmissionContext, AdmissionOp};
 use crate::atomic;
 use crate::error::WikiResult;
 use crate::git::GitAdapter;
@@ -37,6 +38,18 @@ pub struct Wiki {
     /// write-page CLI, agent-supplied tool input) still gets scrubbed
     /// at the wiki boundary even if upstream forgot.
     sanitizer: Sanitizer,
+    /// Optional HTTP webhook chain invoked just before page persistence.
+    /// When configured, each `write_page` call POSTs the (path, frontmatter,
+    /// body, ctx) tuple to every webhook subscribing to the op; webhooks
+    /// may mutate frontmatter/body before the atomic write hits disk.
+    /// Set via [`Wiki::with_admission_chain`]; see [`crate::admission`].
+    admission_chain: Option<AdmissionChain>,
+    /// Optional store reader used to resolve `workspace_id`/`project_id`
+    /// into human names for the [`AdmissionContext`] passed to webhooks.
+    /// Set via [`Wiki::with_store_reader`]; when unset, webhooks receive
+    /// empty `workspace`/`project` strings and must fall back to
+    /// IDs/headers/`_unscoped` paths.
+    store_reader: Option<ReaderPool>,
 }
 
 impl Wiki {
@@ -56,7 +69,37 @@ impl Wiki {
             git,
             embedder: None,
             sanitizer: Sanitizer::builtin(),
+            admission_chain: None,
+            store_reader: None,
         })
+    }
+
+    /// Attach an admission webhook chain. When set, every `write_page` call
+    /// invokes the chain after the [`Markdown`] is built but before the
+    /// atomic write — webhooks may mutate frontmatter/body. An empty chain
+    /// is a no-op (skipped without HTTP overhead).
+    #[must_use]
+    pub fn with_admission_chain(mut self, chain: AdmissionChain) -> Self {
+        if !chain.is_empty() {
+            self.admission_chain = Some(chain);
+        }
+        self
+    }
+
+    /// Attach a store reader so the admission chain receives
+    /// human-readable `workspace`/`project` names in its context, resolved
+    /// from the `workspace_id`/`project_id` carried on the
+    /// [`WritePageRequest`]. Without this, those fields stay empty and
+    /// external webhooks must fall back to header introspection or use
+    /// `_unscoped` placeholders.
+    ///
+    /// The reader is only invoked when the chain is configured AND would
+    /// actually fire; tests and CLI paths that don't wire a chain pay
+    /// nothing for setting (or omitting) this.
+    #[must_use]
+    pub fn with_store_reader(mut self, reader: ReaderPool) -> Self {
+        self.store_reader = Some(reader);
+        self
     }
 
     /// Replace the default built-in-only sanitizer with one carrying
@@ -153,14 +196,89 @@ impl Wiki {
     ///
     /// # Errors
     /// Returns [`WikiError::Io`] for any OS error other than "not found".
-    pub fn delete_page(
+    /// Best-effort fill of `ctx.workspace`/`ctx.project` from ids via the
+    /// store reader, so webhooks address pages by the same human names the
+    /// engine uses. Mirrors the inline resolution in [`Self::write_page`].
+    async fn resolve_admission_names(
+        &self,
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+        ctx: &mut AdmissionContext,
+    ) {
+        if let Some(reader) = &self.store_reader {
+            if ctx.workspace.is_empty()
+                && let Ok(Some(name)) = reader.workspace_name_by_id(workspace_id).await
+            {
+                ctx.workspace = name;
+            }
+            if ctx.project.is_empty()
+                && let Ok(Some(name)) = reader.project_name_by_id(workspace_id, project_id).await
+            {
+                ctx.project = name;
+            }
+        }
+    }
+
+    /// Delete a single page file. When an admission chain is attached, it is
+    /// notified (`op=delete`) BEFORE the file is removed, so a mirror can
+    /// `git rm` the same path. A `Reject`-policy webhook aborts the delete.
+    ///
+    /// # Errors
+    /// Returns [`WikiError`] on a filesystem error or a rejecting webhook.
+    pub async fn delete_page(
         &self,
         workspace_id: WorkspaceId,
         project_id: ProjectId,
         path: &PagePath,
+        admission_ctx: Option<AdmissionContext>,
     ) -> WikiResult<()> {
+        if let Some(chain) = &self.admission_chain {
+            let mut ctx = admission_ctx.unwrap_or_default();
+            ctx.op = AdmissionOp::Delete;
+            self.resolve_admission_names(workspace_id, project_id, &mut ctx)
+                .await;
+            chain.notify(Some(path.as_str()), &ctx).await?;
+            chain.dispatch_async(Some(path.as_str()), &serde_json::Value::Null, "", &ctx);
+        }
         let abs = self.abs_path(workspace_id, project_id, path);
         match std::fs::remove_file(&abs) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(crate::WikiError::Io(e)),
+        }
+        // The watcher only reconciles create/modify events, not deletions, so
+        // drop the derived index rows here — otherwise the page lingers in
+        // search/recent with stale content after its file is gone.
+        self.writer
+            .delete_page(workspace_id, project_id, path.clone())
+            .await?;
+        Ok(())
+    }
+
+    /// Purge a whole project's wiki directory. When an admission chain is
+    /// attached, it is notified (`op=purge_project`, no page path) BEFORE the
+    /// directory is removed, so a mirror can drop the project. A `Reject`
+    /// webhook aborts the purge. Routes the on-disk removal through the
+    /// namespaced [`Self::project_root`] (invariant: never hand-roll paths).
+    ///
+    /// # Errors
+    /// Returns [`WikiError`] on a filesystem error or a rejecting webhook.
+    pub async fn purge_project(
+        &self,
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+        admission_ctx: Option<AdmissionContext>,
+    ) -> WikiResult<()> {
+        if let Some(chain) = &self.admission_chain {
+            let mut ctx = admission_ctx.unwrap_or_default();
+            ctx.op = AdmissionOp::PurgeProject;
+            self.resolve_admission_names(workspace_id, project_id, &mut ctx)
+                .await;
+            chain.notify(None, &ctx).await?;
+            chain.dispatch_async(None, &serde_json::Value::Null, "", &ctx);
+        }
+        let root = self.project_root(workspace_id, project_id);
+        match std::fs::remove_dir_all(&root) {
             Ok(()) => Ok(()),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
             Err(e) => Err(crate::WikiError::Io(e)),
@@ -205,6 +323,8 @@ impl Wiki {
                 frontmatter_json: md.frontmatter,
                 pinned,
                 links,
+
+                author_id: None,
             })
             .await?;
         Ok(id)
@@ -270,6 +390,7 @@ impl Wiki {
                 frontmatter_json: req.frontmatter.clone(),
                 pinned: req.pinned || is_slot_path(&req.path),
                 links: extract_links(&req.body, &req.path),
+                author_id: None,
             })
             .collect();
 
@@ -303,6 +424,9 @@ impl Wiki {
             tier,
             pinned,
             title: explicit_title,
+            admission_ctx,
+            author_id,
+            actor,
         } = req;
 
         // Defence-in-depth: scrub the body before we touch disk or the
@@ -312,16 +436,60 @@ impl Wiki {
         // tool slips through.
         let body = self.sanitizer.scrub(&body);
 
+        let pinned = pinned || is_slot_path(&path);
+        // Multi-user attribution (P1.6): stamp `last_modified_by` into the
+        // frontmatter BEFORE building the markdown, so both the admission
+        // chain and the on-disk file see the resolved author. Rung 0
+        // (anonymous) → no block, no disk-shape change for single-user.
+        let frontmatter = stamp_last_modified_by(frontmatter, &actor);
+        let mut markdown = Markdown { frontmatter, body };
+
+        // Admission webhook chain — runs AFTER the markdown is built and
+        // sanitised, BEFORE emit + atomic write. Mutations to
+        // frontmatter/body here propagate to both the on-disk markdown
+        // (via emit below) and the store's `frontmatter_json` / `body`
+        // (via the upsert below) atomically. See `crate::admission`.
+        let resolved_ctx = if let Some(chain) = &self.admission_chain {
+            let mut ctx = admission_ctx.unwrap_or_default();
+            // Single identity source: the webhook actor is the same
+            // `ActorContext` used for on-disk attribution (req.actor),
+            // populated by the auth layer — not a separate header bridge.
+            ctx.actor = actor.clone();
+            // Resolve workspace + project names from the store reader (if
+            // attached) so webhooks address pages by the human-readable
+            // names the engine uses on disk and in the UI. Best-effort —
+            // lookup failures fall through with empty names (webhooks
+            // tolerate that and fall back to header introspection).
+            if let Some(reader) = &self.store_reader {
+                if ctx.workspace.is_empty()
+                    && let Ok(Some(name)) = reader.workspace_name_by_id(workspace_id).await
+                {
+                    ctx.workspace = name;
+                }
+                if ctx.project.is_empty()
+                    && let Ok(Some(name)) =
+                        reader.project_name_by_id(workspace_id, project_id).await
+                {
+                    ctx.project = name;
+                }
+            }
+            // Blocking webhooks run synchronously (they may mutate / reject).
+            chain.run(&path, &mut markdown, &ctx).await?;
+            Some(ctx)
+        } else {
+            None
+        };
+
+        // Re-derive title + links from the (possibly mutated) markdown.
+        // We do this after the chain so explicit title overrides survive
+        // mutations and webhooks that rename or restructure the body
+        // still get the right title/links extracted.
         let title = explicit_title
             .clone()
             .map(|t| self.sanitizer.scrub(&t))
-            .unwrap_or_else(|| derive_title(&frontmatter, &body, &path));
-        let links = extract_links(&body, &path);
-        let pinned = pinned || is_slot_path(&path);
-        let markdown = Markdown {
-            frontmatter: frontmatter.clone(),
-            body: body.clone(),
-        };
+            .unwrap_or_else(|| derive_title(&markdown.frontmatter, &markdown.body, &path));
+        let links = extract_links(&markdown.body, &path);
+
         let emitted = emit(&markdown)?;
         let abs = self.abs_path(workspace_id, project_id, &path);
         if let Some(parent) = abs.parent() {
@@ -329,6 +497,22 @@ impl Wiki {
         }
         atomic::write_atomic(&abs, emitted.as_bytes())?;
 
+        // Non-blocking webhooks fire-and-forget AFTER the page has landed on
+        // disk (the markdown-in-git source of truth). They only observe/mirror
+        // the final page — never block the write or mutate it.
+        if let (Some(chain), Some(ctx)) = (&self.admission_chain, &resolved_ctx) {
+            chain.dispatch_async(
+                Some(path.as_str()),
+                &markdown.frontmatter,
+                &markdown.body,
+                ctx,
+            );
+        }
+
+        let Markdown {
+            frontmatter: final_frontmatter,
+            body: final_body,
+        } = markdown;
         let page_id = self
             .writer
             .upsert_page(NewPage {
@@ -336,11 +520,12 @@ impl Wiki {
                 project_id,
                 path,
                 title,
-                body: body.clone(),
+                body: final_body.clone(),
                 tier,
-                frontmatter_json: frontmatter,
+                frontmatter_json: final_frontmatter,
                 pinned,
                 links,
+                author_id,
             })
             .await?;
         // Embed if configured. We do this on the caller's task so the
@@ -348,7 +533,7 @@ impl Wiki {
         // transaction" (basic-memory #763 lesson): no fire-and-forget
         // background embedding.
         if let Some(embedder) = &self.embedder {
-            match embedder.embed_document(&body).await {
+            match embedder.embed_document(&final_body).await {
                 Ok(vec) => {
                     let bytes = f32_vec_to_bytes(&vec);
                     self.writer
@@ -392,10 +577,82 @@ pub struct WritePageRequest {
     /// title between the staged markdown file + the store row).
     #[doc(hidden)]
     pub title: Option<String>,
+    /// Optional admission webhook context (op + loop-prevention skip
+    /// list + resolved workspace/project names). Populated by
+    /// authenticated callers (MCP tool, admin endpoint); left `None` by
+    /// internal callers (CLI bootstrap, consolidator from hooks, tests)
+    /// — when the chain is configured, `None` is treated as a default
+    /// [`AdmissionContext`]. The actor that rides in the webhook payload
+    /// comes from [`Self::actor`], not from here (single source of
+    /// identity since the v0.8 multi-user merge).
+    pub admission_ctx: Option<AdmissionContext>,
+    /// Multi-user attribution: the registered user (rung-2) who made
+    /// this write, when resolved by the auth middleware. Propagates to
+    /// `pages.author_id` and the on-disk frontmatter `last_modified_by`
+    /// block (the latter is built from the broader `ActorContext` —
+    /// see [`Self::actor`] — so root + anonymous writes also get
+    /// frontmatter even though they leave `author_id` NULL). Defaults
+    /// to `None` for backward compat with internal callers
+    /// (consolidator, lint rewriters) that build `WritePageRequest`
+    /// without an HTTP request layer.
+    pub author_id: Option<ai_memory_core::UserId>,
+    /// Identity carried in the on-disk frontmatter's `last_modified_by`
+    /// block AND the admission webhook payload's `ctx.actor`. The auth
+    /// middleware fills this from the four-rung resolution (injected as
+    /// `Extension<ai_memory_core::ActorContext>`): rung 1 supplies the
+    /// configured root template, rung 2 supplies the row's
+    /// user/name/email. Defaults to anonymous for backward compat.
+    pub actor: ai_memory_core::ActorContext,
 }
 
 fn ai_memory_wiki_error(msg: &str) -> crate::WikiError {
     crate::WikiError::Io(std::io::Error::other(msg.to_string()))
+}
+
+/// Append a `last_modified_by` block to the page's frontmatter when the
+/// auth middleware resolved a non-anonymous actor. The block carries the
+/// stable `username` plus optional `name` + `email`. Designed to be
+/// **idempotent on the keys** (the value replaces any prior version), so
+/// repeated writes by different users always reflect the latest one
+/// rather than accumulating history — historical authorship lives in
+/// `pages.author_id` + the supersession chain, not in frontmatter.
+///
+/// When the actor is anonymous (rung 0) the input is returned
+/// untouched — pre-multi-user installs see zero disk-shape change.
+fn stamp_last_modified_by(
+    frontmatter: serde_json::Value,
+    actor: &ai_memory_core::ActorContext,
+) -> serde_json::Value {
+    let Some(username) = actor.user.as_ref().filter(|s| !s.is_empty()) else {
+        return frontmatter;
+    };
+    let mut obj = match frontmatter {
+        serde_json::Value::Object(m) => m,
+        serde_json::Value::Null => serde_json::Map::new(),
+        // Frontmatter is conventionally an object; preserve a non-null
+        // non-object value by NOT mutating it (operator wrote something
+        // exotic; we shouldn't clobber it on every write).
+        other => return other,
+    };
+    let mut author = serde_json::Map::new();
+    author.insert(
+        "username".to_string(),
+        serde_json::Value::String(username.clone()),
+    );
+    if let Some(name) = &actor.name {
+        author.insert("name".to_string(), serde_json::Value::String(name.clone()));
+    }
+    if let Some(email) = &actor.email {
+        author.insert(
+            "email".to_string(),
+            serde_json::Value::String(email.clone()),
+        );
+    }
+    obj.insert(
+        "last_modified_by".to_string(),
+        serde_json::Value::Object(author),
+    );
+    serde_json::Value::Object(obj)
 }
 
 fn is_slot_path(path: &PagePath) -> bool {
@@ -440,6 +697,9 @@ mod tests {
             tier: Tier::Semantic,
             pinned: false,
             title: None,
+            admission_ctx: None,
+            author_id: None,
+            actor: ai_memory_core::ActorContext::anonymous(),
         }
     }
 
@@ -619,6 +879,9 @@ mod tests {
                 tier: Tier::Semantic,
                 pinned: false,
                 title: None,
+                admission_ctx: None,
+                author_id: None,
+                actor: ai_memory_core::ActorContext::anonymous(),
             })
             .collect();
         let ids = wiki.apply_batch(batch).await.unwrap();
@@ -667,6 +930,9 @@ mod tests {
             tier: Tier::Semantic,
             pinned: false,
             title: None,
+            admission_ctx: None,
+            author_id: None,
+            actor: ai_memory_core::ActorContext::anonymous(),
         })
         .await
         .unwrap();
@@ -680,6 +946,9 @@ mod tests {
             tier: Tier::Semantic,
             pinned: false,
             title: None,
+            admission_ctx: None,
+            author_id: None,
+            actor: ai_memory_core::ActorContext::anonymous(),
         })
         .await
         .unwrap();
@@ -721,5 +990,303 @@ mod tests {
         assert_eq!(a, b);
         let c = wiki.write_page(r("body two")).await.unwrap();
         assert_ne!(b, c);
+    }
+
+    /// End-to-end gate for the workspace/project name resolution:
+    /// when a wiki is built with both a store reader and an admission
+    /// chain, `write_page` populates `AdmissionContext.workspace` and
+    /// `AdmissionContext.project` from the resolved store rows before
+    /// invoking the chain. Without [`Wiki::with_store_reader`] the
+    /// fields stay empty (backward compat with external test setups).
+    #[tokio::test]
+    async fn write_page_resolves_workspace_and_project_names_for_chain() {
+        use crate::admission::{
+            AdmissionChain, AdmissionContext, AdmissionOp, FailurePolicy, WebhookConfig,
+        };
+        use axum::http::StatusCode;
+        use axum::response::IntoResponse;
+        use axum::routing::post;
+        use axum::{Json, Router};
+        use std::sync::Mutex;
+        use tokio::net::TcpListener;
+
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let ws = store
+            .writer
+            .get_or_create_workspace("staging")
+            .await
+            .unwrap();
+        let proj = store
+            .writer
+            .get_or_create_project(ws, "ai-memory-ops", None)
+            .await
+            .unwrap();
+
+        // Throwaway HTTP server that records the payload it receives.
+        let recorder: Arc<Mutex<Option<serde_json::Value>>> = Arc::new(Mutex::new(None));
+        let recorder_clone = recorder.clone();
+        let app = Router::new().route(
+            "/sync",
+            post(move |Json(payload): Json<serde_json::Value>| {
+                let recorder = recorder_clone.clone();
+                async move {
+                    *recorder.lock().unwrap() = Some(payload);
+                    StatusCode::NO_CONTENT.into_response()
+                }
+            }),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let chain = AdmissionChain::new(vec![WebhookConfig {
+            name: "recorder".into(),
+            url: format!("http://{addr}/sync"),
+            timeout_ms: 1_000,
+            failure_policy: FailurePolicy::Ignore,
+            events: vec![AdmissionOp::WritePage],
+            blocking: true,
+        }])
+        .unwrap();
+
+        let wiki = Wiki::new(tmp.path(), store.writer.clone())
+            .unwrap()
+            .with_admission_chain(chain)
+            .with_store_reader(store.reader.clone());
+
+        wiki.write_page(WritePageRequest {
+            workspace_id: ws,
+            project_id: proj,
+            path: PagePath::new("notes/x.md").unwrap(),
+            frontmatter: serde_json::json!({"title": "X"}),
+            body: "hi".into(),
+            tier: Tier::Semantic,
+            pinned: false,
+            title: None,
+            admission_ctx: Some(AdmissionContext {
+                op: AdmissionOp::WritePage,
+                ..AdmissionContext::default()
+            }),
+            author_id: None,
+            actor: ai_memory_core::ActorContext::anonymous(),
+        })
+        .await
+        .unwrap();
+
+        let payload = recorder
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("webhook should have recorded the payload");
+        assert_eq!(payload["ctx"]["workspace"], serde_json::json!("staging"));
+        assert_eq!(
+            payload["ctx"]["project"],
+            serde_json::json!("ai-memory-ops")
+        );
+    }
+
+    // ── P1.6: write attribution ─────────────────────────────────────
+
+    /// Anonymous actor must NOT add a `last_modified_by` block — this
+    /// is the backward-compat gate for every existing single-user
+    /// install.
+    #[test]
+    fn stamp_last_modified_by_skips_anonymous_actor() {
+        let fm = serde_json::json!({"title": "X", "kind": "fact"});
+        let stamped =
+            stamp_last_modified_by(fm.clone(), &ai_memory_core::ActorContext::anonymous());
+        assert_eq!(
+            stamped, fm,
+            "anonymous actor must leave frontmatter untouched"
+        );
+    }
+
+    /// Identified actor adds the full block (username + name + email
+    /// when present). Existing keys in frontmatter are preserved.
+    #[test]
+    fn stamp_last_modified_by_adds_full_block() {
+        let actor = ai_memory_core::ActorContext {
+            user: Some("alice".into()),
+            name: Some("Alice Smith".into()),
+            email: Some("alice@home".into()),
+            ..ai_memory_core::ActorContext::default()
+        };
+        let stamped =
+            stamp_last_modified_by(serde_json::json!({"title": "X", "kind": "fact"}), &actor);
+        let lmb = &stamped["last_modified_by"];
+        assert_eq!(lmb["username"], "alice");
+        assert_eq!(lmb["name"], "Alice Smith");
+        assert_eq!(lmb["email"], "alice@home");
+        assert_eq!(stamped["title"], "X");
+        assert_eq!(stamped["kind"], "fact");
+    }
+
+    /// Username-only (no name/email) writes a minimal block.
+    #[test]
+    fn stamp_last_modified_by_minimal_username_only() {
+        let actor = ai_memory_core::ActorContext {
+            user: Some("boss".into()),
+            ..ai_memory_core::ActorContext::default()
+        };
+        let stamped = stamp_last_modified_by(serde_json::json!({}), &actor);
+        let lmb = &stamped["last_modified_by"];
+        assert_eq!(lmb["username"], "boss");
+        assert!(lmb.get("name").is_none(), "name omitted when not set");
+        assert!(lmb.get("email").is_none(), "email omitted when not set");
+    }
+
+    /// Repeated writes by different actors replace the block.
+    #[test]
+    fn stamp_last_modified_by_replaces_previous_block() {
+        let first = ai_memory_core::ActorContext {
+            user: Some("alice".into()),
+            ..ai_memory_core::ActorContext::default()
+        };
+        let after_alice = stamp_last_modified_by(serde_json::json!({}), &first);
+        assert_eq!(after_alice["last_modified_by"]["username"], "alice");
+
+        let second = ai_memory_core::ActorContext {
+            user: Some("bob".into()),
+            ..ai_memory_core::ActorContext::default()
+        };
+        let after_bob = stamp_last_modified_by(after_alice, &second);
+        assert_eq!(
+            after_bob["last_modified_by"]["username"], "bob",
+            "second write replaces, doesn't accumulate"
+        );
+    }
+
+    /// Null frontmatter is turned into a fresh object on a
+    /// non-anonymous write rather than rejected.
+    #[test]
+    fn stamp_last_modified_by_handles_null_input() {
+        let actor = ai_memory_core::ActorContext {
+            user: Some("alice".into()),
+            ..ai_memory_core::ActorContext::default()
+        };
+        let stamped = stamp_last_modified_by(serde_json::Value::Null, &actor);
+        assert_eq!(stamped["last_modified_by"]["username"], "alice");
+    }
+
+    /// End-to-end: a write with a non-anonymous actor lands a
+    /// `last_modified_by` block on disk AND `pages.author_id` carries
+    /// the UserId.
+    #[tokio::test]
+    async fn write_page_with_actor_stamps_frontmatter_and_author_id() {
+        use ai_memory_core::{NewUser, UserId};
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let wiki = Wiki::new(tmp.path(), store.writer.clone()).unwrap();
+
+        let ws = store
+            .writer
+            .get_or_create_workspace("default")
+            .await
+            .unwrap();
+        let proj = store
+            .writer
+            .get_or_create_project(ws, "scratch", None)
+            .await
+            .unwrap();
+
+        // Pre-load an actual users row so author_id can FK-resolve.
+        let pepper = ai_memory_store::TokenPepper::new("test-pepper-attribution");
+        let token_hash = ai_memory_store::hash_token("test-token", &pepper);
+        let mut new_user = NewUser {
+            username: "alice".into(),
+            name: Some("Alice Smith".into()),
+            email: Some("alice@example.com".into()),
+        };
+        new_user.validate().unwrap();
+        let user_id: UserId = store
+            .writer
+            .create_user(new_user, token_hash)
+            .await
+            .unwrap();
+
+        wiki.write_page(WritePageRequest {
+            workspace_id: ws,
+            project_id: proj,
+            path: PagePath::new("notes/note.md").unwrap(),
+            frontmatter: serde_json::json!({"title": "Note"}),
+            body: "body".into(),
+            tier: Tier::Semantic,
+            pinned: false,
+            title: None,
+            admission_ctx: None,
+            author_id: Some(user_id),
+            actor: ai_memory_core::ActorContext {
+                user: Some("alice".into()),
+                name: Some("Alice Smith".into()),
+                email: Some("alice@example.com".into()),
+                ..ai_memory_core::ActorContext::default()
+            },
+        })
+        .await
+        .unwrap();
+
+        let md = wiki
+            .read_page(ws, proj, &PagePath::new("notes/note.md").unwrap())
+            .unwrap();
+        assert_eq!(md.frontmatter["last_modified_by"]["username"], "alice");
+        assert_eq!(
+            md.frontmatter["last_modified_by"]["email"],
+            "alice@example.com"
+        );
+
+        let meta = store
+            .reader
+            .page_meta_by_path("notes/note.md")
+            .await
+            .unwrap()
+            .expect("page exists");
+        let _ = meta;
+    }
+
+    /// Backward-compat: anonymous writes leave frontmatter and
+    /// author_id untouched.
+    #[tokio::test]
+    async fn write_page_with_anonymous_actor_leaves_frontmatter_unchanged() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let wiki = Wiki::new(tmp.path(), store.writer.clone()).unwrap();
+        let ws = store
+            .writer
+            .get_or_create_workspace("default")
+            .await
+            .unwrap();
+        let proj = store
+            .writer
+            .get_or_create_project(ws, "scratch", None)
+            .await
+            .unwrap();
+
+        wiki.write_page(WritePageRequest {
+            workspace_id: ws,
+            project_id: proj,
+            path: PagePath::new("notes/anon.md").unwrap(),
+            frontmatter: serde_json::json!({"title": "Anon"}),
+            body: "body".into(),
+            tier: Tier::Semantic,
+            pinned: false,
+            title: None,
+            admission_ctx: None,
+            author_id: None,
+            actor: ai_memory_core::ActorContext::anonymous(),
+        })
+        .await
+        .unwrap();
+
+        let md = wiki
+            .read_page(ws, proj, &PagePath::new("notes/anon.md").unwrap())
+            .unwrap();
+        assert!(
+            md.frontmatter.get("last_modified_by").is_none(),
+            "anonymous writes must NOT add last_modified_by — backward compat"
+        );
+        assert_eq!(md.frontmatter["title"], "Anon");
     }
 }

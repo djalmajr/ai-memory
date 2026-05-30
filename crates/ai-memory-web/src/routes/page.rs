@@ -48,6 +48,17 @@ pub(crate) async fn handler(
         page_href(&workspace, &project, &supersedes_path)
     };
 
+    let (author_username, author_name, author_email) = meta.author.map_or_else(
+        || (String::new(), String::new(), String::new()),
+        |a| {
+            (
+                a.username,
+                a.name.unwrap_or_default(),
+                a.email.unwrap_or_default(),
+            )
+        },
+    );
+
     match (PageView {
         workspace,
         project,
@@ -62,6 +73,9 @@ pub(crate) async fn handler(
         supersedes_path,
         supersedes_href,
         body_html,
+        author_username,
+        author_name,
+        author_email,
     }
     .render())
     {

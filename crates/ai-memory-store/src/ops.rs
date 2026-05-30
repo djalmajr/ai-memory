@@ -7,8 +7,8 @@
 use std::collections::BTreeSet;
 
 use ai_memory_core::{
-    AgentKind, HandoffId, NewHandoff, NewObservation, NewPage, NewSession, ObservationId,
-    ObservationKind, PageId, PagePath, ProjectId, SessionId, WorkspaceId,
+    AgentKind, HandoffId, LinkTarget, NewHandoff, NewObservation, NewPage, NewSession,
+    ObservationId, ObservationKind, PageId, PagePath, ProjectId, SessionId, WorkspaceId,
 };
 
 /// Summary returned by [`reorg_sessions`] and exposed via
@@ -221,8 +221,9 @@ fn upsert_page_in_tx(
         tx.execute(
             "INSERT INTO pages \
              (id, workspace_id, project_id, path, title, tier, body, body_sha256, \
-              frontmatter_json, is_latest, supersedes, pinned, created_at, updated_at) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 1, ?10, ?11, ?12, ?12)",
+              frontmatter_json, is_latest, supersedes, pinned, author_id, \
+              created_at, updated_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 1, ?10, ?11, ?12, ?13, ?13)",
             params![
                 new_id.as_bytes(),
                 page.workspace_id.as_bytes(),
@@ -235,6 +236,7 @@ fn upsert_page_in_tx(
                 frontmatter_str,
                 &existing.id,
                 i64::from(page.pinned),
+                page.author_id.map(|id| id.as_bytes().to_vec()),
                 now,
             ],
         )?;
@@ -246,6 +248,9 @@ fn upsert_page_in_tx(
             Some(page.workspace_id.as_bytes()),
             Some(page.project_id.as_bytes()),
             Some(new_id.as_bytes()),
+            page.author_id
+                .as_ref()
+                .map(ai_memory_core::UserId::as_bytes),
             now,
         )?;
         return Ok(new_id);
@@ -254,8 +259,8 @@ fn upsert_page_in_tx(
     tx.execute(
         "INSERT INTO pages \
          (id, workspace_id, project_id, path, title, tier, body, body_sha256, \
-          frontmatter_json, is_latest, pinned, created_at, updated_at) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 1, ?10, ?11, ?11)",
+          frontmatter_json, is_latest, pinned, author_id, created_at, updated_at) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 1, ?10, ?11, ?12, ?12)",
         params![
             new_id.as_bytes(),
             page.workspace_id.as_bytes(),
@@ -267,6 +272,7 @@ fn upsert_page_in_tx(
             body_sha256.as_slice(),
             frontmatter_str,
             i64::from(page.pinned),
+            page.author_id.map(|id| id.as_bytes().to_vec()),
             now,
         ],
     )?;
@@ -278,6 +284,9 @@ fn upsert_page_in_tx(
         Some(page.workspace_id.as_bytes()),
         Some(page.project_id.as_bytes()),
         Some(new_id.as_bytes()),
+        page.author_id
+            .as_ref()
+            .map(ai_memory_core::UserId::as_bytes),
         now,
     )?;
     Ok(new_id)
@@ -294,35 +303,84 @@ fn replace_links_in_tx(
     )?;
 
     let mut seen = BTreeSet::new();
-    for to_path in &page.links {
-        if !seen.insert(to_path.as_str().to_string()) {
+    for link in &page.links {
+        let key = (
+            link.workspace.clone(),
+            link.project.clone(),
+            link.path.as_str().to_string(),
+        );
+        if !seen.insert(key) {
             continue;
         }
-        let to_page_id = latest_page_id_for_path(tx, page, to_path)?;
+        let to_page_id = latest_page_id_for_link(tx, page, link)?;
         let to_page_blob = to_page_id.as_ref().map(|id| &id.as_bytes()[..]);
         tx.execute(
-            "INSERT INTO links (from_page_id, to_page_id, to_path, link_type) \
-             VALUES (?1, ?2, ?3, 'references')",
-            params![from_page_id.as_bytes(), to_page_blob, to_path.as_str()],
+            "INSERT INTO links \
+                 (from_page_id, to_page_id, to_workspace, to_project, to_path, link_type) \
+             VALUES (?1, ?2, ?3, ?4, ?5, 'references')",
+            params![
+                from_page_id.as_bytes(),
+                to_page_blob,
+                link.workspace,
+                link.project,
+                link.path.as_str(),
+            ],
         )?;
     }
     Ok(())
 }
 
-fn latest_page_id_for_path(
+/// Resolve a link target to the latest page id it points at, or `None` if the
+/// target workspace / project / page does not exist yet (an unresolved forward
+/// link). A bare link resolves within the source page's own project; a
+/// `[[project:path]]` / `[[workspace/project:path]]` link resolves against the
+/// named project (same workspace when only the project is given).
+fn latest_page_id_for_link(
     tx: &rusqlite::Transaction<'_>,
     page: &NewPage,
-    to_path: &PagePath,
+    link: &LinkTarget,
 ) -> StoreResult<Option<PageId>> {
+    let (workspace_blob, project_blob): (Vec<u8>, Vec<u8>) = match &link.project {
+        None => (
+            page.workspace_id.as_bytes().to_vec(),
+            page.project_id.as_bytes().to_vec(),
+        ),
+        Some(project_name) => {
+            let workspace_blob: Vec<u8> = match &link.workspace {
+                None => page.workspace_id.as_bytes().to_vec(),
+                Some(workspace_name) => {
+                    let found: Option<Vec<u8>> = tx
+                        .query_row(
+                            "SELECT id FROM workspaces WHERE name = ?1",
+                            params![workspace_name],
+                            |row| row.get(0),
+                        )
+                        .optional()?;
+                    match found {
+                        Some(id) => id,
+                        None => return Ok(None),
+                    }
+                }
+            };
+            let project_blob: Option<Vec<u8>> = tx
+                .query_row(
+                    "SELECT id FROM projects WHERE workspace_id = ?1 AND name = ?2",
+                    params![workspace_blob, project_name],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            match project_blob {
+                Some(id) => (workspace_blob, id),
+                None => return Ok(None),
+            }
+        }
+    };
+
     let bytes: Option<Vec<u8>> = tx
         .query_row(
             "SELECT id FROM pages \
              WHERE workspace_id = ?1 AND project_id = ?2 AND path = ?3 AND is_latest = 1",
-            params![
-                page.workspace_id.as_bytes(),
-                page.project_id.as_bytes(),
-                to_path.as_str(),
-            ],
+            params![workspace_blob, project_blob, link.path.as_str()],
             |row| row.get(0),
         )
         .optional()?;
@@ -336,10 +394,13 @@ fn refresh_incoming_links_for_path(
     page: &NewPage,
     latest_page_id: &PageId,
 ) -> StoreResult<()> {
+    // (1) Bare (same-project) links: from_page lives in this page's project and
+    // the target carries no scope. Repoints all matches (not only unresolved):
+    // a new page version changes the latest id, so resolved links must follow.
     tx.execute(
         "UPDATE links \
          SET to_page_id = ?1 \
-         WHERE to_path = ?2 \
+         WHERE to_project IS NULL AND to_path = ?2 \
            AND EXISTS ( \
                SELECT 1 FROM pages from_page \
                WHERE from_page.id = links.from_page_id \
@@ -353,6 +414,48 @@ fn refresh_incoming_links_for_path(
             page.project_id.as_bytes(),
         ],
     )?;
+
+    // (2) Cross-project links naming this page's project by name. `to_workspace`
+    // may be explicit (cross-workspace) or NULL (same workspace as the source).
+    let project_name: Option<String> = tx
+        .query_row(
+            "SELECT name FROM projects WHERE id = ?1",
+            params![page.project_id.as_bytes()],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let workspace_name: Option<String> = tx
+        .query_row(
+            "SELECT name FROM workspaces WHERE id = ?1",
+            params![page.workspace_id.as_bytes()],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if let (Some(project_name), Some(workspace_name)) = (project_name, workspace_name) {
+        tx.execute(
+            "UPDATE links \
+             SET to_page_id = ?1 \
+             WHERE to_project = ?2 AND to_path = ?3 \
+               AND ( \
+                   to_workspace = ?4 \
+                   OR ( \
+                       to_workspace IS NULL \
+                       AND EXISTS ( \
+                           SELECT 1 FROM pages from_page \
+                           WHERE from_page.id = links.from_page_id \
+                             AND from_page.workspace_id = ?5 \
+                       ) \
+                   ) \
+               )",
+            params![
+                latest_page_id.as_bytes(),
+                project_name,
+                page.path.as_str(),
+                workspace_name,
+                page.workspace_id.as_bytes(),
+            ],
+        )?;
+    }
     Ok(())
 }
 
@@ -543,10 +646,36 @@ pub fn soft_delete_for_decay(conn: &mut Connection, page_ids: &[PageId]) -> Stor
         None,
         None,
         None,
+        // Decay sweep is a system op (scheduled / admin-triggered) — no
+        // user-attributable actor at the row level.
+        None,
         Timestamp::now().as_microsecond(),
     )?;
     tx.commit()?;
     Ok(affected)
+}
+
+/// Delete every version of a page (by path) from the index. Used when the
+/// wiki file is removed (`Wiki::delete_page`): the watcher does not handle
+/// file deletions, so the derived rows must be dropped explicitly or the
+/// page keeps surfacing in search/recent with stale content. FK cascades
+/// drop outgoing links + embeddings; the `pages_fts_ad` trigger keeps FTS in
+/// sync; incoming links are set to NULL (unresolved). Idempotent.
+pub fn delete_page(
+    conn: &Connection,
+    workspace_id: WorkspaceId,
+    project_id: ProjectId,
+    path: &PagePath,
+) -> StoreResult<()> {
+    conn.execute(
+        "DELETE FROM pages WHERE workspace_id = ?1 AND project_id = ?2 AND path = ?3",
+        params![
+            workspace_id.as_bytes(),
+            project_id.as_bytes(),
+            path.as_str()
+        ],
+    )?;
+    Ok(())
 }
 
 /// Hard-delete rows that were soft-deleted by an earlier sweep at
@@ -633,17 +762,19 @@ fn audit(
     workspace_id: Option<&[u8; 16]>,
     project_id: Option<&[u8; 16]>,
     page_id: Option<&[u8; 16]>,
+    author_id: Option<&[u8; 16]>,
     at: i64,
 ) -> StoreResult<()> {
     tx.execute(
-        "INSERT INTO audit_log (at, op, workspace_id, project_id, page_id, detail) \
-         VALUES (?1, ?2, ?3, ?4, ?5, '{}')",
+        "INSERT INTO audit_log (at, op, workspace_id, project_id, page_id, author_id, detail) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, '{}')",
         params![
             at,
             op,
             workspace_id.map(|b| &b[..]),
             project_id.map(|b| &b[..]),
-            page_id.map(|b| &b[..])
+            page_id.map(|b| &b[..]),
+            author_id.map(|b| &b[..]),
         ],
     )?;
     Ok(())
@@ -916,7 +1047,7 @@ mod tests {
     //! deserve direct coverage so a regression surfaces with a
     //! one-line diff instead of a cascading e2e failure.
     use super::*;
-    use ai_memory_core::{NewHandoff, NewPage, NewSession, PagePath, Tier};
+    use ai_memory_core::{LinkTarget, NewHandoff, NewPage, NewSession, PagePath, Tier};
     use rusqlite::Connection;
     use tempfile::TempDir;
 
@@ -955,6 +1086,7 @@ mod tests {
             frontmatter_json: serde_json::json!({}),
             pinned: false,
             links: Vec::new(),
+            author_id: None,
         }
     }
 
@@ -962,6 +1094,114 @@ mod tests {
     /// produce a NEW row and mark the previous row `is_latest = 0`.
     /// This is the M7 supersession chain — the entire wiki versioning
     /// guarantee rides on it.
+    /// V16: every page write lands an `audit_log` row whose
+    /// `author_id` mirrors the NewPage's. Anonymous writes leave it
+    /// NULL (the entire audit-log-by-author query pattern relies on
+    /// the partial index covering only the non-NULL minority).
+    #[test]
+    fn audit_log_records_author_for_attributed_create_page() {
+        use ai_memory_core::UserId;
+
+        let (_tmp, mut conn, ws, proj) = fresh_db();
+
+        // Seed a synthetic user row so the FK on author_id resolves.
+        let user_id = UserId::new();
+        let now = jiff::Timestamp::now().as_microsecond();
+        conn.execute(
+            "INSERT INTO users \
+             (id, username, name, email, token_hash, created_at) \
+             VALUES (?1, 'alice', NULL, NULL, X'00', ?2)",
+            params![user_id.as_bytes(), now],
+        )
+        .unwrap();
+
+        let mut np = page(ws, proj, "notes/by-alice.md", "alice body");
+        np.author_id = Some(user_id);
+        let page_id = upsert_page(&mut conn, &np).unwrap();
+
+        let author_bytes: Vec<u8> = conn
+            .query_row(
+                "SELECT author_id FROM audit_log \
+                 WHERE op = 'create_page' AND page_id = ?1",
+                params![page_id.as_bytes()],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let recorded = UserId::from_slice(&author_bytes).unwrap();
+        assert_eq!(
+            recorded, user_id,
+            "create_page audit row must carry the writer's user_id"
+        );
+    }
+
+    /// Backward-compat gate (and the headline of the "no behaviour
+    /// change for legacy installs" promise): anonymous writes leave
+    /// audit_log.author_id NULL — the partial index stays empty for
+    /// pre-multi-user history.
+    #[test]
+    fn audit_log_records_null_author_for_anonymous_create_page() {
+        let (_tmp, mut conn, ws, proj) = fresh_db();
+        let np = page(ws, proj, "notes/anon.md", "anon body");
+        assert!(np.author_id.is_none());
+        let page_id = upsert_page(&mut conn, &np).unwrap();
+
+        let author: Option<Vec<u8>> = conn
+            .query_row(
+                "SELECT author_id FROM audit_log \
+                 WHERE op = 'create_page' AND page_id = ?1",
+                params![page_id.as_bytes()],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(
+            author.is_none(),
+            "anonymous writes must record audit_log.author_id = NULL"
+        );
+    }
+
+    /// Supersession rows carry the SUPERSEDING author, not the
+    /// original. Two consecutive attributed writes (alice then bob)
+    /// yield a create_page row tagged alice and a supersede_page row
+    /// tagged bob — point-in-time truth, not "latest author".
+    #[test]
+    fn audit_log_supersede_records_new_authors_identity() {
+        use ai_memory_core::UserId;
+
+        let (_tmp, mut conn, ws, proj) = fresh_db();
+        let now = jiff::Timestamp::now().as_microsecond();
+        let alice = UserId::new();
+        let bob = UserId::new();
+        conn.execute(
+            "INSERT INTO users (id, username, name, email, token_hash, created_at) \
+             VALUES (?1, 'alice', NULL, NULL, X'01', ?2), \
+                    (?3, 'bob',   NULL, NULL, X'02', ?2)",
+            params![alice.as_bytes(), now, bob.as_bytes()],
+        )
+        .unwrap();
+
+        let mut np1 = page(ws, proj, "notes/shared.md", "v1");
+        np1.author_id = Some(alice);
+        upsert_page(&mut conn, &np1).unwrap();
+
+        let mut np2 = page(ws, proj, "notes/shared.md", "v2 — different body");
+        np2.author_id = Some(bob);
+        let v2_id = upsert_page(&mut conn, &np2).unwrap();
+
+        let bob_bytes: Vec<u8> = conn
+            .query_row(
+                "SELECT author_id FROM audit_log \
+                 WHERE op = 'supersede_page' AND page_id = ?1",
+                params![v2_id.as_bytes()],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            UserId::from_slice(&bob_bytes).unwrap(),
+            bob,
+            "supersede_page audit row must carry the SUPERSEDING author"
+        );
+    }
+
     #[test]
     fn upsert_page_supersedes_on_body_change() {
         let (_tmp, mut conn, ws, proj) = fresh_db();
@@ -1075,7 +1315,7 @@ mod tests {
     fn upsert_page_persists_and_resolves_links() {
         let (_tmp, mut conn, ws, proj) = fresh_db();
         let mut source = page(ws, proj, "concepts/source.md", "see target");
-        source.links = vec![PagePath::new("decisions/target.md").unwrap()];
+        source.links = vec![PagePath::new("decisions/target.md").unwrap().into()];
         let source_id = upsert_page(&mut conn, &source).unwrap();
 
         let unresolved: i64 = conn
@@ -1102,6 +1342,53 @@ mod tests {
             )
             .unwrap();
         assert_eq!(resolved.as_deref(), Some(&target_id.as_bytes()[..]));
+    }
+
+    /// A `[[infra:runbooks/02.md]]` link from one project resolves to a page
+    /// in a sibling project once that page exists — the cross-project edge.
+    #[test]
+    fn upsert_page_resolves_cross_project_link() {
+        let (_tmp, mut conn, ws, scratch) = fresh_db();
+        let infra = get_or_create_project(&mut conn, &ws, "infra", None).unwrap();
+
+        let mut source = page(ws, scratch, "concepts/dep.md", "depends on infra runbook");
+        source.links = vec![LinkTarget {
+            workspace: None,
+            project: Some("infra".into()),
+            path: PagePath::new("runbooks/02.md").unwrap(),
+        }];
+        let source_id = upsert_page(&mut conn, &source).unwrap();
+
+        // Persisted with the scope, unresolved until the target project's page exists.
+        let (to_project, resolved): (Option<String>, Option<Vec<u8>>) = conn
+            .query_row(
+                "SELECT to_project, to_page_id FROM links \
+                 WHERE from_page_id = ?1 AND to_path = ?2",
+                params![source_id.as_bytes(), "runbooks/02.md"],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(to_project.as_deref(), Some("infra"));
+        assert!(
+            resolved.is_none(),
+            "cross-project link is unresolved before the target exists"
+        );
+
+        // Create the target in `infra` → the forward link repoints across projects.
+        let target_id =
+            upsert_page(&mut conn, &page(ws, infra, "runbooks/02.md", "the runbook")).unwrap();
+        let resolved: Option<Vec<u8>> = conn
+            .query_row(
+                "SELECT to_page_id FROM links WHERE from_page_id = ?1 AND to_path = ?2",
+                params![source_id.as_bytes(), "runbooks/02.md"],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            resolved.as_deref(),
+            Some(&target_id.as_bytes()[..]),
+            "link must resolve across projects once the target lands"
+        );
     }
 
     /// Handoff state machine: insert → Open; accept_handoff → Accepted

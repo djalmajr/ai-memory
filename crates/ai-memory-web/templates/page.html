@@ -34,6 +34,15 @@
     <span>·</span>
     <span>Supersedes <a href="{{ supersedes_href }}" class="text-blue-600 dark:text-blue-400 underline">{{ supersedes_path }}</a></span>
     {% endif %}
+    {% if author_username != "" %}
+    <span>·</span>
+    <span>
+      Last edited by
+      <span class="font-medium text-slate-700 dark:text-slate-300">{{ author_username }}</span>
+      {% if author_name != "" %}<span class="text-slate-500 dark:text-slate-500">({{ author_name }})</span>{% endif %}
+      {% if author_email != "" %}<a href="mailto:{{ author_email }}" class="text-blue-600 dark:text-blue-400 underline">{{ author_email }}</a>{% endif %}
+    </span>
+    {% endif %}
   </div>
 
   <!-- Rendered markdown body -->
