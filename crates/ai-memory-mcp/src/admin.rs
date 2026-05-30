@@ -36,7 +36,7 @@ use ai_memory_llm::{Embedder, LlmProvider, ProviderHealth, ProviderHealthSnapsho
 use ai_memory_store::{
     DecayParams, EmbeddingWrite, ReaderPool, StoreError, WriterHandle, f32_vec_to_bytes,
 };
-use ai_memory_wiki::{Wiki, WritePageRequest};
+use ai_memory_wiki::{AdmissionContext, AdmissionOp, Wiki, WritePageRequest};
 use axum::Json;
 use axum::Router;
 use axum::body::Body;
@@ -1378,6 +1378,17 @@ async fn handle_purge_project(
     // DB cascade already deleted all rows. Routed through Wiki::purge_project so
     // the admission chain is notified (op=purge_project) before removal — a
     // mirror can drop its copy of the project. Best-effort dir removal.
+    //
+    // The admission context MUST carry the workspace/project NAMES: the DB
+    // rows were already deleted above, so Wiki's name-resolution fallback
+    // would find nothing and a name-based mirror would purge the wrong
+    // ("_unscoped") path. We have the names from the request — pass them.
+    let purge_ctx = AdmissionContext {
+        workspace: req.workspace.clone(),
+        project: req.project.clone(),
+        op: AdmissionOp::PurgeProject,
+        ..Default::default()
+    };
     let proj_root_str = state
         .wiki
         .project_root(ws_id, proj_id)
@@ -1385,7 +1396,11 @@ async fn handle_purge_project(
         .to_string();
     let mut files_deleted: Vec<String> = Vec::new();
     let mut files_failed: Vec<String> = Vec::new();
-    match state.wiki.purge_project(ws_id, proj_id, None).await {
+    match state
+        .wiki
+        .purge_project(ws_id, proj_id, Some(purge_ctx))
+        .await
+    {
         Ok(()) => {
             files_deleted.push(proj_root_str);
         }
@@ -1801,5 +1816,106 @@ mod tests {
             .unwrap();
 
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    /// Bug E regression: purge deletes the project's DB rows first, so by the
+    /// time the admission chain fires, name-resolution from the (now gone)
+    /// project row would yield an empty name and a name-based mirror would
+    /// purge the wrong path. The handler must seed the admission context with
+    /// the request's workspace/project names. We capture the `purge_project`
+    /// webhook and assert it carries the real project name.
+    #[tokio::test]
+    async fn purge_project_admission_carries_the_project_name() {
+        use ai_memory_wiki::{AdmissionChain, FailurePolicy, WebhookConfig};
+        use axum::http::HeaderMap;
+        use axum::routing::post;
+        use std::sync::Mutex;
+
+        let captured: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+        let cap = captured.clone();
+        let app = Router::new().route(
+            "/sync",
+            post(
+                move |headers: HeaderMap, Json(payload): Json<serde_json::Value>| {
+                    let cap = cap.clone();
+                    async move {
+                        if headers.get("X-Memory-Op").and_then(|v| v.to_str().ok())
+                            == Some("purge_project")
+                        {
+                            *cap.lock().unwrap() = Some(
+                                payload["ctx"]["project"]
+                                    .as_str()
+                                    .unwrap_or_default()
+                                    .to_string(),
+                            );
+                        }
+                        StatusCode::NO_CONTENT
+                    }
+                },
+            ),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let chain = AdmissionChain::new(vec![WebhookConfig {
+            name: "mirror".into(),
+            url: format!("{base}/sync"),
+            timeout_ms: 2_000,
+            failure_policy: FailurePolicy::Ignore,
+            events: vec![AdmissionOp::WritePage, AdmissionOp::PurgeProject],
+        }])
+        .unwrap();
+        let wiki = Wiki::new(tmp.path(), store.writer.clone())
+            .unwrap()
+            .with_admission_chain(chain)
+            .with_store_reader(store.reader.clone());
+        let router = admin_router(AdminState {
+            writer: store.writer.clone(),
+            reader: store.reader.clone(),
+            wiki,
+            llm: None,
+            embedder: None,
+            provider_health: ProviderHealth::default(),
+            decay_params: DecayParams::default(),
+            data_dir: tmp.path().to_path_buf(),
+            db_path: store.db_path().to_path_buf(),
+            bind: "127.0.0.1:49374".to_string(),
+            bootstrap_lock: Arc::new(tokio::sync::Mutex::new(())),
+        });
+
+        post_write_page(&router, "default", "doomed", "notes/x.md", "bye").await;
+
+        let resp = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/admin/purge-project")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&serde_json::json!({
+                            "workspace": "default",
+                            "project": "doomed",
+                            "confirm": true,
+                        }))
+                        .unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "purge should succeed");
+
+        // Let the async notify land.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert_eq!(
+            captured.lock().unwrap().as_deref(),
+            Some("doomed"),
+            "purge admission must carry the real project name, not an empty/_unscoped placeholder"
+        );
     }
 }
