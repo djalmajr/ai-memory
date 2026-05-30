@@ -470,7 +470,17 @@ fn build_batch_request_with_slots(
     buf.push_str("Session id: ");
     buf.push_str(&session_id.to_string());
     buf.push_str("\n\nObservations:\n");
-    for o in observations {
+    let (windowed, skipped) = window_observations_to_budget(observations, OBSERVATION_BUDGET_CHARS);
+    if skipped > 0 {
+        buf.push_str(&format!(
+            "(showing {} most recent observations; {} older observations omitted \
+             because they exceeded the context budget — PreCompact / earlier \
+             consolidation runs should have already captured them)\n",
+            windowed.len(),
+            skipped,
+        ));
+    }
+    for o in windowed {
         buf.push_str(&format!(
             "- {} | {}\n",
             observation_label(o),
@@ -503,16 +513,14 @@ fn build_batch_request_with_slots(
          - decisions/<short>.md       (semantic, ADR-style records)\n\
          - gotchas/<slug>.md          (semantic, failure modes / surprises)\n\
          - _slots/<name>.md           (pinned memory slot; use sparingly)\n\
-         \nSlot pages have two write regimes. For `_slots/*` updates you may include `slot_kind`:\n\
-         - \"state\"      (default; mutable current focus, pending items, working context)\n\
-         - \"invariant\"  (high-resistance project rules, identity, or user preferences)\n\
-         Do not emit an update for an existing invariant slot unless the observations directly contradict specific existing content. State slots may be refreshed normally.\n\
-         \nSet `tier` to EXACTLY ONE of these four strings — never an integer, never a synonym:\n\
+         \n## `tier` field — EXACTLY ONE of these four strings on every update\n\
+         Never an integer, never a synonym, never one of the `slot_kind` values below.\n\
          - \"working\"      (the live in-progress slice of the session — rarely used here)\n\
          - \"episodic\"     (per-session narrative; the sessions/<id>.md page)\n\
          - \"semantic\"     (durable knowledge: concepts/, decisions/, gotchas/, rules)\n\
          - \"procedural\"   (repeated patterns extracted from many episodic pages)\n\
-         \nSet `kind` to EXACTLY ONE of these four strings — never an integer, never \"session\" / \"concept\" / \"note\":\n\
+         \n## `kind` field — EXACTLY ONE of these four strings on every update\n\
+         Never an integer, never \"session\" / \"concept\" / \"note\".\n\
          - \"decision\" (the project chose X over Y)\n\
          - \"gotcha\"   (a failure mode or surprise worth remembering)\n\
          - \"rule\"     (durable project convention: \"always X\", \"never Y\")\n\
@@ -522,14 +530,20 @@ fn build_batch_request_with_slots(
          action. The path you suggest for a rule will be overridden — the \
          system routes rules to `_rules/<slug>.md` automatically and the \
          lint pass surfaces a hint to copy it into the project's CLAUDE.md.\
+         \n## `slot_kind` field — OPTIONAL, ONLY for `_slots/*` paths\n\
+         **Completely unrelated to `tier`.** A separate flag that controls the\n\
+         write regime for pinned memory slots. Do NOT put these values in `tier`.\n\
+         - \"state\"      (default; mutable current focus, pending items, working context)\n\
+         - \"invariant\"  (high-resistance project rules, identity, or user preferences)\n\
+         Do not emit an update for an existing invariant slot unless the observations directly contradict specific existing content. State slots may be refreshed normally.\n\
          \n## Required JSON keys on every update (use these EXACT names)\n\
          - \"path\"            (string)  required — the wiki path\n\
          - \"title\"           (string)  required — the page title\n\
          - \"body_markdown\"   (string)  required — the page body in Markdown; NOTE the underscore + the suffix `_markdown`, NOT just `body`\n\
-         - \"tier\"            (string)  required — one of the four tier strings above\n\
-         - \"kind\"            (string)  required — one of the four kind strings above\n\
+         - \"tier\"            (string)  required — one of: working | episodic | semantic | procedural\n\
+         - \"kind\"            (string)  required — one of: decision | gotcha | rule | fact\n\
          - \"tags\"            (array of string)  required — may be empty `[]`, but the key must be present\n\
-         - \"slot_kind\"       (string) optional — only for `_slots/*`; one of \"state\" or \"invariant\"; omitted means \"state\"\n\
+         - \"slot_kind\"       (string) optional — ONLY for `_slots/*`; one of \"state\" or \"invariant\"; this is the SLOT WRITE REGIME, NOT a tier value\n\
          No other keys except optional `slot_kind` on `_slots/*`. No `body`, no `content`, no `summary`. Field names \
          are case-sensitive and the `_markdown` suffix matters.\n\
          \n## Output format (read this carefully)\n\
@@ -574,7 +588,17 @@ fn build_request(
     buf.push_str("Session id: ");
     buf.push_str(&session_id.to_string());
     buf.push_str("\nObservations (in order):\n\n");
-    for o in observations {
+    let (windowed, skipped) = window_observations_to_budget(observations, OBSERVATION_BUDGET_CHARS);
+    if skipped > 0 {
+        buf.push_str(&format!(
+            "(showing {} most recent observations; {} older observations omitted \
+             because they exceeded the context budget — PreCompact / earlier \
+             consolidation runs should have already captured them)\n\n",
+            windowed.len(),
+            skipped,
+        ));
+    }
+    for o in windowed {
         buf.push_str(&format!(
             "- {} | {}\n",
             observation_label(o),
@@ -607,6 +631,72 @@ fn build_request(
         max_tokens: 32_000,
         temperature: Some(0.2),
     }
+}
+
+/// Character budget for observations rendered into the consolidation prompt.
+/// ~4 chars per English token → ~100k token budget for the observation
+/// dump, leaving the other ~100k of a 200k-context model for the system
+/// prompt, page conventions, slot snapshots, the structured-output schema,
+/// and the LLM's output token reservation (max_tokens=32k). Conservative:
+/// providers vary on what's a "token" and some count whitespace
+/// differently; under-shooting the budget loses some context but never
+/// causes a 400 from the provider.
+const OBSERVATION_BUDGET_CHARS: usize = 400_000;
+
+/// Per-observation char-cost estimate used by [`window_observations_to_budget`]
+/// to predict how much each entry will add to the prompt buffer. Matches
+/// the rendered `"- {label} | {one-line title}\n    body: {one-line body}\n"`
+/// shape used by both `build_request` and `build_batch_request_with_slots`.
+fn observation_render_cost(o: &Observation) -> usize {
+    // "- " + label + " | " + title + "\n" plus optional "    body: " + body + "\n"
+    let label = observation_label(o).len();
+    let title = o.title.chars().count();
+    let body = if o.body.trim().is_empty() {
+        0
+    } else {
+        // "    body: " (10) + one-line body + "\n"
+        10 + o.body.chars().count() + 1
+    };
+    2 + label + 3 + title + 1 + body
+}
+
+/// Take observations from most-recent backward, accumulating into the
+/// budget. Returns the included slice (in original chronological order)
+/// and the count of observations skipped. When everything fits, returns
+/// the input unchanged and `skipped = 0`.
+///
+/// This is the long-session fallback for super-long agent runs that
+/// would otherwise exceed the model's context window (the failure mode
+/// sabadell's 7,234-observation 16-hour session hit pre-v0.8.1). The
+/// truncation note prepended by callers tells the LLM that older
+/// observations were omitted, so its output should not pretend to cover
+/// the early session. Earlier observations should already have been
+/// captured by intra-session PreCompact runs; if they weren't, they're
+/// preserved in the raw `observations` table for future
+/// `memory_consolidate` calls.
+fn window_observations_to_budget(
+    observations: &[Observation],
+    budget: usize,
+) -> (&[Observation], usize) {
+    if observations.is_empty() {
+        return (observations, 0);
+    }
+    let mut total = 0usize;
+    // Walk from most recent backward; include each whole entry whose
+    // cost still fits. The first observation that pushes us over the
+    // budget is excluded along with everything older than it.
+    let mut keep_from = observations.len();
+    for (i, o) in observations.iter().enumerate().rev() {
+        let cost = observation_render_cost(o);
+        if total + cost > budget {
+            keep_from = i + 1;
+            break;
+        }
+        total += cost;
+        keep_from = i;
+    }
+    let skipped = keep_from;
+    (&observations[keep_from..], skipped)
 }
 
 fn observation_label(obs: &Observation) -> String {
@@ -710,6 +800,103 @@ const SYSTEM_PROMPT: &str = include_str!("../prompts/single_consolidate_system.m
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ai_memory_core::{ObservationId, ObservationKind, ProjectId, SessionId, WorkspaceId};
+    use jiff::Timestamp;
+
+    /// Helper for windowing tests — produces an Observation with the
+    /// given body length, all other fields filled with cheap defaults
+    /// so observation_render_cost is dominated by the body size.
+    fn obs_of_size(body_len: usize) -> Observation {
+        Observation {
+            id: ObservationId::new(),
+            workspace_id: WorkspaceId::new(),
+            project_id: ProjectId::new(),
+            session_id: SessionId::new(),
+            kind: ObservationKind::Other,
+            title: "t".into(),
+            body: "x".repeat(body_len),
+            created_at: Timestamp::UNIX_EPOCH,
+            importance: 5,
+            extension: None,
+            source_event: None,
+        }
+    }
+
+    /// Tiny input that fits in any budget returns unchanged with skipped=0.
+    #[test]
+    fn window_observations_returns_all_when_under_budget() {
+        let obs = vec![obs_of_size(10), obs_of_size(20), obs_of_size(30)];
+        let (kept, skipped) = window_observations_to_budget(&obs, 10_000);
+        assert_eq!(kept.len(), 3);
+        assert_eq!(skipped, 0);
+    }
+
+    /// Empty input returns empty + skipped=0 — the early-return guard.
+    #[test]
+    fn window_observations_empty_input_is_empty_output() {
+        let obs: Vec<Observation> = vec![];
+        let (kept, skipped) = window_observations_to_budget(&obs, 10_000);
+        assert_eq!(kept.len(), 0);
+        assert_eq!(skipped, 0);
+    }
+
+    /// Tight budget keeps only the most recent observations. Critical
+    /// behaviour: the LATEST entries are preserved (most useful for the
+    /// LLM); older ones get dropped. Mirrors the sabadell failure mode.
+    #[test]
+    fn window_observations_keeps_most_recent_within_budget() {
+        // 100 observations of ~1k chars each → ~100k chars total.
+        // Budget of 30k chars should keep ~30 most recent.
+        let obs: Vec<Observation> = (0..100).map(|_| obs_of_size(1_000)).collect();
+        let (kept, skipped) = window_observations_to_budget(&obs, 30_000);
+
+        assert!(
+            skipped > 0,
+            "with 100k of input + 30k budget some must drop"
+        );
+        assert_eq!(
+            kept.len() + skipped,
+            100,
+            "kept + skipped must equal total — no double-counting"
+        );
+        // The kept slice must be the suffix of the input — i.e. the
+        // most recent entries, not the oldest.
+        let first_kept_id = kept.first().unwrap().id;
+        let expected_first = obs[skipped].id;
+        assert_eq!(
+            first_kept_id, expected_first,
+            "kept window must start at obs[skipped], not from the beginning"
+        );
+    }
+
+    /// One observation that already exceeds the budget: keep zero,
+    /// skip everything. Caller's prepended "(showing 0 most recent …)"
+    /// message still fires, signalling to the LLM that the session was
+    /// too big to summarise.
+    #[test]
+    fn window_observations_drops_everything_when_single_obs_exceeds_budget() {
+        let obs = vec![obs_of_size(50_000)];
+        let (kept, skipped) = window_observations_to_budget(&obs, 1_000);
+        assert_eq!(kept.len(), 0);
+        assert_eq!(skipped, 1);
+    }
+
+    /// Budget granularity: drops are at observation boundaries, never
+    /// mid-observation. Two equal-cost obs with a budget that fits
+    /// exactly one → keep the most recent one, drop the older one.
+    #[test]
+    fn window_observations_drops_at_observation_boundary() {
+        let a = obs_of_size(100);
+        let b = obs_of_size(100);
+        let cost_each = observation_render_cost(&a);
+        let obs = vec![a, b];
+        // Budget exactly fits one observation.
+        let (kept, skipped) = window_observations_to_budget(&obs, cost_each);
+        assert_eq!(kept.len(), 1);
+        assert_eq!(skipped, 1);
+        // Most-recent (index 1) is the one kept.
+        assert_eq!(kept[0].id, obs[1].id);
+    }
 
     /// Slugifier produces a clean ASCII path for typical English titles.
     #[test]
