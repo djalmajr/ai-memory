@@ -14,6 +14,7 @@ struct MoveProjectRequest {
     project: String,
     to_workspace: String,
     confirm: bool,
+    force: bool,
 }
 
 /// Run the `move-project` subcommand.
@@ -31,11 +32,17 @@ pub async fn run(config: &Config, args: MoveProjectArgs) -> Result<()> {
 
     if !args.confirm {
         bail!(
-            "move-project copies the project's pages into the destination \
-             workspace, then PURGES the source.\n\
+            "move-project moves {}/{} to workspace {}. If the destination has \
+             no same-named project it is a lossless true-move (re-stamp in \
+             place — sessions, observations and history preserved). If it \
+             already has one, the pages are copied in and merged, then the \
+             source is PURGED. Both are irreversible.\n\
              Re-run with --confirm to proceed:\n\n  \
              ai-memory move-project --from-workspace {} --project {} \
              --to-workspace {} --confirm",
+            args.from_workspace,
+            project,
+            args.to_workspace,
             args.from_workspace,
             project,
             args.to_workspace,
@@ -51,6 +58,7 @@ pub async fn run(config: &Config, args: MoveProjectArgs) -> Result<()> {
             project: project.clone(),
             to_workspace: args.to_workspace.clone(),
             confirm: true,
+            force: args.force,
         },
     )
     .await?;
@@ -86,6 +94,20 @@ pub async fn run(config: &Config, args: MoveProjectArgs) -> Result<()> {
                 "Warning: {skipped_count} page(s) could not be read from the \
                  source and were skipped; the source was NOT purged. Fix and re-run.",
             );
+        }
+        if let Some(conflicts) = report["conflicts"].as_array().filter(|c| !c.is_empty()) {
+            println!(
+                "{} path conflict(s) — source page kept under a de-duplicated path \
+                 (both versions preserved):",
+                conflicts.len()
+            );
+            for c in conflicts {
+                println!(
+                    "  {} → {}",
+                    c["path"].as_str().unwrap_or("?"),
+                    c["moved_to"].as_str().unwrap_or("?"),
+                );
+            }
         }
     }
     Ok(())

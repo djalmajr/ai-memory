@@ -4,9 +4,14 @@
 //! a real [`AdminState`] over a tmpdir-backed store + wiki, drive the
 //! router with `tower::ServiceExt::oneshot`.
 //!
-//! move-project copies every latest page of the source project into the
-//! destination workspace through the normal write path, then purges the
-//! source. Sessions/observations/handoffs are NOT migrated (only pages).
+//! move-project has two paths. To a FRESH destination (no same-named project)
+//! it does a lossless TRUE-MOVE: re-stamp the project's workspace_id in place,
+//! keeping the same project_id, sessions, observations, handoffs, page history
+//! and embeddings. To an EXISTING same-named project it does a COPY-PURGE
+//! merge: copy the source's latest pages in through the normal write path
+//! (carrying embeddings over verbatim, de-duplicating any conflicting path so
+//! both versions survive), then purge the source — there the episodic rows
+//! (sessions/observations/handoffs) are dropped by the purge.
 
 use ai_memory_core::{PagePath, Tier};
 use ai_memory_mcp::{AdminState, admin_router};
@@ -39,6 +44,7 @@ async fn make_state(tmp: &TempDir) -> (AdminState, Store) {
         bind: "127.0.0.1:0".to_string(),
         bootstrap_lock: std::sync::Arc::new(tokio::sync::Mutex::new(())),
         token_pepper: None,
+        active_project: ai_memory_core::ActiveProject::new(),
     };
     (state, store)
 }
@@ -356,6 +362,7 @@ async fn move_project_carries_source_embedding() {
         bind: "127.0.0.1:0".to_string(),
         bootstrap_lock: std::sync::Arc::new(tokio::sync::Mutex::new(())),
         token_pepper: None,
+        active_project: ai_memory_core::ActiveProject::new(),
     };
 
     // Seed source page (gets a synthetic embedding on write).
@@ -535,4 +542,418 @@ async fn move_project_true_move_preserves_sessions_and_observations() {
     let obs = store.reader.observations_for_session(sid).await.unwrap();
     assert_eq!(obs.len(), 1, "observation must survive the move");
     assert_eq!(obs[0].workspace_id, dst_ws, "observation re-stamped to dst");
+}
+
+// ---------------------------------------------------------------------------
+// Rework (PR #60 review): failure model, live-session guard, copy-purge
+// conflict/partial/idempotency, copy-purge embedding carry-over.
+// ---------------------------------------------------------------------------
+
+/// Build an AdminState with a synthetic embedder (for copy-purge embedding
+/// carry-over) and a published active project pointer.
+async fn make_state_with_embedder(tmp: &TempDir) -> (AdminState, Store) {
+    let store = Store::open(tmp.path()).unwrap();
+    let embedder: std::sync::Arc<dyn ai_memory_llm::Embedder> =
+        std::sync::Arc::new(ai_memory_llm::SyntheticEmbedder::new(8));
+    let wiki = Wiki::new(tmp.path(), store.writer.clone())
+        .unwrap()
+        .with_embedder(embedder.clone());
+    let db_path = store.db_path().to_path_buf();
+    let state = AdminState {
+        writer: store.writer.clone(),
+        reader: store.reader.clone(),
+        wiki,
+        llm: None,
+        embedder: Some(embedder),
+        provider_health: ai_memory_llm::ProviderHealth::default(),
+        decay_params: DecayParams::default(),
+        data_dir: tmp.path().to_path_buf(),
+        db_path,
+        bind: "127.0.0.1:0".to_string(),
+        bootstrap_lock: std::sync::Arc::new(tokio::sync::Mutex::new(())),
+        token_pepper: None,
+        active_project: ai_memory_core::ActiveProject::new(),
+    };
+    (state, store)
+}
+
+async fn ids(
+    store: &Store,
+    ws: &str,
+    proj: &str,
+) -> (ai_memory_core::WorkspaceId, ai_memory_core::ProjectId) {
+    let ws_id = store
+        .reader
+        .find_workspace(ws.to_string())
+        .await
+        .unwrap()
+        .unwrap();
+    let proj_id = store
+        .reader
+        .find_project(ws_id, proj.to_string())
+        .await
+        .unwrap()
+        .unwrap();
+    (ws_id, proj_id)
+}
+
+/// W1: when the on-disk dir rename fails mid true-move, the SQL re-stamp is
+/// rolled back so NOTHING moves (no DB-ahead-of-disk split-brain). We force the
+/// rename to fail by planting a FILE where the destination workspace dir would
+/// be created.
+#[tokio::test]
+async fn true_move_rolls_back_when_dir_rename_fails() {
+    let tmp = TempDir::new().unwrap();
+    let (state, store) = make_state(&tmp).await;
+    seed_page(&store, &state.wiki, "src", "proj", "notes/a.md", "body a").await;
+
+    // Pre-create the destination workspace, then plant a FILE at its wiki dir
+    // so `create_dir_all` during the rename fails. The pre-check passes because
+    // the project subdir cannot exist under a file.
+    let dst_ws = store
+        .writer
+        .get_or_create_workspace("dst".to_string())
+        .await
+        .unwrap();
+    let dst_ws_dir = tmp.path().join("wiki").join(dst_ws.to_string());
+    std::fs::write(&dst_ws_dir, b"not a dir").unwrap();
+
+    let (src_ws, src_proj) = ids(&store, "src", "proj").await;
+    let resp = post(
+        state,
+        "/admin/move-project",
+        json!({ "from_workspace": "src", "project": "proj", "to_workspace": "dst", "confirm": true }),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    let body = body_json(resp).await;
+    assert!(
+        body["error"]
+            .as_str()
+            .unwrap_or("")
+            .contains("nothing changed"),
+        "{body}"
+    );
+
+    // The project must still live in the SOURCE workspace (rollback worked).
+    let still_src = store
+        .reader
+        .find_project(src_ws, "proj".to_string())
+        .await
+        .unwrap();
+    assert_eq!(
+        still_src,
+        Some(src_proj),
+        "project rolled back to source ws"
+    );
+    assert!(
+        store
+            .reader
+            .find_project(dst_ws, "proj".to_string())
+            .await
+            .unwrap()
+            .is_none(),
+        "destination must hold no project after rollback"
+    );
+}
+
+/// W3: moving the project the hook router has published as ACTIVE is refused
+/// (409) without `force`.
+#[tokio::test]
+async fn move_refuses_active_project_without_force() {
+    let tmp = TempDir::new().unwrap();
+    let (state, store) = make_state(&tmp).await;
+    seed_page(&store, &state.wiki, "src", "proj", "notes/a.md", "body a").await;
+    let (src_ws, src_proj) = ids(&store, "src", "proj").await;
+    state.active_project.set(src_ws, src_proj);
+
+    let resp = post(
+        state,
+        "/admin/move-project",
+        json!({ "from_workspace": "src", "project": "proj", "to_workspace": "dst", "confirm": true }),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::CONFLICT);
+}
+
+/// W3: `force: true` overrides the active-project guard, and the move
+/// republishes the active pointer under the destination workspace.
+#[tokio::test]
+async fn move_active_project_with_force_succeeds_and_republishes() {
+    let tmp = TempDir::new().unwrap();
+    let (state, store) = make_state(&tmp).await;
+    seed_page(&store, &state.wiki, "src", "proj", "notes/a.md", "body a").await;
+    let (src_ws, src_proj) = ids(&store, "src", "proj").await;
+    let active = state.active_project.clone();
+    active.set(src_ws, src_proj);
+
+    let resp = post(
+        state,
+        "/admin/move-project",
+        json!({ "from_workspace": "src", "project": "proj", "to_workspace": "dst",
+                "confirm": true, "force": true }),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    // The active pointer now points at the SAME project in the destination ws.
+    let (dst_ws, _) = ids(&store, "dst", "proj").await;
+    assert_eq!(
+        active.get(),
+        Some((dst_ws, src_proj)),
+        "active republished to dst"
+    );
+}
+
+/// Build an AdminState over an already-open store (lets one test drive two
+/// routers — e.g. a move then a re-run — against the same SQLite file).
+fn build_state(store: &Store, tmp: &TempDir) -> AdminState {
+    AdminState {
+        writer: store.writer.clone(),
+        reader: store.reader.clone(),
+        wiki: Wiki::new(tmp.path(), store.writer.clone()).unwrap(),
+        llm: None,
+        embedder: None,
+        provider_health: ai_memory_llm::ProviderHealth::default(),
+        decay_params: DecayParams::default(),
+        data_dir: tmp.path().to_path_buf(),
+        db_path: store.db_path().to_path_buf(),
+        bind: "127.0.0.1:0".to_string(),
+        bootstrap_lock: std::sync::Arc::new(tokio::sync::Mutex::new(())),
+        token_pepper: None,
+        active_project: ai_memory_core::ActiveProject::new(),
+    }
+}
+
+/// W5: a same-path conflict in a copy-purge merge de-duplicates the source page
+/// so BOTH versions survive, and the remap is reported.
+#[tokio::test]
+async fn copy_purge_conflict_duplicates_keeping_both() {
+    let tmp = TempDir::new().unwrap();
+    let (state, store) = make_state(&tmp).await;
+    seed_page(&store, &state.wiki, "src", "proj", "notes/a.md", "body SRC").await;
+    seed_page(&store, &state.wiki, "dst", "proj", "notes/a.md", "body DST").await;
+
+    let resp = post(
+        state,
+        "/admin/move-project",
+        json!({ "from_workspace": "src", "project": "proj", "to_workspace": "dst", "confirm": true }),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = body_json(resp).await;
+    assert_eq!(body["moved_via"], "copy-purge", "{body}");
+
+    let conflicts = body["conflicts"].as_array().unwrap();
+    assert_eq!(conflicts.len(), 1, "{body}");
+    assert_eq!(conflicts[0]["path"], "notes/a.md");
+    assert_eq!(conflicts[0]["moved_to"], "notes/a-from-src.md");
+
+    let mut paths: Vec<String> = store
+        .reader
+        .list_pages("dst", "proj")
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|p| p.path)
+        .collect();
+    paths.sort();
+    assert_eq!(paths, vec!["notes/a-from-src.md", "notes/a.md"]);
+
+    let (dw, dp) = ids(&store, "dst", "proj").await;
+    let kept = store
+        .reader
+        .page_body_by_ids(dw, dp, "notes/a.md")
+        .await
+        .unwrap()
+        .unwrap();
+    let moved = store
+        .reader
+        .page_body_by_ids(dw, dp, "notes/a-from-src.md")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(kept.body, "body DST", "destination's original page is kept");
+    assert_eq!(
+        moved.body, "body SRC",
+        "source page lands under the de-duped path"
+    );
+}
+
+/// W6: the copy-purge (merge) path carries the source embedding verbatim onto
+/// the new destination page id — not a recompute. (The existing embedding test
+/// exercised only the true-move path.)
+#[tokio::test]
+async fn copy_purge_carries_source_embedding() {
+    let tmp = TempDir::new().unwrap();
+    let (state, store) = make_state_with_embedder(&tmp).await;
+    seed_page(
+        &store,
+        &state.wiki,
+        "src",
+        "proj",
+        "notes/a.md",
+        "hello world embed",
+    )
+    .await;
+    // A pre-existing same-named dst project forces the copy-purge path.
+    seed_page(&store, &state.wiki, "dst", "proj", "notes/keep.md", "keep").await;
+
+    let (src_ws, src_proj) = ids(&store, "src", "proj").await;
+    let src = store
+        .reader
+        .load_embeddings(
+            src_ws,
+            src_proj,
+            "synthetic".to_string(),
+            "bag-of-words-v1".to_string(),
+            8,
+        )
+        .await
+        .unwrap();
+    assert_eq!(src.len(), 1);
+    let marker: Vec<f32> = vec![9.0, 8.0, 7.0, 6.0, 5.0, 4.0, 3.0, 2.0];
+    store
+        .writer
+        .store_embedding(
+            src[0].id,
+            ai_memory_store::f32_vec_to_bytes(&marker),
+            "synthetic".to_string(),
+            "bag-of-words-v1".to_string(),
+            8,
+        )
+        .await
+        .unwrap();
+
+    let resp = post(
+        state,
+        "/admin/move-project",
+        json!({ "from_workspace": "src", "project": "proj", "to_workspace": "dst", "confirm": true }),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = body_json(resp).await;
+    assert_eq!(body["moved_via"], "copy-purge", "{body}");
+
+    let (dst_ws, dst_proj) = ids(&store, "dst", "proj").await;
+    let dst = store
+        .reader
+        .load_embeddings(
+            dst_ws,
+            dst_proj,
+            "synthetic".to_string(),
+            "bag-of-words-v1".to_string(),
+            8,
+        )
+        .await
+        .unwrap();
+    let moved = dst
+        .iter()
+        .find(|e| e.path.as_str() == "notes/a.md")
+        .expect("moved page embedding");
+    for (got, want) in moved.vector.iter().zip(marker.iter()) {
+        assert!(
+            (got - want).abs() < 1e-4,
+            "carried marker, got {:?}",
+            moved.vector
+        );
+    }
+}
+
+/// W6: an unreadable source page is skipped and the source is NOT purged, so a
+/// fixed re-run is safe; the readable pages still land at the destination.
+#[tokio::test]
+async fn copy_purge_partial_skips_and_preserves_source() {
+    let tmp = TempDir::new().unwrap();
+    let (state, store) = make_state(&tmp).await;
+    seed_page(&store, &state.wiki, "src", "proj", "notes/ok.md", "ok").await;
+    seed_page(&store, &state.wiki, "src", "proj", "notes/bad.md", "bad").await;
+    seed_page(&store, &state.wiki, "dst", "proj", "notes/keep.md", "keep").await;
+
+    let (src_ws, src_proj) = ids(&store, "src", "proj").await;
+    let bad = tmp
+        .path()
+        .join("wiki")
+        .join(src_ws.to_string())
+        .join(src_proj.to_string())
+        .join("notes/bad.md");
+    std::fs::remove_file(&bad).unwrap();
+
+    let resp = post(
+        state,
+        "/admin/move-project",
+        json!({ "from_workspace": "src", "project": "proj", "to_workspace": "dst", "confirm": true }),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = body_json(resp).await;
+    assert_eq!(body["source_purged"], false, "{body}");
+    let skipped = body["pages_skipped"].as_array().unwrap();
+    assert_eq!(skipped.len(), 1, "{body}");
+    assert_eq!(skipped[0], "notes/bad.md");
+
+    assert!(
+        store
+            .reader
+            .find_project(src_ws, "proj".to_string())
+            .await
+            .unwrap()
+            .is_some(),
+        "source must NOT be purged when a page was skipped"
+    );
+    let dst_paths: Vec<String> = store
+        .reader
+        .list_pages("dst", "proj")
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|p| p.path)
+        .collect();
+    assert!(
+        dst_paths.contains(&"notes/ok.md".to_string()),
+        "readable page copied"
+    );
+}
+
+/// W6: re-running a copy-purge merge is idempotent — re-copying an
+/// already-present page is a no-op supersession, leaving no duplicates.
+#[tokio::test]
+async fn copy_purge_rerun_is_idempotent() {
+    let tmp = TempDir::new().unwrap();
+    let store = Store::open(tmp.path()).unwrap();
+
+    // First move: src/proj (a.md) into existing dst/proj (keep.md), purges src.
+    let s1 = build_state(&store, &tmp);
+    seed_page(&store, &s1.wiki, "src", "proj", "notes/a.md", "body a").await;
+    seed_page(&store, &s1.wiki, "dst", "proj", "notes/keep.md", "keep").await;
+    let r1 = post(
+        s1,
+        "/admin/move-project",
+        json!({ "from_workspace": "src", "project": "proj", "to_workspace": "dst", "confirm": true }),
+    )
+    .await;
+    assert_eq!(r1.status(), StatusCode::OK);
+
+    // Re-create the source identically and run the merge again.
+    let s2 = build_state(&store, &tmp);
+    seed_page(&store, &s2.wiki, "src", "proj", "notes/a.md", "body a").await;
+    let r2 = post(
+        s2,
+        "/admin/move-project",
+        json!({ "from_workspace": "src", "project": "proj", "to_workspace": "dst", "confirm": true }),
+    )
+    .await;
+    assert_eq!(r2.status(), StatusCode::OK);
+
+    // Destination still holds exactly one of each path — no duplicates.
+    let mut paths: Vec<String> = store
+        .reader
+        .list_pages("dst", "proj")
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|p| p.path)
+        .collect();
+    paths.sort();
+    assert_eq!(paths, vec!["notes/a.md", "notes/keep.md"]);
 }

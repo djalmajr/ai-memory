@@ -35,6 +35,7 @@ async fn make_state(tmp: &TempDir) -> (AdminState, Store) {
         bind: "127.0.0.1:0".to_string(),
         bootstrap_lock: std::sync::Arc::new(tokio::sync::Mutex::new(())),
         token_pepper: None,
+        active_project: ai_memory_core::ActiveProject::new(),
     };
     (state, store)
 }
@@ -318,6 +319,7 @@ async fn rename_project_pages_still_searchable() {
         bind: "127.0.0.1:0".to_string(),
         bootstrap_lock: std::sync::Arc::new(tokio::sync::Mutex::new(())),
         token_pepper: None,
+        active_project: ai_memory_core::ActiveProject::new(),
     };
 
     let rename_resp = post(

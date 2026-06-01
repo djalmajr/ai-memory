@@ -365,6 +365,12 @@ pub struct MoveProjectArgs {
     /// source, both irreversible. Without this flag the CLI errors out.
     #[arg(long)]
     pub confirm: bool,
+    /// Override the live-session guard. By default the server refuses (409) to
+    /// move the project a hook session is actively writing to; `--force`
+    /// proceeds anyway (still safe — the move keeps the active pointer correct
+    /// and the schema rejects any stale write).
+    #[arg(long)]
+    pub force: bool,
 }
 
 /// Arguments for `install-instructions`.

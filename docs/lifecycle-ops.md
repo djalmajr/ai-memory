@@ -146,13 +146,22 @@ a low-level re-stamp:
    they follow with no re-stamp.
 5. `fs::rename` the project dir
    `<wiki>/<from_ws>/<proj>` → `<wiki>/<to_ws>/<proj>` (atomic within one
-   wiki root). SQL commits **before** the rename, so when the watcher sees
-   the new-path events it re-derives the same `(ws, proj)` the DB already
-   holds and the reindex is a sha256 no-op.
+   wiki root). The destination dir is pre-checked to be absent first. The
+   SQL commits before the rename, but the move is **all-or-nothing**: if the
+   rename fails, the SQL re-stamp is rolled back (the op is symmetric) and
+   the call returns `move aborted (nothing changed)` — never a
+   DB-ahead-of-disk split-brain.
 
 This is O(1) (one transaction + one rename), re-embeds nothing, and
 **preserves everything** — sessions, observations, handoffs and the full
 supersession history all travel with the project.
+
+**Live-session guard.** The server refuses (409) to move the project the
+hook router has published as the *active* project (a live session's next
+observation would carry a now-stale `workspace_id`). Pass `--force` /
+`force: true` to override — still safe: the move republishes the active
+pointer, and the `(workspace_id, project_id)` insert trigger (V18) rejects
+any stale write cleanly, so the router re-resolves instead of corrupting.
 
 **2. Destination already has a same-named project → `"copy-purge"`
 (merge).** Two distinct `project_id`s can't be re-stamped into one (it
@@ -167,6 +176,15 @@ Copy-before-purge means any copy failure aborts **before** the purge,
 leaving the source intact. An unreadable source file is skipped and also
 blocks the purge (`source_purged: false`) so a fixed re-run is safe
 (re-running is idempotent — copied pages just supersede).
+
+**Same-path conflicts → duplicate (keep both).** When a source page's path
+already exists in the destination with **different** content, the source
+page is landed under a de-duplicated path
+(`<stem>-from-<src_workspace>.md`, then `-2`, `-3`, …) so neither version is
+lost; each remap is listed in the response `conflicts` array. Identical
+content is a no-op supersession at the same path. (Wikilinks pointing at the
+old path are not rewritten — the lossless `true-move` path is the way to
+preserve paths and links.)
 
 **What does NOT migrate (merge case only):** in the `copy-purge` path the
 source's `sessions`, `observations`, and `handoffs` (the raw episodic

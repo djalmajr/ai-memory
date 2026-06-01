@@ -62,6 +62,14 @@ impl ActiveProject {
         let guard = self.inner.read().unwrap_or_else(|e| e.into_inner());
         *guard
     }
+
+    /// Forget the active project. Called after an admin operation invalidates
+    /// the published pointer (e.g. a `move-project` whose copy-purge path gives
+    /// the project a NEW id, so the old pointer no longer resolves).
+    pub fn clear(&self) {
+        let mut guard = self.inner.write().unwrap_or_else(|e| e.into_inner());
+        *guard = None;
+    }
 }
 
 #[cfg(test)]

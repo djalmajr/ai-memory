@@ -32,7 +32,8 @@ use ai_memory_consolidate::{
     prune_sources_to_budget, run_lint, run_sweep,
 };
 use ai_memory_core::{
-    DEFAULT_PROJECT_NAME, DEFAULT_WORKSPACE_NAME, PagePath, ProjectId, SessionId, Tier, WorkspaceId,
+    ActiveProject, DEFAULT_PROJECT_NAME, DEFAULT_WORKSPACE_NAME, PagePath, ProjectId, SessionId,
+    Tier, WorkspaceId,
 };
 use ai_memory_llm::{Embedder, LlmProvider, ProviderHealth, ProviderHealthSnapshot};
 use ai_memory_store::{
@@ -50,7 +51,7 @@ use flate2::Compression;
 use flate2::write::GzEncoder;
 use serde::{Deserialize, Serialize};
 use tokio_util::io::ReaderStream;
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 
 const EMBEDDING_WRITE_BATCH: usize = 100;
 
@@ -93,6 +94,12 @@ pub struct AdminState {
     /// installs that predate v0.8); user-management endpoints then
     /// return 503 `multi-user not enabled`.
     pub token_pepper: Option<ai_memory_store::TokenPepper>,
+    /// Shared in-process pointer to the project the agent is currently
+    /// active in (published by the hook router). Read by `move-project` to
+    /// refuse moving the live project (unless `force`) and to keep the
+    /// pointer correct after a move. Empty `ActiveProject::new()` when no
+    /// hook router is attached (admin-only tests).
+    pub active_project: ActiveProject,
 }
 
 /// JSON request body for `POST /admin/bootstrap`.
@@ -1598,6 +1605,14 @@ struct MoveProjectRequest {
     /// Mandatory confirmation flag. The move PURGES the source after
     /// copying, so without `confirm: true` the server returns 400.
     confirm: bool,
+    /// Override the live-session guard. By default the server refuses (409)
+    /// to move the project the hook router is currently writing to, since a
+    /// live session's next observation would carry a stale workspace id.
+    /// `force: true` proceeds anyway (still safe: the move republishes the
+    /// active pointer and the (workspace_id, project_id) trigger makes any
+    /// stale write fail cleanly rather than corrupt).
+    #[serde(default)]
+    force: bool,
 }
 
 /// Wire-format report returned by `POST /admin/move-project`.
@@ -1641,6 +1656,20 @@ pub struct MoveProjectReport {
     pub files_deleted: Vec<String>,
     /// Source on-disk dirs that could not be removed (non-fatal).
     pub files_failed: Vec<String>,
+    /// Same-path conflicts in the copy-purge merge: a source page whose path
+    /// already existed in the destination (with different content) was landed
+    /// under a de-duplicated path so BOTH survive. Each entry is the original
+    /// source path and the de-duplicated destination path it was written to.
+    pub conflicts: Vec<PathConflict>,
+}
+
+/// One same-path collision resolved by de-duplicating the source page's path.
+#[derive(Debug, Serialize)]
+pub struct PathConflict {
+    /// The source page's original path (also the destination's existing path).
+    pub path: String,
+    /// The de-duplicated path the source page was written to instead.
+    pub moved_to: String,
 }
 
 /// Lossless cross-workspace move: re-stamp the source project's
@@ -1672,6 +1701,22 @@ async fn true_move_project(
         Err(e) => return internal_err(e.to_string()),
     };
 
+    // A true move targets a FRESH destination, so its dir must not already
+    // exist. Check BEFORE touching the DB so a stale leftover can never lead to
+    // a DB-ahead-of-disk split-brain or a clobbered directory.
+    let dst_dir = state.wiki.project_root(dst_ws, src_proj);
+    if dst_dir.exists() {
+        return (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({
+                "error": format!(
+                    "destination dir already exists: {}; refusing true-move",
+                    dst_dir.display()
+                )
+            })),
+        );
+    }
+
     let summary = match state
         .writer
         .move_project_workspace(src_proj, src_ws, dst_ws)
@@ -1688,24 +1733,52 @@ async fn true_move_project(
     };
 
     // Land the files where the re-stamped rows now point. The SQL is already
-    // committed; a rename failure leaves the DB ahead of disk (the one
-    // inconsistency window) and is an exceptional fs error, not a normal path.
+    // committed, so a rename failure would leave the DB ahead of disk. Make the
+    // move all-or-nothing: on failure, roll the DB re-stamp back (the op is
+    // symmetric) so either both rows AND files move, or neither does.
     if let Err(e) = state.wiki.rename_project_dir(src_proj, src_ws, dst_ws) {
         let src_dir = state.wiki.project_root(src_ws, src_proj);
-        let dst_dir = state.wiki.project_root(dst_ws, src_proj);
-        warn!(
-            error = %e,
-            src = %src_dir.display(),
-            dst = %dst_dir.display(),
-            "true-move: SQL re-stamp committed but dir rename failed; \
-             move the directory manually to reconcile"
-        );
-        return internal_err(format!(
-            "project rows moved but on-disk dir rename failed: {e}; \
-             manually move {} -> {}",
-            src_dir.display(),
-            dst_dir.display()
-        ));
+        match state
+            .writer
+            .move_project_workspace(src_proj, dst_ws, src_ws)
+            .await
+        {
+            Ok(_) => {
+                warn!(
+                    error = %e,
+                    "true-move: dir rename failed; rolled the DB re-stamp back — nothing moved"
+                );
+                return internal_err(format!(
+                    "move aborted (nothing changed): on-disk dir rename failed: {e}"
+                ));
+            }
+            Err(rollback_err) => {
+                // Double fault: rows are in the destination workspace but files
+                // remain at the source AND the revert failed. Surface a precise
+                // manual-repair message.
+                error!(
+                    error = %e,
+                    rollback_error = %rollback_err,
+                    src = %src_dir.display(),
+                    dst = %dst_dir.display(),
+                    "true-move: dir rename failed AND DB rollback failed — manual repair required"
+                );
+                return internal_err(format!(
+                    "INCONSISTENT STATE: rows moved but dir rename failed ({e}) and DB rollback \
+                     also failed ({rollback_err}); manually move {} -> {} or re-stamp the project back",
+                    src_dir.display(),
+                    dst_dir.display()
+                ));
+            }
+        }
+    }
+
+    // Keep the in-process active-project pointer correct: the project_id is
+    // unchanged, only its workspace moved. If a hook had published this project
+    // as active, republish it under the destination workspace so the next event
+    // resolves cleanly (rather than tripping the pairing trigger first).
+    if state.active_project.get().map(|(_, p)| p) == Some(src_proj) {
+        state.active_project.set(dst_ws, src_proj);
     }
 
     let report = MoveProjectReport {
@@ -1725,11 +1798,59 @@ async fn true_move_project(
         source_embeddings_deleted: 0,
         files_deleted: Vec::new(),
         files_failed: Vec::new(),
+        // A true move never copies pages, so it never has a path conflict.
+        conflicts: Vec::new(),
     };
     (
         StatusCode::OK,
         Json(serde_json::to_value(&report).unwrap_or_else(|_| serde_json::json!({}))),
     )
+}
+
+/// Pick a destination path that collides with neither an existing destination
+/// page nor one already claimed in this run. Keeps the source page's stem and
+/// appends `-from-<src_workspace>` (then `-2`, `-3`, …). Used by the copy-purge
+/// merge to keep BOTH pages when a path conflicts.
+async fn dedup_dest_path(
+    state: &AdminState,
+    dst_ws: WorkspaceId,
+    dst_proj: ProjectId,
+    src_path: &str,
+    src_workspace: &str,
+    used: &std::collections::HashSet<String>,
+) -> PagePath {
+    let (stem, ext) = match src_path.rsplit_once('.') {
+        Some((s, e)) => (s.to_string(), format!(".{e}")),
+        None => (src_path.to_string(), String::new()),
+    };
+    let slug: String = src_workspace
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '-'
+            }
+        })
+        .collect();
+    let base = format!("{stem}-from-{slug}");
+    let mut n = 0u32;
+    loop {
+        let cand = if n == 0 {
+            format!("{base}{ext}")
+        } else {
+            format!("{base}-{n}{ext}")
+        };
+        let collides = used.contains(&cand)
+            || matches!(
+                state.reader.page_body_by_ids(dst_ws, dst_proj, &cand).await,
+                Ok(Some(_))
+            );
+        if !collides && let Ok(p) = PagePath::new(cand) {
+            return p;
+        }
+        n += 1;
+    }
 }
 
 async fn handle_move_project(
@@ -1764,6 +1885,24 @@ async fn handle_move_project(
             Ok(ids) => ids,
             Err(e) => return e,
         };
+
+    // Live-session guard: refuse to move the project the hook router is
+    // currently writing to. A live session's next observation/log would carry
+    // the now-stale workspace id (the (workspace_id, project_id) trigger would
+    // make it fail, but the operator should consciously opt in). `force: true`
+    // proceeds — safe because the move republishes the active pointer below.
+    if !req.force && state.active_project.get().map(|(_, p)| p) == Some(src_proj) {
+        return (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({
+                "error": format!(
+                    "{}/{} is the active session's project; a live move risks stale-cache writes. \
+                     Re-run with force=true to proceed.",
+                    req.from_workspace, req.project
+                )
+            })),
+        );
+    }
 
     // Detect MERGE: does the destination workspace already hold a same-named
     // project? (find_workspace may be None when the dest ws doesn't exist yet.)
@@ -1848,6 +1987,8 @@ async fn handle_move_project(
     // fire — minus the per-page embed, which we carry over below.
     let mut pages_copied = 0u64;
     let mut pages_skipped: Vec<String> = Vec::new();
+    let mut conflicts: Vec<PathConflict> = Vec::new();
+    let mut used_dest_paths: std::collections::HashSet<String> = std::collections::HashSet::new();
     for s in &summaries {
         let path = match PagePath::new(s.path.clone()) {
             Ok(p) => p,
@@ -1869,11 +2010,39 @@ async fn handle_move_project(
                 continue;
             }
         };
+        // Same-path conflict → duplicate (keep both): if the destination already
+        // holds this path with DIFFERENT content, land the source page under a
+        // de-duplicated path so neither version is lost. Identical content falls
+        // through to a no-op supersession at the same path.
+        let dest_path = match state
+            .reader
+            .page_body_by_ids(dst_ws, dst_proj, s.path.as_str())
+            .await
+        {
+            Ok(Some(existing)) if existing.body != md.body => {
+                let deduped = dedup_dest_path(
+                    &state,
+                    dst_ws,
+                    dst_proj,
+                    &s.path,
+                    &req.from_workspace,
+                    &used_dest_paths,
+                )
+                .await;
+                conflicts.push(PathConflict {
+                    path: s.path.clone(),
+                    moved_to: deduped.as_str().to_string(),
+                });
+                deduped
+            }
+            _ => path.clone(),
+        };
+        used_dest_paths.insert(dest_path.as_str().to_string());
         let new_page_id = match copy_wiki
             .write_page(WritePageRequest {
                 workspace_id: dst_ws,
                 project_id: dst_proj,
-                path: path.clone(),
+                path: dest_path.clone(),
                 frontmatter: md.frontmatter,
                 body: md.body,
                 tier,
@@ -1933,6 +2102,7 @@ async fn handle_move_project(
             source_embeddings_deleted: 0,
             files_deleted: Vec::new(),
             files_failed: Vec::new(),
+            conflicts,
         };
         return (
             StatusCode::OK,
@@ -1977,6 +2147,13 @@ async fn handle_move_project(
         }
     }
 
+    // The source project_id was just purged; if it was the published active
+    // project, the pointer now dangles — clear it so the next hook re-resolves
+    // to the (new) project rather than the deleted id.
+    if state.active_project.get().map(|(_, p)| p) == Some(src_proj) {
+        state.active_project.clear();
+    }
+
     let report = MoveProjectReport {
         from: label,
         to: format!("{}/{}", req.to_workspace, req.project),
@@ -1992,6 +2169,7 @@ async fn handle_move_project(
         source_embeddings_deleted: summary.embeddings_deleted,
         files_deleted,
         files_failed,
+        conflicts,
     };
     (
         StatusCode::OK,
@@ -2457,6 +2635,7 @@ mod tests {
             bind: "127.0.0.1:49374".to_string(),
             bootstrap_lock: Arc::new(tokio::sync::Mutex::new(())),
             token_pepper: None,
+            active_project: ai_memory_core::ActiveProject::new(),
         });
 
         let resp = router
@@ -2493,6 +2672,7 @@ mod tests {
             bind: "127.0.0.1:49374".to_string(),
             bootstrap_lock: Arc::new(tokio::sync::Mutex::new(())),
             token_pepper: None,
+            active_project: ai_memory_core::ActiveProject::new(),
         });
         (tmp, router)
     }
@@ -2672,6 +2852,7 @@ mod tests {
             bind: "127.0.0.1:49374".to_string(),
             bootstrap_lock: Arc::new(tokio::sync::Mutex::new(())),
             token_pepper: None,
+            active_project: ai_memory_core::ActiveProject::new(),
         });
 
         post_write_page(&router, "default", "doomed", "notes/x.md", "bye").await;
@@ -2731,6 +2912,7 @@ mod tests {
             bind: "127.0.0.1:49374".to_string(),
             bootstrap_lock: Arc::new(tokio::sync::Mutex::new(())),
             token_pepper: Some(pepper),
+            active_project: ai_memory_core::ActiveProject::new(),
         });
         // Wrap in a middleware that stamps the AuthLevel ourselves —
         // the real auth middleware lives in ai-memory-cli, and this
@@ -3015,6 +3197,7 @@ mod tests {
             bind: "127.0.0.1:49374".to_string(),
             bootstrap_lock: Arc::new(tokio::sync::Mutex::new(())),
             token_pepper: None,
+            active_project: ai_memory_core::ActiveProject::new(),
         });
         // Inject a Root level so we're past the require_root gate;
         // the 503 must come from require_pepper.

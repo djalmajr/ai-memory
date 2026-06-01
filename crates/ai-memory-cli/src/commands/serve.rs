@@ -225,6 +225,7 @@ pub async fn run(config: &Config, args: ServeArgs) -> Result<()> {
                     .as_ref()
                     .filter(|p| !p.trim().is_empty())
                     .map(|p| ai_memory_store::TokenPepper::new(p.clone())),
+                active_project: active_project.clone(),
             });
             // Multi-rung auth assembly:
             //   - rung 0 (no bearer_token configured) → AuthState::new
