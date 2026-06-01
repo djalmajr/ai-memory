@@ -169,11 +169,30 @@ struct ExistingPageVersion {
     pinned: i64,
 }
 
+/// Normalise a page path into FTS-friendly search text, indexing BOTH forms
+/// so either a whole-slug or a single-word query hits:
+/// - segments: `/` and `.` → space, KEEPING `-`/`_` (FTS token chars) so the
+///   full hyphenated slug stays one token (`foo-bar` matches a `"foo-bar"`
+///   query);
+/// - words: also split `-`/`_` so each word is its own token (`bar` matches).
+///
+/// `notes/foo-bar.md` → `notes foo-bar md notes foo bar md`.
+///
+/// MUST stay byte-identical to the backfill expression in migration V17 so
+/// the `rebuild` and live-write paths index the same text (matching bm25
+/// term frequencies, not just the same match set).
+pub(crate) fn path_search_text(path: &str) -> String {
+    let segments = path.replace(['/', '.'], " ");
+    let words = segments.replace(['-', '_'], " ");
+    format!("{segments} {words}")
+}
+
 fn upsert_page_in_tx(
     tx: &rusqlite::Transaction<'_>,
     page: &NewPage,
     now: i64,
 ) -> StoreResult<PageId> {
+    let path_search = path_search_text(page.path.as_str());
     let body_sha256: [u8; 32] = {
         let mut hasher = Sha256::new();
         hasher.update(page.body.as_bytes());
@@ -220,15 +239,16 @@ fn upsert_page_in_tx(
         )?;
         tx.execute(
             "INSERT INTO pages \
-             (id, workspace_id, project_id, path, title, tier, body, body_sha256, \
+             (id, workspace_id, project_id, path, path_search, title, tier, body, body_sha256, \
               frontmatter_json, is_latest, supersedes, pinned, author_id, \
               created_at, updated_at) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 1, ?10, ?11, ?12, ?13, ?13)",
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 1, ?11, ?12, ?13, ?14, ?14)",
             params![
                 new_id.as_bytes(),
                 page.workspace_id.as_bytes(),
                 page.project_id.as_bytes(),
                 page.path.as_str(),
+                path_search,
                 page.title,
                 tier_str,
                 page.body,
@@ -258,14 +278,15 @@ fn upsert_page_in_tx(
     let new_id = PageId::new();
     tx.execute(
         "INSERT INTO pages \
-         (id, workspace_id, project_id, path, title, tier, body, body_sha256, \
+         (id, workspace_id, project_id, path, path_search, title, tier, body, body_sha256, \
           frontmatter_json, is_latest, pinned, author_id, created_at, updated_at) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 1, ?10, ?11, ?12, ?12)",
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 1, ?11, ?12, ?13, ?13)",
         params![
             new_id.as_bytes(),
             page.workspace_id.as_bytes(),
             page.project_id.as_bytes(),
             page.path.as_str(),
+            path_search,
             page.title,
             tier_str,
             page.body,
@@ -1685,5 +1706,63 @@ mod tests {
             other_rows, 1,
             "explicit project purge must not touch siblings"
         );
+    }
+
+    #[test]
+    fn path_search_text_indexes_slug_and_words() {
+        // Both forms: hyphenated slug kept whole, plus split into words.
+        assert_eq!(
+            path_search_text("notes/foo-bar.md"),
+            "notes foo-bar md notes foo bar md"
+        );
+        assert_eq!(path_search_text("a/b_c.md"), "a b_c md a b c md");
+    }
+
+    /// A page is findable by its PATH slug even when the slug appears in
+    /// neither the title nor the body — the V17 `path_search` FTS column.
+    #[test]
+    fn fts_matches_page_by_path_slug_not_in_body() {
+        let (_tmp, mut conn, ws, proj) = fresh_db();
+        // Title + body deliberately avoid the slug words.
+        let mut p = page(
+            ws,
+            proj,
+            "notes/followup-bulk-rename-runbook-titles.md",
+            "totally unrelated prose about elephants",
+        );
+        p.title = "Elephants".into();
+        upsert_page(&mut conn, &p).unwrap();
+
+        // The slug, as a quoted single token (how prepare_fts5_query renders a
+        // hyphenated term), matches via the path_search column.
+        let n: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pages_fts \
+                 WHERE pages_fts MATCH ?1",
+                params!["\"followup-bulk-rename-runbook-titles\""],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(n, 1, "slug in path must be searchable");
+
+        // A distinct path segment is independently searchable too.
+        let seg: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pages_fts WHERE pages_fts MATCH 'runbook'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(seg, 1, "path segment token must match");
+
+        // Body words still match (regression: body stays indexed at col 1).
+        let body_hit: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pages_fts WHERE pages_fts MATCH 'elephants'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(body_hit, 1, "body must remain searchable");
     }
 }
