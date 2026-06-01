@@ -59,6 +59,16 @@ pub struct Config {
     pub llm_model: Option<String>,
     /// Optional LLM base URL override.
     pub llm_base_url: Option<String>,
+    /// Opt-in: send `response_format=json_schema` (strict) to the
+    /// `openai-compat` provider instead of asking for prose JSON and
+    /// extracting the first balanced object. Off by default — the tolerant
+    /// parser stays the default for older local engines that ignore
+    /// `response_format`. Modern engines (recent Ollama, vLLM, LM Studio,
+    /// llama.cpp) honour structured output; this lets the operator opt in.
+    /// When the strict call fails, the provider falls back to the tolerant
+    /// parser, so enabling it never regresses below the default. Set with
+    /// `AI_MEMORY_LLM_COMPAT_STRICT=true`.
+    pub llm_compat_strict: bool,
     /// Opt-in: run LLM consolidation on SessionEnd (in addition to the
     /// always-written heuristic session page), when an LLM provider is
     /// configured. Off by default — SessionEnd stays cheap and
@@ -275,6 +285,7 @@ impl Default for Config {
             llm_provider: None,
             llm_model: None,
             llm_base_url: None,
+            llm_compat_strict: false,
             consolidate_on_session_end: false,
             embedding_provider: None,
             embedding_model: None,
@@ -446,6 +457,7 @@ impl Config {
                 .llm_base_url
                 .clone()
                 .or_else(|| self.runtime_env.llm_base_url.clone()),
+            compat_strict: self.llm_compat_strict,
         }))
     }
 

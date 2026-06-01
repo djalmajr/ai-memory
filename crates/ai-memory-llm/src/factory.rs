@@ -87,6 +87,11 @@ pub struct ProviderConfig {
     pub auth: ProviderAuth,
     /// Base URL override (required for OpenAI-compat).
     pub base_url: Option<String>,
+    /// Opt-in strict mode for the `openai-compat` provider: send
+    /// `response_format=json_schema` instead of the tolerant prose-JSON
+    /// parser. Ignored by every other provider. Sourced once from
+    /// `AI_MEMORY_LLM_COMPAT_STRICT` by `Config::load`.
+    pub compat_strict: bool,
 }
 
 /// Embedding providers available to ai-memory.
@@ -200,11 +205,10 @@ pub fn build_provider(config: ProviderConfig) -> LlmResult<Arc<dyn LlmProvider>>
             let base = config
                 .base_url
                 .ok_or_else(|| LlmError::NotConfigured("LLM_BASE_URL".into()))?;
-            Ok(Arc::new(OpenAiCompatProvider::new(
-                base,
-                config.auth.optional_api_key(),
-                config.model,
-            )?))
+            Ok(Arc::new(
+                OpenAiCompatProvider::new(base, config.auth.optional_api_key(), config.model)?
+                    .with_strict(config.compat_strict),
+            ))
         }
         ProviderChoice::OpenAiOAuth => {
             let path = config.auth.require_openai_oauth_token_file()?.to_path_buf();
@@ -276,6 +280,7 @@ mod tests {
             model: "gpt-4o-mini".into(),
             auth: ProviderAuth::required_api_key_from_env("OPENAI_API_KEY", None),
             base_url: None,
+            compat_strict: false,
         };
 
         let err = match build_provider(cfg) {

@@ -368,6 +368,9 @@ impl From<ResolvedConfig> for ProviderConfig {
             model: r.model,
             auth: r.auth,
             base_url: r.base_url,
+            // The eval harness benchmarks the default tolerant path; strict
+            // mode is an operator opt-in not modeled by these comparisons.
+            compat_strict: false,
         }
     }
 }
