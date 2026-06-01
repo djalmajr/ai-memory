@@ -115,6 +115,23 @@ pub struct Config {
     /// `*` is rejected.
     #[serde(deserialize_with = "deserialize_string_or_vec", default)]
     pub cors_allow_origins: Vec<String>,
+    /// Admission webhook chain — synchronous HTTP hooks invoked in
+    /// [`ai_memory_wiki::Wiki::write_page`] just before page persistence.
+    /// Each entry is a [`ai_memory_wiki::WebhookConfig`]. Empty by default
+    /// (no chain attached → engine runs as before). Configure via TOML:
+    /// ```toml
+    /// [[admission_webhooks]]
+    /// name = "contributors"
+    /// url  = "http://contributors-webhook.memory.svc.cluster.local/enrich"
+    /// timeout_ms = 2000
+    /// failure_policy = "ignore"
+    /// events = ["write_page", "consolidate"]
+    /// ```
+    /// Env override: `AI_MEMORY_ADMISSION_WEBHOOKS__0__URL=…`,
+    /// `AI_MEMORY_ADMISSION_WEBHOOKS__0__NAME=…`, etc.
+    /// See [`ai_memory_wiki::admission`] for the contract.
+    #[serde(default)]
+    pub admission_webhooks: Vec<ai_memory_wiki::WebhookConfig>,
     /// Process-only env values that should never be written to config files.
     #[serde(skip)]
     pub runtime_env: RuntimeEnv,
@@ -269,6 +286,7 @@ impl Default for Config {
             auth: AuthSettings::default(),
             allowed_hosts: vec!["localhost".into(), "127.0.0.1".into(), "::1".into()],
             cors_allow_origins: Vec::new(),
+            admission_webhooks: Vec::new(),
             runtime_env: RuntimeEnv::default(),
         }
     }
@@ -337,6 +355,22 @@ impl Config {
         }
         if let Some(server_url) = runtime_env.server_url.clone() {
             config.server_url = server_url;
+        }
+        // Convenience env override for the admission webhook list. Figment
+        // can't reliably round-trip `Vec<Struct>` from `AI_MEMORY_X__0__Y`
+        // (env split builds a Map, not a Vec), so we accept a single
+        // JSON-encoded env var instead — perfect for charts that
+        // `toJson` a values.yaml list. Overrides anything figment loaded
+        // from file/other env layers.
+        if let Ok(raw) = std::env::var("AI_MEMORY_ADMISSION_WEBHOOKS_JSON")
+            && !raw.trim().is_empty()
+        {
+            let parsed: Vec<ai_memory_wiki::WebhookConfig> = serde_json::from_str(&raw)
+                .with_context(|| {
+                    "parsing AI_MEMORY_ADMISSION_WEBHOOKS_JSON (must be a JSON array of \
+                     {name,url,timeout_ms?,failure_policy?,events})"
+                })?;
+            config.admission_webhooks = parsed;
         }
 
         // CLI override always wins (figment doesn't see it because clap has

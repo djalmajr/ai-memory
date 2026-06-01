@@ -12,7 +12,7 @@ use std::thread::{self, JoinHandle};
 
 use ai_memory_core::{
     AgentKind, HandoffId, NewHandoff, NewObservation, NewPage, NewSession, NewUser, ObservationId,
-    PageId, ProjectId, SessionId, UserId, WorkspaceId,
+    PageId, PagePath, ProjectId, SessionId, UserId, WorkspaceId,
 };
 use rusqlite::Connection;
 use tokio::sync::{mpsc, oneshot};
@@ -40,6 +40,12 @@ pub(crate) enum WriteCmd {
     UpsertPageBatch {
         pages: Vec<NewPage>,
         reply: oneshot::Sender<StoreResult<Vec<PageId>>>,
+    },
+    DeletePage {
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+        path: PagePath,
+        reply: oneshot::Sender<StoreResult<()>>,
     },
     BeginSession {
         session: NewSession,
@@ -517,6 +523,31 @@ impl WriterHandle {
         rx.await.map_err(|_| StoreError::WriterClosed)?
     }
 
+    /// Delete every version of a page (by path) from the index. The wiki file
+    /// removal is the caller's concern; this drops the derived rows so the
+    /// page stops appearing in search/recent (the watcher does NOT reconcile
+    /// file deletions — it only handles create/modify events).
+    ///
+    /// # Errors
+    /// Returns [`StoreError::WriterClosed`] if the actor has shut down, or a
+    /// SQL error from the delete.
+    pub async fn delete_page(
+        &self,
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+        path: PagePath,
+    ) -> StoreResult<()> {
+        let (tx, rx) = oneshot::channel();
+        self.send(WriteCmd::DeletePage {
+            workspace_id,
+            project_id,
+            path,
+            reply: tx,
+        })
+        .await?;
+        rx.await.map_err(|_| StoreError::WriterClosed)?
+    }
+
     /// Insert a new user. `new_user` MUST already have been validated by
     /// [`NewUser::validate`](ai_memory_core::NewUser::validate); the
     /// caller (CLI or admin handler) generates the plaintext token,
@@ -663,6 +694,15 @@ fn worker_loop(mut conn: Connection, mut rx: mpsc::Receiver<WriteCmd>) {
             WriteCmd::UpsertPage { page, reply } => {
                 let result = ops::upsert_page(&mut conn, &page);
                 send_or_warn(reply, result, "upsert_page");
+            }
+            WriteCmd::DeletePage {
+                workspace_id,
+                project_id,
+                path,
+                reply,
+            } => {
+                let result = ops::delete_page(&conn, workspace_id, project_id, &path);
+                send_or_warn(reply, result, "delete_page");
             }
             WriteCmd::UpsertPageBatch { pages, reply } => {
                 let result = ops::upsert_pages_batch(&mut conn, &pages);

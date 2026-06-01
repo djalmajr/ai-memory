@@ -229,7 +229,7 @@ Each crate has a single responsibility and exposes a typed API. No
 circular deps. Inter-crate boundaries enforce the cross-cutting
 invariants below.
 
-## MCP tool surface (13 tools)
+## MCP tool surface (14 tools)
 
 | Tool | Hint | Purpose |
 |---|---|---|
@@ -243,22 +243,24 @@ invariants below.
 | `memory_handoff_accept` | destructive | Fetch + ack the latest open handoff (auto-cwd-matched). |
 | `memory_consolidate` | destructive | LLM-driven page rewrite. `multi_page=true` for atomic fan-out. |
 | `memory_write_page` | destructive | Write durable wiki knowledge when the user explicitly asks to remember/annotate something permanent. |
+| `memory_delete_page` | destructive | Delete a single page by exact `path`. Fires the admission chain (op=delete); idempotent. |
 | `memory_forget_sweep` | destructive | M8 retention pass. `dry_run=true` for preview. |
 | `memory_lint` | destructive | Rule-based + LLM contradiction findings → `wiki/_lint/`. |
 | `memory_install_self_routing` | read-only | Return the canonical routing snippet for CLAUDE.md / AGENTS.md. |
 
 `memory_briefing`, `memory_explore`, `memory_write_page`,
-`memory_install_self_routing`, and `memory_read_page`
+`memory_install_self_routing`, `memory_read_page`, and `memory_delete_page`
 post-date the original "narrow on purpose" cut (§10 of
 `design-decisions.md`): briefing/explore separate the structured vs.
 prose halves of "what's going on", `memory_write_page` covers explicit
 durable annotations without abusing single-use handoffs,
 `memory_install_self_routing` exists for the meta case where the agent
 must re-write its own routing rules into a project's `CLAUDE.md` /
-`AGENTS.md`, and `memory_read_page` complements `memory_query` for the
+`AGENTS.md`, `memory_read_page` complements `memory_query` for the
 "I need the full page, not a snippet" case (e.g. opening a decision page
-end-to-end). The narrow-surface discipline still holds — every new tool
-has to earn its slot — but the v1 count is 13, not 10.
+end-to-end), and `memory_delete_page` is the exact-path destructive pair
+needed by admission-aware mirrors. The narrow-surface discipline still holds
+— every new tool has to earn its slot — but the v1 count is 14, not 10.
 
 MCP parameter aliases are intentionally sparse: `memory_query.query` accepts
 `q|search`, and limit fields accept `n` / `top_k` where shipped. Project and

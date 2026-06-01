@@ -409,6 +409,7 @@ impl Bootstrap {
                 tier: Tier::Semantic,
                 pinned: false,
                 title: Some(page.title.clone()),
+                admission_ctx: None,
                 author_id: None,
                 actor: ai_memory_core::ActorContext::anonymous(),
             });
@@ -438,6 +439,7 @@ impl Bootstrap {
             tier: Tier::Semantic,
             pinned: true,
             title: Some("Bootstrap manifest".into()),
+            admission_ctx: None,
             author_id: None,
             actor: ai_memory_core::ActorContext::anonymous(),
         });

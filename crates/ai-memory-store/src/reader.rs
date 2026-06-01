@@ -1679,6 +1679,32 @@ impl ReaderPool {
         .await
     }
 
+    /// Look up a workspace name by id.
+    ///
+    /// Returns `None` when no matching workspace exists. Used by the
+    /// admission webhook chain to populate `AdmissionContext.workspace`
+    /// so external webhooks can address the page by human name without
+    /// re-implementing UUID→name lookup against the engine's store.
+    ///
+    /// # Errors
+    /// Propagates any SQL or pool error.
+    pub async fn workspace_name_by_id(
+        &self,
+        workspace_id: WorkspaceId,
+    ) -> StoreResult<Option<String>> {
+        self.with_conn(move |conn| {
+            let row_opt = conn
+                .query_row(
+                    "SELECT name FROM workspaces WHERE id = ?1",
+                    params![workspace_id.as_bytes()],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()?;
+            Ok(row_opt)
+        })
+        .await
+    }
+
     /// Look up a project name by id within a workspace.
     ///
     /// Returns `None` when no matching project exists.

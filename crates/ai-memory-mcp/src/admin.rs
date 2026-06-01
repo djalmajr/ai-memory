@@ -36,12 +36,12 @@ use ai_memory_llm::{Embedder, LlmProvider, ProviderHealth, ProviderHealthSnapsho
 use ai_memory_store::{
     DecayParams, EmbeddingWrite, ReaderPool, StoreError, WriterHandle, f32_vec_to_bytes,
 };
-use ai_memory_wiki::{Wiki, WikiError, WritePageRequest};
+use ai_memory_wiki::{AdmissionContext, AdmissionOp, Wiki, WikiError, WritePageRequest};
 use axum::Json;
 use axum::Router;
 use axum::body::Body;
 use axum::extract::{Query, State};
-use axum::http::{StatusCode, header};
+use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use flate2::Compression;
@@ -1420,34 +1420,53 @@ async fn handle_purge_project(
         };
 
     let label = format!("{}/{}", req.workspace, req.project);
+
+    // Admission must run before any destructive work. A reject-policy webhook
+    // is allowed to abort the purge while DB rows and files are still intact.
+    // Seed names from the request so mirrors do not depend on DB lookup after
+    // the rows are purged below.
+    let purge_ctx = AdmissionContext {
+        workspace: req.workspace.clone(),
+        project: req.project.clone(),
+        op: AdmissionOp::PurgeProject,
+        ..Default::default()
+    };
+    let resolved_purge_ctx = match state
+        .wiki
+        .admit_purge_project(ws_id, proj_id, Some(purge_ctx))
+        .await
+    {
+        Ok(ctx) => ctx,
+        Err(e) => return internal_err(e.to_string()),
+    };
+
     let summary = match state.writer.purge_project(ws_id, proj_id, &label).await {
         Ok(s) => s,
-        Err(e) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({ "error": e.to_string() })),
-            );
-        }
+        Err(e) => return internal_err(e.to_string()),
     };
 
     // Remove the entire per-project directory: <wiki_root>/<ws_uuid>/<proj_uuid>/.
-    // DB cascade already deleted all rows; the dir removal is best-effort.
-    let proj_root = state.wiki.project_root(ws_id, proj_id);
-    let proj_root_str = proj_root.display().to_string();
+    // DB cascade already deleted all rows. Directory removal remains best-effort
+    // and is reported separately, matching the pre-admission purge contract.
+    let proj_root_str = state
+        .wiki
+        .project_root(ws_id, proj_id)
+        .display()
+        .to_string();
     let mut files_deleted: Vec<String> = Vec::new();
     let mut files_failed: Vec<String> = Vec::new();
-    match std::fs::remove_dir_all(&proj_root) {
+    match state.wiki.remove_project_dir(ws_id, proj_id) {
         Ok(()) => {
             files_deleted.push(proj_root_str);
-        }
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            // Already absent; nothing to do.
         }
         Err(e) => {
             warn!(path = %proj_root_str, error = %e, "purge-project: failed to remove project dir");
             files_failed.push(proj_root_str);
         }
     }
+    state
+        .wiki
+        .dispatch_purge_project(resolved_purge_ctx.as_ref());
 
     let report = PurgeProjectReport {
         label: summary.label,
@@ -1608,6 +1627,10 @@ struct WritePageResponse {
 
 async fn handle_write_page(
     State(state): State<Arc<AdminState>>,
+    actor_ext: Option<axum::Extension<ai_memory_core::ActorContext>>,
+    author_ext: Option<axum::Extension<ai_memory_core::UserId>>,
+    level_ext: Option<axum::Extension<ai_memory_core::AuthLevel>>,
+    headers: HeaderMap,
     Json(req): Json<WritePageAdminRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<serde_json::Value>)> {
     let tier: Tier = req.tier.parse().map_err(|_| {
@@ -1658,6 +1681,26 @@ async fn handle_write_page(
         serde_json::Value::Object(fm)
     };
 
+    let actor = actor_ext
+        .map(|axum::Extension(actor)| actor)
+        .unwrap_or_else(ai_memory_core::ActorContext::anonymous);
+    let author_id = author_ext.map(|axum::Extension(author_id)| author_id);
+    let skip_webhooks = match level_ext.map(|axum::Extension(level)| level) {
+        Some(ai_memory_core::AuthLevel::User) => Vec::new(),
+        Some(ai_memory_core::AuthLevel::Root | ai_memory_core::AuthLevel::Anonymous) | None => {
+            crate::actor::skip_webhooks_from_headers(&headers)
+        }
+    };
+    let admission_ctx = if actor.has_any() || !skip_webhooks.is_empty() {
+        Some(AdmissionContext {
+            op: AdmissionOp::WritePage,
+            skip_webhooks,
+            ..AdmissionContext::default()
+        })
+    } else {
+        None
+    };
+
     let page_id = state
         .wiki
         .write_page(WritePageRequest {
@@ -1669,8 +1712,9 @@ async fn handle_write_page(
             tier,
             pinned: req.pinned,
             title: req.title,
-            author_id: None,
-            actor: ai_memory_core::ActorContext::anonymous(),
+            admission_ctx,
+            author_id,
+            actor,
         })
         .await
         .map_err(|e| internal_err(e.to_string()))?;
@@ -2136,6 +2180,109 @@ mod tests {
             .unwrap();
 
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    /// Bug E regression: purge deletes the project's DB rows first, so by the
+    /// time the admission chain fires, name-resolution from the (now gone)
+    /// project row would yield an empty name and a name-based mirror would
+    /// purge the wrong path. The handler must seed the admission context with
+    /// the request's workspace/project names. We capture the `purge_project`
+    /// webhook and assert it carries the real project name.
+    #[tokio::test]
+    async fn purge_project_admission_carries_the_project_name() {
+        use ai_memory_wiki::{AdmissionChain, FailurePolicy, WebhookConfig};
+        use axum::http::HeaderMap;
+        use axum::routing::post;
+        use std::sync::Mutex;
+
+        let captured: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+        let cap = captured.clone();
+        let app = Router::new().route(
+            "/sync",
+            post(
+                move |headers: HeaderMap, Json(payload): Json<serde_json::Value>| {
+                    let cap = cap.clone();
+                    async move {
+                        if headers.get("X-Memory-Op").and_then(|v| v.to_str().ok())
+                            == Some("purge_project")
+                        {
+                            *cap.lock().unwrap() = Some(
+                                payload["ctx"]["project"]
+                                    .as_str()
+                                    .unwrap_or_default()
+                                    .to_string(),
+                            );
+                        }
+                        StatusCode::NO_CONTENT
+                    }
+                },
+            ),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let chain = AdmissionChain::new(vec![WebhookConfig {
+            name: "mirror".into(),
+            url: format!("{base}/sync"),
+            timeout_ms: 2_000,
+            failure_policy: FailurePolicy::Ignore,
+            events: vec![AdmissionOp::WritePage, AdmissionOp::PurgeProject],
+            blocking: true,
+        }])
+        .unwrap();
+        let wiki = Wiki::new(tmp.path(), store.writer.clone())
+            .unwrap()
+            .with_admission_chain(chain)
+            .with_store_reader(store.reader.clone());
+        let router = admin_router(AdminState {
+            writer: store.writer.clone(),
+            reader: store.reader.clone(),
+            wiki,
+            llm: None,
+            embedder: None,
+            provider_health: ProviderHealth::default(),
+            decay_params: DecayParams::default(),
+            data_dir: tmp.path().to_path_buf(),
+            db_path: store.db_path().to_path_buf(),
+            bind: "127.0.0.1:49374".to_string(),
+            bootstrap_lock: Arc::new(tokio::sync::Mutex::new(())),
+            token_pepper: None,
+        });
+
+        post_write_page(&router, "default", "doomed", "notes/x.md", "bye").await;
+
+        let resp = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/admin/purge-project")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&serde_json::json!({
+                            "workspace": "default",
+                            "project": "doomed",
+                            "confirm": true,
+                        }))
+                        .unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "purge should succeed");
+
+        // Let the async notify land.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert_eq!(
+            captured.lock().unwrap().as_deref(),
+            Some("doomed"),
+            "purge admission must carry the real project name, not an empty/_unscoped placeholder"
+        );
     }
 
     // ── user-management endpoints (P1.4) ──────────────────────────

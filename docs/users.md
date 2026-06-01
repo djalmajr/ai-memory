@@ -24,7 +24,7 @@ You probably want multi-user mode when:
 - You want the audit log to record *who* made each write (e.g. to
   trace `Codex` writes vs `Claude Code` writes vs hand-rolled CLI
   calls).
-- You're planning to use the (deferred) admission webhook chain —
+- You're planning to use the admission webhook chain —
   webhooks receive the actor identity in their payload.
 
 You probably **don't** need it when:

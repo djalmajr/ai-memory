@@ -111,7 +111,8 @@ regex = "1"
 git2 = { version = "0.20", default-features = false, features = ["vendored-libgit2"] }
 
 # LLM provider HTTP.
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
+futures-util = "0.3"
 async-trait = "0.1"
 
 # Testing.

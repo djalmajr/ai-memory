@@ -10,7 +10,7 @@ use std::sync::Arc;
 use ai_memory_core::{Observation, PagePath, ProjectId, SessionId, Tier, WorkspaceId};
 use ai_memory_llm::{ChatMessage, ChatRequest, LlmError, LlmProvider, Role, complete_structured};
 use ai_memory_store::{ReaderPool, WriterHandle};
-use ai_memory_wiki::{Wiki, WritePageRequest};
+use ai_memory_wiki::{AdmissionContext, AdmissionOp, Wiki, WritePageRequest};
 use thiserror::Error;
 use tracing::{debug, info};
 
@@ -157,6 +157,10 @@ impl Consolidator {
                 tier: Tier::Episodic,
                 pinned: false,
                 title: None,
+                admission_ctx: Some(AdmissionContext {
+                    op: AdmissionOp::Consolidate,
+                    ..Default::default()
+                }),
                 author_id: None,
                 actor: ai_memory_core::ActorContext::anonymous(),
             })
@@ -392,6 +396,10 @@ fn build_update(
         tier,
         pinned: false,
         title: Some(upd.title.clone()),
+        admission_ctx: Some(AdmissionContext {
+            op: AdmissionOp::Consolidate,
+            ..Default::default()
+        }),
         author_id: None,
         actor: ai_memory_core::ActorContext::anonymous(),
     };

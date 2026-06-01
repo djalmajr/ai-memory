@@ -5,6 +5,7 @@
 //! actor so the SQLite index never diverges from the file. The watcher +
 //! git layer arrive in M1-D and M5.
 
+pub mod admission;
 mod atomic;
 mod error;
 mod git;
@@ -13,6 +14,10 @@ pub mod migrations;
 mod watcher;
 mod wiki;
 
+pub use admission::{
+    AdmissionChain, AdmissionContext, AdmissionOp, FailurePolicy, MAX_ADMISSION_WEBHOOKS,
+    MAX_RESPONSE_BYTES, WebhookConfig,
+};
 pub use error::{WikiError, WikiResult};
 pub use git::{COMMIT_AUTHOR_EMAIL, COMMIT_AUTHOR_NAME, GitAdapter};
 pub use markdown::{Markdown, derive_title, emit, parse};

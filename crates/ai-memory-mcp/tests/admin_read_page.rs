@@ -129,6 +129,7 @@ async fn read_page_serves_on_disk_page() {
             tier: Tier::Semantic,
             pinned: false,
             title: Some("On Disk".into()),
+            admission_ctx: None,
             author_id: None,
             actor: ai_memory_core::ActorContext::anonymous(),
         })
@@ -178,6 +179,7 @@ async fn read_page_does_not_fall_back_when_disk_frontmatter_is_malformed() {
             tier: Tier::Semantic,
             pinned: false,
             title: Some("Stored Copy".into()),
+            admission_ctx: None,
             author_id: None,
             actor: ai_memory_core::ActorContext::anonymous(),
         })

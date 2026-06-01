@@ -93,6 +93,23 @@ pub async fn run(config: &Config, args: ServeArgs) -> Result<()> {
     let sanitizer = Sanitizer::new(&config.sanitize)
         .context("compiling sanitizer.extra_patterns from config")?;
     let wiki = Wiki::new(&config.data_dir, store.writer.clone())?.with_sanitizer(sanitizer.clone());
+    // Attach the admission webhook chain (operator-configured via
+    // `[[admission_webhooks]]` in config.toml or `AI_MEMORY_ADMISSION_WEBHOOKS__N__*`
+    // env vars). Empty config = no chain attached, zero overhead. The store
+    // reader is forwarded so the chain can resolve workspace_id/project_id
+    // into the human names webhooks address pages by.
+    let wiki = if config.admission_webhooks.is_empty() {
+        wiki
+    } else {
+        let chain = ai_memory_wiki::AdmissionChain::new(config.admission_webhooks.clone())
+            .context("building admission webhook chain")?;
+        tracing::info!(
+            count = config.admission_webhooks.len(),
+            "admission webhook chain attached"
+        );
+        wiki.with_admission_chain(chain)
+            .with_store_reader(store.reader.clone())
+    };
     let provider_health = ProviderHealth::default();
     let (wiki, embedder) = configure_embedder(config, &store, wiki, &provider_health).await?;
 
@@ -931,6 +948,7 @@ mod tests {
             tier: Tier::Semantic,
             pinned: false,
             title: None,
+            admission_ctx: None,
             author_id: None,
             actor: ai_memory_core::ActorContext::anonymous(),
         })

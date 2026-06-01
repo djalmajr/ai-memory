@@ -10,9 +10,13 @@ use ai_memory_core::{
 };
 use ai_memory_mcp::{AdminState, admin_router};
 use ai_memory_store::{DecayParams, Store};
-use ai_memory_wiki::{Wiki, WritePageRequest};
+use ai_memory_wiki::{
+    AdmissionChain, AdmissionOp, FailurePolicy, WebhookConfig, Wiki, WritePageRequest,
+};
+use axum::Router;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
+use axum::routing::post as route_post;
 use serde_json::json;
 use tempfile::TempDir;
 use tower::ServiceExt;
@@ -90,6 +94,7 @@ async fn seed_two_projects(store: &Store, wiki: &Wiki) -> (WorkspaceId, ProjectI
         tier: Tier::Semantic,
         pinned: false,
         title: Some("Keep page".into()),
+        admission_ctx: None,
         author_id: None,
         actor: ai_memory_core::ActorContext::anonymous(),
     })
@@ -105,6 +110,7 @@ async fn seed_two_projects(store: &Store, wiki: &Wiki) -> (WorkspaceId, ProjectI
         tier: Tier::Semantic,
         pinned: false,
         title: Some("Doomed page".into()),
+        admission_ctx: None,
         author_id: None,
         actor: ai_memory_core::ActorContext::anonymous(),
     })
@@ -292,6 +298,86 @@ async fn purge_project_deletes_data_and_files() {
     assert!(
         !proj_dir.exists(),
         "project directory must be removed after purge"
+    );
+}
+
+/// A reject-policy purge webhook must be able to abort before DB rows or files
+/// are deleted. This guards the destructive-operation ordering.
+#[tokio::test]
+async fn purge_project_rejecting_admission_leaves_source_intact() {
+    let tmp = TempDir::new().unwrap();
+    let store = Store::open(tmp.path()).unwrap();
+
+    let app = Router::new().route(
+        "/guard",
+        route_post(|| async { (StatusCode::FORBIDDEN, "blocked") }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+
+    let chain = AdmissionChain::new(vec![WebhookConfig {
+        name: "purge-guard".into(),
+        url: format!("http://{addr}/guard"),
+        timeout_ms: 1_000,
+        failure_policy: FailurePolicy::Reject,
+        events: vec![AdmissionOp::PurgeProject],
+        blocking: true,
+    }])
+    .unwrap();
+    let wiki = Wiki::new(tmp.path(), store.writer.clone())
+        .unwrap()
+        .with_admission_chain(chain)
+        .with_store_reader(store.reader.clone());
+    let state = AdminState {
+        writer: store.writer.clone(),
+        reader: store.reader.clone(),
+        wiki,
+        llm: None,
+        embedder: None,
+        provider_health: ai_memory_llm::ProviderHealth::default(),
+        decay_params: DecayParams::default(),
+        data_dir: tmp.path().to_path_buf(),
+        db_path: store.db_path().to_path_buf(),
+        bind: "127.0.0.1:0".to_string(),
+        bootstrap_lock: std::sync::Arc::new(tokio::sync::Mutex::new(())),
+        token_pepper: None,
+    };
+
+    let (ws, _keep, doomed) = seed_two_projects(&store, &state.wiki).await;
+    let doomed_dir = state.wiki.project_root(ws, doomed);
+
+    let resp = post(
+        state,
+        "/admin/purge-project",
+        json!({ "workspace": "default", "project": "doomed", "confirm": true }),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+
+    assert!(
+        store
+            .reader
+            .find_project(ws, "doomed".to_string())
+            .await
+            .unwrap()
+            .is_some(),
+        "rejecting admission must leave project row intact"
+    );
+    assert!(
+        doomed_dir.exists(),
+        "rejecting admission must leave files intact"
+    );
+    assert_eq!(
+        store
+            .reader
+            .list_pages("default", "doomed")
+            .await
+            .unwrap()
+            .len(),
+        1
     );
 }
 

@@ -12,6 +12,7 @@ use ai_memory_llm::{Embedder, LlmProvider};
 use ai_memory_store::{DecayParams, PageHit, ReaderPool, WriterHandle};
 use ai_memory_wiki::{Wiki, WikiError, WritePageRequest};
 use rmcp::handler::server::router::tool::ToolRouter;
+use rmcp::handler::server::tool::Extension;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{
     CallToolResult, Content, Implementation, ProtocolVersion, ServerCapabilities, ServerInfo,
@@ -85,6 +86,9 @@ the conversation calls for them:\n\
   sibling workspace/project. Use \
   this instead of memory_query when the user wants the complete text, \
   not just snippets.\n\
+- `memory_delete_page` — when the user explicitly asks to delete or \
+  remove a specific page (by exact path). Idempotent; fires the \
+  admission chain so mirrors/backups stay consistent.\n\
 - `memory_lint` — when the user asks to audit the wiki for stale \
   pages, contradictions, or rule suggestions.\n\
 - `memory_forget_sweep` — when the user wants to prune old / cold \
@@ -388,6 +392,17 @@ struct ReadPageArgs {
     /// a shared server).
     #[serde(default)]
     workspace: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
+struct DeletePageArgs {
+    /// Exact wiki path to delete (e.g. `notes/foo.md`).
+    path: String,
+    /// Project to delete from. Omit to target the project you're currently
+    /// working in (resolved from recent hook activity). **Omit unless the
+    /// user explicitly names a *different* project.**
+    #[serde(default)]
+    project: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
@@ -972,6 +987,7 @@ impl AiMemoryServer {
     async fn memory_write_page(
         &self,
         Parameters(args): Parameters<WritePageArgs>,
+        Extension(parts): Extension<axum::http::request::Parts>,
     ) -> Result<CallToolResult, McpError> {
         let Some(wiki) = self.wiki.as_ref() else {
             return Err(McpError::internal_error(
@@ -1014,6 +1030,26 @@ impl AiMemoryServer {
             serde_json::Value::Object(fm)
         };
 
+        // rmcp exposes the original HTTP `Parts`; trust the auth middleware's
+        // extension, not raw client-controlled actor headers.
+        let actor = crate::actor::actor_from_parts(&parts);
+        let author_id = crate::actor::author_id_from_parts(&parts);
+        // Loop prevention: a webhook that writes back into the engine sets
+        // `X-Memory-Skip-Admission-Chain` so the chain doesn't re-invoke it
+        // on the recursive write. Only trusted/root re-entry can honor it.
+        let skip_webhooks = crate::actor::skip_webhooks_from_parts(&parts);
+        let admission_ctx = if actor.has_any() || !skip_webhooks.is_empty() {
+            // Actor is NOT carried here — `write_page` fills the webhook
+            // context from `req.actor` (single identity source).
+            Some(ai_memory_wiki::AdmissionContext {
+                op: ai_memory_wiki::AdmissionOp::WritePage,
+                skip_webhooks,
+                ..ai_memory_wiki::AdmissionContext::default()
+            })
+        } else {
+            None
+        };
+
         let page_id = wiki
             .write_page(WritePageRequest {
                 workspace_id: ws,
@@ -1024,8 +1060,9 @@ impl AiMemoryServer {
                 tier,
                 pinned: args.pinned,
                 title: args.title,
-                author_id: None,
-                actor: ai_memory_core::ActorContext::anonymous(),
+                admission_ctx,
+                author_id,
+                actor,
             })
             .await
             .map_err(|e| McpError::internal_error(e.to_string(), None))?;
@@ -1139,6 +1176,50 @@ impl AiMemoryServer {
             }
             Err(disk_err) => Err(McpError::internal_error(disk_err.to_string(), None)),
         }
+    }
+
+    /// Delete a single wiki page by exact path.
+    #[tool(description = "Delete a single wiki page by its exact relative \
+        path (e.g. `notes/foo.md`). Use when the user explicitly asks to \
+        delete or remove a page. Fires the admission chain (op=delete) \
+        before the file is removed so backups/mirrors stay consistent. \
+        Idempotent — deleting a page that is already gone is a no-op. \
+        Returns `{ path, deleted }`.")]
+    async fn memory_delete_page(
+        &self,
+        Parameters(args): Parameters<DeletePageArgs>,
+        Extension(parts): Extension<axum::http::request::Parts>,
+    ) -> Result<CallToolResult, McpError> {
+        let Some(wiki) = self.wiki.as_ref() else {
+            return Err(McpError::internal_error(
+                "memory_delete_page requires the server to be built with a wiki handle",
+                None,
+            ));
+        };
+        let path = PagePath::new(args.path.clone())
+            .map_err(|e| McpError::internal_error(format!("invalid path: {e}"), None))?;
+        let (ws, proj) = self.effective_ids(args.project.as_deref()).await;
+
+        // Carry actor identity + loop-prevention skip list (same as write_page).
+        // `Wiki::delete_page` stamps `op = Delete` regardless of what we pass.
+        let actor = crate::actor::actor_from_parts(&parts);
+        let skip_webhooks = crate::actor::skip_webhooks_from_parts(&parts);
+        let admission_ctx = if actor.has_any() || !skip_webhooks.is_empty() {
+            Some(ai_memory_wiki::AdmissionContext {
+                actor,
+                op: ai_memory_wiki::AdmissionOp::Delete,
+                skip_webhooks,
+                ..ai_memory_wiki::AdmissionContext::default()
+            })
+        } else {
+            None
+        };
+
+        wiki.delete_page(ws, proj, &path, admission_ctx)
+            .await
+            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+
+        ok_json(&serde_json::json!({ "path": path.to_string(), "deleted": true }))
     }
 
     /// Create a handoff snapshot for the next agent CLI.
@@ -1593,6 +1674,7 @@ mod tests {
             "memory_consolidate",
             "memory_write_page",
             "memory_read_page",
+            "memory_delete_page",
             "memory_lint",
             "memory_forget_sweep",
             "memory_install_self_routing",
@@ -1802,18 +1884,28 @@ mod tests {
             .await
             .unwrap();
         server.active_project.set(active_ws, active_proj);
+        let parts = axum::http::Request::builder()
+            .uri("/mcp")
+            .method("POST")
+            .body(())
+            .unwrap()
+            .into_parts()
+            .0;
 
         server
-            .memory_write_page(Parameters(WritePageArgs {
-                path: "notes/sibling.md".to_string(),
-                body: "project-only write should use the active workspace".to_string(),
-                title: Some("Sibling Note".to_string()),
-                tier: None,
-                tags: Vec::new(),
-                pinned: false,
-                project: Some("sibling".to_string()),
-                workspace: None,
-            }))
+            .memory_write_page(
+                Parameters(WritePageArgs {
+                    path: "notes/sibling.md".to_string(),
+                    body: "project-only write should use the active workspace".to_string(),
+                    title: Some("Sibling Note".to_string()),
+                    tier: None,
+                    tags: Vec::new(),
+                    pinned: false,
+                    project: Some("sibling".to_string()),
+                    workspace: None,
+                }),
+                rmcp::handler::server::tool::Extension(parts),
+            )
             .await
             .unwrap();
 
@@ -2023,6 +2115,7 @@ mod tests {
             tier: Tier::Semantic,
             pinned: false,
             title: Some("Sibling Page".into()),
+            admission_ctx: None,
             author_id: None,
             actor: ai_memory_core::ActorContext::anonymous(),
         })
@@ -2458,17 +2551,30 @@ mod tests {
         let server = AiMemoryServer::new(store.reader.clone(), store.writer.clone(), ws, proj)
             .with_wiki(wiki);
 
+        // Build a synthetic `Parts` so the new `Extension<Parts>` extractor
+        // can be satisfied — no actor headers, so the admission chain
+        // gets a default (anonymous) context, same as a stdio caller.
+        let parts = axum::http::Request::builder()
+            .uri("/mcp")
+            .method("POST")
+            .body(())
+            .unwrap()
+            .into_parts()
+            .0;
         let result = server
-            .memory_write_page(Parameters(WritePageArgs {
-                path: "notes/santander-2025.md".into(),
-                body: "# Santander 2025\n\nDurable tax annotation.".into(),
-                title: Some("Santander 2025".into()),
-                tier: Some("semantic".into()),
-                tags: vec!["finance".into()],
-                pinned: true,
-                project: None,
-                workspace: None,
-            }))
+            .memory_write_page(
+                Parameters(WritePageArgs {
+                    path: "notes/santander-2025.md".into(),
+                    body: "# Santander 2025\n\nDurable tax annotation.".into(),
+                    title: Some("Santander 2025".into()),
+                    tier: Some("semantic".into()),
+                    tags: vec!["finance".into()],
+                    pinned: true,
+                    project: None,
+                    workspace: None,
+                }),
+                rmcp::handler::server::tool::Extension(parts),
+            )
             .await
             .unwrap();
         let text = result
@@ -2500,6 +2606,95 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn memory_delete_page_removes_the_page() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let ws = store
+            .writer
+            .get_or_create_workspace("default")
+            .await
+            .unwrap();
+        let proj = store
+            .writer
+            .get_or_create_project(ws, "scratch", None)
+            .await
+            .unwrap();
+        let wiki = Wiki::new(tmp.path(), store.writer.clone()).unwrap();
+        let server = AiMemoryServer::new(store.reader.clone(), store.writer.clone(), ws, proj)
+            .with_wiki(wiki);
+        let parts = || {
+            axum::http::Request::builder()
+                .uri("/mcp")
+                .method("POST")
+                .body(())
+                .unwrap()
+                .into_parts()
+                .0
+        };
+
+        server
+            .memory_write_page(
+                Parameters(WritePageArgs {
+                    path: "notes/temp.md".into(),
+                    body: "# Temp\n\nthrowaway".into(),
+                    title: Some("Temp".into()),
+                    tier: Some("semantic".into()),
+                    tags: vec![],
+                    pinned: false,
+                    project: None,
+                    workspace: None,
+                }),
+                rmcp::handler::server::tool::Extension(parts()),
+            )
+            .await
+            .unwrap();
+
+        server
+            .memory_delete_page(
+                Parameters(DeletePageArgs {
+                    path: "notes/temp.md".into(),
+                    project: None,
+                }),
+                rmcp::handler::server::tool::Extension(parts()),
+            )
+            .await
+            .unwrap();
+
+        // The on-disk file is gone; reading it back errors (file not found).
+        let read = server
+            .memory_read_page(Parameters(ReadPageArgs {
+                query: None,
+                path: Some("notes/temp.md".into()),
+                project: None,
+                workspace: None,
+            }))
+            .await;
+        assert!(read.is_err(), "deleted page must not be readable");
+
+        // Regression: the derived index row must also be gone — the watcher
+        // does not reconcile deletions, so a file-only delete would leave the
+        // page surfacing in recent/search with stale content.
+        let recent = server
+            .memory_recent(Parameters(RecentArgs {
+                limit: Some(10),
+                project: None,
+                workspace: None,
+            }))
+            .await
+            .unwrap();
+        let recent_text = recent
+            .content
+            .first()
+            .and_then(|c| c.as_text())
+            .map(|t| t.text.clone())
+            .unwrap();
+        assert!(
+            !recent_text.contains("notes/temp.md"),
+            "deleted page must not linger in the index; got {recent_text}"
+        );
+    }
+
+    #[tokio::test]
     async fn memory_write_page_creates_explicit_project() {
         // Bug B regression: an explicit `project` that doesn't exist yet must
         // be created and written to — NOT silently land in the current project.
@@ -2518,18 +2713,30 @@ mod tests {
         let wiki = Wiki::new(tmp.path(), store.writer.clone()).unwrap();
         let server = AiMemoryServer::new(store.reader.clone(), store.writer.clone(), ws, baked)
             .with_wiki(wiki);
+        let parts = || {
+            axum::http::Request::builder()
+                .uri("/mcp")
+                .method("POST")
+                .body(())
+                .unwrap()
+                .into_parts()
+                .0
+        };
 
         server
-            .memory_write_page(Parameters(WritePageArgs {
-                path: "notes/elsewhere.md".into(),
-                body: "lands in `other`, not `scratch`".into(),
-                title: None,
-                tier: Some("semantic".into()),
-                tags: vec![],
-                pinned: false,
-                project: Some("other".into()),
-                workspace: None,
-            }))
+            .memory_write_page(
+                Parameters(WritePageArgs {
+                    path: "notes/elsewhere.md".into(),
+                    body: "lands in `other`, not `scratch`".into(),
+                    title: None,
+                    tier: Some("semantic".into()),
+                    tags: vec![],
+                    pinned: false,
+                    project: Some("other".into()),
+                    workspace: None,
+                }),
+                rmcp::handler::server::tool::Extension(parts()),
+            )
             .await
             .unwrap();
 
@@ -2745,18 +2952,30 @@ mod tests {
         let wiki = Wiki::new(tmp.path(), store.writer.clone()).unwrap();
         let server = AiMemoryServer::new(store.reader.clone(), store.writer.clone(), ws, baked)
             .with_wiki(wiki);
+        let parts = || {
+            axum::http::Request::builder()
+                .uri("/mcp")
+                .method("POST")
+                .body(())
+                .unwrap()
+                .into_parts()
+                .0
+        };
 
         server
-            .memory_write_page(Parameters(WritePageArgs {
-                path: "log/ep.md".into(),
-                body: "episodic note".into(),
-                title: None,
-                tier: Some("episodic".into()),
-                tags: vec![],
-                pinned: false,
-                project: Some("audited".into()),
-                workspace: None,
-            }))
+            .memory_write_page(
+                Parameters(WritePageArgs {
+                    path: "log/ep.md".into(),
+                    body: "episodic note".into(),
+                    title: None,
+                    tier: Some("episodic".into()),
+                    tags: vec![],
+                    pinned: false,
+                    project: Some("audited".into()),
+                    workspace: None,
+                }),
+                rmcp::handler::server::tool::Extension(parts()),
+            )
             .await
             .unwrap();
 

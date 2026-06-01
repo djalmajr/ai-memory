@@ -241,6 +241,7 @@ pub async fn require_bearer(
                     ..ActorContext::default()
                 };
                 req.extensions_mut().insert(actor);
+                req.extensions_mut().insert(user.id);
                 req.extensions_mut().insert(AuthLevel::User);
 
                 // Fire-and-forget last_seen_at bump. Errors are logged

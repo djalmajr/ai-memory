@@ -362,6 +362,7 @@ async fn embed_all_projects_rebuilds_workspace_projects() {
             tier: Tier::Semantic,
             pinned: false,
             title: Some("A".into()),
+            admission_ctx: None,
             author_id: None,
             actor: ai_memory_core::ActorContext::anonymous(),
         })
@@ -378,6 +379,7 @@ async fn embed_all_projects_rebuilds_workspace_projects() {
             tier: Tier::Semantic,
             pinned: false,
             title: Some("B".into()),
+            admission_ctx: None,
             author_id: None,
             actor: ai_memory_core::ActorContext::anonymous(),
         })
@@ -469,6 +471,7 @@ async fn commit_with_new_page_returns_committed_true_and_40char_oid() {
             tier: Tier::Semantic,
             pinned: false,
             title: Some("Commit test".into()),
+            admission_ctx: None,
             author_id: None,
             actor: ai_memory_core::ActorContext::anonymous(),
         })

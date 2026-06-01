@@ -506,6 +506,7 @@ async fn process(state: &HookState, env: HookEnvelope) -> anyhow::Result<()> {
                 tier: new_page.tier,
                 pinned: new_page.pinned,
                 title: None,
+                admission_ctx: None,
                 author_id: None,
                 actor: ai_memory_core::ActorContext::anonymous(),
             })
@@ -704,6 +705,7 @@ async fn consolidate_or_synth(
             tier: new_page.tier,
             pinned: new_page.pinned,
             title: None,
+            admission_ctx: None,
             author_id: None,
             actor: ai_memory_core::ActorContext::anonymous(),
         })

@@ -56,6 +56,7 @@ fn wiki_req(
         tier: Tier::Semantic,
         pinned: false,
         title: None,
+        admission_ctx: None,
         author_id: None,
         actor: ai_memory_core::ActorContext::anonymous(),
     }
@@ -1638,6 +1639,7 @@ async fn api_page_handler_emits_etag_and_supports_if_none_match() {
         tier: Tier::Semantic,
         pinned: false,
         title: None,
+        admission_ctx: None,
         author_id: None,
         actor: ai_memory_core::ActorContext::anonymous(),
     })
@@ -1718,6 +1720,7 @@ async fn api_page_handler_etag_differs_per_page() {
         tier: Tier::Semantic,
         pinned: false,
         title: None,
+        admission_ctx: None,
         author_id: None,
         actor: ai_memory_core::ActorContext::anonymous(),
     })
@@ -1732,6 +1735,7 @@ async fn api_page_handler_etag_differs_per_page() {
         tier: Tier::Semantic,
         pinned: false,
         title: None,
+        admission_ctx: None,
         author_id: None,
         actor: ai_memory_core::ActorContext::anonymous(),
     })

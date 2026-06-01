@@ -9,6 +9,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 - Page FTS now indexes normalized page paths, so searches can find pages by
   filename or slug even when the slug does not appear in the title/body ([#62]).
+- Admission webhooks can now observe, mutate, or reject engine write/delete/
+  purge operations, with authenticated actor context, loop-prevention skip
+  lists for trusted re-entry, and non-blocking observer webhooks for mirrors
+  and backups ([#55]).
+- New `memory_delete_page` MCP tool deletes a single page by exact path,
+  updates the SQLite index directly, and fires `op=delete` admission hooks
+  before removal ([#55]).
 
 ### Fixed
 - `memory_write_page` calls that specify `project` without `workspace` now

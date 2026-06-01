@@ -8,7 +8,7 @@ use std::collections::BTreeSet;
 
 use ai_memory_core::{
     AgentKind, HandoffId, LinkTarget, NewHandoff, NewObservation, NewPage, NewSession,
-    ObservationId, ObservationKind, PageId, ProjectId, SessionId, WorkspaceId,
+    ObservationId, ObservationKind, PageId, PagePath, ProjectId, SessionId, WorkspaceId,
 };
 
 /// Summary returned by [`reorg_sessions`] and exposed via
@@ -674,6 +674,29 @@ pub fn soft_delete_for_decay(conn: &mut Connection, page_ids: &[PageId]) -> Stor
     )?;
     tx.commit()?;
     Ok(affected)
+}
+
+/// Delete every version of a page (by path) from the index. Used when the
+/// wiki file is removed (`Wiki::delete_page`): the watcher does not handle
+/// file deletions, so the derived rows must be dropped explicitly or the
+/// page keeps surfacing in search/recent with stale content. FK cascades
+/// drop outgoing links + embeddings; the `pages_fts_ad` trigger keeps FTS in
+/// sync; incoming links are set to NULL (unresolved). Idempotent.
+pub fn delete_page(
+    conn: &Connection,
+    workspace_id: WorkspaceId,
+    project_id: ProjectId,
+    path: &PagePath,
+) -> StoreResult<()> {
+    conn.execute(
+        "DELETE FROM pages WHERE workspace_id = ?1 AND project_id = ?2 AND path = ?3",
+        params![
+            workspace_id.as_bytes(),
+            project_id.as_bytes(),
+            path.as_str()
+        ],
+    )?;
+    Ok(())
 }
 
 /// Hard-delete rows that were soft-deleted by an earlier sweep at

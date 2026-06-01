@@ -20,7 +20,7 @@ const LINT_SYSTEM_PROMPT: &str = include_str!("../prompts/lint_system.md");
 use ai_memory_core::{PagePath, ProjectId, Tier, WorkspaceId};
 use ai_memory_llm::{ChatMessage, ChatRequest, LlmProvider, Role, complete_structured};
 use ai_memory_store::{DecayCandidate, ReaderPool};
-use ai_memory_wiki::{Wiki, WritePageRequest};
+use ai_memory_wiki::{AdmissionContext, AdmissionOp, Wiki, WritePageRequest};
 use jiff::Timestamp;
 use jiff::tz::TimeZone;
 use schemars::JsonSchema;
@@ -313,6 +313,10 @@ async fn write_report_page(
         tier: Tier::Semantic,
         pinned: false,
         title: Some(title),
+        admission_ctx: Some(AdmissionContext {
+            op: AdmissionOp::Consolidate,
+            ..Default::default()
+        }),
         author_id: None,
         actor: ai_memory_core::ActorContext::anonymous(),
     })
