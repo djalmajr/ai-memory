@@ -1,6 +1,10 @@
-//! Markdown → HTML rendering with `syntect` syntax highlighting.
+//! Markdown → HTML rendering for the read-only web browser, plus the
+//! `[[wikilink]]` preprocessor that turns wiki shorthand into ordinary
+//! markdown links before parsing.
 //!
-//! Stub at scaffold time; full implementation in the next step.
+//! The renderer treats wiki content as untrusted (it can originate from
+//! prompts, hooks, or LLM output), so raw HTML is escaped and unsafe
+//! link schemes are neutralised.
 
 use ai_memory_core::PagePath;
 use pulldown_cmark::{CowStr, Event, Options, Parser, Tag, html};
@@ -40,20 +44,38 @@ pub fn render(body: &str, workspace: &str, project: &str) -> String {
 }
 
 /// Convert `[[target]]` / `[[target|label]]` spans into `[label](href)`
-/// markdown links, skipping fenced code blocks and inline-code spans. Targets
-/// that aren't internal pages (external schemes, traversal, empty) are left as
-/// literal `[[…]]`.
+/// markdown links, skipping fenced code blocks, inline-code spans, and
+/// 4-space-indented code blocks. Targets that aren't internal pages
+/// (external schemes, traversal, empty) are left as literal `[[…]]`.
 fn preprocess_wikilinks(body: &str, workspace: &str, project: &str) -> String {
     let mut out = String::with_capacity(body.len() + 64);
-    let mut in_fence = false;
+    // None when outside a fence; Some(char) carrying the opener glyph
+    // (`'`' ` for ```` ``` ````, `'~'` for `~~~`) when inside one. The
+    // CommonMark rule is that a fence closes only with the *same* glyph,
+    // so opening with `~~~` ignores a `` ``` `` line in between and
+    // vice versa.
+    let mut fence: Option<char> = None;
     for line in body.split_inclusive('\n') {
         let trimmed = line.trim_start();
-        if trimmed.starts_with("```") || trimmed.starts_with("~~~") {
-            in_fence = !in_fence;
+        let leading_indent = line.len() - trimmed.len();
+        if let Some(kind) = fence_glyph(trimmed) {
+            match fence {
+                None => fence = Some(kind),
+                Some(open) if open == kind => fence = None,
+                _ => {} // Mismatched glyph inside a fenced block — literal text.
+            }
             out.push_str(line);
             continue;
         }
-        if in_fence {
+        if fence.is_some() {
+            out.push_str(line);
+            continue;
+        }
+        // 4-space-indented (or tab-indented) lines are CommonMark code
+        // blocks. A wikilink inside one must stay literal so it ends up
+        // inside the rendered `<pre><code>…</code></pre>`. Blank-only
+        // indented lines are pass-through (paragraph continuation).
+        if !trimmed.is_empty() && (leading_indent >= 4 || line.starts_with('\t')) {
             out.push_str(line);
             continue;
         }
@@ -71,6 +93,20 @@ fn preprocess_wikilinks(body: &str, workspace: &str, project: &str) -> String {
         }
     }
     out
+}
+
+/// If `trimmed` opens or closes a CommonMark code fence, return its
+/// opener glyph (`` ` `` or `~`). CommonMark requires at least three
+/// of the same glyph; we accept the lenient "starts with three" rule
+/// to mirror the pulldown-cmark parser's behaviour for our preprocessor.
+fn fence_glyph(trimmed: &str) -> Option<char> {
+    if trimmed.starts_with("```") {
+        Some('`')
+    } else if trimmed.starts_with("~~~") {
+        Some('~')
+    } else {
+        None
+    }
 }
 
 /// Rewrite every `[[…]]` in a non-code text run into a markdown link.
@@ -107,16 +143,28 @@ fn rewrite_wikilinks_in_text(seg: &str, workspace: &str, project: &str, out: &mu
 }
 
 /// Escape the characters that would prematurely close a markdown link label.
+///
+/// The wikilink rewriter emits `[<label>](<href>)`. Brackets and the
+/// backslash need to escape, but so do parentheses — `]` plus an
+/// unbalanced `(` inside the label lets the next `)` end the link
+/// markup early. Without this, `[[a|x](y]]` rendered as
+/// `[x](y](href)` and pulldown-cmark closed the link at the first `)`.
 fn escape_link_label(label: &str) -> String {
     label
         .replace('\\', r"\\")
         .replace('[', r"\[")
         .replace(']', r"\]")
+        .replace('(', r"\(")
+        .replace(')', r"\)")
 }
 
 /// Resolve a `[[…]]` target (inner text, no brackets) into a relative page
 /// href + display label. Returns `None` for empty/external/malformed targets
 /// (callers then keep the literal `[[…]]`).
+///
+/// A `|` inside `raw` separates target from label at the FIRST pipe —
+/// `[[a|b|c]]` → target `a`, label `b|c`. Targets are paths and must
+/// not contain pipes; labels are display text and may.
 fn wikilink_href_label(raw: &str, workspace: &str, project: &str) -> Option<(String, String)> {
     let (target, label) = match raw.split_once('|') {
         Some((t, l)) => (t.trim(), Some(l.trim())),
@@ -126,14 +174,9 @@ fn wikilink_href_label(raw: &str, workspace: &str, project: &str) -> Option<(Str
         return None;
     }
     // External / scheme-qualified targets are not internal wiki pages.
-    let lower = target.to_ascii_lowercase();
-    if target.contains("://")
-        || lower.starts_with("mailto:")
-        || lower.starts_with("data:")
-        || lower.starts_with("javascript:")
-        || lower.starts_with("tel:")
-        || target.starts_with('#')
-    {
+    // Bare fragment targets (`[[#anchor]]`) are page-internal anchors, not
+    // wiki pages — also bail.
+    if target.starts_with('#') || has_external_or_unsafe_scheme(target) {
         return None;
     }
 
@@ -237,6 +280,28 @@ fn safe_url(url: CowStr<'_>) -> CowStr<'_> {
     } else {
         CowStr::Boxed("#".into())
     }
+}
+
+/// True when `target` carries a URL scheme that should never be
+/// resolved as a wiki page. Two paths feed this rule:
+///   * the wikilink rewriter, which falls back to literal `[[…]]`;
+///   * `safe_url`, which independently allows the four explicitly
+///     listed schemes (http/https/mailto + root/fragment/no-colon
+///     relatives) and rewrites everything else to `#`.
+///
+/// The two checks are NOT the same: `safe_url` ACCEPTS by allowlist;
+/// this helper REJECTS by denylist. The shared concern is "this looks
+/// like an external scheme" — keeping the list in one place lets a
+/// future scheme (e.g. `vscode://`) extend both surfaces at once.
+fn has_external_or_unsafe_scheme(target: &str) -> bool {
+    let lower = target.to_ascii_lowercase();
+    target.contains("://")
+        || lower.starts_with("mailto:")
+        || lower.starts_with("data:")
+        || lower.starts_with("javascript:")
+        || lower.starts_with("vbscript:")
+        || lower.starts_with("tel:")
+        || lower.starts_with("file:")
 }
 
 /// Escape text for insertion into an HTML template while preserving the
@@ -436,5 +501,115 @@ mod tests {
             "scratch",
         );
         assert!(!d.contains("<a href"), "invalid page path: {d}");
+    }
+
+    /// A `~~~` fence must NOT be closed by a `` ``` `` line and vice
+    /// versa (audit finding: same-glyph close rule per CommonMark).
+    /// Without the fix, opening with `~~~` and including a `` ``` ``
+    /// line ended the block early and linkified wikilinks afterwards.
+    #[test]
+    fn wikilink_respects_fence_glyph() {
+        let md = "~~~\n[[a/b]]\n```\n[[c/d]]\n~~~\nafter [[e/f]]\n";
+        let html = render(md, "default", "scratch");
+        // Inside the tilde-fenced block, BOTH wikilinks must stay literal.
+        // The backtick line is NOT a fence here.
+        assert!(html.contains("[[a/b]]"), "a/b literal in fence: {html}");
+        assert!(html.contains("[[c/d]]"), "c/d literal in fence: {html}");
+        // After the tilde fence closes, the wikilink IS linkified.
+        assert!(
+            html.contains(r#"href="w/default/scratch/p/e/f.md""#),
+            "post-fence link: {html}"
+        );
+    }
+
+    /// 4-space-indented code blocks (CommonMark) must NOT be rewritten —
+    /// the wikilink should survive as literal text inside `<pre><code>`.
+    #[test]
+    fn wikilink_inside_indented_code_block_stays_literal() {
+        let md = "Paragraph.\n\n    [[notes/foo]]\n\nresume\n";
+        let html = render(md, "default", "scratch");
+        // The indented block renders as <pre><code>; the wikilink is
+        // verbatim inside, with HTML-escaped square brackets.
+        assert!(
+            html.contains("<pre><code>") && html.contains("[[notes/foo]]"),
+            "indented code wikilink: {html}"
+        );
+        assert!(
+            !html.contains(r#"href="w/default/scratch/p/notes/foo.md""#),
+            "must NOT linkify inside indented code: {html}"
+        );
+    }
+
+    /// A label that contains `(` or `)` must not let the next `)` close
+    /// the rewritten markdown link prematurely. Audit case: `[[a|x](y]]`.
+    /// The escape must keep the parens inside the label.
+    #[test]
+    fn wikilink_label_with_parens_does_not_break_out() {
+        let html = render("[[a|foo (bar)]]", "default", "scratch");
+        // The href must point at the wiki page, not at any of the
+        // parenthesised text.
+        assert!(
+            html.contains(r#"href="w/default/scratch/p/a.md""#),
+            "href intact: {html}"
+        );
+        // The displayed label keeps the parentheses literally.
+        assert!(html.contains("foo (bar)"), "paren label: {html}");
+    }
+
+    /// `[[<script>...]]`: malformed as a page path (HTML chars are
+    /// not in `PagePath`'s allowed charset), so the wikilink stays
+    /// literal; whatever HTML survives is escaped by `sanitize_event`.
+    /// Regression guard for XSS via crafted target.
+    #[test]
+    fn wikilink_with_script_tag_target_does_not_emit_raw_html() {
+        let html = render("[[<script>alert(1)</script>]]", "default", "scratch");
+        assert!(!html.contains("<script>"), "raw html escaped: {html}");
+        assert!(html.contains("&lt;script&gt;"), "html-escaped: {html}");
+    }
+
+    /// `[[#anchor]]` is an in-page anchor reference, not a wiki page.
+    /// Must stay literal so the renderer doesn't fabricate a wiki link.
+    #[test]
+    fn wikilink_fragment_only_target_stays_literal() {
+        let html = render("see [[#section]] above", "default", "scratch");
+        assert!(html.contains("[[#section]]"), "fragment literal: {html}");
+        assert!(
+            !html.contains(r#"href="w/default/scratch/p/"#),
+            "must not fabricate wiki link: {html}"
+        );
+    }
+
+    /// Multiple pipes: split on the FIRST pipe, so `[[a|b|c]]` has
+    /// target `a`, label `b|c`. Document the choice with an explicit
+    /// assertion (a future "split on last pipe" change must update
+    /// this test).
+    #[test]
+    fn wikilink_multiple_pipes_split_at_first() {
+        let html = render("[[a|b|c]]", "default", "scratch");
+        assert!(html.contains(r#"href="w/default/scratch/p/a.md""#));
+        assert!(html.contains("b|c"), "label keeps later pipes: {html}");
+    }
+
+    /// External schemes inside `[[…]]` all stay literal — the wikilink
+    /// rewriter and `safe_url` agree on what is "external", so the
+    /// authoritative list is exercised end-to-end.
+    #[test]
+    fn wikilink_external_schemes_all_kept_literal() {
+        for raw in [
+            "[[http://x]]",
+            "[[https://x]]",
+            "[[mailto:x@y]]",
+            "[[data:text/html,x]]",
+            "[[javascript:alert(1)]]",
+            "[[vbscript:msgbox]]",
+            "[[tel:+1]]",
+            "[[file:///etc/passwd]]",
+        ] {
+            let html = render(raw, "default", "scratch");
+            assert!(
+                !html.contains("<a href"),
+                "{raw} must stay literal, got: {html}"
+            );
+        }
     }
 }
