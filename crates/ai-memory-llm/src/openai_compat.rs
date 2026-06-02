@@ -127,9 +127,25 @@ impl LlmProvider for OpenAiCompatProvider {
         // response_format. The dialect stays Compat, so the api.openai.com
         // token/temperature quirks do NOT leak into the local engine.
         //
-        // If the strict raw call fails (engine that rejects the schema,
-        // truncated JSON, etc.) we fall through to the tolerant parser below
-        // instead of propagating that raw-call error.
+        // Note: `enforce_strict_object_schemas` is invoked here because the
+        // inner provider's own normalisation is gated on `RequestDialect::
+        // Official` (see openai.rs::complete_structured_raw). The wrapper
+        // owns the Compat-side rewrite so a refactor of the inner cannot
+        // silently drop it.
+        //
+        // Fallback path:
+        // Fallback only on *parse-shape* failures — the engine returned a
+        // response but it wasn't a valid JSON object (the case the tolerant
+        // path was designed for). On `LlmError::Provider` (HTTP 4xx/5xx,
+        // auth, rate-limit) and transport-level failures, propagate the
+        // error: a `complete()` retry inside the fallback would hit the
+        // same wall and double the latency / token spend for no gain.
+        //
+        // The fallback itself is a SECOND HTTP call to the model — the
+        // strict raw call returns parsed JSON or an error, not raw text,
+        // so we can't reuse the response body. Operators on engines that
+        // routinely fall back (e.g. reasoning models with `<think>` in
+        // `content`) should keep `strict=false` to avoid the double call.
         if self.strict {
             let mut strict_schema = schema.clone();
             enforce_strict_object_schemas(&mut strict_schema);
@@ -142,8 +158,14 @@ impl LlmProvider for OpenAiCompatProvider {
                 Ok(_) => {
                     debug!("compat strict: non-object response, falling back to tolerant parser");
                 }
+                Err(err) if is_parse_shape_error(&err) => {
+                    debug!(error = %err, "compat strict parse-shape mismatch, falling back to tolerant parser");
+                }
                 Err(err) => {
-                    debug!(error = %err, "compat strict failed, falling back to tolerant parser");
+                    // Transport / 5xx / auth / rate-limit: a tolerant retry
+                    // would hit the same failure. Propagate so the caller
+                    // sees the real cause and can back off appropriately.
+                    return Err(err);
                 }
             }
         }
@@ -181,6 +203,14 @@ impl LlmProvider for OpenAiCompatProvider {
             }
         }
     }
+}
+
+/// True for errors where a *retry without structured-output coercion*
+/// has a real chance of succeeding — i.e. the upstream returned a
+/// response, but it wasn't in the shape we wanted. Transport / HTTP /
+/// auth errors are excluded because they would just reproduce.
+fn is_parse_shape_error(err: &LlmError) -> bool {
+    matches!(err, LlmError::UnexpectedShape(_) | LlmError::Serde(_))
 }
 
 /// Find the first balanced `{...}` object in a string, skipping
@@ -238,6 +268,36 @@ mod tests {
         assert!(!p.strict);
         let p = p.with_strict(true);
         assert!(p.strict);
+    }
+
+    /// The strict path's fallback policy lives in `is_parse_shape_error`:
+    /// fall back ONLY when the upstream returned a response in the wrong
+    /// shape (the tolerant prose-JSON parser has a real chance). Propagate
+    /// transport / HTTP-status / auth errors — a tolerant retry would just
+    /// hit the same wall and double cost. Regression guard for the audit
+    /// finding that the original strict-fallback caught every `Err(_)`.
+    #[test]
+    fn is_parse_shape_error_classifies_correctly() {
+        // Shape failures → fall back.
+        assert!(is_parse_shape_error(&LlmError::UnexpectedShape(
+            "no JSON object".into()
+        )));
+        assert!(is_parse_shape_error(&LlmError::Serde(
+            "trailing comma".into()
+        )));
+        // Transport / HTTP / auth → propagate.
+        assert!(!is_parse_shape_error(&LlmError::Provider {
+            status: 500,
+            body: "engine boom".into()
+        }));
+        assert!(!is_parse_shape_error(&LlmError::Provider {
+            status: 401,
+            body: "unauthorized".into()
+        }));
+        assert!(!is_parse_shape_error(&LlmError::Provider {
+            status: 429,
+            body: "rate limited".into()
+        }));
     }
 
     #[test]
