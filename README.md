@@ -436,6 +436,15 @@ also set `COPILOT_GITHUB_TOKEN`, `GH_TOKEN`, or `GITHUB_TOKEN` on the server.
 > model is plenty and is much easier on subscription rate limits. Save the
 > high-effort thinking models for your coding agent.
 
+> [!TIP]
+> **On a local engine (Ollama, vLLM, LM Studio, llama.cpp) with
+> `openai-compat`, if consolidation fails on large sessions** with
+> `did not contain a JSON object` or `serde: unknown variant`, set
+> `AI_MEMORY_LLM_COMPAT_STRICT=true`. It sends `response_format=json_schema`
+> (strict) so capable engines constrain output to the schema. If the strict
+> raw call fails, ai-memory falls back to the default tolerant parser. Off by
+> default.
+
 Embeddings are optional and separate from the LLM provider. Set
 `AI_MEMORY_EMBEDDING_PROVIDER=openai`, `voyage`, `google`, or `gemini` when
 you want vector reranking in addition to FTS5 + graph-neighbor retrieval.

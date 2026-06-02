@@ -806,6 +806,18 @@ required. For OpenRouter (Kimi, DeepSeek, etc.):
 -e LLM_API_KEY=sk-or-v1-...
 ```
 
+Modern Ollama, vLLM, LM Studio, llama.cpp, and gateway endpoints may honour
+OpenAI-style `response_format=json_schema`. If the tolerant default parser fails
+with errors such as `did not contain a JSON object` or `serde: unknown variant`,
+try strict compat mode:
+
+```bash
+-e AI_MEMORY_LLM_COMPAT_STRICT=true
+```
+
+Strict mode is opt-in. ai-memory sends the schema-constrained request first and
+falls back to the tolerant parser only when that raw strict call fails.
+
 ---
 
 ## Subcommand reference

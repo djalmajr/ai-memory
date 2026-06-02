@@ -2,9 +2,10 @@
 //!
 //! Uses the same wire format as [`crate::openai::OpenAiProvider`] but
 //! with a configurable base URL (and no key required for most local
-//! deployments). Structured output falls back to "parse first JSON
-//! object out of the text" because most local engines lack reliable
-//! `response_format` honour.
+//! deployments). Structured output defaults to "parse first JSON object
+//! out of the text" because many local engines lack reliable
+//! `response_format` honour; operators can opt into strict
+//! `response_format=json_schema` for engines that support it.
 
 use std::sync::LazyLock;
 
@@ -14,7 +15,7 @@ use secrecy::SecretString;
 use tracing::debug;
 
 use crate::error::{LlmError, LlmResult};
-use crate::openai::{OpenAiProvider, RequestDialect};
+use crate::openai::{OpenAiProvider, RequestDialect, enforce_strict_object_schemas};
 use crate::provider::LlmProvider;
 use crate::text::{suffix_within_bytes, truncate_with_ellipsis};
 use crate::types::{ChatRequest, ChatResponse};
@@ -56,6 +57,10 @@ pub(crate) fn strip_reasoning_blocks(s: &str) -> String {
 pub struct OpenAiCompatProvider {
     inner: OpenAiProvider,
     name_tag: &'static str,
+    /// When `true`, structured output sends a strict `response_format`
+    /// instead of the tolerant parser. Set by the factory from
+    /// `ProviderConfig::compat_strict` (sourced once by `Config::load`).
+    strict: bool,
 }
 
 impl OpenAiCompatProvider {
@@ -81,7 +86,17 @@ impl OpenAiCompatProvider {
         Ok(Self {
             inner,
             name_tag: "openai-compat",
+            strict: false,
         })
+    }
+
+    /// Set strict mode. The factory calls this with
+    /// `ProviderConfig::compat_strict`; `new` defaults it off so the
+    /// tolerant parser stays the zero-config behaviour.
+    #[must_use]
+    pub fn with_strict(mut self, strict: bool) -> Self {
+        self.strict = strict;
+        self
     }
 }
 
@@ -102,11 +117,39 @@ impl LlmProvider for OpenAiCompatProvider {
     async fn complete_structured_raw(
         &self,
         request: ChatRequest,
-        _schema: serde_json::Value,
+        schema: serde_json::Value,
     ) -> LlmResult<serde_json::Value> {
-        // Most local engines don't honour `response_format`. We
-        // ask the model to emit a JSON object and fall back to
-        // extracting the first balanced `{…}` from the text.
+        // Strict mode (opt-in; see `strict` field): modern local engines
+        // honour `response_format=json_schema`. Normalise the schema
+        // to the strict subset (additionalProperties:false, full required, no
+        // oneOf / no $ref siblings) — the same rewrite the Official dialect
+        // applies — and delegate to the inner provider, which sends the
+        // response_format. The dialect stays Compat, so the api.openai.com
+        // token/temperature quirks do NOT leak into the local engine.
+        //
+        // If the strict raw call fails (engine that rejects the schema,
+        // truncated JSON, etc.) we fall through to the tolerant parser below
+        // instead of propagating that raw-call error.
+        if self.strict {
+            let mut strict_schema = schema.clone();
+            enforce_strict_object_schemas(&mut strict_schema);
+            match self
+                .inner
+                .complete_structured_raw(request.clone(), strict_schema)
+                .await
+            {
+                Ok(v) if v.is_object() => return Ok(v),
+                Ok(_) => {
+                    debug!("compat strict: non-object response, falling back to tolerant parser");
+                }
+                Err(err) => {
+                    debug!(error = %err, "compat strict failed, falling back to tolerant parser");
+                }
+            }
+        }
+        // Default (and strict fallback): most older local engines don't
+        // honour `response_format`. Ask for JSON and extract the first
+        // balanced `{…}` object from the text.
         let res = self.inner.complete(request).await?;
         // Reasoning models (DeepSeek, Qwen, MiniMax M2.7, …) prepend
         // `<think>…</think>` before the JSON. Strip those blocks (and any
@@ -185,6 +228,17 @@ fn first_json_object(s: &str) -> Option<&str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `new` defaults strict off; `with_strict` is the only way to turn it
+    /// on, mirroring how the factory threads `ProviderConfig::compat_strict`.
+    #[test]
+    fn strict_defaults_off_and_can_be_overridden() {
+        let p = OpenAiCompatProvider::new("http://localhost:11434/v1", None, "mistral-nemo")
+            .expect("provider builds");
+        assert!(!p.strict);
+        let p = p.with_strict(true);
+        assert!(p.strict);
+    }
 
     #[test]
     fn first_json_object_finds_balanced_object() {

@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 ### Added
+- `openai-compat` LLM providers can now opt into strict JSON Schema structured
+  output with `AI_MEMORY_LLM_COMPAT_STRICT=true`. Strict mode sends
+  `response_format=json_schema` first for compatible Ollama, vLLM, LM Studio,
+  llama.cpp, and gateway endpoints, while the tolerant JSON-object parser
+  remains the default and the fallback for strict raw-call failures ([#70]).
 - The read-only web browser now renders `[[wiki links]]` as clickable internal
   links to the target page. Supports `[[path]]`, `[[path|label]]`,
   `[[project:path]]`, and `[[workspace/project:path]]`, resolved against the

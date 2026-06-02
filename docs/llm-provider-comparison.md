@@ -162,10 +162,13 @@ synonym, never code fences". Local instruction-tuned models -
 especially when there's no `response_format: json_schema`
 support to enforce - will drift to whatever feels natural.
 
-Compounding this: openai-compat providers (Ollama, OpenRouter
-passthrough) do **not** expose strict-mode JSON-schema
-validation. The schema is descriptive, not coercive. So the
-prompt has to do the load-bearing work.
+Compounding this at the time of the run: openai-compat providers
+(Ollama, OpenRouter passthrough) were using ai-memory's tolerant
+parser path, so the schema was descriptive, not coercive. ai-memory
+now has opt-in `AI_MEMORY_LLM_COMPAT_STRICT=true` for compatible
+engines that honour OpenAI-style `response_format=json_schema`, but
+the prompt still has to do the load-bearing work when strict mode is
+off or the strict raw call falls back.
 
 ## The fix
 
