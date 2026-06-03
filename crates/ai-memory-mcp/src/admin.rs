@@ -177,6 +177,7 @@ pub fn admin_router(state: AdminState) -> Router {
         .route("/admin/rename-project", post(handle_rename_project))
         .route("/admin/move-project", post(handle_move_project))
         .route("/admin/write-page", post(handle_write_page))
+        .route("/admin/delete-page", post(handle_delete_page))
         .route_layer(axum::middleware::from_fn_with_state(
             state.clone(),
             require_root_for_multiuser_admin,
@@ -2593,6 +2594,96 @@ async fn handle_write_page(
 }
 
 // ---------------------------------------------------------------------
+// delete-page
+// ---------------------------------------------------------------------
+
+/// JSON request body for `POST /admin/delete-page`.
+///
+/// Unlike `memory_delete_page` (MCP), this endpoint REQUIRES explicit
+/// `workspace` so cross-workspace ambiguity can never silently route a
+/// delete to the wrong slot.
+#[derive(Deserialize)]
+struct DeletePageAdminRequest {
+    /// Workspace name. Required (no auto-create — delete acts on existing data).
+    workspace: String,
+    /// Project name within the workspace. Required.
+    project: String,
+    /// Relative wiki path (e.g. `concepts/foo.md`).
+    path: String,
+}
+
+/// JSON response body for `POST /admin/delete-page`.
+#[derive(Serialize)]
+struct DeletePageResponse {
+    /// Canonical wiki path of the deletion target.
+    path: String,
+    /// Always `true` on a successful (resolved-scope) call. `Wiki::delete_page`
+    /// itself is idempotent — a missing file is treated as already-deleted —
+    /// so the boolean reports "the call succeeded", not "a row was removed".
+    /// The structural defense is in the 404 returned when `(workspace, project)`
+    /// fails to resolve (so a stale or wrong-scope call never returns a misleading
+    /// `deleted: true`).
+    deleted: bool,
+}
+
+async fn handle_delete_page(
+    State(state): State<Arc<AdminState>>,
+    actor_ext: Option<axum::Extension<ai_memory_core::ActorContext>>,
+    level_ext: Option<axum::Extension<ai_memory_core::AuthLevel>>,
+    headers: HeaderMap,
+    Json(req): Json<DeletePageAdminRequest>,
+) -> Result<impl IntoResponse, (StatusCode, Json<serde_json::Value>)> {
+    let path = PagePath::new(req.path.clone()).map_err(|e| {
+        (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(serde_json::json!({ "error": format!("invalid path: {e}") })),
+        )
+    })?;
+
+    // Use the no-create lookup (same as purge/rename/move): a delete on a
+    // typo'd workspace/project must return 404, NOT silently auto-create
+    // empty containers and then return `deleted: true` for nothing.
+    let (ws, proj) = lookup_ws_proj_no_create(&state, &req.workspace, &req.project).await?;
+
+    let actor = actor_ext
+        .map(|axum::Extension(actor)| actor)
+        .unwrap_or_else(ai_memory_core::ActorContext::anonymous);
+    let skip_webhooks = match level_ext.map(|axum::Extension(level)| level) {
+        Some(ai_memory_core::AuthLevel::User) => Vec::new(),
+        Some(ai_memory_core::AuthLevel::Root | ai_memory_core::AuthLevel::Anonymous) | None => {
+            crate::actor::skip_webhooks_from_headers(&headers)
+        }
+    };
+    let admission_ctx = if actor.has_any() || !skip_webhooks.is_empty() {
+        Some(AdmissionContext {
+            actor,
+            op: AdmissionOp::Delete,
+            skip_webhooks,
+            ..AdmissionContext::default()
+        })
+    } else {
+        None
+    };
+
+    state
+        .wiki
+        .delete_page(ws, proj, &path, admission_ctx)
+        .await
+        .map_err(|e| internal_err(e.to_string()))?;
+
+    Ok((
+        StatusCode::OK,
+        Json(
+            serde_json::to_value(DeletePageResponse {
+                path: path.to_string(),
+                deleted: true,
+            })
+            .unwrap_or_else(|_| serde_json::json!({})),
+        ),
+    ))
+}
+
+// ---------------------------------------------------------------------
 // user management (root-only)
 // ---------------------------------------------------------------------
 
@@ -3621,5 +3712,130 @@ mod tests {
             .unwrap();
         assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
         let _ = tmp;
+    }
+
+    // ---------------------------------------------------------------------
+    // delete-page
+    // ---------------------------------------------------------------------
+
+    /// Helper: POST /admin/delete-page and return (status, body json).
+    async fn post_delete_page(
+        router: &Router,
+        ws: &str,
+        project: &str,
+        path: &str,
+    ) -> (StatusCode, serde_json::Value) {
+        let req_body = serde_json::json!({
+            "workspace": ws,
+            "project": project,
+            "path": path,
+        });
+        let resp = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/admin/delete-page")
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::to_vec(&req_body).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = resp.status();
+        let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value =
+            serde_json::from_slice(&body).unwrap_or(serde_json::json!({}));
+        (status, json)
+    }
+
+    #[tokio::test]
+    async fn delete_page_removes_existing_page() {
+        let (_tmp, router) = read_page_test_router();
+        post_write_page(&router, "default", "audit", "notes/doomed.md", "bye body").await;
+
+        // Confirm the page is reachable before delete.
+        let resp = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/admin/read-page?workspace=default&project=audit&path=notes/doomed.md")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "setup precondition: page must exist before delete"
+        );
+
+        let (status, json) = post_delete_page(&router, "default", "audit", "notes/doomed.md").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(json["path"], "notes/doomed.md");
+        assert_eq!(json["deleted"], true);
+
+        // Read-back must now 404.
+        let resp = router
+            .oneshot(
+                Request::builder()
+                    .uri("/admin/read-page?workspace=default&project=audit&path=notes/doomed.md")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::NOT_FOUND,
+            "page must be gone after delete"
+        );
+    }
+
+    /// A delete request whose `(workspace, project)` doesn't resolve to a
+    /// real `(WorkspaceId, ProjectId)` must NOT report success. The shared
+    /// `resolve_ws_proj` returns the unresolved-scope error; the handler
+    /// surfaces it as a 4xx/5xx — never as `deleted: true`. This guards the
+    /// Bug 5 regression where MCP `memory_delete_page` returned `true` for
+    /// a scope it never touched.
+    #[tokio::test]
+    async fn delete_page_unknown_workspace_does_not_fake_success() {
+        let (_tmp, router) = read_page_test_router();
+        let (status, json) =
+            post_delete_page(&router, "no-such-ws", "audit", "notes/whatever.md").await;
+        assert_ne!(
+            status,
+            StatusCode::OK,
+            "delete on unresolved scope must not return 200/deleted=true; got body {json:?}",
+        );
+        assert!(
+            json.get("deleted").and_then(|v| v.as_bool()) != Some(true),
+            "body must not claim deleted=true on unresolved scope; got {json:?}"
+        );
+    }
+
+    /// `Wiki::delete_page` is idempotent for a path that doesn't exist
+    /// inside an EXISTING (workspace, project) — the file is just not there
+    /// to quarantine. The handler reports `deleted: true` (i.e. "the call
+    /// succeeded") rather than 404, matching the documented MCP semantics.
+    #[tokio::test]
+    async fn delete_page_idempotent_for_missing_file_in_existing_scope() {
+        let (_tmp, router) = read_page_test_router();
+        // Seed the project so (workspace, project) resolves, but skip the
+        // page we'll try to delete.
+        post_write_page(&router, "default", "audit", "notes/keep.md", "keeper").await;
+
+        let (status, json) =
+            post_delete_page(&router, "default", "audit", "notes/never-existed.md").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(json["deleted"], true);
+    }
+
+    #[tokio::test]
+    async fn delete_page_traversal_rejected_with_422() {
+        let (_tmp, router) = read_page_test_router();
+        let (status, _) = post_delete_page(&router, "default", "audit", "../etc/passwd").await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
     }
 }

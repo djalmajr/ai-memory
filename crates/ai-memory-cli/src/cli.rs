@@ -39,6 +39,11 @@ pub enum Command {
     ReadPage(ReadPageArgs),
     /// Write or update a wiki page atomically (also indexes it in the store).
     WritePage(WritePageArgs),
+    /// Delete a single wiki page. The server routes scope resolution
+    /// through `resolve_ws_proj`, so a delete targeting a project that
+    /// exists in multiple workspaces never silently lands in the wrong
+    /// slot (the MCP `memory_delete_page` had that gap until this build).
+    DeletePage(DeletePageArgs),
     /// Run the MCP server (with watcher) over stdio or HTTP.
     Serve(ServeArgs),
     /// Wipe the data directory's wiki/, db/, raw/ contents.
@@ -570,6 +575,23 @@ pub struct ReadPageArgs {
     /// Emit the page as JSON (includes frontmatter).
     #[arg(long)]
     pub json: bool,
+}
+
+/// Arguments for `delete-page`.
+#[derive(Debug, Args)]
+pub struct DeletePageArgs {
+    /// Exact wiki path to delete (e.g. `notes/foo.md`).
+    #[arg(long)]
+    pub path: String,
+    /// Workspace name. Defaults to `default`. Required (no auto-detect) so
+    /// a cross-workspace project-name collision can never silently route
+    /// the delete to the wrong slot.
+    #[arg(long, default_value_t = crate::config::DEFAULT_WORKSPACE.to_string())]
+    pub workspace: String,
+    /// Project name. When omitted, auto-derived from the current project
+    /// (same heuristic write-page/read-page use).
+    #[arg(long)]
+    pub project: Option<String>,
 }
 
 /// Arguments for `reset`.

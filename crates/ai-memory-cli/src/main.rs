@@ -45,6 +45,7 @@ async fn main() -> Result<()> {
         Command::Search(args) => commands::search::run(&config, args).await,
         Command::ReadPage(args) => commands::read_page::run(&config, args).await,
         Command::WritePage(args) => commands::write_page::run(&config, args).await,
+        Command::DeletePage(args) => commands::delete_page::run(&config, args).await,
         Command::Serve(args) => commands::serve::run(&config, args).await,
         Command::Reset(args) => commands::reset::run(&config, args),
         Command::Backup(args) => commands::backup::run(&config, args).await,

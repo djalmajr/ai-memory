@@ -10,6 +10,7 @@ pub mod backup;
 pub mod bootstrap;
 pub mod commit;
 pub mod data_purge;
+pub mod delete_page;
 pub mod embed;
 pub mod forget_sweep;
 pub mod generate_auth_token;

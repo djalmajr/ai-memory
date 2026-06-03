@@ -6,6 +6,25 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
+### Added
+- New `POST /admin/delete-page` HTTP endpoint deletes a single page with
+  explicit `(workspace, project)`. Like `purge-project`/`rename-project`, it
+  uses no-create lookup — a delete on a typo'd or wrong scope now returns
+  `404 workspace 'X' not found` instead of silently auto-creating the
+  container and returning misleading `deleted: true`.
+- New `ai-memory delete-page --path <P> --workspace <W> --project <P>` CLI
+  subcommand, a thin client of `/admin/delete-page`. Mirrors the
+  write-page/read-page CLI shape so terminal users get a complete
+  delete-single-page surface for the first time.
+
+### Fixed
+- `memory_delete_page` (MCP) now accepts `workspace` alongside `project` and
+  routes scope through `effective_ids_for_read_args`, the same path the read
+  tools use. Previously a project name that lived in multiple workspaces
+  could silently route the delete to the wrong slot and return `deleted:
+  true` for a page that was never touched. Operators on shared (multi-
+  workspace) servers should explicitly pass `workspace + project` to make
+  the target unambiguous.
 
 ## [0.9.0] - 2026-06-02
 ### Added

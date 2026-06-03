@@ -71,7 +71,7 @@ match the intent to the tool. They do not need to name the tool.
 | "consolidate this session" / "compile what we learned" (also runs on PreCompact; at session end only if `AI_MEMORY_CONSOLIDATE_ON_SESSION_END` is set) | `memory_consolidate` |
 | "remember this permanently" / "save a note" / "add an annotation" / durable project knowledge | `memory_write_page` (write a wiki page; do **not** use handoff for permanent notes; put the title as a `# H1` on the first line of `body` and omit the `title` arg — ai-memory derives it from the H1) |
 | "read the page about X" / "show me the full content of Y" / "open the page on Z" | `memory_read_page` (full body; pass a query to search or `path` for a direct lookup; pass `workspace` + `project` together only for a named sibling workspace/project) |
-| "delete the page X" / "remove that note" | `memory_delete_page` (by exact `path`; idempotent) |
+| "delete the page X" / "remove that note" | `memory_delete_page` (by exact `path`; idempotent; pass `workspace` + `project` together only for a named sibling workspace/project) |
 | "audit the wiki" / "find contradictions" / "what rules should we add?" | `memory_lint` |
 | "prune old pages" / "memory cleanup" | `memory_forget_sweep` |
 

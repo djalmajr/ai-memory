@@ -91,7 +91,10 @@ the conversation calls for them:\n\
   not just snippets.\n\
 - `memory_delete_page` — when the user explicitly asks to delete or \
   remove a specific page (by exact path). Idempotent; fires the \
-  admission chain so mirrors/backups stay consistent.\n\
+  admission chain so mirrors/backups stay consistent. Pass `workspace` \
+  + `project` together only when the page lives in a sibling workspace \
+  (otherwise a project name that exists in multiple workspaces can \
+  silently route the delete to the wrong slot).\n\
 - `memory_lint` — when the user asks to audit the wiki for stale \
   pages, contradictions, or rule suggestions.\n\
 - `memory_forget_sweep` — when the user wants to prune old / cold \
@@ -406,6 +409,15 @@ struct DeletePageArgs {
     /// user explicitly names a *different* project.**
     #[serde(default)]
     project: Option<String>,
+    /// Workspace to delete from together with `project`. Omit to use the
+    /// current/default workspace resolution chain. Provide both to delete a
+    /// page that lives in a *different* workspace (e.g. a sibling project on
+    /// a shared server). Without this, a delete targeting a project that
+    /// exists in MULTIPLE workspaces can silently land in the wrong slot —
+    /// fixed by routing scope resolution through the same path the read
+    /// tools use (`effective_ids_for_read_args`).
+    #[serde(default)]
+    workspace: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
@@ -1203,6 +1215,9 @@ impl AiMemoryServer {
         delete or remove a page. Fires the admission chain (op=delete) \
         before the file is removed so backups/mirrors stay consistent. \
         Idempotent — deleting a page that is already gone is a no-op. \
+        Pass `workspace` + `project` together when the page lives in a \
+        sibling workspace (otherwise a project name that exists in multiple \
+        workspaces can silently route the delete to the wrong slot). \
         Returns `{ path, deleted }`.")]
     async fn memory_delete_page(
         &self,
@@ -1217,7 +1232,13 @@ impl AiMemoryServer {
         };
         let path = PagePath::new(args.path.clone())
             .map_err(|e| McpError::internal_error(format!("invalid path: {e}"), None))?;
-        let (ws, proj) = self.effective_ids(args.project.as_deref()).await;
+        // Same resolution as read/write tools: when (workspace, project) are
+        // BOTH given, they're looked up explicitly; otherwise the cwd-based
+        // active-project chain is used. Closes the silent cross-workspace
+        // delete that the single-arg `effective_ids(project)` allowed.
+        let (ws, proj) = self
+            .effective_ids_for_read_args(args.workspace.as_deref(), args.project.as_deref())
+            .await?;
 
         // Carry actor identity + loop-prevention skip list (same as write_page).
         // `Wiki::delete_page` stamps `op = Delete` regardless of what we pass.
@@ -2722,6 +2743,7 @@ mod tests {
                 Parameters(DeletePageArgs {
                     path: "notes/temp.md".into(),
                     project: None,
+                    workspace: None,
                 }),
                 rmcp::handler::server::tool::Extension(parts()),
             )
@@ -2760,6 +2782,128 @@ mod tests {
             !recent_text.contains("notes/temp.md"),
             "deleted page must not linger in the index; got {recent_text}"
         );
+    }
+
+    /// Bug 5 regression: when a project name lives in MULTIPLE workspaces,
+    /// `memory_delete_page` without `workspace` resolved scope via
+    /// `effective_ids(project)` and could silently land in the wrong slot
+    /// (returning `deleted: true` while the page survived in the workspace
+    /// the operator actually meant). Passing `workspace` + `project` now
+    /// flows through `effective_ids_for_read_args` — the same path the read
+    /// tools use — so the delete lands EXACTLY where the operator pointed.
+    #[tokio::test]
+    async fn memory_delete_page_with_explicit_workspace_targets_right_scope() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let ws_alpha = store.writer.get_or_create_workspace("alpha").await.unwrap();
+        let proj_alpha_shared = store
+            .writer
+            .get_or_create_project(ws_alpha, "shared", None)
+            .await
+            .unwrap();
+        let ws_beta = store.writer.get_or_create_workspace("beta").await.unwrap();
+        let proj_beta_shared = store
+            .writer
+            .get_or_create_project(ws_beta, "shared", None)
+            .await
+            .unwrap();
+        let wiki = Wiki::new(tmp.path(), store.writer.clone()).unwrap();
+        // Server's baked default is alpha/shared; beta/shared is the
+        // sibling we'll target via explicit (workspace, project).
+        let server = AiMemoryServer::new(
+            store.reader.clone(),
+            store.writer.clone(),
+            ws_alpha,
+            proj_alpha_shared,
+        )
+        .with_wiki(wiki);
+        let parts = || {
+            axum::http::Request::builder()
+                .uri("/mcp")
+                .method("POST")
+                .body(())
+                .unwrap()
+                .into_parts()
+                .0
+        };
+
+        // Seed both workspaces with a SAME-NAMED page.
+        server
+            .memory_write_page(
+                Parameters(WritePageArgs {
+                    path: "notes/twin.md".into(),
+                    body: "# alpha twin".into(),
+                    title: None,
+                    tier: Some("semantic".into()),
+                    tags: vec![],
+                    pinned: false,
+                    project: Some("shared".into()),
+                    workspace: Some("alpha".into()),
+                }),
+                rmcp::handler::server::tool::Extension(parts()),
+            )
+            .await
+            .unwrap();
+        server
+            .memory_write_page(
+                Parameters(WritePageArgs {
+                    path: "notes/twin.md".into(),
+                    body: "# beta twin".into(),
+                    title: None,
+                    tier: Some("semantic".into()),
+                    tags: vec![],
+                    pinned: false,
+                    project: Some("shared".into()),
+                    workspace: Some("beta".into()),
+                }),
+                rmcp::handler::server::tool::Extension(parts()),
+            )
+            .await
+            .unwrap();
+
+        // Delete from BETA only, explicit scope.
+        server
+            .memory_delete_page(
+                Parameters(DeletePageArgs {
+                    path: "notes/twin.md".into(),
+                    project: Some("shared".into()),
+                    workspace: Some("beta".into()),
+                }),
+                rmcp::handler::server::tool::Extension(parts()),
+            )
+            .await
+            .unwrap();
+
+        // Alpha twin must survive.
+        let read_alpha = server
+            .memory_read_page(Parameters(ReadPageArgs {
+                query: None,
+                path: Some("notes/twin.md".into()),
+                project: Some("shared".into()),
+                workspace: Some("alpha".into()),
+            }))
+            .await;
+        assert!(
+            read_alpha.is_ok(),
+            "alpha/shared/notes/twin.md must survive a delete targeting beta"
+        );
+
+        // Beta twin must be gone (file-on-disk delete + DB row cleared).
+        let read_beta = server
+            .memory_read_page(Parameters(ReadPageArgs {
+                query: None,
+                path: Some("notes/twin.md".into()),
+                project: Some("shared".into()),
+                workspace: Some("beta".into()),
+            }))
+            .await;
+        assert!(
+            read_beta.is_err(),
+            "beta/shared/notes/twin.md must be gone after delete with explicit workspace"
+        );
+
+        // Defense-in-depth: the alpha-side IDs survive purge-check (project_id != deleted).
+        let _ = proj_beta_shared;
     }
 
     #[tokio::test]
