@@ -350,3 +350,79 @@ async fn rename_project_pages_still_searchable() {
         "page must still be searchable after rename: {hits}"
     );
 }
+
+/// Regression for the rename-vs-purge race surfaced by live exploration.
+///
+/// The race shape: admin handler resolves `(ws_id, proj_id)` via the
+/// reader pool, then dispatches the rename to the writer actor. A
+/// `POST /admin/purge-project` that arrives between those two steps
+/// deletes the row. The writer's `UPDATE projects` then affects ZERO
+/// rows but `conn.execute` returns `Ok(0)` — the pre-fix code accepted
+/// any `Ok` as success and the handler responded `200 OK` for an
+/// operation that touched nothing.
+///
+/// We don't need a concurrent purge to reproduce the symptom: any
+/// state where the project row is gone but the admin handler still
+/// holds its id triggers the same code path. The test takes the
+/// shortcut of purging serially first, then asserting that a rename
+/// of the now-vanished project returns `404 Not Found` instead of a
+/// false `200 OK`.
+#[tokio::test]
+async fn rename_project_after_purge_returns_404_not_silent_200() {
+    let tmp = TempDir::new().unwrap();
+    let (state, store) = make_state(&tmp).await;
+
+    // Seed default/race-victim so the workspace + project rows exist.
+    seed_page(&store, &state.wiki, "race-victim").await;
+
+    // Purge the row out from under any in-flight rename.
+    let purge_state = AdminState {
+        writer: state.writer.clone(),
+        reader: state.reader.clone(),
+        wiki: state.wiki.clone(),
+        llm: state.llm.clone(),
+        embedder: state.embedder.clone(),
+        provider_health: state.provider_health.clone(),
+        decay_params: state.decay_params,
+        data_dir: state.data_dir.clone(),
+        db_path: state.db_path.clone(),
+        bind: state.bind.clone(),
+        bootstrap_lock: state.bootstrap_lock.clone(),
+        token_pepper: None,
+        active_project: state.active_project.clone(),
+        on_project_moved: None,
+    };
+    let purge_resp = post(
+        purge_state,
+        "/admin/purge-project",
+        json!({ "workspace": "default", "project": "race-victim", "confirm": true }),
+    )
+    .await;
+    assert_eq!(
+        purge_resp.status(),
+        StatusCode::OK,
+        "purge step must succeed"
+    );
+
+    // Now rename the now-deleted project. Without the fix this returns
+    // `200 OK` with `pages: 0` — visibly indistinguishable from a happy
+    // path on an empty project. With the fix the writer surfaces
+    // `StoreError::NotFound` and the admin handler maps to 404.
+    let rename_resp = post(
+        state,
+        "/admin/rename-project",
+        json!({ "workspace": "default", "from": "race-victim", "to": "race-survivor" }),
+    )
+    .await;
+
+    // The pre-lookup also runs against the missing project; depending
+    // on which step trips the absence (handler-level `lookup_ws_proj_no_create`
+    // vs writer-side `UPDATE projects ... = 0 rows`), either path must
+    // produce a 404. Accept either — the load-bearing invariant is
+    // "no false 200 OK".
+    assert_eq!(
+        rename_resp.status(),
+        StatusCode::NOT_FOUND,
+        "rename of a vanished project must NOT silently return 200"
+    );
+}

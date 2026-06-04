@@ -1593,7 +1593,11 @@ async fn handle_rename_project(
     };
 
     // Step 3: execute the rename. The writer validates the name and
-    // returns ProjectNameTaken / InvalidProjectName on conflicts.
+    // returns ProjectNameTaken / InvalidProjectName on conflicts. A
+    // `NotFound` here signals a race — typically a concurrent
+    // `purge-project` deleted the row between the lookup above and
+    // this UPDATE. Map it to 404 so the caller sees an honest failure
+    // instead of the previous false-200.
     if let Err(e) = state
         .writer
         .rename_project(ws_id, proj_id, req.to.clone())
@@ -1603,6 +1607,7 @@ async fn handle_rename_project(
             StoreError::ProjectNameTaken(_) | StoreError::InvalidProjectName(_) => {
                 StatusCode::UNPROCESSABLE_ENTITY
             }
+            StoreError::NotFound(_) => StatusCode::NOT_FOUND,
             _ => StatusCode::INTERNAL_SERVER_ERROR,
         };
         return (status, Json(serde_json::json!({ "error": e.to_string() })));

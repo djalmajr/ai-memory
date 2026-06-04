@@ -917,6 +917,17 @@ pub fn rename_project(
     );
 
     match rows {
+        // Zero rows affected means the project row vanished between the
+        // admin handler's `lookup_ws_proj_no_create` and this UPDATE —
+        // the classic shape is a concurrent `purge-project` racing the
+        // rename. Without this check, the rename would happily return
+        // `Ok(())` and the admin handler would respond `200 OK` for an
+        // operation that touched nothing, contradicting the purge's
+        // (also `200 OK`) destruction of the same row.
+        Ok(0) => Err(StoreError::NotFound(format!(
+            "project id {project_id} no longer exists in workspace {workspace_id} \
+             (race with concurrent purge or delete)",
+        ))),
         Ok(_) => Ok(()),
         Err(rusqlite::Error::SqliteFailure(err, _))
             if err.extended_code == rusqlite::ffi::SQLITE_CONSTRAINT_UNIQUE
@@ -2220,5 +2231,45 @@ mod tests {
             ..mismatched_handoff
         };
         insert_handoff(&mut conn, &good_handoff).unwrap();
+    }
+
+    /// Regression for the rename-vs-purge race that live exploration
+    /// caught: a `rename_project` for a row that was deleted between
+    /// the admin handler's `lookup_ws_proj_no_create` and the
+    /// `UPDATE projects` used to silently return `Ok(())` — the admin
+    /// endpoint then responded `200 OK` for an operation that touched
+    /// zero rows, contradicting the concurrent purge's (also `200 OK`)
+    /// destruction of the same project. After the fix, the writer
+    /// returns `StoreError::NotFound`, which the admin handler maps to
+    /// `404 Not Found`. Pins both the writer-side semantic and a
+    /// concrete recipe for the failure shape so a future refactor
+    /// can't quietly downgrade the error back to a silent Ok.
+    #[test]
+    fn rename_project_after_purge_returns_not_found() {
+        let (_tmp, mut conn, ws, proj) = fresh_db();
+        // Simulate the post-purge state: project row gone.
+        // `purge_project` drives the cascading deletes we want here.
+        let _ = purge_project(&mut conn, &ws, &proj, "default/scratch")
+            .expect("purge of fresh project should succeed");
+        // Now try to rename the project that no longer exists. The
+        // pre-fix code returned `Ok(())` because `UPDATE` affected
+        // zero rows. The fix returns `NotFound` so admin handlers
+        // can respond 404 honestly.
+        let err = rename_project(&mut conn, &ws, &proj, "renamed")
+            .expect_err("rename of purged project must error");
+        match err {
+            StoreError::NotFound(_) => {}
+            other => panic!("expected StoreError::NotFound, got {other:?}"),
+        }
+    }
+
+    /// Belt-and-suspenders for the common path: rename of an existing
+    /// project still succeeds. Without this, a future "always return
+    /// NotFound" regression would also pass the test above by accident.
+    #[test]
+    fn rename_project_of_live_project_succeeds() {
+        let (_tmp, mut conn, ws, proj) = fresh_db();
+        rename_project(&mut conn, &ws, &proj, "renamed-live")
+            .expect("rename of live project must succeed");
     }
 }
