@@ -31,6 +31,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `ActorContext` into scope resolution, so opt-in isolation takes effect
   for the full read surface.
 
+### Fixed
+- `POST /admin/rename-project` now returns `404 Not Found` when the project row
+  has been deleted (typically by a concurrent `purge-project`) between the
+  handler's id lookup and the writer's `UPDATE`. The pre-fix path silently
+  responded `200 OK` with `pages: 0` for an operation that affected zero rows,
+  which contradicted the concurrent purge's also-`200 OK` destruction of the
+  same project and gave operators no signal that the rename had been undone.
+
 ## [0.10.0] - 2026-06-04
 ### Added
 - New `POST /admin/delete-page` HTTP endpoint deletes a single page with
