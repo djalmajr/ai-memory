@@ -54,6 +54,10 @@ pub enum Command {
     Restore(RestoreArgs),
     /// Print (or apply) lifecycle-hook configuration for an agent CLI.
     InstallHooks(InstallHooksArgs),
+    /// Emit a single lifecycle hook natively (reads the event payload
+    /// from stdin), avoiding a shell spawn. Used by the WindowsNative
+    /// hook config; mirrors hooks/<agent>/<event>.sh.
+    Hook(HookArgs),
     /// Print MCP server registration snippets for any supported client
     /// (Claude Code, Codex, OpenCode, Cursor, Claude Desktop, Gemini
     /// CLI, OpenClaw, pi). See docs/mcp-install.md for the full guide.
@@ -792,6 +796,23 @@ pub struct LlmTestArgs {
     /// Optional API key override (otherwise pulled from env).
     #[arg(long, hide_env_values = true)]
     pub api_key: Option<String>,
+}
+
+/// Arguments for `hook` — emit one lifecycle event natively.
+#[derive(Debug, Args)]
+pub struct HookArgs {
+    /// Lifecycle event, e.g. `pre-tool-use`, `session-start`.
+    #[arg(long)]
+    pub event: String,
+    /// Agent name to attribute the event to, e.g. `claude-code`.
+    #[arg(long)]
+    pub agent: String,
+    /// Base URL of the ai-memory hook server.
+    #[arg(long)]
+    pub server_url: String,
+    /// Optional bearer token (`Authorization: Bearer <token>`).
+    #[arg(long, hide_env_values = true)]
+    pub auth_token: Option<String>,
 }
 
 /// Arguments for `install-hooks`.

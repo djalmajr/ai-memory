@@ -17,10 +17,13 @@ launches Claude Code, Codex, Cursor, Gemini CLI, or another agent.
 The difference matters because hook configs contain executable paths.
 WSL2 agents need Linux paths and POSIX `.sh` hooks. Native Windows
 agents need Windows paths, but the hook runner is agent-specific:
-Claude Code invokes hooks through Git Bash, so ai-memory renders
-`bash -c` commands that call `.sh` scripts with Git Bash paths
-(`/c/Users/...`). Other native Windows script-hook agents keep the
-PowerShell `.ps1` default until their harness behavior is verified.
+Claude Code invokes its hooks as a direct native binary call
+(`"…ai-memory.exe" hook --event …`) with no shell — see [Native Hook
+Command](#native-hook-command-claude-code-on-windows). Set
+`AI_MEMORY_HOOK_PLATFORM=windows-bash` to fall back to the older
+`bash -c` + `.sh` Git Bash commands. Other native Windows script-hook
+agents keep the PowerShell `.ps1` default until their harness behavior
+is verified.
 
 ## Scenario A: Everything Inside WSL2
 
@@ -101,8 +104,10 @@ the CLI to render hook commands for the native Windows agent:
 
 - Config files are written through the mounted Windows home directory.
 - Hook scripts are staged under `$HOME\.local\share\ai-memory\hooks\`.
-- Claude Code hook commands call `bash -c` and point at `.sh` scripts using
-  Git Bash paths such as `/c/Users/alice/...`.
+- Claude Code hook commands call the `ai-memory` binary directly
+  (`"…ai-memory.exe" hook --event …`), no shell — set
+  `AI_MEMORY_HOOK_PLATFORM=windows-bash` for the old `bash -c` + `.sh`
+  Git Bash path.
 - Other native Windows script-hook agents currently call `powershell.exe` and
   point at `.ps1` scripts.
 
@@ -136,11 +141,37 @@ target\debug\ai-memory.exe install-mcp --client claude-code --apply
 target\debug\ai-memory.exe install-hooks --agent claude-code --apply
 ```
 
-Native Windows builds render agent-specific lifecycle hooks. Claude Code uses
-Git Bash-compatible `.sh` commands on native Windows; other script-hook agents
-use the PowerShell `.ps1` default. The hook bundle ships matching `.sh` and
-`.ps1` event scripts, and tests enforce one-to-one event/agent parity between
-them.
+Native Windows builds render agent-specific lifecycle hooks. Claude Code
+defaults to the native binary command (see below); other script-hook agents
+use the PowerShell `.ps1` default. The hook bundle still ships matching `.sh`
+and `.ps1` event scripts as a fallback, and tests enforce one-to-one
+event/agent parity between them.
+
+## Native Hook Command (Claude Code on Windows)
+
+By default on native Windows, Claude Code hooks are rendered as a direct
+call to the `ai-memory` binary instead of a `bash -c` wrapper around a
+`.sh` script:
+
+```
+"C:\Users\you\.cargo\bin\ai-memory.exe" hook --event pre-tool-use --agent claude-code --server-url "http://host:49374" --auth-token "..."
+```
+
+This avoids spawning Git Bash plus `cat`/`sed`/`curl` child processes on
+every tool call. Process spawning is expensive on Windows, so the native
+path is roughly 3-5× faster per hook (measured ~735 ms shell → ~150-205 ms
+native on an i7-6700HQ). Notes:
+
+- The binary path comes from the `ai-memory` that runs `install-hooks`, so
+  `cargo install --path crates/ai-memory-cli` puts it on a stable
+  `~/.cargo/bin` path.
+- The command is double-quoted: Claude Code runs hook commands through
+  `cmd.exe`, which rejects POSIX single quotes; double quotes work in both
+  cmd.exe and Git Bash.
+- The `.sh`/`.ps1` scripts stay bundled as a fallback — the Docker /
+  `setup-agent` flow (no local binary) keeps emitting the shell command.
+- To force the old Git Bash behavior, set
+  `AI_MEMORY_HOOK_PLATFORM=windows-bash` before running `install-hooks`.
 
 ## Current Harness Caveats
 
@@ -148,8 +179,9 @@ Windows hook support is new and needs real-world testing against native
 Windows agent builds.
 
 - Claude Code may be used natively on Windows or from inside WSL2. Native
-  Claude Code invokes hooks through Git Bash; WSL2 Claude Code uses normal
-  WSL paths.
+  Claude Code invokes hooks as a direct binary call (no shell) by default;
+  `AI_MEMORY_HOOK_PLATFORM=windows-bash` restores the Git Bash `bash -c`
+  path. WSL2 Claude Code uses normal WSL `.sh` paths.
 - Codex, OpenCode, Cursor, Gemini CLI, and OpenClaw may each choose different
   Windows config locations or shell execution behavior. ai-memory uses
   the current best-known defaults, but they need validation on real
@@ -176,8 +208,9 @@ For native Windows:
 1. Run all install commands from PowerShell or `cmd.exe` using
    `ai-memory` / `ai-memory.ps1`.
 2. Confirm generated hook commands match the agent: Claude Code should use
-   `bash -c` plus `.sh` files with `/c/...` Git Bash paths; other script-hook
-   agents should use `.ps1` files under your Windows home directory.
+   the native `"…ai-memory.exe" hook --event …` command (or `bash -c` + `.sh`
+   when `AI_MEMORY_HOOK_PLATFORM=windows-bash`); other script-hook agents
+   should use `.ps1` files under your Windows home directory.
 3. Launch the native Windows agent.
 4. Call `memory_status` from the agent.
 5. Send a prompt, then run `ai-memory status` or `ai-memory recent`.

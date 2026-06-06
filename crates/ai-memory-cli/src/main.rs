@@ -27,6 +27,18 @@ use config::Config;
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
+
+    // Hooks fire on every tool call: they must be cheap and must emit ONLY
+    // their JSON object to stdout. Short-circuit before config load and
+    // tracing init (added latency + possible stdout noise). The hook reads
+    // its server URL + token from flags, so it needs no config.
+    if matches!(cli.command, Command::Hook(_)) {
+        let Command::Hook(args) = cli.command else {
+            unreachable!()
+        };
+        return commands::hook::run(args).await;
+    }
+
     let config_path = cli.config.clone();
 
     let config = Arc::new(Config::load(cli.config.as_deref(), cli.data_dir.clone())?);
@@ -51,6 +63,8 @@ async fn main() -> Result<()> {
         Command::Backup(args) => commands::backup::run(&config, args).await,
         Command::Restore(args) => commands::restore::run(&config, args),
         Command::InstallHooks(args) => commands::install_hooks::run(&config, args),
+        // `Hook` is handled in the fast-path above (before config/tracing).
+        Command::Hook(_) => unreachable!("hook handled before config load"),
         Command::InstallMcp(args) => commands::install_mcp::run(&config, args),
         Command::Commit(args) => commands::commit::run(&config, args).await,
         Command::LlmTest(args) => commands::llm_test::run(&config, args).await,

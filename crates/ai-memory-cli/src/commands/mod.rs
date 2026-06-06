@@ -14,6 +14,8 @@ pub mod delete_page;
 pub mod embed;
 pub mod forget_sweep;
 pub mod generate_auth_token;
+pub mod hook;
+pub mod hook_capture;
 pub mod init;
 pub mod install_hooks;
 pub mod install_instructions;

@@ -334,6 +334,11 @@ pub(crate) enum HookCommandPlatform {
     /// wrapped in `bash -c '...'` with drive-letter paths converted
     /// to Git Bash format (`C:\x` → `/c/x`).
     WindowsBash,
+    /// Windows, native: invoke the `ai-memory` binary directly
+    /// (`<exe> hook --event … --agent …`) with no shell or child
+    /// processes — ~3.5× faster per hook than `WindowsBash`. Default for
+    /// Claude Code on Windows; see docs/windows-native-hooks.md.
+    WindowsNative,
 }
 
 impl HookCommandPlatform {
@@ -344,6 +349,7 @@ impl HookCommandPlatform {
                 Self::Posix
             }
             Ok(v) if v.eq_ignore_ascii_case("windows-bash") => Self::WindowsBash,
+            Ok(v) if v.eq_ignore_ascii_case("windows-native") => Self::WindowsNative,
             _ if cfg!(windows) => Self::Windows,
             _ => Self::Posix,
         }
@@ -359,7 +365,8 @@ impl HookCommandPlatform {
                 Self::Posix
             }
             Ok(v) if v.eq_ignore_ascii_case("windows-bash") => Self::WindowsBash,
-            _ if cfg!(windows) => Self::WindowsBash,
+            Ok(v) if v.eq_ignore_ascii_case("windows-native") => Self::WindowsNative,
+            _ if cfg!(windows) => Self::WindowsNative,
             _ => Self::Posix,
         }
     }
@@ -427,7 +434,9 @@ fn build_hook_payload_for_platform(
 
 fn script_for_platform(script: &str, platform: HookCommandPlatform) -> Cow<'_, str> {
     match platform {
-        HookCommandPlatform::Posix | HookCommandPlatform::WindowsBash => Cow::Borrowed(script),
+        HookCommandPlatform::Posix
+        | HookCommandPlatform::WindowsBash
+        | HookCommandPlatform::WindowsNative => Cow::Borrowed(script),
         HookCommandPlatform::Windows => match script.strip_suffix(".sh") {
             Some(stem) => Cow::Owned(format!("{stem}.ps1")),
             None => Cow::Borrowed(script),
@@ -479,6 +488,35 @@ fn hook_command(
             inner.push_str(&shell_quote(&bash_path));
             format!("bash -c {}", shell_quote(&inner))
         }
+        HookCommandPlatform::WindowsNative => {
+            // Invoke the binary directly: `"<exe>" hook --event <e> --agent
+            // claude-code --server-url "<url>" [--auth-token "<t>"]`. The
+            // event token is the script stem (`pre-tool-use.sh` →
+            // `pre-tool-use`). No shell, no child processes.
+            //
+            // Quote with DOUBLE quotes, not POSIX single quotes: Claude Code
+            // on Windows runs the hook command through cmd.exe, which treats
+            // '…' literally and errors out; double quotes + the native
+            // Windows path work in BOTH cmd.exe and Git Bash (verified). The
+            // event name is a fixed slug with no shell metacharacters, so it
+            // is left unquoted.
+            let exe = std::env::current_exe()
+                .map(|p| p.to_string_lossy().into_owned())
+                .unwrap_or_else(|_| "ai-memory".to_string());
+            let event = script
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or_default();
+            let mut cmd = format!(
+                "{} hook --event {event} --agent claude-code --server-url {}",
+                win_double_quote(&exe),
+                win_double_quote(server_url),
+            );
+            if let Some(t) = auth_token {
+                cmd.push_str(&format!(" --auth-token {}", win_double_quote(t)));
+            }
+            cmd
+        }
     }
 }
 
@@ -515,6 +553,16 @@ fn shell_quote(s: &str) -> String {
 
 fn powershell_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', "''"))
+}
+
+/// Wrap a value in double quotes for the `WindowsNative` hook command.
+/// Claude Code on Windows runs hook commands via cmd.exe, which does not
+/// honour POSIX single quotes; double quotes work in both cmd.exe and Git
+/// Bash. The quoted values (binary path, URL, hex auth token) never
+/// contain a literal `"`; any is stripped defensively rather than risk a
+/// broken command line.
+fn win_double_quote(s: &str) -> String {
+    format!("\"{}\"", s.replace('"', ""))
 }
 
 #[cfg(test)]
@@ -741,11 +789,54 @@ mod tests {
             .pointer("/hooks/SessionStart/0/hooks/0/command")
             .and_then(|s| s.as_str())
             .unwrap();
-        assert!(command.contains("AI_MEMORY_HOOK_URL="));
+        // Format-agnostic: POSIX/WindowsBash inline `AI_MEMORY_HOOK_URL=…`,
+        // WindowsNative passes `--server-url …`. Both carry the host:port,
+        // and neither must carry a token when none was supplied.
         assert!(
-            !command.contains("AI_MEMORY_AUTH_TOKEN="),
+            command.contains("localhost:49374"),
+            "server url expected: {command}"
+        );
+        assert!(
+            !command.contains("AUTH_TOKEN") && !command.contains("--auth-token"),
             "no token expected in command: {command}"
         );
+    }
+
+    #[test]
+    fn windows_native_emits_binary_command_with_event_token() {
+        let root = PathBuf::from(r"C:\hooks");
+        let v = build_hook_payload_for_platform(
+            &CLAUDE_CODE_EVENTS,
+            &root,
+            "http://h:49374",
+            Some("tok"),
+            HookShape::Nested,
+            HookCommandPlatform::WindowsNative,
+        );
+        // Each native command must carry `hook --event <stem>` where <stem>
+        // matches the .sh script the other platforms invoke — so the server
+        // buckets the event identically — and must not spawn a shell.
+        for (event, script) in CLAUDE_CODE_EVENTS {
+            let stem = script.strip_suffix(".sh").unwrap();
+            let cmd = v
+                .pointer(&format!("/hooks/{event}/0/hooks/0/command"))
+                .and_then(|s| s.as_str())
+                .unwrap();
+            assert!(
+                cmd.contains(&format!("hook --event {stem}")),
+                "{event}: {cmd}"
+            );
+            assert!(cmd.contains("--agent claude-code"), "{event}: {cmd}");
+            assert!(
+                cmd.contains("--server-url \"http://h:49374\""),
+                "{event}: {cmd}"
+            );
+            assert!(cmd.contains("--auth-token \"tok\""), "{event}: {cmd}");
+            assert!(
+                !cmd.contains("bash -c"),
+                "{event}: must not spawn a shell: {cmd}"
+            );
+        }
     }
 
     #[test]
