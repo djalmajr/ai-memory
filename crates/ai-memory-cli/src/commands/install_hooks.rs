@@ -336,6 +336,61 @@ fn bearer_token_from_header(header: &str) -> Option<String> {
         .map(ToOwned::to_owned)
 }
 
+/// True if a hook-array entry belongs to ai-memory — i.e. some command
+/// string inside it mentions the `ai-memory` binary/script. Used to
+/// replace our own entries on re-apply while preserving hooks that other
+/// tools registered under the same event.
+fn is_ai_memory_hook_entry(entry: &serde_json::Value) -> bool {
+    fn mentions_ai_memory(value: &serde_json::Value) -> bool {
+        value
+            .get("command")
+            .and_then(|c| c.as_str())
+            .map(|c| c.to_ascii_lowercase())
+            // Case-insensitive, and matches BOTH the binary/script path
+            // (`ai-memory`) AND the inlined env vars (`AI_MEMORY_HOOK_URL` /
+            // `AI_MEMORY_AUTH_TOKEN`). The env vars are present in every
+            // command shape (native, bash, PowerShell), so detection works
+            // even when the hooks dir path has no "ai-memory" in it.
+            .is_some_and(|c| c.contains("ai-memory") || c.contains("ai_memory"))
+    }
+    // Flat shape (Cursor): `{ "type":"command", "command":"…" }`.
+    // Nested shape (Claude Code / Codex / Gemini):
+    // `{ "matcher":"", "hooks":[ {"command":"…"} ] }`.
+    mentions_ai_memory(entry)
+        || entry
+            .get("hooks")
+            .and_then(|h| h.as_array())
+            .is_some_and(|inner| inner.iter().any(mentions_ai_memory))
+}
+
+/// Overlay our hook entries for one event onto the user's existing array
+/// for that event: drop any prior ai-memory entries (so re-running
+/// `install-hooks` never duplicates them) and append ours, while keeping
+/// every third-party hook registered under the same event. Replaces a
+/// blind `map.insert(event, value)`, which discarded co-located hooks
+/// from other tools (e.g. a context-mode SessionStart hook).
+fn overlay_event_hooks(
+    map: &mut serde_json::Map<String, serde_json::Value>,
+    event: &str,
+    our_value: &serde_json::Value,
+) {
+    let mut entries: Vec<serde_json::Value> = map
+        .get(event)
+        .and_then(|v| v.as_array())
+        .map(|existing| {
+            existing
+                .iter()
+                .filter(|e| !is_ai_memory_hook_entry(e))
+                .cloned()
+                .collect()
+        })
+        .unwrap_or_default();
+    if let Some(ours) = our_value.as_array() {
+        entries.extend(ours.iter().cloned());
+    }
+    map.insert(event.to_string(), serde_json::Value::Array(entries));
+}
+
 /// Mutate `~/.claude/settings.json` in place: replace the seven hook
 /// entries ai-memory cares about; preserve every other hook the user
 /// has wired up to other tools.
@@ -359,17 +414,18 @@ fn apply_to_claude_code_settings(
         .clone();
     let outcome = apply_atomic(&path, |existing| {
         mutate_json(existing, |root| {
-            // Get-or-create the top-level `hooks` table, then OVERLAY
-            // our seven event keys onto the user's table. Anything
-            // they had under a non-overlapping event name (e.g. a
-            // hand-written "Notification" hook) survives.
+            // Get-or-create the top-level `hooks` table, then merge our
+            // event keys in via `overlay_event_hooks`: our entries replace
+            // any prior ai-memory entries, while hooks the user (or another
+            // tool) wired under the same event — or under a non-overlapping
+            // event name (e.g. a hand-written "Notification" hook) — survive.
             let hooks = root
                 .entry("hooks")
                 .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()))
                 .as_object_mut()
                 .context("`hooks` is present in settings.json but not an object")?;
             for (event, value) in &our_hooks {
-                hooks.insert(event.clone(), value.clone());
+                overlay_event_hooks(hooks, event, value);
             }
             Ok(())
         })
@@ -476,7 +532,7 @@ fn merge_codex_hooks(
             // without dead keys.
             hooks.remove("SessionEnd");
             for (event, value) in &our_hooks {
-                hooks.insert(event.clone(), value.clone());
+                overlay_event_hooks(hooks, event, value);
             }
             Ok(())
         })
@@ -553,7 +609,7 @@ fn merge_cursor_hooks(
                 .as_object_mut()
                 .context("`hooks` is present in hooks.json but not an object")?;
             for (event, value) in &our_hooks {
-                hooks.insert(event.clone(), value.clone());
+                overlay_event_hooks(hooks, event, value);
             }
             Ok(())
         })
@@ -624,7 +680,7 @@ fn merge_gemini_hooks(
                 .as_object_mut()
                 .context("`hooks` is present in settings.json but not an object")?;
             for (event, value) in &our_hooks {
-                hooks.insert(event.clone(), value.clone());
+                overlay_event_hooks(hooks, event, value);
             }
             Ok(())
         })
@@ -688,7 +744,7 @@ fn merge_antigravity_hooks(
                 .as_object_mut()
                 .context("`ai-memory` is present in hooks.json but not an object")?;
             for (event, value) in &our_group {
-                group.insert(event.clone(), value.clone());
+                overlay_event_hooks(group, event, value);
             }
             Ok(())
         })
@@ -1609,6 +1665,88 @@ mod tests {
     #[cfg(unix)]
     use std::process::Command;
     use tempfile::TempDir;
+
+    #[test]
+    fn overlay_event_hooks_preserves_third_party_and_replaces_own() {
+        // Regression for issue #80: install-hooks must MERGE into the event
+        // array, not replace it. A third-party SessionStart hook (e.g.
+        // context-mode) must survive while our own stale entry is swapped
+        // for the fresh one.
+        let mut hooks = serde_json::Map::new();
+        hooks.insert(
+            "SessionStart".into(),
+            serde_json::json!([
+                { "hooks": [ { "type": "command", "command": "node context-mode-cache-heal.mjs" } ] },
+                { "matcher": "", "hooks": [ { "type": "command", "command": "/old/ai-memory.exe hook --event session-start" } ] }
+            ]),
+        );
+        let ours = serde_json::json!([
+            { "matcher": "", "hooks": [ { "type": "command", "command": "/new/.cargo/bin/ai-memory.exe hook --event session-start" } ] }
+        ]);
+        overlay_event_hooks(&mut hooks, "SessionStart", &ours);
+
+        let arr = hooks["SessionStart"].as_array().unwrap();
+        assert_eq!(
+            arr.len(),
+            2,
+            "third-party + our single fresh entry: {arr:?}"
+        );
+        let joined = serde_json::to_string(arr).unwrap();
+        assert!(
+            joined.contains("context-mode-cache-heal"),
+            "third-party hook must survive"
+        );
+        assert!(
+            !joined.contains("/old/ai-memory.exe"),
+            "stale ai-memory entry must be replaced"
+        );
+        assert!(
+            joined.contains("/new/.cargo/bin/ai-memory.exe"),
+            "fresh ai-memory entry must be present"
+        );
+    }
+
+    #[test]
+    fn overlay_event_hooks_inserts_when_event_absent() {
+        let mut hooks = serde_json::Map::new();
+        let ours = serde_json::json!([
+            { "matcher": "", "hooks": [ { "type": "command", "command": "ai-memory.exe hook --event stop" } ] }
+        ]);
+        overlay_event_hooks(&mut hooks, "Stop", &ours);
+        assert_eq!(hooks["Stop"].as_array().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn overlay_event_hooks_is_idempotent_on_reapply() {
+        // Re-applying must not accumulate duplicate ai-memory entries.
+        let mut hooks = serde_json::Map::new();
+        let ours = serde_json::json!([
+            { "matcher": "", "hooks": [ { "type": "command", "command": "ai-memory.exe hook --event pre-tool-use" } ] }
+        ]);
+        overlay_event_hooks(&mut hooks, "PreToolUse", &ours);
+        overlay_event_hooks(&mut hooks, "PreToolUse", &ours);
+        assert_eq!(
+            hooks["PreToolUse"].as_array().unwrap().len(),
+            1,
+            "no duplicates on re-apply"
+        );
+    }
+
+    #[test]
+    fn is_ai_memory_hook_entry_detects_nested_flat_and_skips_third_party() {
+        // Nested (Claude Code / Codex / Gemini)
+        assert!(is_ai_memory_hook_entry(&serde_json::json!(
+            { "matcher": "", "hooks": [ { "type": "command", "command": "ai-memory.exe hook" } ] }
+        )));
+        // Flat (Cursor) + shell form
+        assert!(is_ai_memory_hook_entry(&serde_json::json!(
+            { "type": "command", "command": "bash -c 'AI_MEMORY_HOOK_URL=x /c/x/ai-memory/hooks/pre.sh'" }
+        )));
+        // Third-party must NOT be flagged
+        assert!(!is_ai_memory_hook_entry(&serde_json::json!(
+            { "hooks": [ { "type": "command", "command": "node context-mode-cache-heal.mjs" } ] }
+        )));
+    }
 
     fn stub_scripts(dir: &Path, names: &[&str]) {
         for name in names {
