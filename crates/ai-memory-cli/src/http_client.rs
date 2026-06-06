@@ -17,14 +17,19 @@ use anyhow::{Context, Result, bail};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 
+use crate::commands::serve::normalize_prefix;
 use crate::config::{Config, DEFAULT_SERVER_URL};
 
-/// Resolved server target — base URL + optional bearer token.
+/// Resolved server target — origin URL + base-path prefix + optional bearer token.
 #[derive(Debug, Clone)]
 pub struct ServerEndpoint {
-    /// Base URL with any trailing slash stripped, e.g.
-    /// `http://127.0.0.1:49374` or `http://192.168.0.90:49374`.
+    /// Origin only (scheme + authority), any trailing slash and path
+    /// stripped, e.g. `http://127.0.0.1:49374` or `http://192.168.0.90:49374`.
     pub url: String,
+    /// Normalised base-path prefix the server is mounted under, e.g.
+    /// `/wiki`, or empty when serving at the root. Always either empty or
+    /// `/`-prefixed with no trailing slash (normalised by `normalize_prefix`).
+    pub base_path: String,
     /// Bearer token when present, else `None`.
     pub auth_token: Option<String>,
     url_configured: bool,
@@ -32,12 +37,23 @@ pub struct ServerEndpoint {
 
 impl ServerEndpoint {
     /// Build the endpoint from the already-loaded process config.
+    ///
+    /// The base-path prefix the server is mounted under (so client routes
+    /// resolve as `<origin><base><path>` instead of 404ing) is resolved
+    /// from, in order of precedence:
+    /// 1. the **path component of `AI_MEMORY_SERVER_URL`** (the remote-client
+    ///    case — `http://host:49374/wiki` → origin `http://host:49374`,
+    ///    base `/wiki`), then
+    /// 2. **`AI_MEMORY_BASE_PATH`** (the in-pod case — the CLI runs in the
+    ///    same container as `serve`, which already reads this var to nest
+    ///    its router).
     #[must_use]
     pub fn from_config(config: &Config) -> Self {
-        Self::from_pair_with_configured(
+        Self::build(
             Some(config.server_url.clone()),
             config.auth.bearer_token.clone(),
             config.server_url_configured(),
+            std::env::var("AI_MEMORY_BASE_PATH").ok(),
         )
     }
 
@@ -46,30 +62,59 @@ impl ServerEndpoint {
     ///
     /// `url` defaults to `http://127.0.0.1:49374` when `None` or empty;
     /// trailing slashes are stripped. `token` is treated as absent when
-    /// `None` or empty.
+    /// `None` or empty. No environment is read — the env base-path fallback
+    /// is `None`; use [`from_pair_with_base`] to exercise that path.
     #[must_use]
     #[cfg(test)]
     pub(crate) fn from_pair(url: Option<String>, token: Option<String>) -> Self {
         let url_configured = url.as_deref().is_some_and(|s| !s.is_empty());
-        Self::from_pair_with_configured(url, token, url_configured)
+        Self::build(url, token, url_configured, None)
     }
 
-    fn from_pair_with_configured(
+    /// Like [`from_pair`] but with an explicit `AI_MEMORY_BASE_PATH` env
+    /// fallback value, so the env-fallback branch is testable hermetically.
+    #[must_use]
+    #[cfg(test)]
+    pub(crate) fn from_pair_with_base(
+        url: Option<String>,
+        token: Option<String>,
+        env_base: Option<String>,
+    ) -> Self {
+        let url_configured = url.as_deref().is_some_and(|s| !s.is_empty());
+        Self::build(url, token, url_configured, env_base)
+    }
+
+    fn build(
         url: Option<String>,
         token: Option<String>,
         url_configured: bool,
+        env_base: Option<String>,
     ) -> Self {
-        let url = url
+        let raw = url
             .filter(|s| !s.is_empty())
-            .unwrap_or_else(|| DEFAULT_SERVER_URL.to_string())
-            .trim_end_matches('/')
-            .to_string();
-        let auth_token = token.filter(|s| !s.is_empty());
+            .unwrap_or_else(|| DEFAULT_SERVER_URL.to_string());
+        let (origin, url_path) = split_origin_and_path(&raw);
+        // The URL path component wins over the env var: it is the more
+        // explicit, request-target-level statement of where the server is.
+        let base_path = if url_path.is_empty() {
+            env_base.map_or_else(String::new, |s| normalize_prefix(&s))
+        } else {
+            normalize_prefix(&url_path)
+        };
         Self {
-            url,
-            auth_token,
+            url: origin,
+            base_path,
+            auth_token: token.filter(|s| !s.is_empty()),
             url_configured,
         }
+    }
+
+    /// Join the resolved origin + base-path prefix + a root-absolute route
+    /// `path` (e.g. `/admin/status`) into the full request URL. When no base
+    /// path is configured this is byte-identical to the old
+    /// `format!("{origin}{path}")`.
+    pub(crate) fn build_url(&self, path: &str) -> String {
+        format!("{}{}{path}", self.url, self.base_path)
     }
 
     /// Apply auth header to a `reqwest::RequestBuilder` if a token is set.
@@ -79,6 +124,26 @@ impl ServerEndpoint {
             None => req,
         }
     }
+}
+
+/// Split a server URL into `(origin, path)` where `origin` is
+/// scheme+authority (`http://host:port`) and `path` is everything from the
+/// first `/` after the authority (`/wiki`, possibly empty). Trailing slashes
+/// are trimmed from both. A URL with no scheme separator is treated as an
+/// opaque origin with no path.
+fn split_origin_and_path(raw: &str) -> (String, String) {
+    let trimmed = raw.trim_end_matches('/');
+    if let Some(scheme_end) = trimmed.find("://") {
+        let after_scheme = scheme_end + 3;
+        if let Some(rel_slash) = trimmed[after_scheme..].find('/') {
+            let split = after_scheme + rel_slash;
+            return (
+                trimmed[..split].to_string(),
+                trimmed[split..].trim_end_matches('/').to_string(),
+            );
+        }
+    }
+    (trimmed.to_string(), String::new())
 }
 
 /// GET `<endpoint>{path}` with optional query params, deserialise JSON.
@@ -92,7 +157,7 @@ pub async fn get_json<T: DeserializeOwned>(
     query: &[(&str, &str)],
 ) -> Result<T> {
     let client = reqwest::Client::new();
-    let url = format!("{}{path}", endpoint.url);
+    let url = endpoint.build_url(path);
     let mut req = client.get(&url);
     if !query.is_empty() {
         req = req.query(query);
@@ -122,7 +187,7 @@ pub async fn post_json<B: Serialize, T: DeserializeOwned>(
     body: &B,
 ) -> Result<T> {
     let client = reqwest::Client::new();
-    let url = format!("{}{path}", endpoint.url);
+    let url = endpoint.build_url(path);
     let req = endpoint.authenticate(client.post(&url).json(body));
     let resp = req
         .send()
@@ -200,7 +265,7 @@ fn augment_connect_error(
 /// or the body cannot be read or written.
 pub async fn post_to_file(endpoint: &ServerEndpoint, path: &str, dest: &Path) -> Result<u64> {
     let client = reqwest::Client::new();
-    let url = format!("{}{path}", endpoint.url);
+    let url = endpoint.build_url(path);
     let req = endpoint.authenticate(client.post(&url));
     let mut resp = req
         .send()
@@ -274,6 +339,150 @@ mod tests {
     fn from_pair_non_empty_token_preserved() {
         let ep = ServerEndpoint::from_pair(None, Some("secret".to_string()));
         assert_eq!(ep.auth_token.as_deref(), Some("secret"));
+    }
+
+    // ----------------------------------------------------------------
+    // Base-path awareness — graduated from the Docker live exploration of
+    // the CLI-client-under-AI_MEMORY_BASE_PATH bug. The server nests every
+    // route under `--base-path` (`/wiki/admin/status`), but the thin client
+    // baked root-absolute paths (`/admin/status`) → 404. Each test below
+    // pins one hypothesis that the live run validated end-to-end.
+    // ----------------------------------------------------------------
+
+    /// H1 — no base path configured: the joined URL is byte-identical to the
+    /// old `format!("{origin}{path}")`. The regression guard for the OFF-by-
+    /// default promise.
+    #[test]
+    fn build_url_without_base_is_byte_identical() {
+        let ep = ServerEndpoint::from_pair(Some("http://h:49374".to_string()), None);
+        assert_eq!(ep.base_path, "");
+        assert_eq!(ep.build_url("/admin/status"), "http://h:49374/admin/status");
+    }
+
+    /// H4/H9 — remote client: the base path comes from the **path component
+    /// of the server URL**, which is split off the origin and normalised
+    /// (trailing slash trimmed).
+    #[test]
+    fn server_url_path_becomes_base_path() {
+        let ep = ServerEndpoint::from_pair(Some("http://h:49374/wiki".to_string()), None);
+        assert_eq!(ep.url, "http://h:49374");
+        assert_eq!(ep.base_path, "/wiki");
+        assert_eq!(
+            ep.build_url("/admin/status"),
+            "http://h:49374/wiki/admin/status"
+        );
+
+        // Trailing slash on the URL path normalises away (H9).
+        let ep = ServerEndpoint::from_pair(Some("http://h:49374/wiki/".to_string()), None);
+        assert_eq!(ep.url, "http://h:49374");
+        assert_eq!(ep.base_path, "/wiki");
+    }
+
+    /// H3 — in-pod client: no path on the server URL, base path falls back to
+    /// the `AI_MEMORY_BASE_PATH` env value (passed explicitly here to stay
+    /// hermetic).
+    #[test]
+    fn env_base_path_used_when_url_has_no_path() {
+        let ep = ServerEndpoint::from_pair_with_base(None, None, Some("/wiki".to_string()));
+        assert_eq!(ep.url, "http://127.0.0.1:49374");
+        assert_eq!(ep.base_path, "/wiki");
+        assert_eq!(
+            ep.build_url("/admin/write-page"),
+            "http://127.0.0.1:49374/wiki/admin/write-page"
+        );
+    }
+
+    /// H8 — precedence: when BOTH a URL path and an env base are present, the
+    /// URL path wins (it is the more explicit, request-target-level value).
+    #[test]
+    fn url_path_wins_over_env_base() {
+        let ep = ServerEndpoint::from_pair_with_base(
+            Some("http://h:49374/url-base".to_string()),
+            None,
+            Some("/env-base".to_string()),
+        );
+        assert_eq!(ep.base_path, "/url-base");
+    }
+
+    /// H11 — multi-segment base path is preserved verbatim.
+    #[test]
+    fn multi_segment_base_path_is_preserved() {
+        let ep = ServerEndpoint::from_pair_with_base(None, None, Some("/a/b".to_string()));
+        assert_eq!(ep.base_path, "/a/b");
+        assert_eq!(
+            ep.build_url("/admin/status"),
+            "http://127.0.0.1:49374/a/b/admin/status"
+        );
+    }
+
+    /// H10 — a traversal-y base (`/wiki/../etc`) is neutralised by
+    /// `normalize_prefix` to empty (it rejects dot-segments), so the client
+    /// falls back to the root rather than emitting `/wiki/../etc/...`. The
+    /// client then 404s consistently instead of walking out of the prefix.
+    #[test]
+    fn traversal_base_path_is_neutralised_to_root() {
+        let ep = ServerEndpoint::from_pair_with_base(None, None, Some("/wiki/../etc".to_string()));
+        assert_eq!(ep.base_path, "");
+        let joined = ep.build_url("/admin/status");
+        assert!(
+            !joined.contains("/../") && !joined.contains("/etc/admin"),
+            "traversal must not leak into the request URL; got {joined}"
+        );
+        assert_eq!(joined, "http://127.0.0.1:49374/admin/status");
+    }
+
+    /// A bare base value without a leading slash is normalised to `/<core>`,
+    /// matching the server's own `normalize_prefix` so the two agree.
+    #[test]
+    fn bare_env_base_gets_leading_slash() {
+        let ep = ServerEndpoint::from_pair_with_base(None, None, Some("wiki".to_string()));
+        assert_eq!(ep.base_path, "/wiki");
+    }
+
+    /// `/` and empty both mean "root" — no prefix added.
+    #[test]
+    fn root_like_base_values_mean_no_prefix() {
+        for raw in ["", "/", "//", "  /  "] {
+            let ep = ServerEndpoint::from_pair_with_base(None, None, Some(raw.to_string()));
+            assert_eq!(ep.base_path, "", "{raw:?} should normalise to no prefix");
+            assert_eq!(
+                ep.build_url("/admin/status"),
+                "http://127.0.0.1:49374/admin/status"
+            );
+        }
+    }
+
+    // ----------------------------------------------------------------
+    // split_origin_and_path
+    // ----------------------------------------------------------------
+
+    #[test]
+    fn split_origin_and_path_cases() {
+        assert_eq!(
+            split_origin_and_path("http://h:49374"),
+            ("http://h:49374".to_string(), String::new())
+        );
+        assert_eq!(
+            split_origin_and_path("http://h:49374/"),
+            ("http://h:49374".to_string(), String::new())
+        );
+        assert_eq!(
+            split_origin_and_path("http://h:49374/wiki"),
+            ("http://h:49374".to_string(), "/wiki".to_string())
+        );
+        assert_eq!(
+            split_origin_and_path("http://h:49374/wiki/"),
+            ("http://h:49374".to_string(), "/wiki".to_string())
+        );
+        assert_eq!(
+            split_origin_and_path("https://h:49374/a/b"),
+            ("https://h:49374".to_string(), "/a/b".to_string())
+        );
+        // No scheme separator → opaque origin, no path split.
+        assert_eq!(
+            split_origin_and_path("127.0.0.1:49374"),
+            ("127.0.0.1:49374".to_string(), String::new())
+        );
     }
 
     // ----------------------------------------------------------------
