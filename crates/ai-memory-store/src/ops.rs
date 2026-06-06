@@ -2272,4 +2272,64 @@ mod tests {
         rename_project(&mut conn, &ws, &proj, "renamed-live")
             .expect("rename of live project must succeed");
     }
+
+    /// Run the reader's exact FTS5 `MATCH` against the real, populated
+    /// `pages_fts` index — the path the web search / MCP query take.
+    /// Returns the matched paths (and surfaces any FTS5 syntax error as
+    /// an `Err`, the way the bug originally manifested).
+    fn fts_match_paths(conn: &Connection, raw: &str) -> rusqlite::Result<Vec<String>> {
+        let fts_query = crate::fts_query::prepare_fts5_query(raw);
+        let mut stmt = conn.prepare(
+            "SELECT pages.path \
+             FROM pages_fts \
+             JOIN pages ON pages.rowid = pages_fts.rowid \
+             WHERE pages_fts MATCH ?1 AND pages.is_latest = 1 \
+             ORDER BY pages_fts.rank",
+        )?;
+        let rows = stmt.query_map(params![fts_query], |r| r.get::<_, String>(0))?;
+        rows.collect()
+    }
+
+    /// End-to-end regression for the dotted-filename search bug (PR #81).
+    /// Searching `current.md` used to reach FTS5 **bare** and SQLite
+    /// errored with `fts5: syntax error near "."`, so the web UI showed
+    /// "No results" and the MCP surfaced the raw error. The string-level
+    /// `fts_query` unit tests only proved the *output* was quoted — they
+    /// never exercised real FTS5. This drives the actual indexed
+    /// `pages_fts` (via `upsert_page` → `path_search` triggers) to prove
+    /// the prepared query (a) does not error and (b) matches the page at
+    /// `reference/architecture-current.md`. This is the scenario that
+    /// would have caught the bug *before* it shipped.
+    #[test]
+    fn dotted_filename_search_matches_indexed_path() {
+        let (_tmp, mut conn, ws, proj) = fresh_db();
+        upsert_page(
+            &mut conn,
+            &page(ws, proj, "reference/architecture-current.md", "body text"),
+        )
+        .unwrap();
+
+        // The prepared query must not error AND must find the page.
+        let hits = fts_match_paths(&conn, "current.md")
+            .expect("dotted-filename search must not raise an FTS5 syntax error");
+        assert!(
+            hits.iter()
+                .any(|p| p == "reference/architecture-current.md"),
+            "search for `current.md` should match the indexed path; got {hits:?}"
+        );
+
+        // Guard the sanitizer is load-bearing: the same token reaching
+        // FTS5 bare (the pre-fix behaviour) is a hard syntax error.
+        let bare = conn
+            .prepare("SELECT rowid FROM pages_fts WHERE pages_fts MATCH ?1")
+            .unwrap()
+            .query_map(params!["current.md"], |r| r.get::<_, i64>(0))
+            .and_then(Iterator::collect::<rusqlite::Result<Vec<i64>>>);
+        assert!(
+            bare.is_err(),
+            "raw `current.md` should error in FTS5 — if this passes, the \
+             quoting sanitizer is no longer load-bearing and the test above \
+             proves nothing"
+        );
+    }
 }
