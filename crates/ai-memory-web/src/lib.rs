@@ -12,7 +12,7 @@
 //! - `GET /w/:workspace/:project`         → page tree + recent activity
 //! - `GET /w/:workspace/:project/p/*path` → rendered markdown + metadata
 //! - `GET /search?q=…`                    → FTS5 hit list
-//! - `GET /static/*`                      → embedded CSS + logos
+//! - `GET /static/*`                      → embedded CSS + logo
 //!
 //! The companion `api_router` exposes the same read-only data as JSON
 //! for custom frontends. It intentionally does not expose write/admin

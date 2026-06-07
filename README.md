@@ -1,7 +1,7 @@
 <p align="center">
   <picture>
     <source media="(prefers-color-scheme: dark)" srcset="docs/logo-dark.png">
-    <img alt="ai-memory" src="docs/logo.png" width="480">
+    <img alt="ai-memory" src="docs/logo-light.png" width="480">
   </picture>
 </p>
 

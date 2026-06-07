@@ -1,4 +1,4 @@
-//! Static asset handlers: Tailwind CSS and logo images.
+//! Static asset handlers: Tailwind CSS and logo image.
 //!
 //! Assets are embedded at compile time so the binary is fully
 //! self-contained — no runtime file access needed.
@@ -10,11 +10,8 @@ use axum::response::IntoResponse;
 /// `AI_MEMORY_WEB_TAILWIND_CSS` cargo env var.
 static TAILWIND_CSS: &str = include_str!(env!("AI_MEMORY_WEB_TAILWIND_CSS"));
 
-/// Light-mode logo (PNG).
-static LOGO_LIGHT: &[u8] = include_bytes!("../../../../docs/logo.png");
-
-/// Dark-mode logo (PNG).
-static LOGO_DARK: &[u8] = include_bytes!("../../../../docs/logo-dark.png");
+/// Logo (PNG), embedded at compile time from `docs/logo.png`.
+static LOGO: &[u8] = include_bytes!("../../../../docs/logo.png");
 
 /// `GET /static/tailwind.css`
 pub(crate) async fn tailwind_css() -> impl IntoResponse {
@@ -27,15 +24,17 @@ pub(crate) async fn tailwind_css() -> impl IntoResponse {
 }
 
 /// `GET /static/logo.png`
-pub(crate) async fn logo_light() -> impl IntoResponse {
-    let mut headers = HeaderMap::new();
-    headers.insert(header::CONTENT_TYPE, HeaderValue::from_static("image/png"));
-    (StatusCode::OK, headers, LOGO_LIGHT)
+pub(crate) async fn logo() -> impl IntoResponse {
+    png_response(LOGO)
 }
 
-/// `GET /static/logo-dark.png`
-pub(crate) async fn logo_dark() -> impl IntoResponse {
+/// `GET /favicon.ico` — same PNG as the header logo (browsers request this path by default).
+pub(crate) async fn favicon() -> impl IntoResponse {
+    png_response(LOGO)
+}
+
+fn png_response(bytes: &'static [u8]) -> (StatusCode, HeaderMap, &'static [u8]) {
     let mut headers = HeaderMap::new();
     headers.insert(header::CONTENT_TYPE, HeaderValue::from_static("image/png"));
-    (StatusCode::OK, headers, LOGO_DARK)
+    (StatusCode::OK, headers, bytes)
 }

@@ -22,8 +22,8 @@ pub(crate) fn build(state: Arc<WebState>) -> Router {
         .route("/w/{workspace}/{project}/p/{*path}", get(page::handler))
         .route("/search", get(search::handler))
         .route("/static/tailwind.css", get(statics::tailwind_css))
-        .route("/static/logo.png", get(statics::logo_light))
-        .route("/static/logo-dark.png", get(statics::logo_dark))
+        .route("/static/logo.png", get(statics::logo))
+        .route("/favicon.ico", get(statics::favicon))
         .with_state(state)
 }
 
