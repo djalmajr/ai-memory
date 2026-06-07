@@ -359,6 +359,21 @@ rendering a project-level dependency view in the SPA.
 Global today (no workspace / project filter); narrower query params
 are a follow-up.
 
+### 4.10 Browser tab icon
+
+```http
+GET /favicon.ico
+```
+
+Returns the same transparent PNG the built-in web UI serves as the
+header logo. Browsers fetch this path automatically. The route is
+present whenever the web UI is enabled (`--enable-web`); the response
+is `image/png` despite the `.ico` URL — modern browsers accept PNG
+icons. Bearer auth applies as it does to `/web/*`: in a browser the
+favicon request rides the same HTTP Basic credentials the user
+pasted to load `/web`, so the icon appears once the session is
+authenticated.
+
 ## 5. Limits and pagination
 
 - All `limit` query params clamp to `1..=100`.

@@ -170,8 +170,14 @@ native on an i7-6700HQ). Notes:
   cmd.exe and Git Bash.
 - The `.sh`/`.ps1` scripts stay bundled as a fallback — the Docker /
   `setup-agent` flow (no local binary) keeps emitting the shell command.
-- To force the old Git Bash behavior, set
-  `AI_MEMORY_HOOK_PLATFORM=windows-bash` before running `install-hooks`.
+- `AI_MEMORY_HOOK_PLATFORM` accepts three values:
+  - `windows-native` — direct binary call (default on native Windows).
+  - `windows-bash` — `bash -c` + `.sh` through Git Bash (the previous
+    default; set this to opt back in).
+  - `posix` — POSIX `.sh` (default on macOS / Linux).
+
+  Set the env var before running `install-hooks` so the chosen platform
+  is baked into the rendered hook commands.
 
 ## Current Harness Caveats
 
