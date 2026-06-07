@@ -2710,18 +2710,38 @@ impl ReaderPool {
 
     /// Find the existing project whose `repo_path` is the longest
     /// prefix of `cwd`, if any. Used by the hook router before
-    /// auto-creating a new project from `basename(cwd)` — so an
-    /// event whose cwd is inside an existing project's tree resolves
-    /// to that parent instead of materialising a fragment project
-    /// for the subdirectory name.
+    /// auto-creating a new project from `basename(cwd)` so an event
+    /// whose cwd is inside an existing project's tree resolves to
+    /// that parent instead of materialising a fragment project for
+    /// the subdirectory name.
     ///
     /// `ORDER BY length(repo_path) DESC` picks the most-specific
     /// match: if the operator declared a sub-project via
     /// `.ai-memory.toml` (which writes its own row with a longer
     /// `repo_path`), the sub-project wins over its outer parent.
-    /// Projects without a `repo_path` (older rows, or those created
-    /// without a usable cwd) cannot match and are filtered out by the
-    /// `IS NOT NULL` predicate.
+    ///
+    /// **Boundary safety.** Every layer of this query has explicit
+    /// guards so a path-shaped value can't accidentally widen the
+    /// match set:
+    ///
+    /// - `workspace_id = ?1` — never matches a project in another
+    ///   workspace.
+    /// - `repo_path IS NOT NULL AND length(repo_path) > 1 AND repo_path
+    ///   NOT LIKE '%/'` — rejects stored values that would match too
+    ///   broadly (`NULL`, `''`, `/`) or fail the `<repo_path>/%`
+    ///   boundary (trailing slash).
+    /// - `repo_path NOT LIKE '%\%%' ESCAPE '\\' AND repo_path NOT
+    ///   LIKE '%\_%' ESCAPE '\\'` — refuses stored values containing
+    ///   LIKE wildcards (`%`, `_`) so a stored `repo_path` can never
+    ///   match unintended siblings.
+    /// - Input canonicalisation — trailing slashes stripped; cwds
+    ///   containing dot-segments (`/foo/../bar`, `/./x`) are rejected
+    ///   outright so a traversal-style path can't match a parent it
+    ///   doesn't logically belong to.
+    ///
+    /// Returns `None` (caller falls through to create-by-basename)
+    /// for every defensive case so a bad input degrades the same way
+    /// as "no match" rather than picking the wrong project.
     ///
     /// # Errors
     /// Propagates any SQL or pool error.
@@ -2730,23 +2750,25 @@ impl ReaderPool {
         workspace_id: WorkspaceId,
         cwd: String,
     ) -> StoreResult<Option<(ProjectId, String)>> {
-        // Trim any trailing slash so the LIKE prefix match treats
-        // `<repo_path>` and `<repo_path>/` identically (the column is
-        // canonically stored without a trailing slash on insert).
         let cwd_norm = cwd.trim_end_matches('/').to_string();
-        if cwd_norm.is_empty() {
+        if !is_safe_cwd_for_prefix_match(&cwd_norm) {
             return Ok(None);
         }
         self.with_conn(move |conn| {
-            // Two-condition LIKE: exact match OR descendant (prefix
-            // plus `/`). The `/%` half stops `/foo/bar` from
-            // accidentally matching a stored `/foo/ba` — boundary
-            // checking is what makes this safe.
+            // Two-condition LIKE: exact match OR descendant (prefix +
+            // `/`). The boundary `/` on the descendant arm stops
+            // `/foo/bar` from matching `/foo/ba`. The WHERE filters
+            // reject any stored repo_path that would slip past the
+            // boundary (empty, `/`, trailing-slash, LIKE wildcards).
             let row_opt = conn
                 .query_row(
                     "SELECT id, name FROM projects \
                      WHERE workspace_id = ?1 \
                        AND repo_path IS NOT NULL \
+                       AND length(repo_path) > 1 \
+                       AND repo_path NOT LIKE '%/' \
+                       AND repo_path NOT LIKE '%\\%%' ESCAPE '\\' \
+                       AND repo_path NOT LIKE '%\\_%' ESCAPE '\\' \
                        AND (?2 = repo_path OR ?2 LIKE repo_path || '/%') \
                      ORDER BY length(repo_path) DESC \
                      LIMIT 1",
@@ -3522,6 +3544,34 @@ fn briefing_page_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoreResu
                 "bad updated_at: {e}"
             )))
         }))
+}
+
+/// Reject cwds that can't safely participate in a `repo_path` prefix
+/// match. Trailing slash is already trimmed by the caller; this catches:
+/// empty / single-slash / dot-segments (a `/foo/../bar` resolved-by-LIKE
+/// could match a stored `/foo` parent the cwd doesn't logically belong
+/// to, since LIKE doesn't normalise paths) / LIKE wildcards (`%`, `_`)
+/// in the input itself. Treats any failure as "no match" so the caller
+/// falls through to the safe create-by-basename path.
+fn is_safe_cwd_for_prefix_match(cwd: &str) -> bool {
+    if cwd.is_empty() || cwd == "/" {
+        return false;
+    }
+    if cwd.contains('%') || cwd.contains('_') {
+        // LIKE wildcards in the BOUND value are taken literally (?2
+        // is parameter-bound, not interpolated), so this isn't a
+        // safety issue per se — but a `_` in a cwd is so unusual it's
+        // more likely to be a sign of an unexpected payload than a
+        // legit match, and rejecting it costs nothing. `%` is even
+        // less likely in a real path.
+        return false;
+    }
+    for segment in cwd.split('/') {
+        if segment == "." || segment == ".." {
+            return false;
+        }
+    }
+    true
 }
 
 fn checkout(inner: &Inner) -> StoreResult<Connection> {

@@ -1174,6 +1174,236 @@ mod tests {
         );
     }
 
+    /// Boundary: prefix-match is workspace-scoped. A project in
+    /// workspace A whose `repo_path` would otherwise match a cwd
+    /// must NEVER be picked when the hook event resolves to workspace
+    /// B (a `workspace_override` carried in the event's query string).
+    #[tokio::test]
+    async fn resolve_does_not_leak_across_workspaces_on_prefix_match() {
+        let tmp = TempDir::new().unwrap();
+        let state = make_state(&tmp).await;
+        let other_ws = state
+            .writer
+            .get_or_create_workspace(String::from("other"))
+            .await
+            .unwrap();
+        // Parent project lives in `other`, not in the default workspace.
+        let other_parent_id = state
+            .writer
+            .get_or_create_project(
+                other_ws,
+                String::from("manga-plus"),
+                Some(String::from("/repo/manga-plus")),
+            )
+            .await
+            .unwrap();
+
+        // Hook fires WITHOUT `workspace` override, so it resolves to
+        // the default workspace. The `other` project must not be picked.
+        let (resolved_ws, resolved_proj) = resolve_project_ids(
+            &state,
+            Some("/repo/manga-plus/reader"),
+            None,
+            None,
+            ProjectStrategy::Basename,
+            &ai_memory_core::ActorKey::default(),
+        )
+        .await
+        .unwrap();
+        assert_ne!(resolved_ws, other_ws);
+        assert_ne!(
+            resolved_proj, other_parent_id,
+            "must not pick a project from a foreign workspace"
+        );
+    }
+
+    /// Boundary: a stored `repo_path` whose value is degenerate
+    /// (empty, single slash, trailing slash) MUST NOT match every
+    /// cwd. The WHERE filters reject each shape; this asserts the
+    /// integrated behaviour end-to-end.
+    #[tokio::test]
+    async fn resolve_ignores_degenerate_repo_paths() {
+        let tmp = TempDir::new().unwrap();
+        let state = make_state(&tmp).await;
+        let ws = state
+            .writer
+            .get_or_create_workspace(String::from(DEFAULT_WORKSPACE_NAME))
+            .await
+            .unwrap();
+        // Three poison rows that would each match too broadly without
+        // the safety filters.
+        for (name, repo) in [
+            ("empty-repo", String::new()),
+            ("root-repo", String::from("/")),
+            ("trailing-repo", String::from("/repo/foo/")),
+        ] {
+            state
+                .writer
+                .get_or_create_project(ws, String::from(name), Some(repo))
+                .await
+                .unwrap();
+        }
+
+        // Resolve a cwd that the three poison rows would each match
+        // pre-fix. Expect: a NEW project created by basename.
+        let (resolved_ws, resolved) = resolve_project_ids(
+            &state,
+            Some("/repo/foo/bar"),
+            None,
+            None,
+            ProjectStrategy::Basename,
+            &ai_memory_core::ActorKey::default(),
+        )
+        .await
+        .unwrap();
+        let by_name = state
+            .reader
+            .find_project(resolved_ws, String::from("bar"))
+            .await
+            .unwrap();
+        assert_eq!(
+            by_name,
+            Some(resolved),
+            "degenerate repo_paths must NOT match — fall through to create"
+        );
+    }
+
+    /// Boundary: `/foo/bar` MUST NOT match a stored `/foo/ba` sibling
+    /// (the `/` boundary on the descendant arm).
+    #[tokio::test]
+    async fn resolve_does_not_match_sibling_substring() {
+        let tmp = TempDir::new().unwrap();
+        let state = make_state(&tmp).await;
+        let ws = state
+            .writer
+            .get_or_create_workspace(String::from(DEFAULT_WORKSPACE_NAME))
+            .await
+            .unwrap();
+        state
+            .writer
+            .get_or_create_project(
+                ws,
+                String::from("foo-ba"),
+                Some(String::from("/repo/foo-ba")),
+            )
+            .await
+            .unwrap();
+        let (resolved_ws, resolved) = resolve_project_ids(
+            &state,
+            Some("/repo/foo-bar"),
+            None,
+            None,
+            ProjectStrategy::Basename,
+            &ai_memory_core::ActorKey::default(),
+        )
+        .await
+        .unwrap();
+        let by_name = state
+            .reader
+            .find_project(resolved_ws, String::from("foo-bar"))
+            .await
+            .unwrap();
+        assert_eq!(
+            by_name,
+            Some(resolved),
+            "sibling substring (`foo-ba` vs `foo-bar`) must not match"
+        );
+    }
+
+    /// Boundary: a cwd containing dot-segments (`/foo/../bar`,
+    /// `/./x`) is rejected by the canonicaliser so it can't be
+    /// LIKE-matched against an unrelated parent.
+    #[tokio::test]
+    async fn resolve_ignores_cwds_with_dot_segments() {
+        let tmp = TempDir::new().unwrap();
+        let state = make_state(&tmp).await;
+        let ws = state
+            .writer
+            .get_or_create_workspace(String::from(DEFAULT_WORKSPACE_NAME))
+            .await
+            .unwrap();
+        let parent_id = state
+            .writer
+            .get_or_create_project(
+                ws,
+                String::from("manga-plus"),
+                Some(String::from("/repo/manga-plus")),
+            )
+            .await
+            .unwrap();
+        for cwd in [
+            "/repo/manga-plus/../other",
+            "/repo/./manga-plus/x",
+            "/repo/manga-plus/./y",
+        ] {
+            let (_ws, resolved) = resolve_project_ids(
+                &state,
+                Some(cwd),
+                None,
+                None,
+                ProjectStrategy::Basename,
+                &ai_memory_core::ActorKey::default(),
+            )
+            .await
+            .unwrap();
+            assert_ne!(
+                resolved, parent_id,
+                "cwd `{cwd}` contains a dot-segment — must NOT match the parent"
+            );
+        }
+    }
+
+    /// Boundary: a stored `repo_path` containing LIKE wildcards
+    /// (`%`, `_`) MUST NOT widen the match set.
+    #[tokio::test]
+    async fn resolve_ignores_repo_paths_with_like_wildcards() {
+        let tmp = TempDir::new().unwrap();
+        let state = make_state(&tmp).await;
+        let ws = state
+            .writer
+            .get_or_create_workspace(String::from(DEFAULT_WORKSPACE_NAME))
+            .await
+            .unwrap();
+        state
+            .writer
+            .get_or_create_project(
+                ws,
+                String::from("poison-percent"),
+                Some(String::from("/repo/anything%/poison")),
+            )
+            .await
+            .unwrap();
+        state
+            .writer
+            .get_or_create_project(
+                ws,
+                String::from("poison-underscore"),
+                Some(String::from("/repo/anyth_ng")),
+            )
+            .await
+            .unwrap();
+        let (resolved_ws, resolved) = resolve_project_ids(
+            &state,
+            Some("/repo/anything-foo/poison/sub"),
+            None,
+            None,
+            ProjectStrategy::Basename,
+            &ai_memory_core::ActorKey::default(),
+        )
+        .await
+        .unwrap();
+        let by_name = state
+            .reader
+            .find_project(resolved_ws, String::from("sub"))
+            .await
+            .unwrap();
+        assert_eq!(
+            by_name,
+            Some(resolved),
+            "stored repo_path with LIKE wildcards must NOT match"
+        );
+    }
+
     /// Cold-start preservation: when NO existing project's `repo_path`
     /// prefix-matches the cwd, the resolver must fall through to the
     /// previous create-by-basename behaviour. This is the "first time
