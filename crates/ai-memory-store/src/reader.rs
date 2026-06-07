@@ -2708,6 +2708,67 @@ impl ReaderPool {
         .await
     }
 
+    /// Find the existing project whose `repo_path` is the longest
+    /// prefix of `cwd`, if any. Used by the hook router before
+    /// auto-creating a new project from `basename(cwd)` — so an
+    /// event whose cwd is inside an existing project's tree resolves
+    /// to that parent instead of materialising a fragment project
+    /// for the subdirectory name.
+    ///
+    /// `ORDER BY length(repo_path) DESC` picks the most-specific
+    /// match: if the operator declared a sub-project via
+    /// `.ai-memory.toml` (which writes its own row with a longer
+    /// `repo_path`), the sub-project wins over its outer parent.
+    /// Projects without a `repo_path` (older rows, or those created
+    /// without a usable cwd) cannot match and are filtered out by the
+    /// `IS NOT NULL` predicate.
+    ///
+    /// # Errors
+    /// Propagates any SQL or pool error.
+    pub async fn find_project_by_cwd_prefix(
+        &self,
+        workspace_id: WorkspaceId,
+        cwd: String,
+    ) -> StoreResult<Option<(ProjectId, String)>> {
+        // Trim any trailing slash so the LIKE prefix match treats
+        // `<repo_path>` and `<repo_path>/` identically (the column is
+        // canonically stored without a trailing slash on insert).
+        let cwd_norm = cwd.trim_end_matches('/').to_string();
+        if cwd_norm.is_empty() {
+            return Ok(None);
+        }
+        self.with_conn(move |conn| {
+            // Two-condition LIKE: exact match OR descendant (prefix
+            // plus `/`). The `/%` half stops `/foo/bar` from
+            // accidentally matching a stored `/foo/ba` — boundary
+            // checking is what makes this safe.
+            let row_opt = conn
+                .query_row(
+                    "SELECT id, name FROM projects \
+                     WHERE workspace_id = ?1 \
+                       AND repo_path IS NOT NULL \
+                       AND (?2 = repo_path OR ?2 LIKE repo_path || '/%') \
+                     ORDER BY length(repo_path) DESC \
+                     LIMIT 1",
+                    params![workspace_id.as_bytes(), cwd_norm],
+                    |row| {
+                        let bytes: Vec<u8> = row.get(0)?;
+                        let name: String = row.get(1)?;
+                        Ok((bytes, name))
+                    },
+                )
+                .optional()?;
+            row_opt
+                .map(|(bytes, name)| {
+                    ProjectId::from_slice(&bytes)
+                        .map(|id| (id, name))
+                        .map_err(StoreError::from)
+                })
+                .transpose()
+        })
+        .await
+    }
+
     /// Return aggregate counts for the `status` view.
     ///
     /// # Errors

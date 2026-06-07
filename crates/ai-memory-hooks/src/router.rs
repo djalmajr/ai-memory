@@ -484,11 +484,44 @@ async fn resolve_project_ids(
         .get_or_create_workspace(workspace_name)
         .await
         .map_err(|e| anyhow::anyhow!("get_or_create_workspace: {e}"))?;
-    let proj = state
-        .writer
-        .get_or_create_project(ws, project_name, repo_path)
-        .await
-        .map_err(|e| anyhow::anyhow!("get_or_create_project: {e}"))?;
+
+    // Prefix-match the cwd against any existing project's `repo_path`
+    // BEFORE auto-creating a new project. Without this, a tool call
+    // whose cwd was `/projects/manga-plus/reader/src/main.rs` would
+    // get its observation attributed to a fresh `src`/`reader` project
+    // instead of the existing `manga-plus` parent. The schema column
+    // `projects.repo_path` was provisioned for exactly this match;
+    // `find_project_by_cwd_prefix` returns the longest-matching parent
+    // so a more-specific declared sub-project (via `.ai-memory.toml`,
+    // whose row has a longer `repo_path`) still wins over its outer
+    // parent. Skipped when the operator passed an explicit
+    // `project_override` (the override always wins) or when the
+    // derived `repo_path` is empty (cwd-less event already handled by
+    // the early returns above).
+    let proj = if project_override.is_none()
+        && let Some(rp) = repo_path.as_deref().filter(|s| !s.is_empty())
+        && let Some((parent_id, parent_name)) = state
+            .reader
+            .find_project_by_cwd_prefix(ws, rp.to_string())
+            .await
+            .map_err(|e| anyhow::anyhow!("find_project_by_cwd_prefix: {e}"))?
+        && parent_name != project_name
+    {
+        debug!(
+            cwd = rp,
+            derived = %project_name,
+            parent = %parent_name,
+            "hook router: cwd inside existing project — using parent instead of \
+             creating fragment"
+        );
+        parent_id
+    } else {
+        state
+            .writer
+            .get_or_create_project(ws, project_name, repo_path)
+            .await
+            .map_err(|e| anyhow::anyhow!("get_or_create_project: {e}"))?
+    };
     let ids = (ws, proj);
     state.project_cache.lock().await.insert(cache_key, ids);
     state.active_project.set_for(actor, ws, proj);
@@ -1027,6 +1060,151 @@ mod tests {
         // active project — that would re-introduce the issue #2 bug of
         // MCP reads defaulting to an empty scratch bucket.
         assert!(state.active_project.get().is_none());
+    }
+
+    /// Post-merge audit (the orphan-observation finding): a hook
+    /// whose cwd sits INSIDE an existing project's tree must resolve
+    /// to that parent — never auto-create a sibling project from
+    /// `basename(cwd)`. Pre-fix: an agent's tool call reporting
+    /// `cwd = /repo/manga-plus/reader` would create a separate
+    /// `reader` project and dump observations there even though the
+    /// real session was attributed to `manga-plus`.
+    #[tokio::test]
+    async fn resolve_uses_existing_parent_when_cwd_is_inside() {
+        let tmp = TempDir::new().unwrap();
+        let state = make_state(&tmp).await;
+        // Seed the parent project at `/repo/manga-plus`.
+        let ws: ai_memory_core::WorkspaceId = state
+            .writer
+            .get_or_create_workspace(String::from(DEFAULT_WORKSPACE_NAME))
+            .await
+            .unwrap();
+        let parent_id: ai_memory_core::ProjectId = state
+            .writer
+            .get_or_create_project(
+                ws,
+                String::from("manga-plus"),
+                Some(String::from("/repo/manga-plus")),
+            )
+            .await
+            .unwrap();
+
+        // Fire a hook with a cwd two levels deep into the parent.
+        let (resolved_ws, resolved_proj) = resolve_project_ids(
+            &state,
+            Some("/repo/manga-plus/reader/src"),
+            None,
+            None,
+            ProjectStrategy::Basename,
+            &ai_memory_core::ActorKey::default(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(resolved_ws, ws);
+        assert_eq!(
+            resolved_proj, parent_id,
+            "cwd inside the parent's tree must resolve to the parent, not a \
+             new `src` / `reader` fragment"
+        );
+
+        // And no fragment project was created — the resolver short-
+        // circuited before `get_or_create_project`.
+        let frag = state
+            .reader
+            .find_project(ws, String::from("src"))
+            .await
+            .unwrap();
+        assert!(frag.is_none(), "no `src` fragment project should exist");
+        let frag = state
+            .reader
+            .find_project(ws, String::from("reader"))
+            .await
+            .unwrap();
+        assert!(frag.is_none(), "no `reader` fragment project should exist");
+    }
+
+    /// A more-specific declared sub-project (one whose `repo_path` is
+    /// itself a child of an outer project's `repo_path`) must rank
+    /// AHEAD of the outer parent. This is how `.ai-memory.toml` markers
+    /// keep working — the marker materialises a row with a longer
+    /// `repo_path`, and `find_project_by_cwd_prefix`'s
+    /// `ORDER BY length(repo_path) DESC` picks it.
+    #[tokio::test]
+    async fn resolve_prefers_more_specific_sub_project_over_outer_parent() {
+        let tmp = TempDir::new().unwrap();
+        let state = make_state(&tmp).await;
+        let ws = state
+            .writer
+            .get_or_create_workspace(String::from(DEFAULT_WORKSPACE_NAME))
+            .await
+            .unwrap();
+        let _outer = state
+            .writer
+            .get_or_create_project(
+                ws,
+                String::from("manga-plus"),
+                Some(String::from("/repo/manga-plus")),
+            )
+            .await
+            .unwrap();
+        let inner = state
+            .writer
+            .get_or_create_project(
+                ws,
+                String::from("reader-app"),
+                Some(String::from("/repo/manga-plus/reader")),
+            )
+            .await
+            .unwrap();
+
+        let (_ws, resolved) = resolve_project_ids(
+            &state,
+            Some("/repo/manga-plus/reader/src"),
+            None,
+            None,
+            ProjectStrategy::Basename,
+            &ai_memory_core::ActorKey::default(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            resolved, inner,
+            "longer-prefix sub-project must win over outer parent"
+        );
+    }
+
+    /// Cold-start preservation: when NO existing project's `repo_path`
+    /// prefix-matches the cwd, the resolver must fall through to the
+    /// previous create-by-basename behaviour. This is the "first time
+    /// you ever ran ai-memory from this repo" path; auto-creation
+    /// stays the default for new projects.
+    #[tokio::test]
+    async fn resolve_falls_through_to_create_when_no_prefix_matches() {
+        let tmp = TempDir::new().unwrap();
+        let state = make_state(&tmp).await;
+        let (ws, resolved) = resolve_project_ids(
+            &state,
+            Some("/repo/brand-new"),
+            None,
+            None,
+            ProjectStrategy::Basename,
+            &ai_memory_core::ActorKey::default(),
+        )
+        .await
+        .unwrap();
+        // Look the resolved project up by id via the inverse — find by
+        // expected name and assert it's the same id.
+        let by_name = state
+            .reader
+            .find_project(ws, String::from("brand-new"))
+            .await
+            .unwrap();
+        assert_eq!(
+            by_name,
+            Some(resolved),
+            "no parent match → fall through to create-by-basename"
+        );
     }
 
     #[tokio::test]
