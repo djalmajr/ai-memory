@@ -114,7 +114,45 @@ the CLI to render hook commands for the native Windows agent:
 Use the matching `--client` / `--agent` values for other clients, for
 example `codex`, `cursor`, or `gemini-cli`.
 
-## Scenario C: Native Windows Source Build
+## Scenario C: Prebuilt Release Binary (No Toolchain)
+
+Use this when the agent CLI runs as a native Windows process and you want
+the fast native hook path **without** installing a Rust toolchain or
+Docker. Each tagged release publishes
+`ai-memory-windows-x86_64.zip` (see the repo's Releases page).
+
+```powershell
+# Download + extract into your user data dir (any stable path works; the
+# native hook command is rendered from wherever ai-memory.exe lives).
+$Dest = "$env:LOCALAPPDATA\ai-memory"
+New-Item -ItemType Directory -Force $Dest | Out-Null
+Invoke-WebRequest `
+    -Uri "https://github.com/akitaonrails/ai-memory/releases/latest/download/ai-memory-windows-x86_64.zip" `
+    -OutFile "$env:TEMP\ai-memory.zip"
+Expand-Archive "$env:TEMP\ai-memory.zip" -DestinationPath $Dest -Force
+Get-ChildItem "$Dest\ai-memory.exe" | Unblock-File
+
+# Put it on PATH for future terminals (optional but convenient).
+$UserPath = [Environment]::GetEnvironmentVariable("Path", "User")
+if (($UserPath -split ';') -notcontains $Dest) {
+    [Environment]::SetEnvironmentVariable("Path", "$UserPath;$Dest", "User")
+    $env:Path = "$env:Path;$Dest"
+}
+
+# Wire MCP + lifecycle hooks against your server.
+& "$Dest\ai-memory.exe" install-mcp --client claude-code --apply
+& "$Dest\ai-memory.exe" install-hooks --agent claude-code --apply `
+    --server-url "https://memory.example.com" --auth-token "<token>"
+```
+
+The zip mirrors the Linux release tarball, minus the Linux-only service
+assets: it contains `ai-memory.exe`, the full `hooks/` bundle (`.ps1` +
+`.sh`), `crates/ai-memory-cli/templates/config.default.toml`, `README.md`,
+`LICENSE`, and `docs/{install,windows}.md`. Because `install-hooks` reads
+the `ai-memory.exe` path from the running binary, keep the extracted `.exe`
+at a stable location (re-run `install-hooks` if you move it).
+
+## Scenario D: Native Windows Source Build
 
 Use this when developing ai-memory itself on Windows or when you do not
 want the Docker wrapper for CLI commands.

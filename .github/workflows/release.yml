@@ -114,6 +114,60 @@ jobs:
             ${{ matrix.artifact }}.tar.gz
             ${{ matrix.artifact }}.tar.gz.sha256
 
+  windows:
+    name: windows x86_64 binary
+    needs: validate-version
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@1.95
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build release binary
+        env:
+          TAILWIND_SKIP: "1"
+        run: cargo build --release -p ai-memory-cli
+
+      # Mirrors the Linux tarball, minus the Linux-only service assets
+      # (packaging/systemd|sysusers|tmpfiles|env). Ships the `.exe`, the full
+      # hooks bundle (the .ps1 + .sh scripts), the default config template, and
+      # the docs a Windows user needs (install.md + windows.md). Zipped (native
+      # Windows archive) with a sha256sum-format checksum so the release body's
+      # checksums block stays uniform across platforms.
+      - name: Create release zip
+        shell: pwsh
+        env:
+          RELEASE_ARTIFACT: ai-memory-windows-x86_64
+        run: |
+          $artifact = $env:RELEASE_ARTIFACT
+          $stage = "dist/$artifact"
+          New-Item -ItemType Directory -Force -Path $stage | Out-Null
+          Copy-Item target/release/ai-memory.exe "$stage/ai-memory.exe"
+          Copy-Item -Recurse hooks "$stage/hooks"
+          New-Item -ItemType Directory -Force -Path "$stage/crates/ai-memory-cli/templates" | Out-Null
+          Copy-Item crates/ai-memory-cli/templates/config.default.toml `
+            "$stage/crates/ai-memory-cli/templates/config.default.toml"
+          New-Item -ItemType Directory -Force -Path "$stage/docs" | Out-Null
+          Copy-Item README.md, LICENSE $stage
+          Copy-Item docs/install.md "$stage/docs/install.md"
+          Copy-Item docs/windows.md "$stage/docs/windows.md"
+          $zip = "$artifact.zip"
+          # Pipe the staged items in (rather than a "$stage/*" glob) so the
+          # archive is rooted at the files themselves — ai-memory.exe, hooks/,
+          # etc. land at the zip root, mirroring the Linux tarball layout.
+          Get-ChildItem $stage | Compress-Archive -DestinationPath $zip
+          $hash = (Get-FileHash $zip -Algorithm SHA256).Hash.ToLower()
+          "$hash  $zip" | Out-File -Encoding ascii "$zip.sha256"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ai-memory-windows-x86_64
+          path: |
+            ai-memory-windows-x86_64.zip
+            ai-memory-windows-x86_64.zip.sha256
+
   # Gate the publish on the Docker Hub secrets actually being present, so a
   # fresh clone (or a fork) doesn't get a red failing run on every tag. The
   # docker job activates automatically once DOCKERHUB_USERNAME + _TOKEN are
@@ -325,7 +379,7 @@ jobs:
 
   github-release:
     name: github release
-    needs: [binary, validate-version]
+    needs: [binary, windows, validate-version]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/download-artifact@v4
@@ -348,6 +402,9 @@ jobs:
           echo "" >> body.md
           echo "# Docker" >> body.md
           echo "docker pull akitaonrails/ai-memory:${{ needs.validate-version.outputs.version }}" >> body.md
+          echo "" >> body.md
+          echo "# Windows x86_64 (no toolchain): download ai-memory-windows-x86_64.zip below," >> body.md
+          echo "# extract it, and follow the bundled docs/windows.md." >> body.md
           echo "" >> body.md
           echo "# From source" >> body.md
           echo "cargo install --git https://github.com/akitaonrails/ai-memory --tag ${GITHUB_REF_NAME}" >> body.md
