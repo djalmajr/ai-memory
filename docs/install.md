@@ -840,7 +840,7 @@ Two ways to invoke a subcommand against the docker deploy:
 
 ```bash
 # A) Against the running container (stateful: status, search, backup,
-#    forget-sweep, lint, embed).
+#    checkpoints, restore-page, forget-sweep, lint, embed).
 docker exec ai-memory ai-memory status --json
 docker exec ai-memory ai-memory search "karpathy"
 docker exec ai-memory ai-memory backup --to /data/snapshot.tar.gz
@@ -861,6 +861,7 @@ docker run --rm akitaonrails/ai-memory:latest --help     # full subcommand tree
 | `search "<query>"` | `docker exec` | Wiki search with FTS5 + graph/vector RRF |
 | `write-page` | `docker exec` | Manual page write (atomic + indexed) |
 | `backup --to` / `restore --from` | `docker exec` | Snapshot or restore the data dir |
+| `checkpoints` / `restore-page` | `docker exec` | List wiki git checkpoints or restore one markdown page and reindex it |
 | `forget-sweep` / `lint` / `embed` | `docker exec` | Manual maintenance; sweep + lint also run on the server schedule by default |
 | `commit -m "…"` | `docker exec` | Stage + commit the wiki tree |
 | `reset --confirm` | `docker exec` | Wipe data (refuses while siblings alive) |

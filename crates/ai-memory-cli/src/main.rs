@@ -68,6 +68,8 @@ async fn main() -> Result<()> {
         Command::Hook(_) => unreachable!("hook handled before config load"),
         Command::InstallMcp(args) => commands::install_mcp::run(&config, args),
         Command::Commit(args) => commands::commit::run(&config, args).await,
+        Command::Checkpoints(args) => commands::checkpoints::run(&config, args).await,
+        Command::RestorePage(args) => commands::restore_page::run(&config, args).await,
         Command::LlmTest(args) => commands::llm_test::run(&config, args).await,
         Command::ForgetSweep(args) => commands::forget_sweep::run(&config, args).await,
         Command::Lint(args) => commands::lint::run(&config, args).await,

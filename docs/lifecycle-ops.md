@@ -12,6 +12,8 @@ on a homelab box where mistakes are harder to undo.
 | `rename-project --from --to` | ✅ yes | no | yes (rename back) | Column-only update on `projects.name`. The on-disk dir is keyed by `project_id` (UUID), so the rename never moves a file. |
 | `move-project --confirm` | ✅ yes | source only in the merge case (a `Reject`-policy `purge_project` webhook can still abort the source teardown leaving everything intact) | no | Fresh destination → lossless **true move** (re-stamp `workspace_id`, keep `project_id`, rename the dir): sessions/observations/handoffs + history all survive. Destination with a same-named project → **copy+purge merge**: only latest pages migrate. |
 | `backup --output-path` | ✅ yes | no | n/a | Streams a gzipped tarball from the server's online `sqlite3 .backup` plus the wiki tree. Safe alongside the live writer. |
+| `checkpoints` | ✅ yes | no | n/a | Lists recent wiki git checkpoints. Read-only. |
+| `restore-page --path --from` | ✅ yes | overwrites one markdown page version | yes (restore another checkpoint) | Restores one page from wiki git history, reindexes it into SQLite, and writes a post-restore checkpoint. Does not restore DB-only state. |
 | `restore --from <tarball>` | ❌ **stop the server first** | overwrites the data dir | no (without prior backup) | Refuses if any sibling `ai-memory` process is alive (sysinfo guard). |
 | `reset --confirm` | ❌ **stop the server first** | yes, all data | no | Refuses if any sibling `ai-memory` process is alive (sysinfo guard). |
 | `reindex` | ❌ **stop the server first** | no wiki wipe; requires a clean DB | only with prior DB backup | Rebuilds pages/links/FTS from `wiki/` using `_meta.md` manifests. Refuses if SQLite already has rows so stale DB-only state cannot survive silently. |
@@ -254,6 +256,63 @@ Failure modes:
   committed move. If a rare rollback double-fault happens after the
   directory moved but before SQL committed, the error includes the
   exact manual repair.
+
+### `checkpoints`
+
+```bash
+ai-memory checkpoints
+```
+
+Lists recent wiki git commits, newest first. The short OID is enough for
+`restore-page`, but the JSON output includes the full OID:
+
+```bash
+ai-memory checkpoints --json
+```
+
+What it is for:
+
+- Finding the checkpoint just before a bad page write, delete, purge, move, or
+  restore.
+- Inspecting wiki history without shelling into the server's `wiki/.git` repo.
+
+Startup creates a one-time `upgrade baseline: existing wiki tree before recovery
+checkpoints` commit for existing data dirs whose wiki repo has zero commits.
+Fresh empty installs still have no commit until there is content to save.
+
+### `restore-page`
+
+```bash
+ai-memory restore-page --workspace default --project my-project \
+  --path notes/foo.md --from <checkpoint>
+```
+
+What happens:
+
+1. Server resolves `(workspace, project)` without auto-creating anything.
+2. Server validates the page path.
+3. Server checkpoints the current wiki tree first (`pre-restore-page ...`) when
+   there are uncommitted changes.
+4. Server reads the exact markdown blob for that project/page from git at
+   `--from`, parses it, writes it back to the live wiki tree, and upserts a new
+   latest page row in SQLite so search, links, and `/web` agree with disk.
+5. Server writes a post-restore checkpoint (`restore-page ...`) when the live
+   tree changed.
+
+Failure modes:
+
+- **Workspace or project name not found** → 404, no mutation.
+- **Invalid page path** → 422, no mutation.
+- **Checkpoint or file not found** → 500 with the git/libgit2 error; any
+  pre-restore checkpoint remains as an audit breadcrumb.
+- **Historical markdown is malformed or non-UTF-8** → 500, live file is not
+  replaced.
+
+What it does not recover:
+
+- Sessions, observations, handoffs, users, audit rows, access counters, and
+  embeddings. Those live only in SQLite and require a full `backup` / `restore`
+  if you need to roll them back.
 
 ### `backup`
 

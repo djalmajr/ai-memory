@@ -129,6 +129,13 @@ pub async fn run(config: &Config, args: ServeArgs) -> Result<()> {
         Ok(n) => tracing::info!(count = n, "wrote _meta.md scope manifests"),
         Err(e) => tracing::warn!(error = %e, "scope-manifest backfill failed (non-fatal)"),
     }
+    match wiki.ensure_upgrade_baseline_checkpoint() {
+        Ok(Some(oid)) => {
+            tracing::info!(checkpoint = %oid, "created wiki upgrade baseline checkpoint")
+        }
+        Ok(None) => {}
+        Err(e) => tracing::warn!(error = %e, "wiki upgrade baseline checkpoint failed (non-fatal)"),
+    }
 
     // Keep the guard alive for the lifetime of `serve`.
     let _watcher = start_watcher(&args, &wiki)?;

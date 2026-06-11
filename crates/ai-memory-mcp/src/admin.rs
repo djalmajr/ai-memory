@@ -11,6 +11,8 @@
 //! - `POST /admin/forget-sweep`   — run the M8 retention sweep.
 //! - `POST /admin/embed`          — backfill embeddings for latest pages.
 //! - `POST /admin/commit`         — stage + commit the wiki tree via git.
+//! - `GET  /admin/checkpoints`    — list recent wiki git checkpoints.
+//! - `POST /admin/restore-page`   — restore one page from a checkpoint.
 //! - `POST /admin/purge-project`  — delete a project and all its data.
 //! - `POST /admin/rename-project` — rename a project (column-only; no files move).
 //! - `POST /admin/move-project`   — move a project into another workspace
@@ -156,6 +158,8 @@ fn default_chunk_input_tokens() -> usize {
 /// - `POST /admin/forget-sweep`
 /// - `POST /admin/embed`
 /// - `POST /admin/commit`
+/// - `GET  /admin/checkpoints`
+/// - `POST /admin/restore-page`
 /// - `POST /admin/purge-project`
 /// - `POST /admin/rename-project`
 /// - `POST /admin/move-project`
@@ -173,6 +177,8 @@ pub fn admin_router(state: AdminState) -> Router {
         .route("/admin/forget-sweep", post(handle_forget_sweep))
         .route("/admin/embed", post(handle_embed))
         .route("/admin/commit", post(handle_commit))
+        .route("/admin/checkpoints", get(handle_checkpoints))
+        .route("/admin/restore-page", post(handle_restore_page))
         .route("/admin/purge-project", post(handle_purge_project))
         .route("/admin/rename-project", post(handle_rename_project))
         .route("/admin/move-project", post(handle_move_project))
@@ -1394,6 +1400,53 @@ struct CommitRequest {
     message: String,
 }
 
+#[derive(Debug, Serialize)]
+struct CheckpointResponse {
+    /// Full git commit OID.
+    oid: String,
+    /// First 12 hex characters, useful for CLI display.
+    short_oid: String,
+    /// Commit author timestamp in seconds since Unix epoch.
+    time: i64,
+    /// First line of the commit message.
+    summary: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct CheckpointListQuery {
+    /// Maximum number of checkpoints to return.
+    #[serde(default = "default_checkpoint_limit")]
+    limit: usize,
+}
+
+fn default_checkpoint_limit() -> usize {
+    20
+}
+
+fn short_oid(oid: &str) -> String {
+    oid.chars().take(12).collect()
+}
+
+fn checkpoint_or_500(
+    wiki: &Wiki,
+    message: impl AsRef<str>,
+) -> Result<Option<String>, (StatusCode, Json<serde_json::Value>)> {
+    wiki.commit_all(message.as_ref())
+        .map(|oid| oid.map(|oid| oid.to_string()))
+        .map_err(|e| internal_err(e.to_string()))
+}
+
+fn checkpoint_or_warn(wiki: &Wiki, message: impl AsRef<str>) -> Option<String> {
+    match wiki.commit_all(message.as_ref()) {
+        Ok(Some(oid)) => Some(oid.to_string()),
+        Ok(None) => None,
+        Err(e) => {
+            warn!(error = %e, "wiki checkpoint failed after mutation");
+            None
+        }
+    }
+}
+
 async fn handle_commit(
     State(state): State<Arc<AdminState>>,
     Json(req): Json<CommitRequest>,
@@ -1418,6 +1471,116 @@ async fn handle_commit(
             Json(serde_json::json!({ "error": e.to_string() })),
         ),
     }
+}
+
+async fn handle_checkpoints(
+    State(state): State<Arc<AdminState>>,
+    Query(query): Query<CheckpointListQuery>,
+) -> impl IntoResponse {
+    let limit = query.limit.clamp(1, 100);
+    match state.wiki.recent_checkpoints(limit) {
+        Ok(checkpoints) => {
+            let checkpoints: Vec<CheckpointResponse> = checkpoints
+                .into_iter()
+                .map(|cp| CheckpointResponse {
+                    short_oid: short_oid(&cp.oid),
+                    oid: cp.oid,
+                    time: cp.time,
+                    summary: cp.summary,
+                })
+                .collect();
+            (
+                StatusCode::OK,
+                Json(serde_json::to_value(checkpoints).unwrap_or_else(|_| serde_json::json!([]))),
+            )
+        }
+        Err(e) => internal_err(e.to_string()),
+    }
+}
+
+// ---------------------------------------------------------------------
+// restore-page
+// ---------------------------------------------------------------------
+
+#[derive(Deserialize)]
+struct RestorePageRequest {
+    /// Workspace name. Must exist.
+    workspace: String,
+    /// Project name. Must exist within `workspace`.
+    project: String,
+    /// Relative wiki path to restore.
+    path: String,
+    /// Git revision/commit to restore from.
+    rev: String,
+}
+
+#[derive(Serialize)]
+struct RestorePageResponse {
+    /// UUID of the restored page version.
+    page_id: String,
+    /// Canonical wiki path restored.
+    path: String,
+    /// Revision requested by the caller.
+    restored_from: String,
+    /// Pre-restore checkpoint, if the current tree had changes to save.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pre_checkpoint: Option<String>,
+    /// Post-restore checkpoint, if the restore changed the tree.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    checkpoint: Option<String>,
+}
+
+async fn handle_restore_page(
+    State(state): State<Arc<AdminState>>,
+    Json(req): Json<RestorePageRequest>,
+) -> Result<impl IntoResponse, (StatusCode, Json<serde_json::Value>)> {
+    let path = PagePath::new(req.path.clone()).map_err(|e| {
+        (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(serde_json::json!({ "error": format!("invalid path: {e}") })),
+        )
+    })?;
+    let (ws, proj) = lookup_ws_proj_no_create(&state, &req.workspace, &req.project).await?;
+
+    let pre_checkpoint = checkpoint_or_500(
+        &state.wiki,
+        format!(
+            "pre-restore-page {}/{}: {}",
+            req.workspace,
+            req.project,
+            path.as_str()
+        ),
+    )?;
+
+    let page_id = state
+        .wiki
+        .restore_page_from_checkpoint(ws, proj, path.clone(), &req.rev)
+        .await
+        .map_err(|e| internal_err(e.to_string()))?;
+    let checkpoint = checkpoint_or_warn(
+        &state.wiki,
+        format!(
+            "restore-page {}/{}: {} from {}",
+            req.workspace,
+            req.project,
+            path.as_str(),
+            req.rev
+        ),
+    );
+
+    Ok((
+        StatusCode::OK,
+        Json(
+            serde_json::to_value(RestorePageResponse {
+                page_id: page_id.to_string(),
+                path: path.to_string(),
+                restored_from: req.rev,
+                pre_checkpoint,
+                checkpoint,
+            })
+            .unwrap_or_else(|_| serde_json::json!({})),
+        ),
+    ))
 }
 
 // ---------------------------------------------------------------------
@@ -1455,6 +1618,12 @@ pub struct PurgeProjectReport {
     pub files_deleted: Vec<String>,
     /// Paths that could not be removed from disk (non-fatal; DB rows are gone).
     pub files_failed: Vec<String>,
+    /// Pre-purge checkpoint, if the tree had uncommitted changes.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pre_checkpoint: Option<String>,
+    /// Post-purge checkpoint, if the purge changed the tree.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub checkpoint: Option<String>,
 }
 
 async fn handle_purge_project(
@@ -1498,6 +1667,12 @@ async fn handle_purge_project(
         Err(e) => return internal_err(e.to_string()),
     };
 
+    let pre_checkpoint = match checkpoint_or_500(&state.wiki, format!("pre-purge-project {label}"))
+    {
+        Ok(oid) => oid,
+        Err(e) => return e,
+    };
+
     let summary = match state.writer.purge_project(ws_id, proj_id, &label).await {
         Ok(s) => s,
         Err(e) => return internal_err(e.to_string()),
@@ -1536,6 +1711,8 @@ async fn handle_purge_project(
     }
     state.wiki.dispatch_purge_project(dispatch_ctx.as_ref());
 
+    let checkpoint = checkpoint_or_warn(&state.wiki, format!("purge-project {label}"));
+
     let report = PurgeProjectReport {
         label: summary.label,
         pages_deleted: summary.pages_deleted,
@@ -1545,6 +1722,8 @@ async fn handle_purge_project(
         embeddings_deleted: summary.embeddings_deleted,
         files_deleted,
         files_failed,
+        pre_checkpoint,
+        checkpoint,
     };
 
     (
@@ -1580,6 +1759,9 @@ pub struct RenameProjectSummary {
     /// Number of `is_latest=1` pages now under the renamed project.
     /// No files move — this is purely an informational count.
     pub pages: u64,
+    /// Post-rename checkpoint, if `_meta.md` changed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub checkpoint: Option<String>,
 }
 
 async fn handle_rename_project(
@@ -1640,10 +1822,22 @@ async fn handle_rename_project(
     };
 
     let summary = RenameProjectSummary {
-        workspace: req.workspace,
-        from: req.from,
-        to: req.to,
+        workspace: req.workspace.clone(),
+        from: req.from.clone(),
+        to: req.to.clone(),
         pages,
+        checkpoint: {
+            if let Err(e) = state.wiki.backfill_scope_manifests().await {
+                warn!(error = %e, "rename-project: scope-manifest backfill failed after rename");
+            }
+            checkpoint_or_warn(
+                &state.wiki,
+                format!(
+                    "rename-project {}/{} -> {}",
+                    req.workspace, req.from, req.to
+                ),
+            )
+        },
     };
     (
         StatusCode::OK,
@@ -1745,6 +1939,12 @@ pub struct MoveProjectReport {
     /// under a de-duplicated path so BOTH survive. Each entry is the original
     /// source path and the de-duplicated destination path it was written to.
     pub conflicts: Vec<PathConflict>,
+    /// Pre-move checkpoint, if the tree had uncommitted changes.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pre_checkpoint: Option<String>,
+    /// Post-move checkpoint, if the move changed the tree.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub checkpoint: Option<String>,
 }
 
 /// One same-path collision resolved by de-duplicating the source page's path.
@@ -1766,6 +1966,7 @@ async fn true_move_project(
     req: &MoveProjectRequest,
     src_ws: WorkspaceId,
     src_proj: ProjectId,
+    pre_checkpoint: Option<String>,
 ) -> (StatusCode, Json<serde_json::Value>) {
     // Ensure the destination workspace ROW exists (FK target for the
     // re-stamp) without creating a new project — the existing project_id is
@@ -1843,6 +2044,17 @@ async fn true_move_project(
         evict(src_proj);
     }
 
+    if let Err(e) = state.wiki.backfill_scope_manifests().await {
+        warn!(error = %e, "true-move: scope-manifest backfill failed after move");
+    }
+    let checkpoint = checkpoint_or_warn(
+        &state.wiki,
+        format!(
+            "move-project {}/{} -> {}/{}",
+            req.from_workspace, req.project, req.to_workspace, req.project
+        ),
+    );
+
     let report = MoveProjectReport {
         from: format!("{}/{}", req.from_workspace, req.project),
         to: format!("{}/{}", req.to_workspace, req.project),
@@ -1862,6 +2074,8 @@ async fn true_move_project(
         files_failed: Vec::new(),
         // A true move never copies pages, so it never has a path conflict.
         conflicts: Vec::new(),
+        pre_checkpoint,
+        checkpoint,
     };
     (
         StatusCode::OK,
@@ -2006,6 +2220,17 @@ async fn handle_move_project(
         Err(e) => return internal_err(e.to_string()),
     };
 
+    let pre_checkpoint = match checkpoint_or_500(
+        &state.wiki,
+        format!(
+            "pre-move-project {}/{} -> {}/{}",
+            req.from_workspace, req.project, req.to_workspace, req.project
+        ),
+    ) {
+        Ok(oid) => oid,
+        Err(e) => return e,
+    };
+
     // FRESH destination (no same-named project there) → lossless TRUE MOVE.
     // Re-stamp the source project's workspace_id across every domain table in
     // one transaction (same project_id), then rename its on-disk dir. This
@@ -2015,7 +2240,7 @@ async fn handle_move_project(
     // case, where two project_ids can't be re-stamped into one
     // (UNIQUE(workspace_id, name) collision).
     if !merged_into_existing {
-        return true_move_project(&state, &req, src_ws, src_proj).await;
+        return true_move_project(&state, &req, src_ws, src_proj, pre_checkpoint).await;
     }
 
     // MERGE: the destination already holds a same-named project. Get-or-create
@@ -2026,7 +2251,16 @@ async fn handle_move_project(
         Err(e) => return e,
     };
 
-    copy_purge_merge(&state, &req, src_ws, src_proj, dst_ws, dst_proj).await
+    copy_purge_merge(
+        &state,
+        &req,
+        src_ws,
+        src_proj,
+        dst_ws,
+        dst_proj,
+        pre_checkpoint,
+    )
+    .await
 }
 
 /// One source page, with everything the copy loop and the block
@@ -2131,6 +2365,7 @@ async fn copy_purge_merge(
     src_proj: ProjectId,
     dst_ws: WorkspaceId,
     dst_proj: ProjectId,
+    pre_checkpoint: Option<String>,
 ) -> (StatusCode, Json<serde_json::Value>) {
     // Enumerate the source's latest pages (authoritative on is_latest).
     let summaries = match state
@@ -2330,6 +2565,13 @@ async fn copy_purge_merge(
     // now would destroy data we failed to copy. Report and let the operator
     // fix + re-run (re-running is idempotent: copied pages just supersede).
     if !pages_skipped.is_empty() {
+        let checkpoint = checkpoint_or_warn(
+            &state.wiki,
+            format!(
+                "move-project-partial {}/{} -> {}/{}",
+                req.from_workspace, req.project, req.to_workspace, req.project
+            ),
+        );
         let report = MoveProjectReport {
             from: format!("{}/{}", req.from_workspace, req.project),
             to: format!("{}/{}", req.to_workspace, req.project),
@@ -2348,6 +2590,8 @@ async fn copy_purge_merge(
             files_deleted: Vec::new(),
             files_failed: Vec::new(),
             conflicts,
+            pre_checkpoint,
+            checkpoint,
         };
         return (
             StatusCode::OK,
@@ -2421,6 +2665,17 @@ async fn copy_purge_merge(
         evict(src_proj);
     }
 
+    if let Err(e) = state.wiki.backfill_scope_manifests().await {
+        warn!(error = %e, "copy-purge move: scope-manifest backfill failed after move");
+    }
+    let checkpoint = checkpoint_or_warn(
+        &state.wiki,
+        format!(
+            "move-project {}/{} -> {}/{}",
+            req.from_workspace, req.project, req.to_workspace, req.project
+        ),
+    );
+
     let report = MoveProjectReport {
         from: label,
         to: format!("{}/{}", req.to_workspace, req.project),
@@ -2438,6 +2693,8 @@ async fn copy_purge_merge(
         files_deleted,
         files_failed,
         conflicts,
+        pre_checkpoint,
+        checkpoint,
     };
     (
         StatusCode::OK,
@@ -2490,6 +2747,9 @@ struct WritePageResponse {
     page_id: String,
     /// Canonical wiki path.
     path: String,
+    /// Post-write checkpoint, if the write changed the tree.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    checkpoint: Option<String>,
 }
 
 async fn handle_write_page(
@@ -2585,6 +2845,15 @@ async fn handle_write_page(
         })
         .await
         .map_err(|e| internal_err(e.to_string()))?;
+    let checkpoint = checkpoint_or_warn(
+        &state.wiki,
+        format!(
+            "write-page {}/{}: {}",
+            req.workspace,
+            req.project,
+            path.as_str()
+        ),
+    );
 
     Ok((
         StatusCode::OK,
@@ -2592,6 +2861,7 @@ async fn handle_write_page(
             serde_json::to_value(WritePageResponse {
                 page_id: page_id.to_string(),
                 path: path.to_string(),
+                checkpoint,
             })
             .unwrap_or_else(|_| serde_json::json!({})),
         ),
@@ -2629,6 +2899,12 @@ struct DeletePageResponse {
     /// fails to resolve (so a stale or wrong-scope call never returns a misleading
     /// `deleted: true`).
     deleted: bool,
+    /// Pre-delete checkpoint, if the tree had uncommitted changes.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pre_checkpoint: Option<String>,
+    /// Post-delete checkpoint, if the delete changed the tree.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    checkpoint: Option<String>,
 }
 
 async fn handle_delete_page(
@@ -2649,6 +2925,16 @@ async fn handle_delete_page(
     // typo'd workspace/project must return 404, NOT silently auto-create
     // empty containers and then return `deleted: true` for nothing.
     let (ws, proj) = lookup_ws_proj_no_create(&state, &req.workspace, &req.project).await?;
+
+    let pre_checkpoint = checkpoint_or_500(
+        &state.wiki,
+        format!(
+            "pre-delete-page {}/{}: {}",
+            req.workspace,
+            req.project,
+            path.as_str()
+        ),
+    )?;
 
     let actor = actor_ext
         .map(|axum::Extension(actor)| actor)
@@ -2675,6 +2961,15 @@ async fn handle_delete_page(
         .delete_page(ws, proj, &path, admission_ctx)
         .await
         .map_err(|e| internal_err(e.to_string()))?;
+    let checkpoint = checkpoint_or_warn(
+        &state.wiki,
+        format!(
+            "delete-page {}/{}: {}",
+            req.workspace,
+            req.project,
+            path.as_str()
+        ),
+    );
 
     Ok((
         StatusCode::OK,
@@ -2682,6 +2977,8 @@ async fn handle_delete_page(
             serde_json::to_value(DeletePageResponse {
                 path: path.to_string(),
                 deleted: true,
+                pre_checkpoint,
+                checkpoint,
             })
             .unwrap_or_else(|_| serde_json::json!({})),
         ),
@@ -3364,6 +3661,17 @@ mod tests {
                 "POST",
                 "/admin/commit",
                 serde_json::json!({"message": "test"}),
+            ),
+            ("GET", "/admin/checkpoints?limit=1", serde_json::Value::Null),
+            (
+                "POST",
+                "/admin/restore-page",
+                serde_json::json!({
+                    "workspace": "default",
+                    "project": "scratch",
+                    "path": "notes/x.md",
+                    "rev": "HEAD"
+                }),
             ),
             (
                 "POST",

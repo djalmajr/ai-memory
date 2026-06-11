@@ -7,7 +7,7 @@
 
 use std::path::{Path, PathBuf};
 
-use git2::{IndexAddOption, Repository, Signature};
+use git2::{IndexAddOption, ObjectType, Repository, Signature};
 use tracing::{debug, warn};
 
 use crate::error::{WikiError, WikiResult};
@@ -22,6 +22,17 @@ pub const COMMIT_AUTHOR_EMAIL: &str = "ai-memory@local";
 #[derive(Clone)]
 pub struct GitAdapter {
     root: PathBuf,
+}
+
+/// One git checkpoint in the wiki repository.
+#[derive(Debug, Clone)]
+pub struct Checkpoint {
+    /// Full commit OID.
+    pub oid: String,
+    /// Commit summary (first line of the commit message).
+    pub summary: String,
+    /// Author timestamp, seconds since Unix epoch.
+    pub time: i64,
 }
 
 impl GitAdapter {
@@ -117,6 +128,61 @@ impl GitAdapter {
         }
         walk.count()
     }
+
+    /// Return the most recent commits reachable from HEAD.
+    ///
+    /// Empty repositories return an empty list.
+    ///
+    /// # Errors
+    /// Propagates any underlying libgit2 error.
+    pub fn recent_checkpoints(&self, limit: usize) -> WikiResult<Vec<Checkpoint>> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let repo = Repository::open(&self.root).map_err(map_git_err)?;
+        let mut walk = repo.revwalk().map_err(map_git_err)?;
+        if walk.push_head().is_err() {
+            return Ok(Vec::new());
+        }
+        let mut out = Vec::with_capacity(limit.min(100));
+        for oid in walk.take(limit) {
+            let oid = oid.map_err(map_git_err)?;
+            let commit = repo.find_commit(oid).map_err(map_git_err)?;
+            out.push(Checkpoint {
+                oid: oid.to_string(),
+                summary: commit.summary().unwrap_or("(no summary)").to_string(),
+                time: commit.time().seconds(),
+            });
+        }
+        Ok(out)
+    }
+
+    /// Read `path` as it existed at `rev`.
+    ///
+    /// `path` is relative to the wiki repo root. The returned bytes are the
+    /// blob contents exactly as stored in git.
+    ///
+    /// # Errors
+    /// Returns [`WikiError`] when the revision, path, or blob cannot be read.
+    pub fn file_at_rev(&self, rev: &str, path: &Path) -> WikiResult<Vec<u8>> {
+        let repo = Repository::open(&self.root).map_err(map_git_err)?;
+        let object = repo.revparse_single(rev).map_err(map_git_err)?;
+        let commit = object.peel_to_commit().map_err(map_git_err)?;
+        let tree = commit.tree().map_err(map_git_err)?;
+        let entry = tree.get_path(path).map_err(map_git_err)?;
+        let blob = entry
+            .to_object(&repo)
+            .map_err(map_git_err)?
+            .peel(ObjectType::Blob)
+            .map_err(map_git_err)?;
+        let blob = blob.as_blob().ok_or_else(|| {
+            WikiError::Io(std::io::Error::other(format!(
+                "{} at {rev} is not a file",
+                path.display()
+            )))
+        })?;
+        Ok(blob.content().to_vec())
+    }
 }
 
 fn map_git_err(e: git2::Error) -> WikiError {
@@ -168,5 +234,40 @@ mod tests {
         let oid = adapter.commit_all("remove a").unwrap();
         assert!(oid.is_some());
         assert_eq!(adapter.commit_count(), 2);
+    }
+
+    #[test]
+    fn recent_checkpoints_returns_newest_first() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().join("wiki");
+        let adapter = GitAdapter::open_or_init(&root).unwrap();
+
+        std::fs::write(root.join("a.md"), "one").unwrap();
+        let first = adapter.commit_all("first checkpoint").unwrap().unwrap();
+        std::fs::write(root.join("a.md"), "two").unwrap();
+        let second = adapter.commit_all("second checkpoint").unwrap().unwrap();
+
+        let checkpoints = adapter.recent_checkpoints(10).unwrap();
+        assert_eq!(checkpoints.len(), 2);
+        assert_eq!(checkpoints[0].oid, second.to_string());
+        assert_eq!(checkpoints[0].summary, "second checkpoint");
+        assert_eq!(checkpoints[1].oid, first.to_string());
+    }
+
+    #[test]
+    fn file_at_rev_reads_historical_blob() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().join("wiki");
+        let adapter = GitAdapter::open_or_init(&root).unwrap();
+
+        std::fs::write(root.join("a.md"), "one").unwrap();
+        let first = adapter.commit_all("first").unwrap().unwrap();
+        std::fs::write(root.join("a.md"), "two").unwrap();
+        adapter.commit_all("second").unwrap();
+
+        let bytes = adapter
+            .file_at_rev(&first.to_string(), Path::new("a.md"))
+            .unwrap();
+        assert_eq!(String::from_utf8(bytes).unwrap(), "one");
     }
 }

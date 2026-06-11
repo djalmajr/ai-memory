@@ -72,7 +72,7 @@ priors are at the [bottom](#influences-and-prior-art).
 - **Karpathy-style LLM wiki.** Pages are compiled from observations
   at session-end (or PreCompact), not retrieved over raw logs.
   Supersession chain + git-versioned markdown means you can
-  time-travel with `git log`.
+  time-travel with `ai-memory checkpoints`, `restore-page`, or raw `git log`.
 - **Built-in `/web` browser.** Read-only HTML UI for the wiki -
   project list, folder tree, FTS5 search, markdown rendering, dark
   mode. Mounted on the same axum server as MCP.
@@ -84,8 +84,9 @@ priors are at the [bottom](#influences-and-prior-art).
   with bearer-token auth. Shared servers can opt into
   [`[auto_scope]` modes](docs/auto-scope.md) for per-user or
   session-aware current-project routing.
-- **Thin-client CLI.** `ai-memory status`, `bootstrap`, `purge-project`,
-  `rename-project`, `move-project`, `lint`, `embed`, `forget-sweep`, `backup` are
+- **Thin-client CLI.** `ai-memory status`, `bootstrap`, `checkpoints`,
+  `restore-page`, `purge-project`, `rename-project`, `move-project`, `lint`,
+  `embed`, `forget-sweep`, `backup` are
   all HTTP clients of the running server - never touch SQLite or
   wiki files directly. `status` also reports passive LLM/embedding
   provider health from the last real provider call. Server is the
@@ -132,6 +133,12 @@ priors are at the [bottom](#influences-and-prior-art).
   the wiki at `http://<server>:49374/web` - HTTP Basic dialog if
   auth is on, paste the token as password. Per-project tree view,
   rendered markdown, supersession chain visible per page.
+- **"Undo one bad page edit without rolling back the whole server."**
+  `ai-memory checkpoints` shows recent wiki commits, then
+  `ai-memory restore-page --path notes/foo.md --from <rev>` restores that one
+  markdown file and reindexes it into SQLite. Full `backup` / `restore` is
+  still the answer for DB-only state such as sessions, observations, handoffs,
+  users, audit rows, and embeddings.
 - **"Drop an experiment, keep the rest."**
   `ai-memory purge-project --project experimental --confirm`.
   Atomic: that project's DB rows cascade away, its wiki subdir gets
@@ -317,8 +324,9 @@ created via `ai-memory user add` get their own tokens that resolve to
 their identity in audit logs (and, in subsequent milestones, page
 frontmatter + the web UI). Data stays single-tenant — there is no
 per-page RBAC — but once `[auth].token_pepper` enables multi-user
-mode, operational `/admin/*` endpoints such as backup, purge, move,
-embed, and commit require the root token. Existing single-user installs
+mode, operational `/admin/*` endpoints such as backup, checkpoints,
+restore-page, purge, move, embed, and commit require the root token.
+Existing single-user installs
 are not affected unless you opt in by setting `[auth].token_pepper`
 (auto-generated for new installs by `ai-memory init`). See
 [`docs/users.md`](docs/users.md) for the full walkthrough and the
@@ -500,7 +508,7 @@ diagram, crate breakdown, schema notes, and invariants.
 | [`docs/deploy.md`](docs/deploy.md) | Homelab deploy: bin/deploy, bearer-token auth, pointers to the TLS guide. |
 | [`docs/users.md`](docs/users.md) | **Multi-user attribution (v0.8).** Four-rung auth ladder, `ai-memory user add/list/expire/revive/rotate-token` walkthrough, backward-compat migration for pre-v0.8 installs, token storage rationale. |
 | [`docs/https-via-proxy.md`](docs/https-via-proxy.md) | **HTTPS via a reverse proxy.** When you need TLS (multi-user, non-loopback) and when you don't (loopback / stdio). Copy-paste docker compose templates for Caddy + Let's Encrypt, Caddy + internal CA (LAN-only), Cloudflare Tunnel (no open ports), and external cert files; plus native-Caddy + nginx recipes. The "thinking you're secure when you're not" failure modes explicitly called out. |
-| [`docs/lifecycle-ops.md`](docs/lifecycle-ops.md) | **Read before running purge / rename / backup / restore / reset / reindex.** Safety matrix for the state-touching commands, per-project disk layout (how isolation actually works), and operator workflows for "fresh start", "snapshot before risky op", "drop one project", and rebuilding SQLite from wiki files. |
+| [`docs/lifecycle-ops.md`](docs/lifecycle-ops.md) | **Read before running purge / rename / backup / restore / reset / reindex / restore-page.** Safety matrix for state-touching commands, per-project disk layout (how isolation actually works), checkpoint-based page recovery, and operator workflows for "fresh start", "snapshot before risky op", "drop one project", and rebuilding SQLite from wiki files. |
 | [`docs/llm-provider-comparison.md`](docs/llm-provider-comparison.md) | Empirical notes behind the recommended LLM defaults. |
 | [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) | Operational summary: data flow, crate layout, cross-cutting invariants, schema. |
 | [`docs/design-decisions.md`](docs/design-decisions.md) | The full v1 spec. |

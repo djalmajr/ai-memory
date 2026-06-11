@@ -6,6 +6,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
+### Added
+- Wiki recovery checkpoints now have first-class operator commands:
+  `ai-memory checkpoints` lists recent wiki git commits and
+  `ai-memory restore-page --path <page.md> --from <rev>` restores one page
+  from a checkpoint, writes a new post-restore checkpoint, and reindexes the
+  restored page into SQLite. Startup also creates a one-time upgrade baseline
+  checkpoint for existing wiki trees that had no git commits yet.
+
 ### Fixed
 - Release publication now limits the GitHub Release asset download step to
   `ai-memory-*` artifacts, avoiding Docker Buildx side artifacts that can make

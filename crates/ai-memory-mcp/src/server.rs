@@ -1225,10 +1225,12 @@ impl AiMemoryServer {
             })
             .await
             .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+        let checkpoint = checkpoint_or_warn(wiki, format!("memory_write_page: {}", path.as_str()));
 
         ok_json(&serde_json::json!({
             "page_id": page_id.to_string(),
-            "path": path.to_string()
+            "path": path.to_string(),
+            "checkpoint": checkpoint
         }))
     }
 
@@ -1390,11 +1392,20 @@ impl AiMemoryServer {
             None
         };
 
+        let pre_checkpoint =
+            checkpoint_or_mcp(wiki, format!("pre-memory_delete_page: {}", path.as_str()))?;
+
         wiki.delete_page(ws, proj, &path, admission_ctx)
             .await
             .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+        let checkpoint = checkpoint_or_warn(wiki, format!("memory_delete_page: {}", path.as_str()));
 
-        ok_json(&serde_json::json!({ "path": path.to_string(), "deleted": true }))
+        ok_json(&serde_json::json!({
+            "path": path.to_string(),
+            "deleted": true,
+            "pre_checkpoint": pre_checkpoint,
+            "checkpoint": checkpoint,
+        }))
     }
 
     /// Create a handoff snapshot for the next agent CLI.
@@ -1755,6 +1766,23 @@ fn ok_json<T: Serialize>(value: &T) -> Result<CallToolResult, McpError> {
     let s = serde_json::to_string_pretty(value)
         .map_err(|e| McpError::internal_error(e.to_string(), None))?;
     Ok(CallToolResult::success(vec![Content::text(s)]))
+}
+
+fn checkpoint_or_mcp(wiki: &Wiki, message: impl AsRef<str>) -> Result<Option<String>, McpError> {
+    wiki.commit_all(message.as_ref())
+        .map(|oid| oid.map(|oid| oid.to_string()))
+        .map_err(|e| McpError::internal_error(e.to_string(), None))
+}
+
+fn checkpoint_or_warn(wiki: &Wiki, message: impl AsRef<str>) -> Option<String> {
+    match wiki.commit_all(message.as_ref()) {
+        Ok(Some(oid)) => Some(oid.to_string()),
+        Ok(None) => None,
+        Err(e) => {
+            tracing::warn!(error = %e, "wiki checkpoint failed after MCP mutation");
+            None
+        }
+    }
 }
 
 fn is_missing_wiki_file(err: &WikiError) -> bool {

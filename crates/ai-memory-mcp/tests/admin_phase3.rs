@@ -68,6 +68,16 @@ async fn post(state: AdminState, uri: &str, body: serde_json::Value) -> axum::re
     router.oneshot(req).await.unwrap()
 }
 
+async fn get(state: AdminState, uri: &str) -> axum::response::Response {
+    let router = admin_router(state);
+    let req = Request::builder()
+        .method("GET")
+        .uri(uri)
+        .body(Body::empty())
+        .unwrap();
+    router.oneshot(req).await.unwrap()
+}
+
 // ---------------------------------------------------------------------------
 // reorg
 // ---------------------------------------------------------------------------
@@ -494,4 +504,95 @@ async fn commit_with_new_page_returns_committed_true_and_40char_oid() {
         oid.chars().all(|c| c.is_ascii_hexdigit()),
         "oid must be all hex digits: {oid}"
     );
+}
+
+#[tokio::test]
+async fn checkpoints_list_and_restore_page_round_trip() {
+    let tmp = TempDir::new().unwrap();
+    let (state, store) = make_state(&tmp).await;
+    let ws = store
+        .writer
+        .get_or_create_workspace("default")
+        .await
+        .unwrap();
+    let proj = store
+        .writer
+        .get_or_create_project(ws, "scratch", None)
+        .await
+        .unwrap();
+    let path = PagePath::new("notes/recover.md").unwrap();
+
+    state
+        .wiki
+        .write_page(WritePageRequest {
+            workspace_id: ws,
+            project_id: proj,
+            path: path.clone(),
+            frontmatter: serde_json::json!({"title": "Recover", "tier": "semantic"}),
+            body: "old body".into(),
+            tier: Tier::Semantic,
+            pinned: false,
+            title: Some("Recover".into()),
+            admission_ctx: None,
+            author_id: None,
+            actor: ai_memory_core::ActorContext::anonymous(),
+        })
+        .await
+        .unwrap();
+    let old_oid = state.wiki.commit_all("old checkpoint").unwrap().unwrap();
+
+    state
+        .wiki
+        .write_page(WritePageRequest {
+            workspace_id: ws,
+            project_id: proj,
+            path: path.clone(),
+            frontmatter: serde_json::json!({"title": "Recover", "tier": "semantic"}),
+            body: "new body".into(),
+            tier: Tier::Semantic,
+            pinned: false,
+            title: Some("Recover".into()),
+            admission_ctx: None,
+            author_id: None,
+            actor: ai_memory_core::ActorContext::anonymous(),
+        })
+        .await
+        .unwrap();
+    state.wiki.commit_all("new checkpoint").unwrap().unwrap();
+
+    let resp = get(state.clone(), "/admin/checkpoints?limit=5").await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let checkpoints = body_json(resp).await;
+    assert!(
+        checkpoints
+            .as_array()
+            .is_some_and(|rows| rows.iter().any(|row| row["summary"] == "old checkpoint")),
+        "expected old checkpoint in list: {checkpoints}"
+    );
+
+    let resp = post(
+        state.clone(),
+        "/admin/restore-page",
+        json!({
+            "workspace": "default",
+            "project": "scratch",
+            "path": "notes/recover.md",
+            "rev": old_oid.to_string(),
+        }),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = body_json(resp).await;
+    assert_eq!(body["path"], "notes/recover.md");
+    assert_eq!(body["restored_from"], old_oid.to_string());
+
+    let md = state.wiki.read_page(ws, proj, &path).unwrap();
+    assert_eq!(md.body, "old body");
+    let stored = store
+        .reader
+        .page_body_by_ids(ws, proj, "notes/recover.md")
+        .await
+        .unwrap()
+        .expect("restored page should be indexed");
+    assert_eq!(stored.body, "old body");
 }

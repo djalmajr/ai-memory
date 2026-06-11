@@ -69,6 +69,10 @@ pub enum Command {
     InstallMcp(InstallMcpArgs),
     /// Stage + commit the wiki tree under git.
     Commit(CommitArgs),
+    /// List recent wiki git checkpoints for recovery.
+    Checkpoints(CheckpointsArgs),
+    /// Restore a single wiki page from a git checkpoint and reindex it.
+    RestorePage(RestorePageArgs),
     /// Smoke-test an LLM provider by sending one prompt.
     LlmTest(LlmTestArgs),
     /// Run the M8 retention sweep over episodic pages.
@@ -628,6 +632,37 @@ pub struct RestoreArgs {
     /// Overwrite an existing non-empty data dir.
     #[arg(long)]
     pub force: bool,
+}
+
+/// Arguments for `checkpoints`.
+#[derive(Debug, Args)]
+pub struct CheckpointsArgs {
+    /// Maximum number of checkpoints to list.
+    #[arg(short = 'n', long, default_value_t = 20)]
+    pub limit: usize,
+    /// Emit checkpoints as JSON instead of human-readable rows.
+    #[arg(long)]
+    pub json: bool,
+}
+
+/// Arguments for `restore-page`.
+#[derive(Debug, Args)]
+pub struct RestorePageArgs {
+    /// Exact wiki path to restore (e.g. `notes/foo.md`).
+    #[arg(long)]
+    pub path: String,
+    /// Git checkpoint/revision to restore from.
+    #[arg(long)]
+    pub from: String,
+    /// Workspace name. Defaults to `default`.
+    #[arg(long, default_value_t = crate::config::DEFAULT_WORKSPACE.to_string())]
+    pub workspace: String,
+    /// Project name. When omitted, auto-derived from the current project.
+    #[arg(long)]
+    pub project: Option<String>,
+    /// Emit the server response as JSON.
+    #[arg(long)]
+    pub json: bool,
 }
 
 /// Arguments for `reindex`.

@@ -11,7 +11,7 @@ use tokio::sync::RwLock;
 use crate::admission::{AdmissionChain, AdmissionContext, AdmissionOp};
 use crate::atomic;
 use crate::error::{WikiError, WikiResult};
-use crate::git::GitAdapter;
+use crate::git::{Checkpoint, GitAdapter};
 use crate::markdown::{Markdown, derive_title, emit, extract_links, parse};
 
 /// Summary of a [`Wiki::reindex_all`] run.
@@ -173,6 +173,31 @@ impl Wiki {
         self.git.commit_all(message)
     }
 
+    /// Return the most recent wiki git checkpoints, newest first.
+    ///
+    /// # Errors
+    /// Propagates [`WikiError`] from the git adapter.
+    pub fn recent_checkpoints(&self, limit: usize) -> WikiResult<Vec<Checkpoint>> {
+        self.git.recent_checkpoints(limit)
+    }
+
+    /// Create the one-time baseline checkpoint for an existing wiki tree that
+    /// was created before git recovery checkpoints existed.
+    ///
+    /// Existing repos with any commit are left untouched. Fresh empty repos
+    /// return `Ok(None)` because there is nothing to commit.
+    ///
+    /// # Errors
+    /// Propagates [`WikiError`] from the git adapter.
+    pub fn ensure_upgrade_baseline_checkpoint(&self) -> WikiResult<Option<git2::Oid>> {
+        if self.git.commit_count() == 0 {
+            self.git
+                .commit_all("upgrade baseline: existing wiki tree before recovery checkpoints")
+        } else {
+            Ok(None)
+        }
+    }
+
     /// Path of the wiki root on disk.
     #[must_use]
     pub fn root(&self) -> &Path {
@@ -309,6 +334,71 @@ impl Wiki {
         let abs = self.abs_path(workspace_id, project_id, path);
         let raw = std::fs::read_to_string(&abs)?;
         parse(&raw)
+    }
+
+    /// Restore one page from a git checkpoint and reindex it into the store.
+    ///
+    /// The checkpoint path is resolved through the UUID-backed wiki layout, so
+    /// callers address pages by `(workspace_id, project_id, page_path)` while
+    /// git still stores the exact markdown file. The restored file is parsed
+    /// before it is written so a malformed checkpoint cannot replace the live
+    /// disk copy and then fail during indexing.
+    ///
+    /// # Errors
+    /// Returns [`WikiError`] when the revision/path does not exist, the stored
+    /// bytes are not UTF-8 markdown, parsing fails, or the filesystem/store
+    /// update fails.
+    pub async fn restore_page_from_checkpoint(
+        &self,
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+        path: PagePath,
+        rev: &str,
+    ) -> WikiResult<PageId> {
+        let rel = PathBuf::from(workspace_id.to_string())
+            .join(project_id.to_string())
+            .join(path.as_str());
+        let bytes = self.git.file_at_rev(rev, &rel)?;
+        let raw = String::from_utf8(bytes).map_err(|e| {
+            WikiError::Io(std::io::Error::other(format!(
+                "{} at {rev} is not valid UTF-8 markdown: {e}",
+                path.as_str()
+            )))
+        })?;
+        let md = parse(&raw)?;
+        let title = derive_title(&md.frontmatter, &md.body, &path);
+        let links = extract_links(&md.body, &path);
+        let pinned = is_slot_path(&path)
+            || md
+                .frontmatter
+                .get("pinned")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+
+        let _guard = self.mutation_lock.read().await;
+        self.ensure_project_workspace(workspace_id, project_id)
+            .await?;
+        let abs = self.abs_path(workspace_id, project_id, &path);
+        if let Some(parent) = abs.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        atomic::write_atomic(&abs, raw.as_bytes())?;
+        let id = self
+            .writer
+            .upsert_page(NewPage {
+                workspace_id,
+                project_id,
+                path,
+                title,
+                body: md.body,
+                tier: Tier::Semantic,
+                frontmatter_json: md.frontmatter,
+                pinned,
+                links,
+                author_id: None,
+            })
+            .await?;
+        Ok(id)
     }
 
     /// Delete the on-disk file for `path` within the given project.
@@ -1121,6 +1211,49 @@ mod tests {
                 .join("wiki")
                 .join(ws.to_string())
                 .join(proj.to_string()),
+        );
+    }
+
+    #[tokio::test]
+    async fn upgrade_baseline_checkpoint_commits_existing_uncommitted_tree_once() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let ws = store
+            .writer
+            .get_or_create_workspace("default")
+            .await
+            .unwrap();
+        let proj = store
+            .writer
+            .get_or_create_project(ws, "scratch", None)
+            .await
+            .unwrap();
+        let wiki = Wiki::new(tmp.path(), store.writer.clone()).unwrap();
+
+        wiki.write_page(req(
+            ws,
+            proj,
+            "notes/baseline.md",
+            "existing page before recovery checkpoints",
+            serde_json::json!({ "title": "Baseline" }),
+        ))
+        .await
+        .unwrap();
+
+        assert_eq!(wiki.git().commit_count(), 0);
+        let oid = wiki
+            .ensure_upgrade_baseline_checkpoint()
+            .unwrap()
+            .expect("existing wiki content should be checkpointed");
+        assert_eq!(wiki.git().commit_count(), 1);
+        assert!(wiki.ensure_upgrade_baseline_checkpoint().unwrap().is_none());
+        assert_eq!(wiki.git().commit_count(), 1);
+
+        let checkpoints = wiki.recent_checkpoints(1).unwrap();
+        assert_eq!(checkpoints[0].oid, oid.to_string());
+        assert_eq!(
+            checkpoints[0].summary,
+            "upgrade baseline: existing wiki tree before recovery checkpoints"
         );
     }
 
