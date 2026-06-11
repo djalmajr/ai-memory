@@ -16,6 +16,7 @@ pub mod forget_sweep;
 pub mod generate_auth_token;
 pub mod hook;
 pub mod hook_capture;
+pub mod hook_spool;
 pub mod init;
 pub mod install_hooks;
 pub mod install_instructions;

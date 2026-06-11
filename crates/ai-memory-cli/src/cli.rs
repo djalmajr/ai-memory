@@ -252,6 +252,10 @@ pub enum AuthProviderChoice {
     OpenaiOauth,
     /// GitHub Copilot Chat backend.
     Copilot,
+    /// Generic OIDC device-authorization grant (e.g. Keycloak). Stores a
+    /// per-developer token the lifecycle hooks use to authenticate to the
+    /// ai-memory server, instead of a shared static `--auth-token`.
+    OidcDevice,
 }
 
 /// Arguments for `auth login`.
@@ -266,9 +270,15 @@ pub struct AuthLoginArgs {
     /// GitHub token to persist for Copilot instead of running device auth.
     #[arg(long, hide_env_values = true)]
     pub github_token: Option<String>,
-    /// OAuth client id override for Copilot device auth.
+    /// OAuth/OIDC public client id. Required for `oidc-device`; an optional
+    /// override for `copilot` device auth.
     #[arg(long)]
     pub client_id: Option<String>,
+    /// OIDC issuer URL for `oidc-device` login, e.g. a Keycloak realm
+    /// (`https://keycloak.example.com/realms/serpro`). Endpoints are
+    /// discovered from `<issuer>/.well-known/openid-configuration`.
+    #[arg(long)]
+    pub issuer: Option<String>,
 }
 
 /// Arguments for `auth logout`.

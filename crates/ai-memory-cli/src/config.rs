@@ -611,6 +611,12 @@ impl Config {
         self.auth_token_path()
     }
 
+    /// Shared OIDC device-grant token file path.
+    #[must_use]
+    pub fn oidc_device_token_path(&self) -> PathBuf {
+        self.auth_token_path()
+    }
+
     /// GitHub token resolved for Copilot auth login/provider use.
     #[must_use]
     pub fn copilot_github_token(&self) -> Option<SecretString> {

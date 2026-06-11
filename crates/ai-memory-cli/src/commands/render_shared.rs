@@ -340,6 +340,13 @@ pub(crate) enum HookCommandPlatform {
     /// Claude Code on Windows; see
     /// `docs/windows.md#native-hook-command-claude-code-on-windows`.
     WindowsNative,
+    /// POSIX (Linux/macOS), native: invoke the `ai-memory` binary directly
+    /// (`<exe> hook --event …`) instead of the `.sh` script, so the hook gets
+    /// the local spool + OIDC-token fallback. **Opt-in** via
+    /// `AI_MEMORY_HOOK_PLATFORM=posix-native` — never the default, because the
+    /// Docker wrapper renders for the host with no local binary (it keeps the
+    /// `.sh` path). Use it when ai-memory is installed as a native binary.
+    PosixNative,
 }
 
 impl HookCommandPlatform {
@@ -351,6 +358,7 @@ impl HookCommandPlatform {
             }
             Ok(v) if v.eq_ignore_ascii_case("windows-bash") => Self::WindowsBash,
             Ok(v) if v.eq_ignore_ascii_case("windows-native") => Self::WindowsNative,
+            Ok(v) if v.eq_ignore_ascii_case("posix-native") => Self::PosixNative,
             _ if cfg!(windows) => Self::Windows,
             _ => Self::Posix,
         }
@@ -367,6 +375,7 @@ impl HookCommandPlatform {
             }
             Ok(v) if v.eq_ignore_ascii_case("windows-bash") => Self::WindowsBash,
             Ok(v) if v.eq_ignore_ascii_case("windows-native") => Self::WindowsNative,
+            Ok(v) if v.eq_ignore_ascii_case("posix-native") => Self::PosixNative,
             _ if cfg!(windows) => Self::WindowsNative,
             _ => Self::Posix,
         }
@@ -436,6 +445,7 @@ fn build_hook_payload_for_platform(
 fn script_for_platform(script: &str, platform: HookCommandPlatform) -> Cow<'_, str> {
     match platform {
         HookCommandPlatform::Posix
+        | HookCommandPlatform::PosixNative
         | HookCommandPlatform::WindowsBash
         | HookCommandPlatform::WindowsNative => Cow::Borrowed(script),
         HookCommandPlatform::Windows => match script.strip_suffix(".sh") {
@@ -515,6 +525,28 @@ fn hook_command(
             );
             if let Some(t) = auth_token {
                 cmd.push_str(&format!(" --auth-token {}", win_double_quote(t)));
+            }
+            cmd
+        }
+        HookCommandPlatform::PosixNative => {
+            // Native POSIX (opt-in): invoke the binary directly so the hook
+            // gets the local spool + OIDC fallback, instead of the `.sh` script
+            // that POSTs via curl. Mirrors `WindowsNative` but with POSIX
+            // single-quote quoting. The event name is the script stem.
+            let exe = std::env::current_exe()
+                .map(|p| p.to_string_lossy().into_owned())
+                .unwrap_or_else(|_| "ai-memory".to_string());
+            let event = script
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or_default();
+            let mut cmd = format!(
+                "{} hook --event {event} --agent claude-code --server-url {}",
+                shell_quote(&exe),
+                shell_quote(server_url),
+            );
+            if let Some(t) = auth_token {
+                cmd.push_str(&format!(" --auth-token {}", shell_quote(t)));
             }
             cmd
         }
@@ -1067,6 +1099,43 @@ mod tests {
     fn windows_bash_script_for_platform_keeps_sh_extension() {
         let s = script_for_platform("session-start.sh", HookCommandPlatform::WindowsBash);
         assert_eq!(s, "session-start.sh");
+    }
+
+    #[test]
+    fn posix_native_hook_command_invokes_binary_directly() {
+        let cmd = hook_command(
+            &PathBuf::from("/home/alice/.local/share/ai-memory/hooks/claude-code/session-start.sh"),
+            "https://my-server.example.com",
+            Some("tok123"),
+            HookCommandPlatform::PosixNative,
+        );
+        assert!(
+            cmd.contains("hook --event session-start"),
+            "invokes the binary subcommand with the event stem: {cmd}"
+        );
+        assert!(cmd.contains("--agent claude-code"), "{cmd}");
+        assert!(cmd.contains("https://my-server.example.com"), "{cmd}");
+        assert!(
+            cmd.contains("--auth-token") && cmd.contains("tok123"),
+            "{cmd}"
+        );
+        assert!(
+            !cmd.contains("session-start.sh"),
+            "must NOT reference the .sh script: {cmd}"
+        );
+        assert!(!cmd.starts_with("bash -c"), "no shell wrapper: {cmd}");
+    }
+
+    #[test]
+    fn posix_native_hook_command_omits_token_when_absent() {
+        let cmd = hook_command(
+            &PathBuf::from("/home/alice/hooks/pre-tool-use.sh"),
+            "http://localhost:49374",
+            None,
+            HookCommandPlatform::PosixNative,
+        );
+        assert!(cmd.contains("hook --event pre-tool-use"), "{cmd}");
+        assert!(!cmd.contains("--auth-token"), "no token expected: {cmd}");
     }
 
     #[test]

@@ -31,12 +31,15 @@ async fn main() -> Result<()> {
     // Hooks fire on every tool call: they must be cheap and must emit ONLY
     // their JSON object to stdout. Short-circuit before config load and
     // tracing init (added latency + possible stdout noise). The hook reads
-    // its server URL + token from flags, so it needs no config.
+    // its server URL + token from flags; it only needs the data-dir to locate
+    // a stored OIDC token when no explicit `--auth-token` is given, so we pass
+    // the bare path rather than loading the full config.
     if matches!(cli.command, Command::Hook(_)) {
+        let data_dir = cli.data_dir.clone();
         let Command::Hook(args) = cli.command else {
             unreachable!()
         };
-        return commands::hook::run(args).await;
+        return commands::hook::run(data_dir, args).await;
     }
 
     let config_path = cli.config.clone();

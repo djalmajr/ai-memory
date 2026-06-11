@@ -3,8 +3,10 @@
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use ai_memory_llm::{
-    CODEX_CLIENT_ID, CopilotToken, GITHUB_ACCESS_TOKEN_URL, GITHUB_COPILOT_CLIENT_ID,
-    GITHUB_DEVICE_CODE_URL, OPENAI_OAUTH_TOKEN_URL, OpenAiOAuthToken, OpenAiOAuthTokenResponse,
+    CODEX_CLIENT_ID, CopilotToken, DeviceAuthorizationResponse, GITHUB_ACCESS_TOKEN_URL,
+    GITHUB_COPILOT_CLIENT_ID, GITHUB_DEVICE_CODE_URL, OIDC_DEFAULT_SCOPE, OPENAI_OAUTH_TOKEN_URL,
+    OidcDiscovery, OidcToken, OidcTokenResponse, OpenAiOAuthToken, OpenAiOAuthTokenResponse,
+    PollOutcome, discover, poll_token_once, request_device_code,
 };
 use anyhow::{Context, Result, anyhow, bail};
 use secrecy::ExposeSecret as _;
@@ -28,21 +30,124 @@ pub async fn run(config: &Config, args: AuthArgs) -> Result<()> {
     match args.command {
         AuthCommand::Login(args) => match args.provider {
             AuthProviderChoice::OpenaiOauth => {
-                if args.github_token.is_some() || args.client_id.is_some() {
-                    bail!("--github-token and --client-id apply only to `auth login copilot`");
+                if args.github_token.is_some() || args.client_id.is_some() || args.issuer.is_some()
+                {
+                    bail!(
+                        "--github-token / --client-id / --issuer do not apply to `auth login openai-oauth`"
+                    );
                 }
                 login_openai_oauth(config, args.timeout_secs).await
             }
             AuthProviderChoice::Copilot => {
+                if args.issuer.is_some() {
+                    bail!("--issuer applies only to `auth login oidc-device`");
+                }
                 login_copilot(config, args.timeout_secs, args.github_token, args.client_id).await
+            }
+            AuthProviderChoice::OidcDevice => {
+                if args.github_token.is_some() {
+                    bail!("--github-token applies only to `auth login copilot`");
+                }
+                let issuer = args
+                    .issuer
+                    .context("--issuer is required for `auth login oidc-device`")?;
+                let client_id = args
+                    .client_id
+                    .context("--client-id is required for `auth login oidc-device`")?;
+                login_oidc_device(config, &issuer, &client_id, args.timeout_secs).await
             }
         },
         AuthCommand::Logout(args) => match args.provider {
             AuthProviderChoice::OpenaiOauth => logout_openai_oauth(config),
             AuthProviderChoice::Copilot => logout_copilot(config),
+            AuthProviderChoice::OidcDevice => logout_oidc_device(config),
         },
         AuthCommand::Status(_) => status(config),
     }
+}
+
+async fn login_oidc_device(
+    config: &Config,
+    issuer: &str,
+    client_id: &str,
+    timeout_secs: u64,
+) -> Result<()> {
+    let client = auth_http_client()?;
+    let discovery = discover(&client, issuer).await?;
+    let device = request_device_code(&client, &discovery, client_id, OIDC_DEFAULT_SCOPE).await?;
+
+    match device.verification_uri_complete.as_deref() {
+        Some(complete) => println!("Open this URL: {complete}"),
+        None => {
+            println!("Open this URL: {}", device.verification_uri);
+            println!("Enter code: {}", device.user_code);
+        }
+    }
+    println!("Waiting for authorization...");
+
+    let token_response = poll_oidc_device(
+        &client,
+        &discovery,
+        client_id,
+        &device,
+        Duration::from_secs(timeout_secs),
+    )
+    .await?;
+    let token = OidcToken::from_token_response(
+        &token_response,
+        issuer,
+        client_id,
+        &discovery.token_endpoint,
+        None,
+    )?;
+    let path = config.oidc_device_token_path();
+    token.save(&path).map_err(anyhow::Error::from)?;
+
+    println!("oidc-device: logged in");
+    println!("issuer: {issuer}");
+    println!("token file: {}", path.display());
+    Ok(())
+}
+
+async fn poll_oidc_device(
+    client: &reqwest::Client,
+    discovery: &OidcDiscovery,
+    client_id: &str,
+    device: &DeviceAuthorizationResponse,
+    timeout: Duration,
+) -> Result<OidcTokenResponse> {
+    let started = Instant::now();
+    let mut interval = Duration::from_secs(
+        device
+            .interval
+            .unwrap_or(5)
+            .max(1)
+            .saturating_add(POLLING_SAFETY_MARGIN_SECS),
+    );
+    let device_timeout = Duration::from_secs(device.expires_in.unwrap_or(600).max(1));
+    let timeout = timeout.min(device_timeout);
+    loop {
+        if started.elapsed() >= timeout {
+            bail!("timed out waiting for oidc-device authorization");
+        }
+        match poll_token_once(client, discovery, client_id, &device.device_code).await? {
+            PollOutcome::Token(token) => return Ok(*token),
+            PollOutcome::Pending => {}
+            PollOutcome::SlowDown => interval = interval.saturating_add(Duration::from_secs(5)),
+            PollOutcome::Denied => bail!("oidc-device authorization denied"),
+            PollOutcome::Expired => bail!("oidc-device code expired before authorization"),
+            PollOutcome::Other(error) => bail!("oidc-device authorization failed: {error}"),
+        }
+        sleep(interval).await;
+    }
+}
+
+fn logout_oidc_device(config: &Config) -> Result<()> {
+    let path = config.oidc_device_token_path();
+    OidcToken::remove(&path).map_err(anyhow::Error::from)?;
+    println!("oidc-device: logged out");
+    println!("token file: {}", path.display());
+    Ok(())
 }
 
 async fn login_openai_oauth(config: &Config, timeout_secs: u64) -> Result<()> {
@@ -171,6 +276,20 @@ fn status(config: &Config) -> Result<()> {
         None => {
             println!("copilot: not logged in");
             println!("token file: {}", copilot_path.display());
+        }
+    }
+
+    let oidc_path = config.oidc_device_token_path();
+    match OidcToken::load(&oidc_path).map_err(anyhow::Error::from)? {
+        Some(token) => {
+            println!("oidc-device: logged in");
+            println!("issuer: {}", token.issuer);
+            println!("expires in: {}", format_duration_until(token.expires_at_ms));
+            println!("token file: {}", oidc_path.display());
+        }
+        None => {
+            println!("oidc-device: not logged in");
+            println!("token file: {}", oidc_path.display());
         }
     }
     Ok(())

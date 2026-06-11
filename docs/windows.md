@@ -170,11 +170,16 @@ native on an i7-6700HQ). Notes:
   cmd.exe and Git Bash.
 - The `.sh`/`.ps1` scripts stay bundled as a fallback — the Docker /
   `setup-agent` flow (no local binary) keeps emitting the shell command.
-- `AI_MEMORY_HOOK_PLATFORM` accepts three values:
+- `AI_MEMORY_HOOK_PLATFORM` accepts four values:
   - `windows-native` — direct binary call (default on native Windows).
   - `windows-bash` — `bash -c` + `.sh` through Git Bash (the previous
     default; set this to opt back in).
   - `posix` — POSIX `.sh` (default on macOS / Linux).
+  - `posix-native` — direct binary call on macOS / Linux (`<exe> hook
+    --event …`) instead of the `.sh` script, so the hook uses the local
+    event spool + OIDC-token fallback. **Opt-in** (never the default,
+    because the Docker wrapper renders for the host with no local binary).
+    Set it when ai-memory is installed as a native binary (cargo / release).
 
   Set the env var before running `install-hooks` so the chosen platform
   is baked into the rendered hook commands.
