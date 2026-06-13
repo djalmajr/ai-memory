@@ -6,6 +6,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
+### Added
+- Native macOS release tarballs (`ai-memory-macos-aarch64.tar.gz` for
+  Apple Silicon and `ai-memory-macos-x86_64.tar.gz` for Intel) are now
+  published on every tag, alongside the existing Linux tarballs and the
+  Windows zip. The macOS `release-build` CI job also runs on every push,
+  so a macOS-only release regression is caught before the tag rather
+  than after. Install instructions added to `README.md` and
+  `docs/install.md` ([#94]).
 
 ## [1.0.2] - 2026-06-12
 ### Fixed
