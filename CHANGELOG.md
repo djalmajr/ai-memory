@@ -18,7 +18,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   destructive (it marks the handoff accepted server-side) and Grok would discard
   the result, silently losing the handoff; recover a prior session's handoff via
   the MCP `memory_handoff_accept` tool instead. Adds `AgentKind::Grok` (`grok`
-  wire tag) and the `AgentKind::session_start_injects_handoff` gate.
+  wire tag), the `AgentKind::session_start_injects_handoff` gate, and migration
+  `V20` extending the `sessions.agent_kind` CHECK so Grok sessions persist on
+  upgraded servers (the antigravity/`V11` precedent).
 
 ## [1.0.3] - 2026-06-13
 ### Added

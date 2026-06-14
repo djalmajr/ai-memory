@@ -1730,6 +1730,7 @@ mod tests {
             AgentKind::OpenClaw,
             AgentKind::AntigravityCli,
             AgentKind::Omp,
+            AgentKind::Grok,
             AgentKind::Other,
         ] {
             let sid = SessionId::new();
