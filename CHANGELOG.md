@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.0.6] - 2026-06-14
+
 ### Changed
 - Centralized workspace/project scope resolution in `ai_memory_store::ScopeResolver`
   and shared explicit helpers, then migrated MCP, admin, and web API routes onto
@@ -1029,7 +1031,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Consolidator used server startup default project instead of the
   session's actual project.
 
-[Unreleased]: https://github.com/akitaonrails/ai-memory/compare/v1.0.5...HEAD
+[Unreleased]: https://github.com/akitaonrails/ai-memory/compare/v1.0.6...HEAD
+[1.0.6]: https://github.com/akitaonrails/ai-memory/releases/tag/v1.0.6
 [1.0.5]: https://github.com/akitaonrails/ai-memory/releases/tag/v1.0.5
 [1.0.4]: https://github.com/akitaonrails/ai-memory/releases/tag/v1.0.4
 [1.0.3]: https://github.com/akitaonrails/ai-memory/releases/tag/v1.0.3
