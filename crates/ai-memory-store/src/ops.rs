@@ -2295,8 +2295,13 @@ mod tests {
             .unwrap();
         }
 
-        // Run the repair migration (V19).
-        crate::migrations::run(&mut conn).unwrap();
+        // Run the repair migration (V19). Target V19 explicitly rather than
+        // the open-ended `run`: this test seeds rows first (leaving cached
+        // statements on `sessions`), so letting a later table-rebuild
+        // migration (V20+) run here would trip SQLITE_LOCKED on its
+        // `DROP TABLE sessions`. Production runs migrations before any query,
+        // so the rebuild is unaffected there.
+        crate::migrations::run_to(&mut conn, 19).unwrap();
 
         // All observations now point at the parent.
         let cnt_parent: i64 = conn
