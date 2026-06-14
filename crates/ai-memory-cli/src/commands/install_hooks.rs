@@ -509,14 +509,13 @@ fn apply_to_claude_code_settings(
     Ok(())
 }
 
-/// Mutate `~/.grok/hooks/ai-memory.json` so Grok Build CLI fires the
-/// ai-memory lifecycle hooks. Grok's hook config is structurally
-/// identical to Claude Code's (`{"hooks":{"SessionStart":[{"hooks":
-/// [{"type":"command","command":"..."}]}]}}`) and uses the same seven
-/// CamelCase event names, so we reuse Claude Code's staged scripts and
-/// only swap the emitted `--agent grok` tag. We merge into a dedicated
-/// `ai-memory.json` (Grok discovers every `~/.grok/hooks/*.json`), so a
-/// pre-existing third-party hook file is left untouched.
+/// Mutate `~/.grok/hooks/ai-memory.json` so Grok Build CLI fires the ai-memory
+/// lifecycle hooks. Grok's hook config is structurally identical to Claude
+/// Code's nested hook JSON and uses the same seven CamelCase event names, but
+/// its script bundle carries `agent=grok` and skips destructive SessionStart
+/// handoff fetches. We merge into a dedicated `ai-memory.json` (Grok discovers
+/// every `~/.grok/hooks/*.json`), so a pre-existing third-party hook file is
+/// left untouched.
 fn apply_to_grok_settings(
     hooks_dir: &Path,
     server_url: &str,
@@ -1718,9 +1717,7 @@ fn resolve_hooks_dir(explicit: Option<&Path>, agent: AgentChoice) -> Result<Path
         AgentChoice::Cursor => "cursor",
         AgentChoice::GeminiCli => "gemini-cli",
         AgentChoice::AntigravityCli => "antigravity-cli",
-        // Grok reuses Claude Code's hook scripts (identical JSON shape +
-        // event vocabulary); only the emitted `--agent grok` tag differs.
-        AgentChoice::Grok => "claude-code",
+        AgentChoice::Grok => "grok",
         AgentChoice::OpenCode | AgentChoice::Omp | AgentChoice::Openclaw => {
             anyhow::bail!("{agent:?} uses a generated integration, not a hook script directory")
         }
@@ -2098,6 +2095,16 @@ mod tests {
             effective_hook_server_url(&config, &args, Some(&inferred)),
             "http://homelab:49374"
         );
+    }
+
+    #[test]
+    fn resolve_hooks_dir_uses_grok_bundle_for_grok() {
+        let tmp = TempDir::new().unwrap();
+        fs::create_dir_all(tmp.path().join("grok")).unwrap();
+        fs::create_dir_all(tmp.path().join("claude-code")).unwrap();
+
+        let resolved = resolve_hooks_dir(Some(tmp.path()), AgentChoice::Grok).unwrap();
+        assert_eq!(resolved, tmp.path().join("grok"));
     }
 
     #[test]

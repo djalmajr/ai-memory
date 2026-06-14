@@ -26,7 +26,7 @@ use serde_json::json;
 ///
 /// Adding a hook event means updating this list AND adding the
 /// matching `.sh` and `.ps1` files under
-/// `hooks/{claude-code,codex,cursor,gemini-cli,opencode}/`. The
+/// `hooks/{claude-code,codex,cursor,gemini-cli,grok,opencode}/`. The
 /// install-hooks parity test fails if the bundle drifts.
 pub(crate) const CLAUDE_CODE_EVENTS: [(&str, &str); 7] = [
     ("SessionStart", "session-start.sh"),
@@ -131,10 +131,28 @@ pub(crate) fn build_claude_code_payload_with_data_dir(
     )
 }
 
-/// Grok Build CLI hook payload. Grok's `~/.grok/hooks/*.json` shares
-/// Claude Code's JSON shape and seven-event vocabulary
-/// (`CLAUDE_CODE_EVENTS`, `HookShape::Nested`), so we reuse both and
-/// only swap the `--agent grok` tag in the emitted native command.
+/// Grok Build CLI hook payload for docker/setup-agent script snippets.
+/// Grok shares Claude Code's JSON shape and event vocabulary, but uses
+/// its own script bundle so script fallback keeps `agent=grok` and never
+/// destructively fetches handoffs on SessionStart.
+#[must_use]
+pub(crate) fn build_grok_payload(
+    emit_root: &Path,
+    server_url: &str,
+    auth_token: Option<&str>,
+) -> serde_json::Value {
+    build_hook_payload_for_platform(
+        &CLAUDE_CODE_EVENTS,
+        emit_root,
+        server_url,
+        auth_token,
+        HookShape::Nested,
+        HookCommandContext::new(HookCommandPlatform::for_bash_script_runner(), "grok", None),
+    )
+}
+
+/// Grok Build CLI hook payload for apply/render paths. Native commands are the
+/// default; explicit script fallback still points at the Grok script bundle.
 pub(crate) fn build_grok_payload_with_data_dir(
     emit_root: &Path,
     server_url: &str,
@@ -765,6 +783,47 @@ mod tests {
         for (event, _) in CLAUDE_CODE_EVENTS {
             assert!(hooks.contains_key(event), "missing event {event}");
         }
+    }
+
+    #[test]
+    fn grok_native_payload_uses_grok_agent() {
+        let root = PathBuf::from("/host/hooks/grok");
+        let v = build_hook_payload_for_platform(
+            &CLAUDE_CODE_EVENTS,
+            &root,
+            "http://localhost:49374",
+            None,
+            HookShape::Nested,
+            HookCommandContext::new(HookCommandPlatform::PosixNative, "grok", None),
+        );
+        let command = v
+            .pointer("/hooks/SessionStart/0/hooks/0/command")
+            .and_then(|s| s.as_str())
+            .unwrap();
+        assert!(command.contains("--agent grok"), "{command}");
+        assert!(!command.contains("claude-code"), "{command}");
+    }
+
+    #[test]
+    fn grok_script_payload_uses_grok_bundle() {
+        let root = PathBuf::from("/host/hooks/grok");
+        let v = build_hook_payload_for_platform(
+            &CLAUDE_CODE_EVENTS,
+            &root,
+            "http://localhost:49374",
+            None,
+            HookShape::Nested,
+            HookCommandContext::new(HookCommandPlatform::Posix, "grok", None),
+        );
+        let command = v
+            .pointer("/hooks/SessionStart/0/hooks/0/command")
+            .and_then(|s| s.as_str())
+            .unwrap();
+        assert!(
+            command.contains("/host/hooks/grok/session-start.sh"),
+            "{command}"
+        );
+        assert!(!command.contains("claude-code"), "{command}");
     }
 
     #[test]

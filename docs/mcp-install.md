@@ -19,13 +19,14 @@
 This page documents how to register ai-memory as an MCP server with
 agent CLIs beyond the README quick start.
 
-Claude Code, OpenAI Codex, Cursor, Gemini CLI, Antigravity CLI, OpenClaw, OpenCode, and
+Claude Code, OpenAI Codex, Cursor, Gemini CLI, Antigravity CLI, Grok Build CLI, OpenClaw, OpenCode, and
 OMP have automatic capture integrations (shell/PowerShell hooks for
-Claude Code / Codex / Cursor / Gemini CLI / Antigravity CLI, TypeScript plugin/extension
+Claude Code / Codex / Cursor / Gemini CLI / Antigravity CLI / Grok Build CLI, TypeScript plugin/extension
 files for OpenClaw / OpenCode / OMP) and are covered in the
 [main README](../README.md#quick-start). On native Windows, Claude Code uses
 Git Bash `.sh` hooks rather than the PowerShell default used by other
-script-hook agents.
+script-hook agents. Grok captures lifecycle events, but it ignores
+SessionStart stdout, so ai-memory does not auto-inject handoffs for Grok.
 
 Claude Desktop and VS Code Copilot are **MCP-only** here: they expose
 long-term memory to their LLMs via ai-memory's MCP tools
@@ -521,8 +522,8 @@ that *starts* the next one - to play nicely with ai-memory:
 
 | Side | What's needed | Covered by |
 |---|---|---|
-| **Ending side** | The agent must create a handoff, either through a true session-end hook or by calling `memory_handoff_begin`. | Built-in for Claude Code, Cursor, Gemini CLI, OpenClaw, and OMP. Codex, OpenCode, and Antigravity CLI have no true session-end event in the current integration, so ask them to call `memory_handoff_begin` before quitting when you need a handoff. |
-| **Starting side** | Either (a) the session-start/plugin path injects the handoff via `/handoff`, OR (b) the model proactively calls `memory_handoff_accept` on first turn. | (a) is built-in for Claude Code / Codex / Cursor / Gemini CLI / Antigravity CLI / OpenClaw / OpenCode / OMP. (b) works for any MCP-capable client if you nudge the model - see [the routing snippet](usage.md#install-the-routing-snippet). |
+| **Ending side** | The agent must create a handoff, either through a true session-end hook or by calling `memory_handoff_begin`. | Built-in for Claude Code, Cursor, Gemini CLI, Grok Build CLI, OpenClaw, and OMP. Codex, OpenCode, and Antigravity CLI have no true session-end event in the current integration, so ask them to call `memory_handoff_begin` before quitting when you need a handoff. |
+| **Starting side** | Either (a) the session-start/plugin path injects the handoff via `/handoff`, OR (b) the model proactively calls `memory_handoff_accept` on first turn. | (a) is built-in for Claude Code / Codex / Cursor / Gemini CLI / Antigravity CLI / OpenClaw / OpenCode / OMP. Grok is explicitly excluded because it ignores SessionStart stdout; use (b). (b) works for any MCP-capable client if you nudge the model - see [the routing snippet](usage.md#install-the-routing-snippet). |
 
 So a typical mixed workflow looks like:
 

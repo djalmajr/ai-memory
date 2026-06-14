@@ -31,7 +31,7 @@
 | Claude Desktop | MCP-only | Uses `mcp-remote`; no lifecycle hooks. |
 | OpenClaw | Supported | MCP config + native plugin lifecycle hooks. |
 | Antigravity CLI | Supported | MCP config (`serverUrl`) + lifecycle hooks (`agy` alias). |
-| Grok Build CLI | Hooks | Lifecycle hooks via `install-hooks --agent grok` (`~/.grok/hooks/ai-memory.json`, native `--agent grok`, reuses claude-code scripts). Capture works; no handoff injection — Grok ignores `SessionStart` stdout, so recover handoffs via MCP `memory_handoff_accept`. |
+| Grok Build CLI | Hooks | Lifecycle hooks via `install-hooks --agent grok` (`~/.grok/hooks/ai-memory.json`, Grok-specific hook bundle, native `--agent grok`). Capture works; no handoff injection — Grok ignores `SessionStart` stdout, so recover handoffs via MCP `memory_handoff_accept`. |
 | VS Code Copilot | MCP-only | `.vscode/mcp.json` for Copilot agent mode; no lifecycle hooks (Copilot does not expose them yet). |
 | LLM/auth providers | Supported | Anthropic, OpenAI, OpenAI OAuth/Codex, GitHub Copilot, Gemini, OpenAI-compatible endpoints, and generic OIDC device auth for native hooks. |
 | Embedding providers | Supported | OpenAI, Voyage, and Google Gemini. |
@@ -101,9 +101,10 @@ priors are at the [bottom](#influences-and-prior-art).
 ## Use cases
 
 - **"Quit at 4 PM, pick up at 9 AM in a different agent."** The
-  classic. SessionStart hook in the next agent (any of the
-  supported CLIs) prepends a typed handoff with the open questions,
-  next steps, and a session summary.
+  classic. SessionStart hook in the next supported hook client prepends a
+  typed handoff with open questions, next steps, and a session summary. Grok
+  captures lifecycle events but ignores SessionStart stdout, so ask it to call
+  `memory_handoff_accept` when resuming from a handoff.
 - **"What did we decide about X six weeks ago?"** Type
   `memory_query X` from the agent (or `ai-memory search X` from a
   terminal) - FTS5 over the wiki. Pages are LLM-consolidated, so
@@ -178,7 +179,7 @@ packaged unit. Full user-service, system-service, auth, and provider setup is in
 ### Docker
 
 You need: Docker + an agent CLI (Claude Code, Codex, OpenCode, OMP, Cursor,
-Antigravity CLI, or anything else that speaks MCP).
+Antigravity CLI, Grok Build CLI, or anything else that speaks MCP).
 
 The published Docker image includes `linux/amd64` and `linux/arm64` variants,
 so Apple Silicon Macs and ARM64 Linux hosts can pull `akitaonrails/ai-memory`
@@ -272,8 +273,8 @@ use `--mcp-url` if you installed MCP with a custom endpoint, and
   and staged hook scripts. Redeploy remote servers separately.
 
 For Codex, OpenCode, OMP, Cursor, Claude Desktop, Gemini CLI, Antigravity CLI,
-OpenClaw, VS Code Copilot, curl-based hook installs, source builds, CLI env vars,
-and the full subcommand reference, see [`docs/install.md`](docs/install.md).
+Grok Build CLI, OpenClaw, VS Code Copilot, curl-based hook installs, source builds,
+CLI env vars, and the full subcommand reference, see [`docs/install.md`](docs/install.md).
 
 ## Security
 

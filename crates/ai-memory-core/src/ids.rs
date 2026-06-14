@@ -246,11 +246,12 @@ impl AgentKind {
     /// **destructive** (the server marks the handoff accepted) and the result
     /// would be discarded — silently losing the handoff. For such agents the
     /// handoff stays available on demand via the MCP `memory_handoff_accept`
-    /// tool. Only the native-hook agents (claude-code, grok) reach this code;
-    /// the others inject via their own staged-script / plugin formats.
+    /// tool. Unknown future agents return `false` until we know their
+    /// SessionStart stdout semantics; accepting a handoff is single-use and
+    /// should fail safe.
     #[must_use]
     pub fn session_start_injects_handoff(self) -> bool {
-        !matches!(self, Self::Grok)
+        !matches!(self, Self::Grok | Self::Other)
     }
 }
 
@@ -296,6 +297,7 @@ mod tests {
         assert!(!AgentKind::Grok.session_start_injects_handoff());
         assert!(AgentKind::ClaudeCode.session_start_injects_handoff());
         assert!(AgentKind::Codex.session_start_injects_handoff());
+        assert!(!AgentKind::Other.session_start_injects_handoff());
     }
 
     #[test]

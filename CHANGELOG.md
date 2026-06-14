@@ -9,8 +9,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 - `install-hooks --agent grok` (plus `setup-agent` / `uninstall` coverage) for
   the xAI **Grok Build CLI**. Grok's `~/.grok/hooks/ai-memory.json` shares Claude
-  Code's JSON shape and seven-event vocabulary, so it reuses the claude-code hook
-  scripts and emits the native `ai-memory hook --event … --agent grok` command.
+  Code's JSON shape and seven-event vocabulary, with a Grok-specific hook bundle
+  and native `ai-memory hook --event … --agent grok` commands.
   ai-memory entries merge into a dedicated `ai-memory.json`, leaving any
   third-party `~/.grok/hooks/*.json` untouched. NOTE: Grok ignores hook stdout on
   `SessionStart`, so capture works but handoff injection does not. Grok's

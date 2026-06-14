@@ -10,7 +10,7 @@
 #       | bash -s -- --agent claude-code
 #
 # Options:
-#   --agent <claude-code|codex|cursor|gemini-cli|antigravity-cli|opencode|openclaw|omp|pi>
+#   --agent <claude-code|codex|cursor|gemini-cli|antigravity-cli|grok|opencode|openclaw|omp|pi>
 #                                                which agent (default: claude-code;
 #                                                generated-plugin agents print hints)
 #   --to <dir>                               install root (default: $HOME/.ai-memory/hooks)
@@ -46,9 +46,9 @@ while [[ $# -gt 0 ]]; do
 done
 
 case "$AGENT" in
-    claude-code|codex|cursor|gemini-cli|antigravity-cli|opencode|openclaw|omp|pi|oh-my-pi) ;;
+    claude-code|codex|cursor|gemini-cli|antigravity-cli|grok|opencode|openclaw|omp|pi|oh-my-pi) ;;
     *)
-        echo "unsupported agent: $AGENT (expected claude-code | codex | cursor | gemini-cli | antigravity-cli | opencode | openclaw | omp | pi | oh-my-pi)" >&2
+        echo "unsupported agent: $AGENT (expected claude-code | codex | cursor | gemini-cli | antigravity-cli | grok | opencode | openclaw | omp | pi | oh-my-pi)" >&2
         exit 64 ;;
 esac
 

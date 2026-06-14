@@ -716,8 +716,8 @@ pub enum AgentChoice {
     AntigravityCli,
     /// xAI Grok Build CLI — JSON-config hooks in
     /// `~/.grok/hooks/ai-memory.json`. Native `ai-memory hook --event`
-    /// integration like Claude Code (reuses the claude-code hook
-    /// scripts). NOTE: Grok ignores hook stdout on `SessionStart`, so
+    /// integration using Grok-specific hook scripts. NOTE: Grok ignores
+    /// hook stdout on `SessionStart`, so
     /// capture works but handoff injection does not — recover the prior
     /// session's handoff via the MCP `memory_handoff_accept` tool.
     Grok,

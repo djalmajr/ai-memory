@@ -9,7 +9,7 @@ path (docker + Claude Code). This page covers everything else:
 - [Arch Linux native packages (AUR)](#arch-linux-native-packages-aur)
   (systemd system service or user service)
 - [Configuring other agent CLIs](#configuring-other-agent-clis)
-  (Codex, OpenCode, OMP, Cursor, Claude Desktop, Gemini CLI, Antigravity CLI, OpenClaw, VS Code Copilot)
+  (Codex, OpenCode, OMP, Cursor, Claude Desktop, Gemini CLI, Antigravity CLI, Grok Build CLI, OpenClaw, VS Code Copilot)
 - [Installing hooks without docker](#installing-hooks-without-docker)
   (curl-based installer)
 - [Running ai-memory without docker](#running-ai-memory-without-docker)
@@ -427,11 +427,11 @@ Each agent CLI needs two things:
    becomes manual.
 
 Claude Desktop is MCP-only today. Claude Code, Codex, OpenCode, OMP,
-Cursor, Gemini CLI, Antigravity CLI, and OpenClaw have lifecycle capture paths through
+Cursor, Gemini CLI, Antigravity CLI, Grok Build CLI, and OpenClaw have lifecycle capture paths through
 `install-hooks`.
 
 > **Two-step hook install pattern.** Claude Code, Codex, Cursor,
-> Gemini CLI, and Antigravity CLI use shell/PowerShell hook scripts: (1) `docker cp` the
+> Gemini CLI, Antigravity CLI, and Grok Build CLI use shell/PowerShell hook scripts: (1) `docker cp` the
 > bundled scripts to your home dir, (2) `docker run --rm install-hooks`
 > to render the config snippet.
 > On native Windows, Claude Code is the exception to the PowerShell default:
@@ -528,7 +528,7 @@ files owned by the user running the command. Prefer it as the
 default; reach for `setup-agent` only when your docker setup is
 known not to remap UIDs.
 
-### Cursor, Gemini CLI, Claude Desktop, OpenClaw, Antigravity CLI, VS Code Copilot
+### Cursor, Gemini CLI, Claude Desktop, OpenClaw, Antigravity CLI, Grok Build CLI, VS Code Copilot
 
 See [**`docs/mcp-install.md`**](mcp-install.md) for the per-client MCP
 config file path and snippet, or one-shot it via:
@@ -563,6 +563,10 @@ docker run --rm akitaonrails/ai-memory:latest \
     --server-url "http://homelab:49374"
 
 docker run --rm akitaonrails/ai-memory:latest \
+    install-hooks --agent grok            --auth-token "$TOKEN" \
+    --server-url "http://homelab:49374"
+
+docker run --rm akitaonrails/ai-memory:latest \
     install-mcp --client openclaw        --auth-token "$TOKEN" \
     --server-url "http://homelab:49374/mcp"
 
@@ -576,12 +580,15 @@ docker run --rm akitaonrails/ai-memory:latest \
 ```
 
 Cursor, Gemini CLI, Antigravity CLI, and OpenClaw support both `install-mcp` and
-`install-hooks`. Claude Desktop and VS Code Copilot are MCP-only here,
+`install-hooks`. Grok Build CLI is hook-only in ai-memory's installer today:
+`install-hooks --agent grok` captures lifecycle events, but Grok ignores
+`SessionStart` stdout, so handoffs must be accepted through MCP with
+`memory_handoff_accept` when resuming. Claude Desktop and VS Code Copilot are MCP-only here,
 so you'll need to nudge the model to call `memory_query` /
 `memory_handoff_accept` itself.
 For clients with `install-hooks` support, the capture path handles
-handoff injection at session start or the client's closest equivalent
-(Antigravity CLI uses `PreInvocation`).
+handoff injection at session start or the client's closest equivalent, except
+for Grok's no-stdout SessionStart behavior (Antigravity CLI uses `PreInvocation`).
 
 ---
 
@@ -605,7 +612,7 @@ docker run --rm akitaonrails/ai-memory:latest \
 ```
 
 The curl script installer supports
-`--agent claude-code|codex|cursor|gemini-cli|antigravity-cli|opencode|openclaw|omp|pi`
+`--agent claude-code|codex|cursor|gemini-cli|antigravity-cli|grok|opencode|openclaw|omp|pi`
 and `--to <dir>`; `--help` prints the full flag list. OpenCode,
 OpenClaw, and OMP do not need script extraction because `install-hooks`
 generates TypeScript plugin/extension files for them instead.

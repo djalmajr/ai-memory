@@ -36,7 +36,8 @@ use anyhow::{Context, Result, bail};
 
 use crate::cli::{AgentChoice, SetupAgentArgs};
 use crate::commands::render_shared::{
-    CLAUDE_CODE_EVENTS, build_claude_code_payload, hook_script_for_current_platform,
+    CLAUDE_CODE_EVENTS, build_claude_code_payload, build_grok_payload,
+    hook_script_for_current_platform,
 };
 use crate::config::{Config, DEFAULT_SERVER_URL};
 
@@ -70,8 +71,7 @@ pub fn run(config: &Config, args: SetupAgentArgs) -> Result<()> {
         AgentChoice::Cursor => "cursor",
         AgentChoice::GeminiCli => "gemini-cli",
         AgentChoice::AntigravityCli => "antigravity-cli",
-        // Grok reuses Claude Code's hook scripts (same shape + events).
-        AgentChoice::Grok => "claude-code",
+        AgentChoice::Grok => "grok",
         AgentChoice::OpenCode => unreachable!("opencode handled above"),
         AgentChoice::Omp => unreachable!("omp handled above"),
         AgentChoice::Openclaw => unreachable!("openclaw handled above"),
@@ -128,7 +128,8 @@ pub fn run(config: &Config, args: SetupAgentArgs) -> Result<()> {
         .join(agent_sub);
 
     match args.agent {
-        AgentChoice::ClaudeCode | AgentChoice::Grok => emit_claude_code(&emit_root, &args)?,
+        AgentChoice::ClaudeCode => emit_claude_code(&emit_root, &args)?,
+        AgentChoice::Grok => emit_grok(&emit_root, &args)?,
         AgentChoice::Codex
         | AgentChoice::Cursor
         | AgentChoice::GeminiCli
@@ -200,6 +201,26 @@ fn emit_claude_code(emit_root: &Path, args: &SetupAgentArgs) -> Result<()> {
     }
     println!("# Tip: also run `ai-memory install-mcp --client claude-code --auth-token <…>`");
     println!("#      to register the MCP endpoint (separate from hooks).");
+    println!();
+    println!("{serialized}");
+    Ok(())
+}
+
+fn emit_grok(emit_root: &Path, args: &SetupAgentArgs) -> Result<()> {
+    let payload = build_grok_payload(emit_root, &args.server_url, args.auth_token.as_deref());
+    let serialized =
+        serde_json::to_string_pretty(&payload).context("serializing Grok hook config")?;
+    println!("# Grok Build CLI — write to ~/.grok/hooks/ai-memory.json");
+    println!("# Hook scripts (must be reachable from the host that runs Grok):");
+    println!("#   {}", emit_root.display());
+    println!("# AI-memory server: {}", args.server_url);
+    if args.auth_token.is_some() {
+        println!("# Auth: AI_MEMORY_AUTH_TOKEN embedded in each hook command below.");
+        println!("#       Treat ~/.grok/hooks/ai-memory.json as sensitive (chmod 600).");
+    }
+    println!("# NOTE: Grok ignores SessionStart stdout, so this config captures");
+    println!("#       lifecycle events but does not inject handoffs automatically.");
+    println!("#       Recover handoffs via the MCP memory_handoff_accept tool.");
     println!();
     println!("{serialized}");
     Ok(())

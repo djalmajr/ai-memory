@@ -7,8 +7,8 @@
 ## Purpose
 
 ai-memory is a single Rust binary that gives AI coding agents (Claude
-Code, OpenAI Codex, Cursor, Gemini CLI, Antigravity CLI, OpenClaw,
-OpenCode, OMP, and MCP-capable clients) long-term memory shared across CLIs.
+Code, OpenAI Codex, Cursor, Gemini CLI, Antigravity CLI, Grok Build CLI,
+OpenClaw, OpenCode, OMP, and MCP-capable clients) long-term memory shared across CLIs.
 Quit one mid-task; open another in the same directory; continue. No
 manual `write_note` ceremony, no copy-pasting summaries between
 sessions.
@@ -26,7 +26,7 @@ markdown stays the source of truth.
                 ┌──────────────────────┐
                 │ Claude Code / Codex  │
                 │ Cursor / Gemini CLI  │
-                │ Antigravity CLI      │
+                │ Antigravity / Grok   │
                 │ OpenClaw / OpenCode  │
                 │ OMP                  │
                 └──────────┬───────────┘

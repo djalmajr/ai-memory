@@ -2334,6 +2334,129 @@ mod tests {
         assert_eq!(parent_rows, 1);
     }
 
+    #[test]
+    fn v20_adds_grok_and_preserves_sessions_invariants_on_upgraded_db() {
+        use ai_memory_core::{AgentKind, NewObservation, NewSession, ObservationKind, SessionId};
+
+        let tmp = TempDir::new().unwrap();
+        let db_path = tmp.path().join("test.sqlite");
+        let ws;
+        let proj;
+        let existing_sid = SessionId::new();
+
+        {
+            let mut conn = Connection::open(&db_path).unwrap();
+            conn.pragma_update(None, "foreign_keys", "OFF").unwrap();
+            crate::migrations::run_to(&mut conn, 19).unwrap();
+            conn.pragma_update(None, "foreign_keys", "ON").unwrap();
+            ws = get_or_create_workspace(&mut conn, "default").unwrap();
+            proj = get_or_create_project(&mut conn, &ws, "scratch", None).unwrap();
+            begin_session(
+                &mut conn,
+                &NewSession {
+                    id: existing_sid,
+                    workspace_id: ws,
+                    project_id: proj,
+                    agent_kind: AgentKind::ClaudeCode,
+                    cwd: None,
+                },
+            )
+            .unwrap();
+            insert_observation(
+                &mut conn,
+                &NewObservation {
+                    session_id: existing_sid,
+                    workspace_id: ws,
+                    project_id: proj,
+                    kind: ObservationKind::UserPrompt,
+                    extension: None,
+                    source_event: None,
+                    title: "before v20".into(),
+                    body: "existing observation survives table rebuild".into(),
+                    importance: 5,
+                },
+            )
+            .unwrap();
+        }
+
+        let mut conn = Connection::open(&db_path).unwrap();
+        conn.pragma_update(None, "foreign_keys", "OFF").unwrap();
+        crate::migrations::run_to(&mut conn, 20).unwrap();
+        conn.pragma_update(None, "foreign_keys", "ON").unwrap();
+
+        begin_session(
+            &mut conn,
+            &NewSession {
+                id: SessionId::new(),
+                workspace_id: ws,
+                project_id: proj,
+                agent_kind: AgentKind::Grok,
+                cwd: None,
+            },
+        )
+        .unwrap();
+
+        let obs_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM observations WHERE session_id = ?1",
+                params![existing_sid.as_bytes()],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(obs_count, 1, "V20 must preserve existing observations");
+
+        let index_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master \
+                 WHERE type = 'index' \
+                   AND name IN ('idx_sessions_recent', 'idx_sessions_project', 'idx_sessions_started_at')",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(index_count, 3, "V20 must recreate sessions indexes");
+
+        let trigger_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master \
+                 WHERE type = 'trigger' AND name = 'sessions_ws_proj_pairing_ai'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            trigger_count, 1,
+            "V20 must recreate the V18 pairing trigger"
+        );
+
+        let other_ws = get_or_create_workspace(&mut conn, "other").unwrap();
+        let other_proj =
+            get_or_create_project(&mut conn, &other_ws, "other-project", None).unwrap();
+        let err = begin_session(
+            &mut conn,
+            &NewSession {
+                id: SessionId::new(),
+                workspace_id: ws,
+                project_id: other_proj,
+                agent_kind: AgentKind::Grok,
+                cwd: None,
+            },
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("sessions.workspace_id does not match"),
+            "pairing trigger must reject split-brain sessions after V20: {err}"
+        );
+
+        let fk_violations: i64 = conn
+            .query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(fk_violations, 0, "V20 must leave foreign keys clean");
+    }
+
     /// V19 is idempotent: re-running on a repaired DB is a no-op.
     /// Also asserts the initial run on a clean DB (no orphans, no
     /// empty fragments) is a no-op.
