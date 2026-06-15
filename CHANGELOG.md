@@ -39,9 +39,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `auto-improve` now tolerates common malformed LLM proposal shapes found during
   live testing: evidence arrays may contain bare quote strings instead of
   `{ page, quote }` objects, a missing `operation` defaults to the only supported
-  `create_or_update` operation, and proposals still missing required target data
-  are rejected by validation instead of turning the whole dry-run review into a
-  502 response.
+  `create_or_update` operation, markdown bodies can arrive as `body`,
+  `markdown`, or `content`, and proposals still missing required target data are
+  rejected by validation instead of turning the whole dry-run review into a 502
+  response.
 - Admin destructive ops (`/admin/purge-project`, `/admin/move-project`) now
   propagate the authenticated actor (from the auth middleware's
   `Extension<ActorContext>`) into the admission context, so a `scope-guard`

@@ -155,7 +155,7 @@ pub struct AutoImproveProposal {
     #[serde(default)]
     pub evidence: Vec<AutoImproveEvidence>,
     /// Markdown body without frontmatter.
-    #[serde(default)]
+    #[serde(default, alias = "body", alias = "markdown", alias = "content")]
     pub body_markdown: String,
 }
 
@@ -1103,6 +1103,36 @@ mod tests {
         assert!(accepted.is_empty());
         assert_eq!(rejected.len(), 1);
         assert_eq!(rejected[0].reason, "invalid_path");
+        assert!(warnings.is_empty());
+    }
+
+    #[test]
+    fn proposal_body_accepts_common_markdown_aliases() {
+        let raw: AutoImproveLlmResponse = serde_json::from_value(serde_json::json!({
+            "summary": "ok",
+            "proposals": [{
+                "path": "procedures/release.md",
+                "title": "Release Procedure",
+                "kind": "procedure",
+                "confidence": 0.91,
+                "rationale": "The session repeated a release workflow with verification.",
+                "evidence": ["run the full gate before release"],
+                "body": "# Release Procedure\n\nRun the full gate before release."
+            }],
+            "rejected_candidates": []
+        }))
+        .unwrap();
+
+        assert!(
+            raw.proposals[0]
+                .body_markdown
+                .starts_with("# Release Procedure")
+        );
+
+        let (accepted, rejected, warnings) =
+            validate_response(raw, &cfg(), &ExistingPageIndex::default());
+        assert_eq!(accepted.len(), 1);
+        assert!(rejected.is_empty());
         assert!(warnings.is_empty());
     }
 
