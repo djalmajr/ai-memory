@@ -2593,7 +2593,7 @@ async fn copy_purge_merge(
                 // git-mirror lands the copy under the destination path.
                 admission_ctx: None,
                 author_id: None,
-                actor: ai_memory_core::ActorContext::anonymous(),
+                actor: actor.clone(),
             })
             .await
         {
@@ -3382,6 +3382,17 @@ mod tests {
     }
 
     async fn post_write_page(router: &Router, ws: &str, project: &str, path: &str, body: &str) {
+        post_write_page_with_actor(router, ws, project, path, body, None).await;
+    }
+
+    async fn post_write_page_with_actor(
+        router: &Router,
+        ws: &str,
+        project: &str,
+        path: &str,
+        body: &str,
+        actor: Option<&'static str>,
+    ) {
         let req_body = serde_json::json!({
             "workspace": ws,
             "project": project,
@@ -3389,13 +3400,20 @@ mod tests {
             "body": body,
             "title": "Read-back fixture",
         });
+        let mut builder = Request::builder()
+            .method("POST")
+            .uri("/admin/write-page")
+            .header("content-type", "application/json");
+        if let Some(user) = actor {
+            builder = builder.extension(ai_memory_core::ActorContext {
+                user: Some(user.into()),
+                ..ai_memory_core::ActorContext::default()
+            });
+        }
         let resp = router
             .clone()
             .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri("/admin/write-page")
-                    .header("content-type", "application/json")
+                builder
                     .body(Body::from(serde_json::to_vec(&req_body).unwrap()))
                     .unwrap(),
             )
@@ -3808,6 +3826,117 @@ mod tests {
             StatusCode::OK,
             "matching actor must be authorized and the purge succeed"
         );
+    }
+
+    /// Merge moves copy source pages through `Wiki::write_page` before purging
+    /// the source. That copy path must carry the authenticated actor too;
+    /// otherwise a scope-guard webhook that gates `write_page` by user still
+    /// rejects `/admin/move-project` even though purge/move admission was fixed.
+    #[tokio::test]
+    async fn move_project_merge_copy_admission_carries_the_actor() {
+        use ai_memory_core::ActorContext;
+        use ai_memory_wiki::{AdmissionChain, FailurePolicy, WebhookConfig};
+        use axum::routing::post;
+
+        let app = Router::new().route(
+            "/guard",
+            post(|Json(payload): Json<serde_json::Value>| async move {
+                if payload["ctx"]["actor"]["user"].as_str() == Some("alice") {
+                    StatusCode::NO_CONTENT
+                } else {
+                    StatusCode::FORBIDDEN
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let chain = AdmissionChain::new(vec![WebhookConfig {
+            name: "scope-guard".into(),
+            url: format!("{base}/guard"),
+            timeout_ms: 2_000,
+            failure_policy: FailurePolicy::Reject,
+            events: vec![AdmissionOp::WritePage, AdmissionOp::PurgeProject],
+            blocking: true,
+        }])
+        .unwrap();
+        let wiki = Wiki::new(tmp.path(), store.writer.clone())
+            .unwrap()
+            .with_admission_chain(chain)
+            .with_store_reader(store.reader.clone());
+        let router = admin_router(AdminState {
+            writer: store.writer.clone(),
+            reader: store.reader.clone(),
+            wiki,
+            llm: None,
+            embedder: None,
+            provider_health: ProviderHealth::default(),
+            decay_params: DecayParams::default(),
+            data_dir: tmp.path().to_path_buf(),
+            db_path: store.db_path().to_path_buf(),
+            bind: "127.0.0.1:49374".to_string(),
+            bootstrap_lock: Arc::new(tokio::sync::Mutex::new(())),
+            token_pepper: None,
+            active_project: ai_memory_core::ActiveProject::new(),
+            on_project_moved: None,
+        });
+
+        post_write_page_with_actor(
+            &router,
+            "src",
+            "merged",
+            "notes/source.md",
+            "source body",
+            Some("alice"),
+        )
+        .await;
+        // Same project name in the destination workspace forces the copy-purge
+        // merge path instead of the true-move path.
+        post_write_page_with_actor(
+            &router,
+            "dst",
+            "merged",
+            "notes/existing.md",
+            "existing body",
+            Some("alice"),
+        )
+        .await;
+
+        let resp = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/admin/move-project")
+                    .header("content-type", "application/json")
+                    .extension(ActorContext {
+                        user: Some("alice".into()),
+                        ..ActorContext::default()
+                    })
+                    .body(Body::from(
+                        serde_json::to_vec(&serde_json::json!({
+                            "from_workspace": "src",
+                            "project": "merged",
+                            "to_workspace": "dst",
+                            "confirm": true,
+                        }))
+                        .unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK, "merge move should succeed");
+        let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["merged_into_existing"], true);
+        assert_eq!(json["moved_via"], "copy-purge");
+        assert_eq!(json["source_purged"], true);
     }
 
     // ── user-management endpoints (P1.4) ──────────────────────────
