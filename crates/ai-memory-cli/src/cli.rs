@@ -31,6 +31,10 @@ pub enum Command {
     Init(InitArgs),
     /// Print runtime status (counts, paths, version).
     Status(StatusArgs),
+    /// Audit the store for likely cross-project contamination (read-only,
+    /// SQL-only). Flags sessions whose cwd resolves to a different project and
+    /// observations whose project disagrees with their session.
+    AuditContamination(AuditContaminationArgs),
     /// Full-text search the wiki via FTS5.
     Search(SearchArgs),
     /// Fetch and display the full body of a wiki page.
@@ -562,6 +566,20 @@ pub struct InitArgs {
 /// Arguments for `status`.
 #[derive(Debug, Args)]
 pub struct StatusArgs {
+    /// Emit the report as JSON instead of human-readable text.
+    #[arg(long)]
+    pub json: bool,
+}
+
+/// Arguments for `audit-contamination`.
+#[derive(Debug, Args)]
+pub struct AuditContaminationArgs {
+    /// Restrict the audit to one workspace (use together with `--project`).
+    #[arg(long)]
+    pub workspace: Option<String>,
+    /// Restrict the audit to one project (use together with `--workspace`).
+    #[arg(long)]
+    pub project: Option<String>,
     /// Emit the report as JSON instead of human-readable text.
     #[arg(long)]
     pub json: bool,

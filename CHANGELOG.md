@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- `GET /admin/audit-contamination` (and `ai-memory audit-contamination`) — a
+  read-only, SQL-only structural cross-project contamination audit. Flags
+  sessions whose `cwd` longest-prefix-resolves to a different project than the
+  one they landed in (the auto-scope-bleed signature, resolved with the same
+  prefix logic the runtime uses) and observations whose project disagrees with
+  their owning session (a regression tripwire that should stay empty on a
+  healthy DB). Optional `?workspace=&project=` scope; reports only, never
+  mutates, so it is safe to run on any cadence. Purely semantic mislandings
+  (no cwd/session anomaly) are out of scope by design.
+
 ## [1.1.0] - 2026-06-16
 
 ### Fixed

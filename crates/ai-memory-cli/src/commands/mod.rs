@@ -5,6 +5,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use crate::config::Config;
 
 pub mod apply_shared;
+pub mod audit_contamination;
 pub mod auth;
 pub mod auto_improve;
 pub mod backup;

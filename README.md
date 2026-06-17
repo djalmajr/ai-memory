@@ -88,8 +88,9 @@ priors are at the [bottom](#influences-and-prior-art).
   [`[auto_scope]` modes](docs/auto-scope.md) for per-user or
   session-aware current-project routing.
 - **Thin-client CLI.** `ai-memory status`, `bootstrap`, `checkpoints`,
-    `restore-page`, `purge-project`, `rename-project`, `move-project`, `lint`,
-  `curator`, `auto-improve`, `pending-writes`, `embed`, `forget-sweep`, `backup` are
+  `restore-page`, `purge-project`, `rename-project`, `move-project`,
+  `audit-contamination`, `lint`, `curator`, `auto-improve`, `pending-writes`,
+  `embed`, `forget-sweep`, `backup` are
   all HTTP clients of the running server - never touch SQLite or
   wiki files directly. `status` also reports passive LLM/embedding
   provider health from the last real provider call. Server is the

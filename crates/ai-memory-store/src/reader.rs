@@ -124,6 +124,55 @@ pub struct StatusCounts {
     pub observations: u64,
 }
 
+/// One likely cross-project contamination finding from
+/// [`ReaderPool::audit_contamination`]. Advisory only — it flags STRUCTURAL
+/// mislandings (an entity whose identity disagrees with the bucket it landed
+/// in). Purely semantic contamination (a page whose topic belongs elsewhere
+/// with no cwd/session anomaly) is not detectable structurally.
+#[derive(Debug, Clone, Serialize)]
+pub struct ContaminationFinding {
+    /// Heuristic that fired: `session_wrong_bucket` | `observation_session_drift`.
+    pub check: &'static str,
+    /// Confidence — `high` for both structural checks.
+    pub confidence: &'static str,
+    /// Entity kind: `session` | `observation`.
+    pub entity_kind: &'static str,
+    /// Entity id (lowercase hex of the 16-byte UUID).
+    pub entity_id: String,
+    /// Workspace name the entity actually landed in.
+    pub landed_workspace: String,
+    /// Project name the entity actually landed in.
+    pub landed_project: String,
+    /// Project the evidence says it belongs to (resolved cwd project for CHECK A,
+    /// the owning session's project for CHECK B).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expected_project: Option<String>,
+    /// Originating session cwd — the prefix-resolution evidence (CHECK A).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<String>,
+    /// Owning session id (lowercase hex) — the drift evidence (CHECK B).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
+}
+
+/// Per-check counts for an [`ReaderPool::audit_contamination`] run.
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct ContaminationSummary {
+    /// Sessions whose cwd prefix-resolves to a different project (CHECK A).
+    pub sessions_misbucketed: usize,
+    /// Observations whose project disagrees with their session (CHECK B).
+    pub observations_drifted: usize,
+}
+
+/// Result of [`ReaderPool::audit_contamination`] — advisory, never mutates.
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct ContaminationReport {
+    /// Per-check counts.
+    pub summary: ContaminationSummary,
+    /// Individual findings.
+    pub findings: Vec<ContaminationFinding>,
+}
+
 /// Counts that must all be zero before `ai-memory reindex` rebuilds the
 /// derived SQLite store from wiki files.
 #[derive(Debug, Clone, Default, Serialize)]
@@ -3277,6 +3326,229 @@ impl ReaderPool {
                 .transpose()
         })
         .await
+    }
+
+    /// Structural cross-project contamination audit (cheap, SQL-only, no LLM).
+    ///
+    /// Two HIGH-precision heuristics:
+    /// - **CHECK A** (`session_wrong_bucket`): a session whose `cwd`
+    ///   longest-prefix-resolves to a *different* project than the one it landed
+    ///   in — the direct signature of the auto-scope bleed bug. Resolved with the
+    ///   same prefix and cwd-safety rules as [`Self::find_project_by_cwd_prefix`],
+    ///   so the audit never claims a session a live resolve would not.
+    /// - **CHECK B** (`observation_session_drift`): an observation whose
+    ///   `project_id` disagrees with its owning session's. On a healthy DB this
+    ///   is always empty, so a non-empty result is a regression alarm.
+    ///
+    /// Detects only contamination with a STRUCTURAL trace; purely semantic
+    /// mislandings (topic-level, no cwd/session anomaly) are not detectable.
+    /// `scope` restricts findings to the given landed `(workspace, project)`.
+    ///
+    /// # Errors
+    /// Propagates any SQL or pool error.
+    pub async fn audit_contamination(
+        &self,
+        scope: Option<(WorkspaceId, ProjectId)>,
+    ) -> StoreResult<ContaminationReport> {
+        let scoped = scope.is_some();
+        let scope_params: Vec<Value> = match &scope {
+            Some((ws, proj)) => vec![
+                Value::Blob(ws.as_bytes().to_vec()),
+                Value::Blob(proj.as_bytes().to_vec()),
+            ],
+            None => Vec::new(),
+        };
+
+        // One connection: CHECK B findings + the candidate session list + the
+        // valid repo_path prefixes used to resolve CHECK A. Loading prefixes
+        // once avoids a reader query per historical session while preserving the
+        // same path boundary and safety rules as the runtime resolver.
+        type Candidate = (String, WorkspaceId, ProjectId, String, String, String);
+        type Prefix = (WorkspaceId, ProjectId, String, String);
+        let sp_b = scope_params.clone();
+        let (mut findings, candidates, prefixes): (
+            Vec<ContaminationFinding>,
+            Vec<Candidate>,
+            Vec<Prefix>,
+        ) = self
+            .with_conn(move |conn| {
+                let mut findings: Vec<ContaminationFinding> = Vec::new();
+
+                // CHECK B — observation drifted from its owning session.
+                let mut b_sql = String::from(
+                    "SELECT lower(hex(o.id)), lower(hex(o.session_id)), wl.name, pl.name, pe.name \
+                     FROM observations o \
+                     JOIN sessions s ON s.id = o.session_id \
+                     JOIN workspaces wl ON wl.id = o.workspace_id \
+                     JOIN projects pl ON pl.id = o.project_id \
+                     JOIN projects pe ON pe.id = s.project_id \
+                     WHERE o.project_id != s.project_id",
+                );
+                if scoped {
+                    b_sql.push_str(" AND o.workspace_id = ? AND o.project_id = ?");
+                }
+                {
+                    let mut stmt = conn.prepare(&b_sql)?;
+                    let rows = stmt.query_map(params_from_iter(sp_b.iter()), |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, String>(2)?,
+                            row.get::<_, String>(3)?,
+                            row.get::<_, String>(4)?,
+                        ))
+                    })?;
+                    for r in rows {
+                        let (id, sess, lws, lproj, eproj) = r?;
+                        findings.push(ContaminationFinding {
+                            check: "observation_session_drift",
+                            confidence: "high",
+                            entity_kind: "observation",
+                            entity_id: id,
+                            landed_workspace: lws,
+                            landed_project: lproj,
+                            expected_project: Some(eproj),
+                            cwd: None,
+                            session_id: Some(sess),
+                        });
+                    }
+                }
+
+                // Candidate sessions (cwd present) — resolved outside the conn.
+                let mut s_sql = String::from(
+                    "SELECT lower(hex(s.id)), s.workspace_id, s.project_id, wl.name, pl.name, s.cwd \
+                     FROM sessions s \
+                     JOIN workspaces wl ON wl.id = s.workspace_id \
+                     JOIN projects pl ON pl.id = s.project_id \
+                     WHERE s.cwd IS NOT NULL",
+                );
+                if scoped {
+                    s_sql.push_str(" AND s.workspace_id = ? AND s.project_id = ?");
+                }
+                let mut candidates: Vec<Candidate> = Vec::new();
+                {
+                    let mut stmt = conn.prepare(&s_sql)?;
+                    let rows = stmt.query_map(params_from_iter(scope_params.iter()), |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, Vec<u8>>(1)?,
+                            row.get::<_, Vec<u8>>(2)?,
+                            row.get::<_, String>(3)?,
+                            row.get::<_, String>(4)?,
+                            row.get::<_, String>(5)?,
+                        ))
+                    })?;
+                    for r in rows {
+                        let (id, ws_b, proj_b, lws, lproj, cwd) = r?;
+                        candidates.push((
+                            id,
+                            WorkspaceId::from_slice(&ws_b)?,
+                            ProjectId::from_slice(&proj_b)?,
+                            lws,
+                            lproj,
+                            cwd,
+                        ));
+                    }
+                }
+
+                let mut p_sql = String::from(
+                    "SELECT workspace_id, id, name, repo_path \
+                     FROM projects \
+                     WHERE repo_path IS NOT NULL \
+                       AND length(repo_path) > 1 \
+                       AND repo_path NOT LIKE '%/' \
+                       AND repo_path NOT LIKE '%\\%%' ESCAPE '\\' \
+                       AND repo_path NOT LIKE '%\\_%' ESCAPE '\\'",
+                );
+                if scoped {
+                    p_sql.push_str(" AND workspace_id = ?");
+                }
+                p_sql.push_str(" ORDER BY length(repo_path) DESC");
+                let mut prefixes: Vec<Prefix> = Vec::new();
+                {
+                    let mut stmt = conn.prepare(&p_sql)?;
+                    if scoped {
+                        let rows = stmt.query_map(params_from_iter(scope_params.iter().take(1)), |row| {
+                            Ok((
+                                row.get::<_, Vec<u8>>(0)?,
+                                row.get::<_, Vec<u8>>(1)?,
+                                row.get::<_, String>(2)?,
+                                row.get::<_, String>(3)?,
+                            ))
+                        })?;
+                        for r in rows {
+                            let (ws_b, proj_b, name, repo_path) = r?;
+                            prefixes.push((
+                                WorkspaceId::from_slice(&ws_b)?,
+                                ProjectId::from_slice(&proj_b)?,
+                                name,
+                                repo_path,
+                            ));
+                        }
+                    } else {
+                        let rows = stmt.query_map([], |row| {
+                            Ok((
+                                row.get::<_, Vec<u8>>(0)?,
+                                row.get::<_, Vec<u8>>(1)?,
+                                row.get::<_, String>(2)?,
+                                row.get::<_, String>(3)?,
+                            ))
+                        })?;
+                        for r in rows {
+                            let (ws_b, proj_b, name, repo_path) = r?;
+                            prefixes.push((
+                                WorkspaceId::from_slice(&ws_b)?,
+                                ProjectId::from_slice(&proj_b)?,
+                                name,
+                                repo_path,
+                            ));
+                        }
+                    }
+                }
+
+                Ok((findings, candidates, prefixes))
+            })
+            .await?;
+
+        // CHECK A: resolve each session's cwd against preloaded valid prefixes
+        // and flag a bucket mismatch.
+        for (id, ws, landed_proj, landed_ws_name, landed_proj_name, cwd) in candidates {
+            let cwd_norm = cwd.trim_end_matches('/').to_string();
+            if !is_safe_cwd_for_prefix_match(&cwd_norm) {
+                continue;
+            }
+            let resolved = prefixes.iter().find(|(prefix_ws, _, _, repo_path)| {
+                *prefix_ws == ws
+                    && (cwd_norm == *repo_path || cwd_norm.starts_with(&format!("{repo_path}/")))
+            });
+            if let Some((_, resolved_proj, resolved_name, _)) = resolved
+                && *resolved_proj != landed_proj
+            {
+                findings.push(ContaminationFinding {
+                    check: "session_wrong_bucket",
+                    confidence: "high",
+                    entity_kind: "session",
+                    entity_id: id,
+                    landed_workspace: landed_ws_name,
+                    landed_project: landed_proj_name,
+                    expected_project: Some(resolved_name.clone()),
+                    cwd: Some(cwd),
+                    session_id: None,
+                });
+            }
+        }
+
+        let summary = ContaminationSummary {
+            sessions_misbucketed: findings
+                .iter()
+                .filter(|f| f.check == "session_wrong_bucket")
+                .count(),
+            observations_drifted: findings
+                .iter()
+                .filter(|f| f.check == "observation_session_drift")
+                .count(),
+        };
+        Ok(ContaminationReport { summary, findings })
     }
 
     /// Return aggregate counts for the `status` view.

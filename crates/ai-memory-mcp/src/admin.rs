@@ -314,6 +314,7 @@ fn default_auto_improve_pending_path() -> String {
 /// - `POST /admin/auto-improve`
 /// - `POST /admin/curator`
 /// - `GET  /admin/status`
+/// - `GET  /admin/audit-contamination`
 /// - `GET  /admin/search`
 /// - `GET  /admin/read-page`
 /// - `POST /admin/reorg`
@@ -354,6 +355,10 @@ pub fn admin_router(state: AdminState) -> Router {
             post(handle_pending_write_reject),
         )
         .route("/admin/status", get(handle_status))
+        .route(
+            "/admin/audit-contamination",
+            get(handle_audit_contamination),
+        )
         .route("/admin/search", get(handle_search))
         .route("/admin/read-page", get(handle_read_page))
         .route("/admin/reorg", post(handle_reorg))
@@ -503,6 +508,54 @@ async fn build_backup_tarball_file(state: &AdminState) -> anyhow::Result<tokio::
 // ---------------------------------------------------------------------
 // status
 // ---------------------------------------------------------------------
+
+/// Query string for `GET /admin/audit-contamination`. Supplying BOTH
+/// `workspace` and `project` scopes the audit to that one landed bucket;
+/// omit both to audit every project.
+#[derive(Deserialize)]
+struct AuditContaminationQuery {
+    workspace: Option<String>,
+    project: Option<String>,
+}
+
+/// `GET /admin/audit-contamination` — read-only structural contamination audit
+/// (see [`ai_memory_store::ReaderPool::audit_contamination`]). Reports likely
+/// cross-project mislandings (a session whose cwd resolves elsewhere; an
+/// observation whose project disagrees with its session); never mutates, so it
+/// is safe to run on any cadence (e.g. a cron probe alerting on non-zero counts).
+async fn handle_audit_contamination(
+    State(state): State<Arc<AdminState>>,
+    Query(q): Query<AuditContaminationQuery>,
+) -> impl IntoResponse {
+    let scope = match (
+        trimmed_opt(q.workspace.as_deref()),
+        trimmed_opt(q.project.as_deref()),
+    ) {
+        (Some(ws), Some(proj)) => match lookup_ws_proj_no_create(&state, ws, proj).await {
+            Ok(ids) => Some(ids),
+            Err(e) => return e,
+        },
+        (Some(_), None) | (None, Some(_)) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "error": "workspace and project must be provided together"
+                })),
+            );
+        }
+        _ => None,
+    };
+    match state.reader.audit_contamination(scope).await {
+        Ok(report) => (
+            StatusCode::OK,
+            Json(serde_json::to_value(&report).unwrap_or_else(|_| serde_json::json!({}))),
+        ),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": e.to_string() })),
+        ),
+    }
+}
 
 /// JSON response body for `GET /admin/status`. The CLI's `status`
 /// subcommand renders this either as JSON (`--json`) or as a small
@@ -4473,6 +4526,32 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn audit_contamination_partial_scope_fails_closed() {
+        let (_tmp, router) = read_page_test_router();
+
+        for uri in [
+            "/admin/audit-contamination?workspace=default",
+            "/admin/audit-contamination?project=ai-memory",
+        ] {
+            let resp = router
+                .clone()
+                .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+
+            assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "{uri}");
+            let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+            let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            assert!(
+                json["error"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .contains("workspace and project must be provided together")
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn auto_improve_auto_approves_by_default_and_uses_concrete_operations() {
         let tmp = TempDir::new().unwrap();
         let store = Store::open(tmp.path()).unwrap();
@@ -5661,6 +5740,7 @@ mod tests {
                 }),
             ),
             ("GET", "/admin/status", serde_json::Value::Null),
+            ("GET", "/admin/audit-contamination", serde_json::Value::Null),
             ("GET", "/admin/search?q=test", serde_json::Value::Null),
             (
                 "GET",
