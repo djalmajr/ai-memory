@@ -78,6 +78,21 @@ pub async fn run(config: &Config, args: ServeArgs) -> Result<()> {
     let store = Store::open(&config.data_dir)
         .with_context(|| format!("opening store at {}", config.data_dir.display()))?;
 
+    // One-shot legacy heal (issue #103): NULL out any project repo_path that
+    // is a known prefix-match catch-all ($HOME or filesystem root) so existing
+    // broken installs self-correct on upgrade. Uses the same $HOME source as
+    // the router's match-time guard so heal and guard agree on its meaning.
+    let healed = store
+        .writer
+        .heal_catch_all_repo_paths(std::env::var("HOME").ok())
+        .await?;
+    if healed > 0 {
+        tracing::info!(
+            healed,
+            "healed catch-all project repo_path rows ($HOME / filesystem root)"
+        );
+    }
+
     // Run any outstanding wiki-structure migrations before the watcher starts
     // so file moves and renames are never raced by the reconciler.
     let wiki_root = config.data_dir.join("wiki");

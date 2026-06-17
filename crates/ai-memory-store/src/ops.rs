@@ -145,6 +145,21 @@ pub fn get_or_create_project(
     Ok(id)
 }
 
+/// NULL out `repo_path` values that act as prefix-match catch-alls: the
+/// operator's home directory (`home`, when provided) and filesystem root
+/// (`/`). Such rows would prefix-match every project nested beneath them
+/// (issue #103). Idempotent; returns the number of rows healed. Targets
+/// ONLY those two sentinels -- get_or_create_project never re-populates a
+/// NULLed repo_path, so a broader heal would be destructive.
+pub fn heal_catch_all_repo_paths(conn: &mut Connection, home: Option<&str>) -> StoreResult<u64> {
+    let n = conn.execute(
+        "UPDATE projects SET repo_path = NULL \
+         WHERE repo_path = '/' OR (?1 IS NOT NULL AND repo_path = ?1)",
+        params![home],
+    )?;
+    Ok(u64::try_from(n).unwrap_or(0))
+}
+
 fn scheduler_state_table_exists(conn: &Connection) -> StoreResult<bool> {
     Ok(conn
         .query_row(
@@ -2868,5 +2883,53 @@ mod tests {
             "kept-hyphen phrase must not match"
         );
         assert_eq!(count("\"ui refresh\""), 1, "sub-token phrase must match");
+    }
+
+    /// Issue #103 legacy heal: a one-shot startup pass NULLs `repo_path`
+    /// rows equal to the two prefix-match catch-alls ($HOME and `/`) so
+    /// existing broken installs self-correct on upgrade. Nested and NULL
+    /// rows are left untouched -- only the two sentinels are healed.
+    #[test]
+    fn heal_catch_all_repo_paths_nulls_home_and_root_only() {
+        let (_tmp, mut conn, ws, _proj) = fresh_db();
+
+        let read_repo_path = |conn: &Connection, id: &ProjectId| -> Option<String> {
+            conn.query_row(
+                "SELECT repo_path FROM projects WHERE id = ?1",
+                params![id.as_bytes()],
+                |row| row.get(0),
+            )
+            .unwrap()
+        };
+
+        let home = get_or_create_project(&mut conn, &ws, "home", Some("/home/tester")).unwrap();
+        let root = get_or_create_project(&mut conn, &ws, "root", Some("/")).unwrap();
+        let nested =
+            get_or_create_project(&mut conn, &ws, "app", Some("/home/tester/projects/app"))
+                .unwrap();
+        let none = get_or_create_project(&mut conn, &ws, "none", None).unwrap();
+
+        let healed = heal_catch_all_repo_paths(&mut conn, Some("/home/tester")).unwrap();
+        assert_eq!(healed, 2, "only the $HOME and `/` rows should be healed");
+
+        assert_eq!(
+            read_repo_path(&conn, &home),
+            None,
+            "$HOME row must be NULLed"
+        );
+        assert_eq!(read_repo_path(&conn, &root), None, "`/` row must be NULLed");
+        assert_eq!(
+            read_repo_path(&conn, &nested),
+            Some("/home/tester/projects/app".to_string()),
+            "nested project must be preserved"
+        );
+        assert_eq!(read_repo_path(&conn, &none), None, "NULL row stays NULL");
+
+        // Idempotent: a second pass over a healed DB changes nothing.
+        assert_eq!(
+            heal_catch_all_repo_paths(&mut conn, Some("/home/tester")).unwrap(),
+            0,
+            "re-running the heal must be a no-op"
+        );
     }
 }

@@ -116,6 +116,10 @@ pub(crate) enum WriteCmd {
         hard_delete_after_days: i64,
         reply: oneshot::Sender<StoreResult<usize>>,
     },
+    HealCatchAllRepoPaths {
+        home: Option<String>,
+        reply: oneshot::Sender<StoreResult<u64>>,
+    },
     StoreEmbedding {
         page_id: PageId,
         vector_bytes: Vec<u8>,
@@ -556,6 +560,19 @@ impl WriterHandle {
             reply: tx,
         })
         .await?;
+        rx.await.map_err(|_| StoreError::WriterClosed)?
+    }
+
+    /// NULL out catch-all project `repo_path` rows ($HOME and filesystem
+    /// root) so existing installs self-heal on upgrade. Idempotent;
+    /// returns the number of rows healed.
+    ///
+    /// # Errors
+    /// Returns [`StoreError::WriterClosed`] or propagates SQL errors.
+    pub async fn heal_catch_all_repo_paths(&self, home: Option<String>) -> StoreResult<u64> {
+        let (tx, rx) = oneshot::channel();
+        self.send(WriteCmd::HealCatchAllRepoPaths { home, reply: tx })
+            .await?;
         rx.await.map_err(|_| StoreError::WriterClosed)?
     }
 
@@ -1063,6 +1080,10 @@ fn worker_loop(mut conn: Connection, mut rx: mpsc::Receiver<WriteCmd>) {
             } => {
                 let result = ops::hard_delete_decayed_pages(&mut conn, hard_delete_after_days);
                 send_or_warn(reply, result, "hard_delete_decayed_pages");
+            }
+            WriteCmd::HealCatchAllRepoPaths { home, reply } => {
+                let result = ops::heal_catch_all_repo_paths(&mut conn, home.as_deref());
+                send_or_warn(reply, result, "heal_catch_all_repo_paths");
             }
             WriteCmd::StoreEmbedding {
                 page_id,
