@@ -506,11 +506,12 @@ async fn resolve_project_ids(
     // The match is keyed on the actual cwd (`cwd_norm`), not the stored
     // `repo_path`: `repo_path` is now the git root or None (issue #103),
     // whereas cwd->parent matching needs the full deep path.
+    let home_dir = std::env::var("HOME").ok();
     let proj = if project_override.is_none()
         && let Some(rp) = cwd_norm.as_deref().filter(|s| !s.is_empty())
         && let Some((parent_id, parent_name)) = state
             .reader
-            .find_project_by_cwd_prefix(ws, rp.to_string())
+            .find_project_by_cwd_prefix(ws, rp.to_string(), home_dir.as_deref())
             .await
             .map_err(|e| anyhow::anyhow!("find_project_by_cwd_prefix: {e}"))?
         && parent_name != project_name
