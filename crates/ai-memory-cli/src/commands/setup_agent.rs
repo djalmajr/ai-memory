@@ -287,24 +287,7 @@ fn copy_support_hook_scripts(source_dir: &Path, dest_dir: &Path) -> Result<()> {
 }
 
 fn resolve_source(explicit: Option<&Path>, sub: &str) -> Result<PathBuf> {
-    let candidates: Vec<PathBuf> = if let Some(p) = explicit {
-        vec![p.join(sub)]
-    } else {
-        let mut v = vec![
-            // Docker image lays them out under /usr/local/share/.
-            PathBuf::from(format!("/usr/local/share/ai-memory/hooks/{sub}")),
-            // Native Linux packages install hook sources under /usr/share.
-            PathBuf::from(format!("/usr/share/ai-memory/hooks/{sub}")),
-        ];
-        // Repo-local fallback for `cargo run setup-agent` during dev.
-        if let Some(p) = std::env::current_exe()
-            .ok()
-            .and_then(|p| p.parent()?.parent()?.parent().map(Path::to_path_buf))
-        {
-            v.push(p.join("hooks").join(sub));
-        }
-        v
-    };
+    let candidates = source_candidates(explicit, sub, std::env::current_exe().ok());
     for path in &candidates {
         if path.is_dir() {
             return Ok(path.clone());
@@ -314,4 +297,86 @@ fn resolve_source(explicit: Option<&Path>, sub: &str) -> Result<PathBuf> {
         "could not locate hook source bundle for {sub}. \
          Tried: {candidates:?}. Pass --source <dir> to override."
     );
+}
+
+/// Ordered directories to probe for the `<sub>` hook bundle.
+///
+/// `exe` is the running binary's path (`std::env::current_exe()`), threaded
+/// in so the derivation is unit-testable. An `explicit` `--source` is trusted
+/// verbatim; otherwise we try the packaged install locations plus two
+/// binary-relative spots:
+///   * `<exe_dir>/hooks/<sub>` — the **release tarball** ships `hooks/` right
+///     beside the binary (macOS/Windows/Linux archives), and
+///   * `<exe_dir>/../../hooks/<sub>` — `cargo run` from the repo, where the
+///     binary lives under `target/<profile>/`.
+///
+/// Without the binary-sibling entry the flat tarball layout was unreachable:
+/// from `/private/tmp/<dir>/ai-memory` the `parent×3` dev fallback derived a
+/// bogus `/private/hooks/<sub>` and discovery failed (issue #107).
+fn source_candidates(explicit: Option<&Path>, sub: &str, exe: Option<PathBuf>) -> Vec<PathBuf> {
+    if let Some(p) = explicit {
+        return vec![p.join(sub)];
+    }
+    let mut v = vec![
+        // Docker image lays them out under /usr/local/share/.
+        PathBuf::from(format!("/usr/local/share/ai-memory/hooks/{sub}")),
+        // Native Linux packages install hook sources under /usr/share.
+        PathBuf::from(format!("/usr/share/ai-memory/hooks/{sub}")),
+    ];
+    if let Some(exe) = exe {
+        // Release tarball: `hooks/` sits in the same dir as the binary.
+        if let Some(dir) = exe.parent() {
+            v.push(dir.join("hooks").join(sub));
+        }
+        // Repo-local fallback for `cargo run setup-agent` during dev:
+        // target/<profile>/<bin> → repo root.
+        if let Some(root) = exe.parent().and_then(Path::parent).and_then(Path::parent) {
+            v.push(root.join("hooks").join(sub));
+        }
+    }
+    v
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn source_candidates_include_binary_sibling_for_flat_tarball() {
+        // Flat release tarball: the binary and its `hooks/` bundle are
+        // extracted side by side. On macOS the path resolves under
+        // /private/..., which the old `parent×3` dev fallback turned into a
+        // bogus `/private/hooks/...` (issue #107).
+        let exe = PathBuf::from("/private/tmp/ai-memory-macos-aarch64/ai-memory");
+        let candidates = source_candidates(None, "claude-code", Some(exe));
+
+        assert!(
+            candidates.contains(&PathBuf::from(
+                "/private/tmp/ai-memory-macos-aarch64/hooks/claude-code"
+            )),
+            "binary-sibling hooks/ dir must be probed; got {candidates:?}"
+        );
+        // Packaged install locations still take precedence.
+        assert_eq!(
+            candidates[0],
+            PathBuf::from("/usr/local/share/ai-memory/hooks/claude-code")
+        );
+    }
+
+    #[test]
+    fn source_candidates_preserve_cargo_run_repo_root() {
+        // `cargo run`: target/<profile>/<bin> → repo root holds `hooks/`.
+        let exe = PathBuf::from("/home/dev/ai-memory/target/debug/ai-memory");
+        let candidates = source_candidates(None, "claude-code", Some(exe));
+        assert!(
+            candidates.contains(&PathBuf::from("/home/dev/ai-memory/hooks/claude-code")),
+            "repo-root hooks/ dir must still be probed; got {candidates:?}"
+        );
+    }
+
+    #[test]
+    fn source_candidates_honour_explicit_override() {
+        let candidates = source_candidates(Some(Path::new("/custom/src")), "codex", None);
+        assert_eq!(candidates, vec![PathBuf::from("/custom/src/codex")]);
+    }
 }

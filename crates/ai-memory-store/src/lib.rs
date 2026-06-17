@@ -35,7 +35,8 @@ pub use decay::{DecayParams, retention_score};
 pub use error::{StoreError, StoreResult};
 pub use ops::{EmbeddingWrite, MoveSummary, PurgeSummary, ReorgSummary};
 pub use reader::{
-    ActivityWindow, AutoImproveCandidateSession, BriefingPage, BriefingSnapshot, DecayCandidate,
+    ActivityWindow, AutoImproveCandidateSession, BriefingPage, BriefingSnapshot,
+    ContaminationFinding, ContaminationReport, ContaminationSummary, DecayCandidate,
     DerivedIndexStatus, EmbeddingTripleCount, HealthDetail, HealthPage, ObservationHit, PageAuthor,
     PageHit, PageHitWithMeta, PageLinks, PageMeta, PageSummary, ProjectSummary, ReaderPool,
     ReindexTargetStatus, RelatedPage, ScopeRow, StatusCounts, StoredEmbedding, StoredPageBody,

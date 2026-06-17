@@ -157,6 +157,7 @@ impl MultiUserHarness {
                 DEFAULT_HOOK_INGEST_MAX_IN_FLIGHT,
             )),
             consolidate_on_session_end: false,
+            home_dir: None,
         });
 
         // Production-equivalent Bearer middleware. Pepper + reader are

@@ -143,7 +143,8 @@ jobs:
 
       # Mirrors the Linux tarball, minus Linux-only service assets
       # (packaging/systemd|sysusers|tmpfiles|env). macOS users get the binary,
-      # hooks bundle, default config template, and install docs.
+      # hooks bundle, default config template, and the docs a macOS user needs
+      # (install.md + macos.md).
       - name: Create release tarball
         env:
           RELEASE_ARTIFACT: ${{ matrix.artifact }}
@@ -159,6 +160,7 @@ jobs:
           mkdir -p "dist/$artifact/docs"
           cp README.md LICENSE "dist/$artifact/"
           cp docs/install.md "dist/$artifact/docs/install.md"
+          cp docs/macos.md "dist/$artifact/docs/macos.md"
           tar -C "dist/$artifact" -czf "$artifact.tar.gz" .
           shasum -a 256 "$artifact.tar.gz" > "$artifact.tar.gz.sha256"
 
@@ -176,6 +178,7 @@ jobs:
             hooks \
             crates/ai-memory-cli/templates/config.default.toml \
             docs/install.md \
+            docs/macos.md \
             README.md \
             LICENSE
           do
@@ -506,7 +509,7 @@ jobs:
           echo "docker pull akitaonrails/ai-memory:${{ needs.validate-version.outputs.version }}" >> body.md
           echo "" >> body.md
           echo "# macOS aarch64/x86_64 (no toolchain): download the matching ai-memory-macos-<arch>.tar.gz below," >> body.md
-          echo "# extract it, and put ai-memory on PATH." >> body.md
+          echo "# extract it, and follow the bundled docs/macos.md." >> body.md
           echo "" >> body.md
           echo "# Windows x86_64 (no toolchain): download ai-memory-windows-x86_64.zip below," >> body.md
           echo "# extract it, and follow the bundled docs/windows.md." >> body.md

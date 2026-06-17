@@ -78,6 +78,23 @@ pub async fn run(config: &Config, args: ServeArgs) -> Result<()> {
     let store = Store::open(&config.data_dir)
         .with_context(|| format!("opening store at {}", config.data_dir.display()))?;
 
+    // One-shot legacy heal (issue #103): NULL out any project repo_path that
+    // is a prefix-match catch-all. That means the $HOME and filesystem-root
+    // sentinels, plus any path that exists locally but is not a git work-tree
+    // root, so existing broken installs self-correct on upgrade. Uses the same
+    // $HOME source as the router's match-time guard (captured once in `Config`)
+    // so heal and guard agree on its meaning.
+    let healed = store
+        .writer
+        .heal_catch_all_repo_paths(config.home_dir.clone())
+        .await?;
+    if healed > 0 {
+        tracing::info!(
+            healed,
+            "healed catch-all project repo_path rows ($HOME, filesystem root, or non-git-root path)"
+        );
+    }
+
     // Run any outstanding wiki-structure migrations before the watcher starts
     // so file moves and renames are never raced by the reconciler.
     let wiki_root = config.data_dir.join("wiki");
@@ -266,6 +283,7 @@ pub async fn run(config: &Config, args: ServeArgs) -> Result<()> {
                     DEFAULT_HOOK_INGEST_MAX_IN_FLIGHT,
                 )),
                 consolidate_on_session_end: config.consolidate_on_session_end,
+                home_dir: config.home_dir.clone(),
             });
             let admin = admin_router(AdminState {
                 writer: store.writer.clone(),
@@ -279,6 +297,7 @@ pub async fn run(config: &Config, args: ServeArgs) -> Result<()> {
                 data_dir: config.data_dir.clone(),
                 db_path: store.db_path().to_path_buf(),
                 bind: bind.clone(),
+                home_dir: config.home_dir.clone(),
                 bootstrap_lock: std::sync::Arc::new(tokio::sync::Mutex::new(())),
                 token_pepper: config
                     .auth

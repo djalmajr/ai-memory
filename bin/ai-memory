@@ -259,6 +259,43 @@ NETWORK_ARGS=()
 # through bind mounts (~/.claude/settings.json, $PWD/, …) stay editable
 # by the invoking user. macOS is the one exception (see Darwin arm).
 USER_ARGS=(-u "$(id -u):$(id -g)")
+
+# Does this invocation RENDER host-side agent config? install-mcp,
+# install-hooks and setup-agent bake a server URL into files the *host*
+# agent reads (the MCP `url` and the `AI_MEMORY_HOOK_URL=…` on every hook
+# command). Thin-client commands (status, search, bootstrap, …) instead make
+# HTTP calls FROM this helper container to the server. On macOS those two
+# needs require different hosts, so the Darwin arm keys off this flag to pick
+# a host-reachable URL for config vs. a container-reachable URL for HTTP.
+# (issue #107)
+RENDERS_HOST_CONFIG=0
+WRAPPER_SUBCOMMAND=""
+WRAPPER_ARGS=("$@")
+idx=0
+while [ "${idx}" -lt "${#WRAPPER_ARGS[@]}" ]; do
+  arg="${WRAPPER_ARGS[$idx]}"
+  case "${arg}" in
+    --data-dir | --config)
+      idx=$((idx + 2))
+      ;;
+    --data-dir=* | --config=*)
+      idx=$((idx + 1))
+      ;;
+    --*)
+      idx=$((idx + 1))
+      ;;
+    *)
+      WRAPPER_SUBCOMMAND="${arg}"
+      break
+      ;;
+  esac
+done
+case "${WRAPPER_SUBCOMMAND}" in
+    install-mcp | install-hooks | setup-agent)
+      RENDERS_HOST_CONFIG=1
+      ;;
+esac
+
 case "$(uname -s 2>/dev/null || true)" in
   Linux)
     if [ -z "${AI_MEMORY_SERVER_URL:-}" ]; then
@@ -266,7 +303,15 @@ case "$(uname -s 2>/dev/null || true)" in
     fi
     ;;
   Darwin)
-    if [ -z "${AI_MEMORY_SERVER_URL:-}" ]; then
+    # macOS has no Docker host networking, so a thin-client command reaches
+    # the host-published loopback server from this helper container via Docker
+    # Desktop's host alias. But install-mcp/install-hooks/setup-agent RENDER
+    # the URL into the *host* agent config, and host.docker.internal does NOT
+    # resolve on the host — baking it in silently breaks MCP and every capture
+    # hook. So for those commands we leave AI_MEMORY_SERVER_URL unset, letting
+    # the CLI render its host-reachable default (http://127.0.0.1:49374).
+    # (issue #107)
+    if [ -z "${AI_MEMORY_SERVER_URL:-}" ] && [ "${RENDERS_HOST_CONFIG}" -eq 0 ]; then
       ENV_ARGS+=(-e "AI_MEMORY_SERVER_URL=http://host.docker.internal:49374")
     fi
     # On macOS, Docker Desktop handles file-sharing permissions via its

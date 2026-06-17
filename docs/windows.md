@@ -238,10 +238,12 @@ apply to the agent's environment (no re-`install-hooks` needed):
 | `AI_MEMORY_HOOK_HANDOFF_TIMEOUT_MINUTES` | 3 seconds | 60 minutes | the synchronous `session-start` handoff GET |
 | `AI_MEMORY_HOOK_START_BUDGET_MINUTES` | 3 seconds | 60 minutes | total time the `session-start` cleanup drain may spend |
 | `AI_MEMORY_HOOK_END_BUDGET_MINUTES` | 10 seconds | 60 minutes | total time the `session-end` flush may spend |
+| `AI_MEMORY_HOOK_INCREMENTAL_THRESHOLD` | 32 events | positive integer | spool backlog size that triggers a 250 ms `post-tool-use` catch-up drain |
 
-Values must be positive whole minutes. Missing, empty, non-numeric, or zero
-values fall back to the built-in defaults; values above 60 are clamped. The
-budgets cap how long a session boundary blocks, so leave headroom over the
+Timing values must be positive whole minutes. Missing, empty, non-numeric, or
+zero values fall back to the built-in defaults; values above 60 are clamped. The
+incremental threshold is a positive event count; invalid values fall back to 32.
+The budgets cap how long a session boundary blocks, so leave headroom over the
 per-request timeout for several events to drain per boundary.
 
 ## Current Harness Caveats

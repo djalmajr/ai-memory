@@ -25,7 +25,7 @@ use ai_memory_llm::{OidcToken, refresh_access_token};
 use secrecy::ExposeSecret as _;
 use serde::{Deserialize, Serialize};
 
-use super::hook_capture::{build_client, post_hook};
+use super::hook_capture::{PostOutcome, build_client, post_hook};
 
 /// Drop a spooled event after this many failed drain passes — bounds retries of
 /// a permanently-undeliverable event (e.g. a server URL that never comes back).
@@ -79,6 +79,14 @@ pub struct SpoolEntry {
 #[must_use]
 pub fn spool_dir(data_dir: &Path) -> PathBuf {
     data_dir.join("hook-spool")
+}
+
+/// Count queued spool entries (`*.json`), or 0 when the dir is missing/empty.
+/// Cheaper than [`drain`] — a single `read_dir` — so the per-event hot path can
+/// gate a mid-session drain on backlog size without building a client.
+#[must_use]
+pub fn spool_len(spool: &Path) -> usize {
+    list_entries(spool).map_or(0, |f| f.len())
 }
 
 fn now_ms() -> u64 {
@@ -216,7 +224,7 @@ pub async fn drain(
             }
         };
 
-        if post_hook(
+        match post_hook(
             &client,
             &entry.url,
             &entry.body,
@@ -225,17 +233,27 @@ pub async fn drain(
         )
         .await
         {
-            let _ = std::fs::remove_file(&path);
-            result.sent += 1;
-        } else {
-            entry.attempts = entry.attempts.saturating_add(1);
-            if entry.attempts >= MAX_ATTEMPTS {
+            PostOutcome::Delivered => {
                 let _ = std::fs::remove_file(&path);
-                result.dropped += 1;
-            } else {
-                // Persist the bumped attempt count for the next boundary.
-                let _ = rewrite_entry(&path, &entry);
+                result.sent += 1;
+            }
+            // Transient server backpressure (429 `hook queue full`): the event
+            // was never processed, so leave it untouched — no attempt bump, no
+            // rewrite — and saturation never burns the entry's retry budget. It
+            // rides the next pass unchanged; `MAX_AGE_MS` still bounds it.
+            PostOutcome::Saturated => {
                 result.remaining += 1;
+            }
+            PostOutcome::Failed => {
+                entry.attempts = entry.attempts.saturating_add(1);
+                if entry.attempts >= MAX_ATTEMPTS {
+                    let _ = std::fs::remove_file(&path);
+                    result.dropped += 1;
+                } else {
+                    // Persist the bumped attempt count for the next boundary.
+                    let _ = rewrite_entry(&path, &entry);
+                    result.remaining += 1;
+                }
             }
         }
     }
@@ -474,5 +492,81 @@ mod tests {
         assert_eq!(r.dropped, 1);
         assert_eq!(r.sent, 0);
         assert!(list_entries(&spool).unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn drain_429_keeps_event_queued_without_bumping_attempts() {
+        // A server that always answers 429 (saturation / `hook queue full`).
+        // The event must ride every pass untouched: never dropped, attempts
+        // never incremented — saturation must not burn the retry budget.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+            while let Ok((mut s, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    let mut buf = [0_u8; 1024];
+                    let _ = s.read(&mut buf).await;
+                    let _ = s
+                        .write_all(
+                            b"HTTP/1.1 429 Too Many Requests\r\nContent-Length: 4\r\nConnection: close\r\n\r\nfull",
+                        )
+                        .await;
+                });
+            }
+        });
+
+        let tmp = tempfile::tempdir().unwrap();
+        let spool = spool_dir(tmp.path());
+        let e = entry_for(
+            format!("http://{addr}/hook?event=x"),
+            "{}".into(),
+            None,
+            false,
+        );
+        enqueue(&spool, &e).unwrap();
+
+        // Far more passes than MAX_ATTEMPTS — a 429 must never consume budget.
+        for _ in 0..(MAX_ATTEMPTS + 2) {
+            let r = drain(
+                &spool,
+                tmp.path(),
+                Duration::from_secs(2),
+                Duration::from_millis(500),
+            )
+            .await;
+            assert_eq!(r.sent, 0);
+            assert_eq!(r.dropped, 0, "a 429 must never drop the event");
+            assert_eq!(r.remaining, 1);
+        }
+        let files = list_entries(&spool).unwrap();
+        assert_eq!(files.len(), 1, "event still queued after many 429s");
+        let loaded: SpoolEntry =
+            serde_json::from_slice(&std::fs::read(&files[0]).unwrap()).unwrap();
+        assert_eq!(loaded.attempts, 0, "429 must not consume the retry budget");
+    }
+
+    #[test]
+    fn spool_len_counts_entries() {
+        let tmp = tempfile::tempdir().unwrap();
+        let spool = spool_dir(tmp.path());
+        assert_eq!(spool_len(&spool), 0, "missing dir counts as 0");
+        std::fs::create_dir_all(&spool).unwrap();
+        // Write distinct files directly (enqueue's ms+pid names would collide in
+        // a tight loop, and its prune caps at the test MAX_SPOOL_FILES).
+        for i in 0..3 {
+            let e = entry_for(
+                format!("http://x/hook?event=e{i}"),
+                "{}".into(),
+                None,
+                false,
+            );
+            std::fs::write(
+                spool.join(format!("evt-{i}.json")),
+                serde_json::to_vec(&e).unwrap(),
+            )
+            .unwrap();
+        }
+        assert_eq!(spool_len(&spool), 3);
     }
 }

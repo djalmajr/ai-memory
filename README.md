@@ -19,7 +19,7 @@
 | Area | Status | Notes |
 |---|---|---|
 | Linux | Supported | Primary Docker/server target and CI platform. Published Docker images support `linux/amd64` and `linux/arm64`. Native Arch/AUR packages include system and user systemd units. |
-| macOS | Supported | Workspace tests run in CI; tagged releases publish native `ai-memory-macos-aarch64.tar.gz` and `ai-memory-macos-x86_64.tar.gz` binaries. Docker images run natively on Apple Silicon via the `linux/arm64` manifest. |
+| macOS | Supported | Workspace tests run in CI; tagged releases publish native `ai-memory-macos-aarch64.tar.gz` and `ai-memory-macos-x86_64.tar.gz` binaries. The native binary is the recommended path on Apple Silicon. See [`docs/macos.md`](docs/macos.md). |
 | Windows via WSL2 | Supported | Use the Linux install path inside WSL2 when the agent runs there. |
 | Native Windows | Experimental | Tagged releases publish `ai-memory-windows-x86_64.zip` with `ai-memory.exe`; Docker Desktop wrapper and source builds are also available. Claude Code uses direct native `ai-memory.exe hook` commands by default; other script-hook agents use the current PowerShell defaults pending harness feedback. See [`docs/windows.md`](docs/windows.md). |
 | Claude Code | Supported | MCP config + lifecycle hooks. |
@@ -88,8 +88,9 @@ priors are at the [bottom](#influences-and-prior-art).
   [`[auto_scope]` modes](docs/auto-scope.md) for per-user or
   session-aware current-project routing.
 - **Thin-client CLI.** `ai-memory status`, `bootstrap`, `checkpoints`,
-    `restore-page`, `purge-project`, `rename-project`, `move-project`, `lint`,
-  `curator`, `auto-improve`, `pending-writes`, `embed`, `forget-sweep`, `backup` are
+  `restore-page`, `purge-project`, `rename-project`, `move-project`,
+  `audit-contamination`, `lint`, `curator`, `auto-improve`, `pending-writes`,
+  `embed`, `forget-sweep`, `backup` are
   all HTTP clients of the running server - never touch SQLite or
   wiki files directly. `status` also reports passive LLM/embedding
   provider health from the last real provider call. Server is the
@@ -257,6 +258,8 @@ ai-memory install-hooks --agent  claude-code --apply
 On Linux/macOS, that's it. Start a Claude Code session as usual - every
 prompt and tool call now lands in ai-memory, and the next session you
 open in this project will see a handoff with where you left off.
+On macOS, the native release binary is also supported and recommended when you
+do not need Docker; see [`docs/macos.md`](docs/macos.md).
 
 The `install-mcp` / `install-hooks` commands use
 `AI_MEMORY_SERVER_URL` / `AI_MEMORY_AUTH_TOKEN` when set; otherwise
@@ -558,6 +561,7 @@ diagram, crate breakdown, schema notes, and invariants.
 | [`docs/usage.md`](docs/usage.md) | Handoffs, proactive memory queries, routing snippet, web UI, raw-wiki inspection, and rules-vs-facts workflow. |
 | [`docs/marker-file.md`](docs/marker-file.md) | `.ai-memory.toml` workspace/project routing for multi-client trees, mono-repos, worktrees, and work/personal separation. |
 | [`docs/auto-scope.md`](docs/auto-scope.md) | `[auto_scope]` modes for shared servers: default single-slot routing, session-aware isolation, and multi-user `per_actor` behavior. |
+| [`docs/macos.md`](docs/macos.md) | macOS install paths: native release binary (recommended), source build, the Docker wrapper, hook-platform notes, and current macOS limitations. |
 | [`docs/windows.md`](docs/windows.md) | Windows install modes: full WSL2, native Windows with Docker Desktop, prebuilt native release zip, native source builds, and current hook/MCP harness caveats. |
 | [`docs/mcp-install.md`](docs/mcp-install.md) | Per-client MCP and lifecycle notes (Cursor, Claude Desktop, Gemini CLI, Antigravity CLI, OpenClaw, OMP, VS Code Copilot). |
 | [`docs/deploy.md`](docs/deploy.md) | Homelab deploy: bin/deploy, bearer-token auth, pointers to the TLS guide. |

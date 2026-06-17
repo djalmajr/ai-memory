@@ -110,19 +110,35 @@ pub fn build_client() -> reqwest::Client {
         .unwrap_or_else(|_| reqwest::Client::new())
 }
 
-/// POST the payload as JSON, best-effort. Returns `true` when the server
-/// acknowledged with a 2xx (the engine answers `202 queued`), `false` on any
-/// non-2xx or transport error — never errors, so a hook/flush never fails the
-/// agent. `timeout` is caller-chosen: the per-tool-call hot path no longer
-/// POSTs at all (it spools); only the session-boundary drain calls this, with a
-/// generous budget that tolerates a remote/slow server.
+/// Outcome of one spooled-event POST — enough for the drain loop to decide
+/// whether a miss should cost the entry a retry attempt. Never errors, so a
+/// hook/flush never fails the agent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PostOutcome {
+    /// Server acknowledged with a 2xx (the engine answers `202 queued`): the
+    /// entry was delivered and can be removed from the spool.
+    Delivered,
+    /// Server answered `429 Too Many Requests` (`hook queue full`): transient
+    /// backpressure, the event was never processed. Keep it queued WITHOUT
+    /// bumping attempts so saturation never burns the entry's retry budget.
+    Saturated,
+    /// Any other non-2xx, or a transport error: a genuine miss that should
+    /// count against `MAX_ATTEMPTS`.
+    Failed,
+}
+
+/// POST the payload as JSON, best-effort. `timeout` is caller-chosen: the
+/// per-tool-call hot path no longer POSTs at all (it spools); the drain calls
+/// this with a budget that tolerates a remote/slow server. Returns a
+/// [`PostOutcome`] (never errors) so the drain can give a 429 (saturation) a
+/// free retry while still bounding genuine failures by `MAX_ATTEMPTS`.
 pub async fn post_hook(
     client: &reqwest::Client,
     url: &str,
     body: &str,
     token: Option<&str>,
     timeout: Duration,
-) -> bool {
+) -> PostOutcome {
     let mut req = client
         .post(url)
         .header("Content-Type", "application/json")
@@ -132,8 +148,12 @@ pub async fn post_hook(
         req = req.bearer_auth(t);
     }
     match req.send().await {
-        Ok(resp) => resp.status().is_success(),
-        Err(_) => false,
+        Ok(resp) if resp.status().is_success() => PostOutcome::Delivered,
+        Ok(resp) if resp.status() == reqwest::StatusCode::TOO_MANY_REQUESTS => {
+            PostOutcome::Saturated
+        }
+        Ok(_) => PostOutcome::Failed,
+        Err(_) => PostOutcome::Failed,
     }
 }
 
@@ -205,11 +225,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn post_hook_returns_false_when_server_unreachable() {
-        // Port 1 is unroutable; best-effort means this resolves to `false`
-        // (no 2xx) rather than panicking or erroring.
+    async fn post_hook_failed_when_server_unreachable() {
+        // Port 1 is unroutable; best-effort means this resolves to `Failed`
+        // (a genuine miss) rather than panicking or erroring.
         let client = build_client();
-        let ok = post_hook(
+        let outcome = post_hook(
             &client,
             "http://127.0.0.1:1/hook?event=pre-tool-use",
             "{}",
@@ -217,7 +237,23 @@ mod tests {
             Duration::from_millis(500),
         )
         .await;
-        assert!(!ok);
+        assert_eq!(outcome, PostOutcome::Failed);
+    }
+
+    #[tokio::test]
+    async fn post_hook_saturated_on_429() {
+        // 429 = server backpressure; the event was never processed, so the
+        // drain must treat it as a free retry, not a failed attempt.
+        let url = serve_once("429 Too Many Requests", "hook queue full").await;
+        let outcome = post_hook(&build_client(), &url, "{}", None, Duration::from_secs(1)).await;
+        assert_eq!(outcome, PostOutcome::Saturated);
+    }
+
+    #[tokio::test]
+    async fn post_hook_delivered_on_2xx() {
+        let url = serve_once("202 Accepted", "queued").await;
+        let outcome = post_hook(&build_client(), &url, "{}", None, Duration::from_secs(1)).await;
+        assert_eq!(outcome, PostOutcome::Delivered);
     }
 
     #[tokio::test]

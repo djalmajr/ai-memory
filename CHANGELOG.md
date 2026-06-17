@@ -7,6 +7,71 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- Unscoped MCP queries could resolve to the wrong project on a shared
+  install. The cwd-to-project resolver recorded the bare working directory
+  as a project's `repo_path` whenever the cwd was not inside a git repo
+  (which, under the default basename strategy, was always), so opening a
+  session in a broad ancestor such as `$HOME` created a row that
+  prefix-matched every project nested beneath it and captured their unscoped
+  lookups. A project's `repo_path` is now the git working-tree root, or unset
+  when the cwd is not inside a git repo, never the bare cwd; under the
+  default basename strategy it is recorded only when the cwd is the
+  repository root, never a subdirectory. A read-time guard additionally
+  refuses to prefix-match a stored `repo_path` equal to the operator's
+  `$HOME`, and `ai-memory serve` heals existing installs on startup by
+  clearing any `repo_path` that is not a real git working-tree root (such as
+  a legacy `~/projects` or `/work` catch-all), not only `$HOME` and the
+  filesystem root, while leaving paths it cannot see locally (a remote or
+  multi-user client path, or an unmounted drive) untouched. (issue #103)
+- macOS Docker quick-start now produces a working native-agent setup out of the
+  box (issue #107). Three independent breakages are fixed: (1) the macOS wrapper
+  baked the container-only `host.docker.internal` URL into the *host* agent
+  config, so MCP and every capture hook failed silently — `install-mcp`,
+  `install-hooks`, and `setup-agent` now render the host-reachable
+  `http://127.0.0.1:49374`, decoupled from the `host.docker.internal` URL the
+  wrapper still uses for its own in-container thin-client commands; (2) those
+  thin-client commands were rejected with `403 forbidden host` because the
+  server's loopback-only Host allowlist excluded `host.docker.internal` — the
+  Docker image now ships it in the default `AI_MEMORY_ALLOWED_HOSTS` (native
+  installs stay loopback-only; exposed deployments still override it); and (3)
+  `setup-agent`/`install-hooks` could not locate the hooks bundle that ships
+  beside the binary in the release tarball (the probe derived a bogus
+  `/private/hooks/…`), so the binary-sibling `hooks/` directory is now on the
+  discovery search path and `--source` is no longer required.
+
+### Added
+- `GET /admin/audit-contamination` (and `ai-memory audit-contamination`) — a
+  read-only, SQL-only structural cross-project contamination audit. Flags
+  sessions whose `cwd` longest-prefix-resolves to a different project than the
+  one they landed in (the auto-scope-bleed signature, resolved with the same
+  prefix logic the runtime uses) and observations whose project disagrees with
+  their owning session (a regression tripwire that should stay empty on a
+  healthy DB). Optional `?workspace=&project=` scope; reports only, never
+  mutates, so it is safe to run on any cadence. Purely semantic mislandings
+  (no cwd/session anomaly) are out of scope by design.
+- Mid-session hook-spool drain: on `post-tool-use`, once the local spool backlog
+  crosses a threshold, the hook runs a tightly time-boxed (~250 ms) catch-up
+  drain so a heavy session keeps the backlog flat instead of waiting for the next
+  session boundary. Tunable via `AI_MEMORY_HOOK_INCREMENTAL_THRESHOLD`
+  (default 32 events).
+- Added [`docs/macos.md`](docs/macos.md) covering macOS install paths (prebuilt
+  release binary, source build, and the Docker wrapper) and the `posix` vs
+  `posix-native` hook platform split, with troubleshooting notes for macOS
+  wrapper and hook-discovery issues. Linked it from the README support matrix, the docs
+  table, and `docs/install.md`, and bundled it into the macOS release tarballs
+  alongside `docs/install.md` (mirroring how the Windows zip ships
+  `docs/windows.md`).
+
+### Fixed
+- Bounded heuristic session-page raw observation dumps and single-page
+  consolidation prompts so very large sessions cannot re-include unbounded
+  `## Raw observations` history (issue #102).
+- Hook spool no longer counts a server `429` (saturation / `hook queue full`)
+  against a spooled event's `MAX_ATTEMPTS` retry budget: transient backpressure
+  keeps the event queued without burning an attempt (`MAX_AGE_MS` still bounds
+  it), so a saturation burst no longer silently discards real observations.
+
 ## [1.1.0] - 2026-06-16
 
 ### Fixed
@@ -109,7 +174,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `403 user '' not allowed to purge_project`, making purge/move unusable on any
   instance running scope-guard. `rename-project` is unaffected (it runs no
   admission chain).
-
 ## [1.0.6] - 2026-06-14
 
 ### Changed

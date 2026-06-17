@@ -617,8 +617,9 @@ fn build_request(
         }
     }
     if !current_body.trim().is_empty() {
+        let current_body = prepare_current_body_for_prompt(current_body);
         buf.push_str("\nCurrent (heuristic) page body:\n\n```\n");
-        buf.push_str(current_body);
+        buf.push_str(&current_body);
         buf.push_str("\n```\n");
     }
 
@@ -650,6 +651,7 @@ fn build_request(
 /// differently; under-shooting the budget loses some context but never
 /// causes a 400 from the provider.
 const OBSERVATION_BUDGET_CHARS: usize = 400_000;
+const CURRENT_BODY_BUDGET_CHARS: usize = 20_000;
 
 /// Per-observation char-cost estimate used by [`window_observations_to_budget`]
 /// to predict how much each entry will add to the prompt buffer. Matches
@@ -705,6 +707,46 @@ fn window_observations_to_budget(
     }
     let skipped = keep_from;
     (&observations[keep_from..], skipped)
+}
+
+fn prepare_current_body_for_prompt(current_body: &str) -> String {
+    let without_raw = elide_raw_observations_section(current_body);
+    clip_current_body_for_prompt(&without_raw, CURRENT_BODY_BUDGET_CHARS)
+}
+
+fn elide_raw_observations_section(current_body: &str) -> String {
+    let Some(raw_start) = current_body.find("## Raw observations") else {
+        return current_body.to_string();
+    };
+
+    let after_raw = raw_start + "## Raw observations".len();
+    let raw_end = current_body[after_raw..]
+        .find("\n## ")
+        .map(|offset| after_raw + offset + 1)
+        .unwrap_or(current_body.len());
+
+    let mut out = String::with_capacity(current_body.len().saturating_sub(raw_end - raw_start));
+    out.push_str(current_body[..raw_start].trim_end());
+    if !out.is_empty() {
+        out.push_str("\n\n");
+    }
+    out.push_str(
+        "[Raw observations section omitted; SQLite observations are supplied separately.]",
+    );
+    if raw_end < current_body.len() {
+        out.push_str("\n\n");
+        out.push_str(current_body[raw_end..].trim_start());
+    }
+    out
+}
+
+fn clip_current_body_for_prompt(s: &str, max_chars: usize) -> String {
+    let mut chars = s.chars();
+    let mut out: String = chars.by_ref().take(max_chars).collect();
+    if chars.next().is_some() {
+        out.push_str("\n[current heuristic page body truncated]");
+    }
+    out
 }
 
 fn observation_label(obs: &Observation) -> String {
@@ -904,6 +946,40 @@ mod tests {
         assert_eq!(skipped, 1);
         // Most-recent (index 1) is the one kept.
         assert_eq!(kept[0].id, obs[1].id);
+    }
+
+    #[test]
+    fn build_request_elides_raw_observations_from_current_body() {
+        let raw_dump = (0..2_000)
+            .map(|i| format!("- `other` @ 1970-01-01T00:00:00Z — raw-entry-{i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let current_body = format!(
+            "# session\n\nKeep this summary.\n\n## Raw observations\n\n{raw_dump}\n\n_Synthesised by ai-memory._\n"
+        );
+
+        let request = build_request(SessionId::new(), &[], &current_body);
+        let prompt = &request.messages[0].content;
+
+        assert!(prompt.contains("Keep this summary."));
+        assert!(prompt.contains("Raw observations section omitted"));
+        assert!(!prompt.contains("raw-entry-0"));
+        assert!(!prompt.contains("raw-entry-1999"));
+    }
+
+    #[test]
+    fn build_request_clips_large_current_body_with_marker() {
+        let current_body = format!(
+            "# huge\n\n{}\n\n## Raw observations\n\n- should-not-appear\n",
+            "x".repeat(CURRENT_BODY_BUDGET_CHARS + 10_000),
+        );
+
+        let request = build_request(SessionId::new(), &[], &current_body);
+        let prompt = &request.messages[0].content;
+
+        assert!(prompt.contains("[current heuristic page body truncated]"));
+        assert!(!prompt.contains("should-not-appear"));
+        assert!(prompt.len() < current_body.len());
     }
 
     /// Slugifier produces a clean ASCII path for typical English titles.

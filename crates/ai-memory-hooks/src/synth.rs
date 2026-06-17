@@ -13,6 +13,10 @@ use ai_memory_core::{
 };
 use jiff::tz::TimeZone;
 
+const RAW_OBSERVATION_MAX_LINES: usize = 500;
+const RAW_OBSERVATION_HEAD_LINES: usize = 250;
+const RAW_OBSERVATION_TAIL_LINES: usize = RAW_OBSERVATION_MAX_LINES - RAW_OBSERVATION_HEAD_LINES;
+
 /// Build a [`NewPage`] from the observations collected during a session.
 ///
 /// The returned page is *always* under `sessions/<session-id>.md` so each
@@ -114,18 +118,40 @@ fn render_body(session_id: SessionId, observations: &[Observation], title: &str)
     }
 
     buf.push_str("## Raw observations\n\n");
-    for obs in observations {
-        let kind = observation_kind_label(obs);
-        buf.push_str(&format!(
-            "- `{}` @ {} — {}\n",
-            kind,
-            human_ts(&obs.created_at),
-            obs.title.chars().take(80).collect::<String>(),
-        ));
-    }
+    render_raw_observations(&mut buf, observations);
 
     buf.push_str("\n_Synthesised by ai-memory (M3, no-LLM heuristic)._\n");
     buf
+}
+
+fn render_raw_observations(buf: &mut String, observations: &[Observation]) {
+    if observations.len() <= RAW_OBSERVATION_MAX_LINES {
+        for obs in observations {
+            render_raw_observation(buf, obs);
+        }
+        return;
+    }
+
+    for obs in &observations[..RAW_OBSERVATION_HEAD_LINES] {
+        render_raw_observation(buf, obs);
+    }
+    let omitted = observations.len() - RAW_OBSERVATION_HEAD_LINES - RAW_OBSERVATION_TAIL_LINES;
+    buf.push_str(&format!(
+        "\n_... {omitted} raw observations omitted from the middle (showing first {RAW_OBSERVATION_HEAD_LINES} and last {RAW_OBSERVATION_TAIL_LINES})._\n\n",
+    ));
+    for obs in &observations[observations.len() - RAW_OBSERVATION_TAIL_LINES..] {
+        render_raw_observation(buf, obs);
+    }
+}
+
+fn render_raw_observation(buf: &mut String, obs: &Observation) {
+    let kind = observation_kind_label(obs);
+    buf.push_str(&format!(
+        "- `{}` @ {} — {}\n",
+        kind,
+        human_ts(&obs.created_at),
+        obs.title.chars().take(80).collect::<String>(),
+    ));
 }
 
 fn observation_kind_label(obs: &Observation) -> String {
@@ -241,5 +267,49 @@ mod tests {
         );
 
         assert!(page.body.contains("`other [fstech:lead.contact]`"));
+    }
+
+    #[test]
+    fn raw_observations_small_session_includes_all_entries() {
+        let observations: Vec<Observation> = (0..5)
+            .map(|i| obs(ObservationKind::Other, &format!("entry-{i}")))
+            .collect();
+
+        let page = synthesize_session_page(
+            WorkspaceId::new(),
+            ProjectId::new(),
+            SessionId::new(),
+            &observations,
+        );
+
+        for i in 0..5 {
+            assert!(page.body.contains(&format!("entry-{i}")));
+        }
+        assert!(!page.body.contains("raw observations omitted"));
+    }
+
+    #[test]
+    fn raw_observations_large_session_omits_middle_with_count() {
+        let observations: Vec<Observation> = (0..600)
+            .map(|i| obs(ObservationKind::Other, &format!("entry-{i}")))
+            .collect();
+
+        let page = synthesize_session_page(
+            WorkspaceId::new(),
+            ProjectId::new(),
+            SessionId::new(),
+            &observations,
+        );
+
+        assert!(page.body.contains("entry-0"));
+        assert!(page.body.contains("entry-249"));
+        assert!(!page.body.contains("entry-250"));
+        assert!(!page.body.contains("entry-349"));
+        assert!(page.body.contains("entry-350"));
+        assert!(page.body.contains("entry-599"));
+        assert!(
+            page.body
+                .contains("100 raw observations omitted from the middle")
+        );
     }
 }

@@ -43,6 +43,7 @@ async fn make_state(tmp: &TempDir) -> (AdminState, Store) {
         data_dir: tmp.path().to_path_buf(),
         db_path,
         bind: "127.0.0.1:0".to_string(),
+        home_dir: None,
         bootstrap_lock: std::sync::Arc::new(tokio::sync::Mutex::new(())),
         token_pepper: None,
         active_project: ai_memory_core::ActiveProject::new(),
@@ -201,6 +202,28 @@ async fn reorg_live_moves_sessions() {
     assert_eq!(body["summary"]["sessions_moved"].as_u64().unwrap(), 2);
     assert_eq!(body["summary"]["observations_updated"].as_u64().unwrap(), 2);
     assert!(!body["dry_run"].as_bool().unwrap());
+}
+
+#[tokio::test]
+async fn reorg_does_not_store_nongit_cwd_as_repo_path() {
+    let tmp = TempDir::new().unwrap();
+    let (state, store) = make_state(&tmp).await;
+    seed_sessions_for_reorg(&store).await;
+
+    let resp = post(state, "/admin/reorg", json!({ "dry_run": false })).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let scopes = store.reader.list_all_scopes().await.unwrap();
+    for project_name in ["alpha-repo", "beta-repo"] {
+        let scope = scopes
+            .iter()
+            .find(|s| s.workspace_name == "default" && s.project_name == project_name)
+            .unwrap_or_else(|| panic!("missing reorg-created project {project_name}"));
+        assert_eq!(
+            scope.repo_path, None,
+            "admin reorg must not turn non-git cwd into catch-all repo_path for {project_name}"
+        );
+    }
 }
 
 #[tokio::test]

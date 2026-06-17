@@ -45,6 +45,14 @@ RUN apt-get update \
 # (and by `setup_agent::resolve_source`).
 COPY hooks /usr/local/share/ai-memory/hooks
 ENV AI_MEMORY_DATA_DIR=/data
+# Allow Docker Desktop's host alias by default so the macOS wrapper's
+# thin-client commands — which reach the loopback-published server from a
+# one-shot helper container via host.docker.internal — aren't rejected by the
+# Host-header DNS-rebinding guard (issue #107). This widens only the *image*
+# default; native (non-Docker) installs keep the loopback-only default, and
+# exposed/homelab deployments still set their own `AI_MEMORY_ALLOWED_HOSTS`,
+# which replaces this value entirely.
+ENV AI_MEMORY_ALLOWED_HOSTS="localhost,127.0.0.1,::1,host.docker.internal"
 WORKDIR /data
 EXPOSE 49374
 HEALTHCHECK --interval=30s --timeout=5s --start-period=5s --retries=3 \

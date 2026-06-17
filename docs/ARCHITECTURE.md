@@ -263,8 +263,8 @@ forget-sweep         lint                 auto-improve
 curator              pending-writes       embed
 generate-auth-token  setup-agent          bootstrap
 install-instructions reorg                purge-project
-rename-project       move-project         uninstall
-auth                 user
+rename-project       move-project         audit-contamination
+uninstall            auth                 user
 ```
 
 Run `ai-memory --help` for the full tree.

@@ -38,6 +38,15 @@ const HANDOFF_TIMEOUT_ENV: &str = "AI_MEMORY_HOOK_HANDOFF_TIMEOUT_MINUTES";
 const START_BUDGET_ENV: &str = "AI_MEMORY_HOOK_START_BUDGET_MINUTES";
 const END_BUDGET_ENV: &str = "AI_MEMORY_HOOK_END_BUDGET_MINUTES";
 
+const INCREMENTAL_THRESHOLD_ENV: &str = "AI_MEMORY_HOOK_INCREMENTAL_THRESHOLD";
+/// Backlog size at which `post-tool-use` does a mid-session catch-up drain, so a
+/// light session pays only a `read_dir`. Override via the env var above.
+const DEFAULT_INCREMENTAL_THRESHOLD: usize = 32;
+/// Total budget AND per-event timeout for the mid-session catch-up drain — kept
+/// well under a second so a `post-tool-use` hook never stalls a tool call (one
+/// in-flight POST against a slow server is bounded by this too).
+const INCREMENTAL_DRAIN_BUDGET: Duration = Duration::from_millis(250);
+
 /// Per-event POST timeout during a drain. Env: `AI_MEMORY_HOOK_DRAIN_TIMEOUT_MINUTES`.
 fn drain_event_timeout() -> Duration {
     drain_event_timeout_from(env_lookup)
@@ -72,6 +81,27 @@ fn start_drain_budget_from(lookup: impl FnMut(&str) -> Option<String>) -> Durati
 
 fn end_drain_budget_from(lookup: impl FnMut(&str) -> Option<String>) -> Duration {
     env_minutes(END_BUDGET_ENV, DEFAULT_END_BUDGET, lookup)
+}
+
+/// Backlog size at which `post-tool-use` triggers a mid-session catch-up drain.
+/// Env: `AI_MEMORY_HOOK_INCREMENTAL_THRESHOLD` (positive integer).
+fn incremental_drain_threshold() -> usize {
+    incremental_drain_threshold_from(env_lookup)
+}
+
+fn incremental_drain_threshold_from(mut lookup: impl FnMut(&str) -> Option<String>) -> usize {
+    lookup(INCREMENTAL_THRESHOLD_ENV)
+        .and_then(|s| s.trim().parse::<usize>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(DEFAULT_INCREMENTAL_THRESHOLD)
+}
+
+/// Whether to run a mid-session catch-up drain for this event: only
+/// `post-tool-use` (the highest-frequency event) and only once the spool backlog
+/// has crossed `threshold`. Boundaries (`session-start`/`session-end`) remain
+/// the main flush, so a light session never drains mid-session.
+fn should_incremental_drain(event: &str, spool_len: usize, threshold: usize) -> bool {
+    event == "post-tool-use" && spool_len >= threshold
 }
 
 fn env_lookup(name: &str) -> Option<String> {
@@ -135,6 +165,25 @@ pub async fn run(data_dir: Option<PathBuf>, args: HookArgs) -> anyhow::Result<()
     );
     let _ = hook_spool::enqueue(&spool, &entry);
 
+    // Mid-session catch-up: per-event hooks only enqueue, so a heavy session
+    // outpaces the boundary-only drain and the spool grows until the next
+    // boundary. On `post-tool-use`, once the backlog crosses the threshold, do a
+    // tightly time-boxed drain (budget == per-event timeout, sub-second) so the
+    // spool stays flat without ever stalling a tool call.
+    if should_incremental_drain(
+        &args.event,
+        hook_spool::spool_len(&spool),
+        incremental_drain_threshold(),
+    ) {
+        let _ = hook_spool::drain(
+            &spool,
+            &dd,
+            INCREMENTAL_DRAIN_BUDGET,
+            INCREMENTAL_DRAIN_BUDGET,
+        )
+        .await;
+    }
+
     // session-start: drain any backlog (e.g. from a previous session that ended
     // abruptly), then fetch + inject the pending handoff for the resuming agent.
     if args.event == "session-start" {
@@ -190,6 +239,38 @@ fn resolve_data_dir(data_dir: Option<&Path>) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn should_incremental_drain_only_post_tool_use_over_threshold() {
+        assert!(should_incremental_drain("post-tool-use", 32, 32));
+        assert!(should_incremental_drain("post-tool-use", 100, 32));
+        // below threshold: a light session never drains mid-session
+        assert!(!should_incremental_drain("post-tool-use", 31, 32));
+        // other events only enqueue; boundaries do the real flush
+        assert!(!should_incremental_drain("pre-tool-use", 999, 32));
+        assert!(!should_incremental_drain("session-start", 999, 32));
+        assert!(!should_incremental_drain("session-end", 999, 32));
+        assert!(!should_incremental_drain("stop", 999, 32));
+    }
+
+    #[test]
+    fn incremental_threshold_parses_and_falls_back() {
+        assert_eq!(incremental_drain_threshold_from(|_| Some("64".into())), 64);
+        assert_eq!(
+            incremental_drain_threshold_from(|_| None),
+            DEFAULT_INCREMENTAL_THRESHOLD
+        );
+        // zero / non-numeric fall back to the default (a 0 threshold would drain
+        // on every post-tool-use)
+        assert_eq!(
+            incremental_drain_threshold_from(|_| Some("0".into())),
+            DEFAULT_INCREMENTAL_THRESHOLD
+        );
+        assert_eq!(
+            incremental_drain_threshold_from(|_| Some("abc".into())),
+            DEFAULT_INCREMENTAL_THRESHOLD
+        );
+    }
 
     #[test]
     fn parse_minutes_falls_back_on_invalid() {

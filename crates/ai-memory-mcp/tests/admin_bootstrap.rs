@@ -32,6 +32,7 @@ async fn make_admin_state(tmp: &TempDir) -> AdminState {
         data_dir: tmp.path().to_path_buf(),
         db_path,
         bind: "127.0.0.1:0".to_string(),
+        home_dir: None,
         bootstrap_lock: std::sync::Arc::new(tokio::sync::Mutex::new(())),
         token_pepper: None,
         active_project: ai_memory_core::ActiveProject::new(),

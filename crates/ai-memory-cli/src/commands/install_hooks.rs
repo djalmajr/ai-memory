@@ -1731,7 +1731,12 @@ fn resolve_hooks_dir(explicit: Option<&Path>, agent: AgentChoice) -> Result<Path
     }
 
     // Probe candidates in order. The first dir that exists wins.
-    let candidates = hook_source_candidates(sub, repo_root_guess(), dirs::data_local_dir());
+    let candidates = hook_source_candidates(
+        sub,
+        repo_root_guess(),
+        exe_dir_guess(),
+        dirs::data_local_dir(),
+    );
     for path in &candidates {
         if !path.as_os_str().is_empty() && path.is_dir() {
             return Ok(path.clone());
@@ -1743,12 +1748,19 @@ fn resolve_hooks_dir(explicit: Option<&Path>, agent: AgentChoice) -> Result<Path
 fn hook_source_candidates(
     sub: &str,
     repo_root: Option<PathBuf>,
+    exe_dir: Option<PathBuf>,
     data_local_dir: Option<PathBuf>,
 ) -> Vec<PathBuf> {
-    let mut candidates = Vec::with_capacity(4);
+    let mut candidates = Vec::with_capacity(5);
     // Cargo-run from the repo.
     if let Some(root) = repo_root {
         candidates.push(root.join("hooks").join(sub));
+    }
+    // Release tarball (macOS/Windows/Linux archive): the `hooks/` bundle
+    // ships in the same directory as the binary, so it's reachable without
+    // `--source` (issue #107).
+    if let Some(dir) = exe_dir {
+        candidates.push(dir.join("hooks").join(sub));
     }
     // Docker image lays them out under /usr/local/share/ai-memory/.
     candidates.push(PathBuf::from(format!(
@@ -1769,6 +1781,15 @@ fn repo_root_guess() -> Option<PathBuf> {
     std::env::current_exe()
         .ok()
         .and_then(|p| p.parent()?.parent()?.parent().map(Path::to_path_buf))
+}
+
+/// Directory the running binary lives in. The release tarball ships the
+/// `hooks/` bundle right next to the binary, so a no-`--source`
+/// `install-hooks` finds it there (issue #107).
+fn exe_dir_guess() -> Option<PathBuf> {
+    std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(Path::to_path_buf))
 }
 
 // CLAUDE_CODE_EVENTS + build_claude_code_payload now live in
@@ -2456,21 +2477,45 @@ model = "gpt-5"
         let candidates = hook_source_candidates(
             "claude-code",
             Some(PathBuf::from("/repo")),
+            Some(PathBuf::from("/opt/ai-memory")),
             Some(PathBuf::from("/home/alice/.local/share")),
         );
 
         assert_eq!(candidates[0], PathBuf::from("/repo/hooks/claude-code"));
         assert_eq!(
             candidates[1],
-            PathBuf::from("/usr/local/share/ai-memory/hooks/claude-code")
+            PathBuf::from("/opt/ai-memory/hooks/claude-code")
         );
         assert_eq!(
             candidates[2],
-            PathBuf::from("/usr/share/ai-memory/hooks/claude-code")
+            PathBuf::from("/usr/local/share/ai-memory/hooks/claude-code")
         );
         assert_eq!(
             candidates[3],
+            PathBuf::from("/usr/share/ai-memory/hooks/claude-code")
+        );
+        assert_eq!(
+            candidates[4],
             PathBuf::from("/home/alice/.local/share/ai-memory/hooks/claude-code")
+        );
+    }
+
+    #[test]
+    fn hook_source_candidates_include_binary_sibling_for_flat_tarball() {
+        // Extracted release tarball: no repo root, `hooks/` beside the binary
+        // (issue #107). The sibling dir must be probed or discovery fails with
+        // a bogus `/private/hooks/...` on macOS.
+        let candidates = hook_source_candidates(
+            "claude-code",
+            None,
+            Some(PathBuf::from("/private/tmp/ai-memory-macos-aarch64")),
+            None,
+        );
+        assert!(
+            candidates.contains(&PathBuf::from(
+                "/private/tmp/ai-memory-macos-aarch64/hooks/claude-code"
+            )),
+            "binary-sibling hooks/ dir must be probed; got {candidates:?}"
         );
     }
 

@@ -56,6 +56,9 @@ async fn main() -> Result<()> {
     match command {
         Command::Init(args) => commands::init::run(&config, args, config_path.as_deref()),
         Command::Status(args) => commands::status::run(&config, args).await,
+        Command::AuditContamination(args) => {
+            commands::audit_contamination::run(&config, args).await
+        }
         Command::Search(args) => commands::search::run(&config, args).await,
         Command::ReadPage(args) => commands::read_page::run(&config, args).await,
         Command::WritePage(args) => commands::write_page::run(&config, args).await,

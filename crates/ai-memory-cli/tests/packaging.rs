@@ -1,6 +1,7 @@
 //! Packaging asset regression tests.
 
 use std::path::{Path, PathBuf};
+use std::process::Command;
 
 fn repo_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -14,6 +15,51 @@ fn read_repo(path: &str) -> String {
     let path = repo_root().join(path);
     std::fs::read_to_string(&path)
         .unwrap_or_else(|e| panic!("failed to read {}: {e}", path.display()))
+}
+
+fn run_wrapper_on_fake_macos(args: &[&str]) -> String {
+    let tmp = tempfile::tempdir().unwrap();
+    let docker_args = tmp.path().join("docker-args.txt");
+    let docker = tmp.path().join("docker");
+    let uname = tmp.path().join("uname");
+    std::fs::write(
+        &docker,
+        format!(
+            "#!/usr/bin/env bash\nprintf '%s\\n' \"$@\" > {}\n",
+            docker_args.display()
+        ),
+    )
+    .unwrap();
+    std::fs::write(&uname, "#!/usr/bin/env bash\nprintf 'Darwin\\n'\n").unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&docker, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::set_permissions(&uname, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    let path = format!(
+        "{}:{}",
+        tmp.path().display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    let output = Command::new(repo_root().join("bin/ai-memory"))
+        .args(args)
+        .env("PATH", path)
+        .env("AI_MEMORY_DOCKER", &docker)
+        .env("AI_MEMORY_NO_VERSION_CHECK", "1")
+        .env("AI_MEMORY_DATA_VOLUME", "test-ai-memory-data")
+        .env("HOME", tmp.path())
+        .env_remove("AI_MEMORY_SERVER_URL")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "wrapper failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    std::fs::read_to_string(docker_args).unwrap()
 }
 
 #[test]
@@ -105,4 +151,53 @@ fn docker_publish_jobs_use_prebuilt_binaries() {
     assert!(ci.contains("runner: macos-15"));
     assert!(ci.contains("runner: macos-15-intel"));
     assert!(ci.contains("--target runtime-prebuilt-amd64"));
+}
+
+#[test]
+fn macos_wrapper_routes_urls_by_real_subcommand() {
+    for subcommand in ["install-mcp", "install-hooks", "setup-agent"] {
+        let args = run_wrapper_on_fake_macos(&[subcommand]);
+        assert!(
+            !args.contains("AI_MEMORY_SERVER_URL=http://host.docker.internal:49374"),
+            "{subcommand} renders host-side config and must keep loopback defaults; got {args}"
+        );
+    }
+
+    let args = run_wrapper_on_fake_macos(&["status"]);
+    assert!(
+        args.contains("AI_MEMORY_SERVER_URL=http://host.docker.internal:49374"),
+        "thin-client commands must reach the host server through Docker Desktop; got {args}"
+    );
+
+    let args = run_wrapper_on_fake_macos(&["search", "install-hooks"]);
+    assert!(
+        args.contains("AI_MEMORY_SERVER_URL=http://host.docker.internal:49374"),
+        "only the actual subcommand should control URL routing; got {args}"
+    );
+
+    let args = run_wrapper_on_fake_macos(&["--config", "/tmp/config.toml", "install-hooks"]);
+    assert!(
+        !args.contains("AI_MEMORY_SERVER_URL=http://host.docker.internal:49374"),
+        "global options before install-hooks must not hide the real subcommand; got {args}"
+    );
+}
+
+#[test]
+fn macos_docs_use_valid_install_commands_and_release_body_points_to_them() {
+    let docs = read_repo("docs/macos.md");
+    assert!(docs.contains("install-hooks --agent claude-code --apply"));
+    assert!(docs.contains("install-mcp --client claude-code --apply"));
+    assert!(
+        !docs.contains("setup-agent --agent claude-code --source ./hooks"),
+        "setup-agent has no --apply path; use install-hooks for native macOS docs"
+    );
+    assert!(
+        !docs.contains("init` configures the bearer token"),
+        "init writes token_pepper, not a bearer token"
+    );
+    assert!(docs.contains("Host-side agent config should use"));
+    assert!(docs.contains("Tagged releases publish a multi-arch manifest"));
+
+    let release = read_repo(".github/workflows/release.yml");
+    assert!(release.contains("follow the bundled docs/macos.md"));
 }
