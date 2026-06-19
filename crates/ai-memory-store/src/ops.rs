@@ -911,15 +911,14 @@ pub fn insert_handoff(conn: &mut Connection, h: &NewHandoff) -> StoreResult<Hand
     let next_s = serde_json::to_string(&h.next_steps)?;
     let files = serde_json::to_string(&h.files_touched)?;
     let from_session: Option<&[u8]> = h.from_session_id.as_ref().map(|s| &s.as_bytes()[..]);
-    // Normalize the stored cwd: strip trailing slashes (keep a bare root
-    // as "/"). The hook extractor preserves whatever the agent payload
-    // sent and the read path does not canonicalize, so this single write
-    // point guarantees a consistent stored form for both manual and auto
-    // (SessionEnd) handoffs, keeping the next session's path-boundary match
-    // robust to trailing-slash drift.
+    // Normalize the stored cwd: strip trailing path separators (keep a bare root
+    // as "/"). The hook extractor preserves whatever the agent payload sent,
+    // so this single write point guarantees a consistent stored form for both
+    // manual and auto (SessionEnd) handoffs, keeping the next session's
+    // path-boundary match robust to trailing slash/backslash drift.
     let cwd: Option<String> = h.cwd.as_ref().map(|p| {
         let s = p.to_string_lossy();
-        let trimmed = s.trim_end_matches('/');
+        let trimmed = s.trim_end_matches(['/', '\\']);
         if trimmed.is_empty() {
             "/".to_string()
         } else {
@@ -1809,12 +1808,12 @@ mod tests {
         assert!(second.is_ok(), "double-accept must not error");
     }
 
-    /// The stored cwd is normalized (trailing slash stripped) at insert time
+    /// The stored cwd is normalized (trailing path separator stripped) at insert time
     /// so trailing-slash drift between agent payloads cannot break the next
     /// session's path-boundary match. Covers both manual and auto handoffs,
     /// since both go through `insert_handoff`.
     #[test]
-    fn insert_handoff_strips_trailing_slash_from_cwd() {
+    fn insert_handoff_strips_trailing_separator_from_cwd() {
         let (_tmp, mut conn, ws, proj) = fresh_db();
         let new = NewHandoff {
             workspace_id: ws,
@@ -1837,6 +1836,28 @@ mod tests {
             )
             .unwrap();
         assert_eq!(cwd.as_deref(), Some("/home/u/repo"));
+
+        let windows = NewHandoff {
+            workspace_id: ws,
+            project_id: proj,
+            from_session_id: None,
+            from_agent: AgentKind::ClaudeCode,
+            to_agent: None,
+            cwd: Some(std::path::PathBuf::from(r"C:\repo\")),
+            summary: "trailing backslash".into(),
+            open_questions: vec![],
+            next_steps: vec![],
+            files_touched: vec![],
+        };
+        let id = insert_handoff(&mut conn, &windows).unwrap();
+        let cwd: Option<String> = conn
+            .query_row(
+                "SELECT cwd FROM handoffs WHERE id = ?1",
+                params![&id.as_bytes()[..]],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(cwd.as_deref(), Some(r"C:\repo"));
     }
 
     #[test]

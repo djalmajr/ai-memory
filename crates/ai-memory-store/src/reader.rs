@@ -1616,11 +1616,18 @@ impl ReaderPool {
                 params![workspace_id.as_bytes(), project_id.as_bytes()],
                 row_to_handoff,
             )?;
-            let mut candidates = Vec::new();
+            let mut selected: Option<Handoff> = None;
             for r in rows {
-                candidates.push(r??);
+                let handoff = r??;
+                if is_handoff_candidate(&handoff, cwd_filter.as_deref())
+                    && selected
+                        .as_ref()
+                        .is_none_or(|current| prefer_handoff(&handoff, current).is_gt())
+                {
+                    selected = Some(handoff);
+                }
             }
-            Ok(select_open_handoff(candidates, cwd_filter.as_deref()))
+            Ok(selected)
         })
         .await
     }
@@ -4041,12 +4048,23 @@ fn materialise_decay_candidate(
     })
 }
 
-/// Trim trailing slashes from a cwd for comparison, keeping a bare root as
-/// `/`. Borrowed slice; pure. The hook extractor and read path do not
-/// canonicalize, so this is the only normalization applied at compare time.
-fn normalize_cwd(p: &str) -> &str {
-    let trimmed = p.trim_end_matches('/');
-    if trimmed.is_empty() { "/" } else { trimmed }
+/// Normalize a cwd for comparison: treat Windows backslashes as path
+/// separators and trim trailing separators while keeping a bare root as `/`.
+/// Pure and string-only; it does not touch the filesystem.
+fn normalize_cwd(p: &str) -> std::borrow::Cow<'_, str> {
+    let replaced = if p.contains('\\') {
+        std::borrow::Cow::Owned(p.replace('\\', "/"))
+    } else {
+        std::borrow::Cow::Borrowed(p)
+    };
+    let trimmed = replaced.trim_end_matches('/');
+    if trimmed.is_empty() {
+        std::borrow::Cow::Borrowed("/")
+    } else if trimmed.len() == replaced.len() {
+        replaced
+    } else {
+        std::borrow::Cow::Owned(trimmed.to_string())
+    }
 }
 
 /// True when `descendant` is the same directory as `ancestor` or nested
@@ -4066,56 +4084,61 @@ fn cwd_within(ancestor: &str, descendant: &str) -> bool {
     }
     // Byte-prefix plus a `/` boundary right after it. `starts_with` is
     // byte-exact and `/` is ASCII, so this is UTF-8 safe.
-    d.starts_with(a) && d.as_bytes().get(a.len()) == Some(&b'/')
+    d.starts_with(a.as_ref()) && d.as_bytes().get(a.len()) == Some(&b'/')
+}
+
+fn is_handoff_candidate(h: &Handoff, cwd_filter: Option<&str>) -> bool {
+    // Manual handoffs (memory_handoff_begin always sets from_session_id = None)
+    // are project-wide and always candidates, whatever cwd they carry. Only auto
+    // SessionEnd handoffs are cwd-path-boundary scoped. This makes "a manual
+    // handoff always beats the auto one" deterministic on from_session_id,
+    // instead of relying on a manual handoff happening to have a NULL cwd.
+    if h.from_session_id.is_none() {
+        return true;
+    }
+    match (cwd_filter, h.cwd.as_deref()) {
+        // Project-wide read: every open handoff is a candidate.
+        (None, _) => true,
+        // No stored cwd: treat as project-wide.
+        (_, None) => true,
+        // cwd-bearing auto handoffs match by path-boundary.
+        (Some(session_cwd), Some(handoff_cwd)) => cwd_within(handoff_cwd, session_cwd),
+    }
+}
+
+fn handoff_selection_key(h: &Handoff) -> (bool, usize, Timestamp) {
+    let manual = h.from_session_id.is_none();
+    // cwd specificity discriminates only AUTO handoffs (most specific subdir
+    // wins). For manual handoffs it must be neutral so the NEWEST manual wins,
+    // not whichever happens to carry the longest cwd. Normalize before counting
+    // so legacy `/repo/` rows do not outrank equivalent `/repo` rows.
+    let auto_specificity = if manual {
+        0
+    } else {
+        h.cwd.as_deref().map_or(0, |cwd| normalize_cwd(cwd).len())
+    };
+    (
+        manual,           // manual beats auto
+        auto_specificity, // most specific auto cwd
+        h.created_at,     // newest
+    )
+}
+
+fn prefer_handoff(a: &Handoff, b: &Handoff) -> std::cmp::Ordering {
+    handoff_selection_key(a).cmp(&handoff_selection_key(b))
 }
 
 /// Pick the handoff to deliver from a project's open handoffs.
 ///
-/// See [`Reader::latest_open_handoff`] for the full contract: manual handoffs
+/// See [`ReaderPool::latest_open_handoff`] for the full contract: manual handoffs
 /// are project-wide, auto handoffs are filtered by cwd path-boundary, and a
 /// manual handoff always beats an auto one, then most specific cwd, then newest.
+#[cfg(test)]
 fn select_open_handoff(candidates: Vec<Handoff>, cwd_filter: Option<&str>) -> Option<Handoff> {
     candidates
         .into_iter()
-        .filter(|h| {
-            // Manual handoffs (memory_handoff_begin always sets
-            // from_session_id = None) are project-wide and always candidates,
-            // whatever cwd they carry. Only auto SessionEnd handoffs are
-            // cwd-path-boundary scoped. This makes "a manual handoff always
-            // beats the auto one" deterministic on from_session_id, instead of
-            // relying on a manual handoff happening to have a NULL cwd.
-            if h.from_session_id.is_none() {
-                return true;
-            }
-            match (cwd_filter, h.cwd.as_deref()) {
-                // Project-wide read: every open handoff is a candidate.
-                (None, _) => true,
-                // No stored cwd: treat as project-wide.
-                (_, None) => true,
-                // cwd-bearing auto handoffs match by path-boundary.
-                (Some(session_cwd), Some(handoff_cwd)) => cwd_within(handoff_cwd, session_cwd),
-            }
-        })
-        .max_by(|a, b| {
-            let key = |h: &Handoff| {
-                let manual = h.from_session_id.is_none();
-                // cwd specificity discriminates only AUTO handoffs (most
-                // specific subdir wins). For manual handoffs it must be neutral
-                // so the NEWEST manual wins, not whichever happens to carry the
-                // longest cwd.
-                let auto_specificity = if manual {
-                    0
-                } else {
-                    h.cwd.as_deref().map_or(0, str::len)
-                };
-                (
-                    manual,           // manual beats auto
-                    auto_specificity, // most specific auto cwd
-                    h.created_at,     // newest
-                )
-            };
-            key(a).cmp(&key(b))
-        })
+        .filter(|h| is_handoff_candidate(h, cwd_filter))
+        .max_by(prefer_handoff)
 }
 
 fn row_to_handoff(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoreResult<Handoff>> {
@@ -4453,7 +4476,7 @@ mod tests {
     use crate::Store;
 
     use ai_memory_core::{
-        AgentKind, Handoff, HandoffId, HandoffState, ProjectId, SessionId, WorkspaceId,
+        AgentKind, Handoff, HandoffId, HandoffState, NewHandoff, ProjectId, SessionId, WorkspaceId,
     };
 
     /// Build an open handoff for the pure-selection tests. `manual` toggles
@@ -4496,6 +4519,14 @@ mod tests {
         assert!(!cwd_within("/repo", "/repo-other")); // sibling, not descendant
         assert!(!cwd_within("/repo", "/repository")); // longer name, not a child
         assert!(!cwd_within("/repo/api", "/repo")); // parent is not within child
+    }
+
+    #[test]
+    fn cwd_within_handles_windows_backslash_boundaries() {
+        use super::cwd_within;
+        assert!(cwd_within(r"C:\repo", r"C:\repo\api"));
+        assert!(cwd_within(r"C:\repo\", r"C:\repo\api"));
+        assert!(!cwd_within(r"C:\repo", r"C:\repo-other"));
     }
 
     // The realistic scenario matrix (see the cwd the SessionEnd hook injects):
@@ -4601,6 +4632,26 @@ mod tests {
     }
 
     #[test]
+    fn handoff_legacy_trailing_slash_does_not_beat_newer_equivalent_auto() {
+        let c = vec![
+            handoff("old-slash", Some("/repo/"), false, 1),
+            handoff("new-no-slash", Some("/repo"), false, 2),
+        ];
+        assert_eq!(pick(c, Some("/repo/api")), "new-no-slash");
+    }
+
+    #[test]
+    fn handoff_wildcard_characters_are_literal_path_components() {
+        let c = vec![
+            handoff("percent", Some("/repo/%"), false, 2),
+            handoff("underscore", Some("/repo/_x"), false, 3),
+            handoff("repo", Some("/repo"), false, 1),
+        ];
+        assert_eq!(pick(c.clone(), Some("/repo/abc")), "repo");
+        assert_eq!(pick(c, Some("/repo/ax")), "repo");
+    }
+
+    #[test]
     fn handoff_parent_session_does_not_inherit_deep_handoff() {
         // A handoff left deep in /repo/api is not delivered to a /repo session.
         let c = vec![handoff("deep", Some("/repo/api"), false, 1)];
@@ -4616,6 +4667,65 @@ mod tests {
             handoff("MAN", None, true, 2),
         ];
         assert_eq!(pick(c, None), "MAN");
+    }
+
+    #[tokio::test]
+    async fn latest_open_handoff_preserves_workspace_project_isolation() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let ws_a = store.writer.get_or_create_workspace("a").await.unwrap();
+        let ws_b = store.writer.get_or_create_workspace("b").await.unwrap();
+        let proj_a = store
+            .writer
+            .get_or_create_project(ws_a, "same-name", None)
+            .await
+            .unwrap();
+        let proj_b = store
+            .writer
+            .get_or_create_project(ws_b, "same-name", None)
+            .await
+            .unwrap();
+
+        store
+            .writer
+            .insert_handoff(NewHandoff {
+                workspace_id: ws_b,
+                project_id: proj_b,
+                from_session_id: None,
+                from_agent: AgentKind::ClaudeCode,
+                to_agent: None,
+                cwd: None,
+                summary: "wrong workspace".into(),
+                open_questions: vec![],
+                next_steps: vec![],
+                files_touched: vec![],
+            })
+            .await
+            .unwrap();
+        store
+            .writer
+            .insert_handoff(NewHandoff {
+                workspace_id: ws_a,
+                project_id: proj_a,
+                from_session_id: None,
+                from_agent: AgentKind::ClaudeCode,
+                to_agent: None,
+                cwd: None,
+                summary: "right project".into(),
+                open_questions: vec![],
+                next_steps: vec![],
+                files_touched: vec![],
+            })
+            .await
+            .unwrap();
+
+        let handoff = store
+            .reader
+            .latest_open_handoff(ws_a, proj_a, Some("/repo".into()))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(handoff.summary, "right project");
     }
 
     /// A stored `repo_path` equal to the operator's `$HOME` must never be
