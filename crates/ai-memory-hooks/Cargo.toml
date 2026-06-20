@@ -17,6 +17,9 @@ anyhow.workspace = true
 thiserror.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+# Parse the per-event `?event=…` query of each spooled URL in `/hook/batch`,
+# the same crate (and version) axum's `Query` extractor uses for `/hook`.
+serde_urlencoded = "0.7"
 tokio.workspace = true
 tracing.workspace = true
 jiff.workspace = true

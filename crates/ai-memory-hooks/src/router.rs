@@ -26,7 +26,7 @@ use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use axum::routing::{get, post};
 use jiff::Timestamp;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use tracing::{debug, info, warn};
 use uuid::Uuid;
 
@@ -190,6 +190,7 @@ pub struct HookState {
 pub fn hook_router(state: HookState) -> Router {
     Router::new()
         .route("/hook", post(handle_hook))
+        .route("/hook/batch", post(handle_hook_batch))
         .route("/handoff", get(handle_handoff))
         .with_state(Arc::new(state))
 }
@@ -218,6 +219,84 @@ async fn handle_hook(
         process_envelope(state, env, actor_user).await;
     });
     (StatusCode::ACCEPTED, "queued")
+}
+
+/// One event in a `POST /hook/batch` request — the same `{url, body}` pair a
+/// single `POST /hook` would carry, so the server reuses the per-event query
+/// parsing instead of inventing a second wire shape.
+#[derive(Debug, Deserialize)]
+pub struct HookBatchItem {
+    /// Full hook URL including the `?event=…&agent=…` query (as the client
+    /// spooled it); only the query is read here — the host/path are the
+    /// client's record of where the event was bound.
+    pub url: String,
+    /// Raw JSON event payload.
+    #[serde(default)]
+    pub body: serde_json::Value,
+}
+
+/// Response to `POST /hook/batch`: the length of the contiguous leading prefix
+/// of items that committed (equals the request length on full success).
+#[derive(Debug, Serialize)]
+pub struct HookBatchAck {
+    /// Items committed, oldest-first. The client deletes exactly this many
+    /// spool entries and re-sends the rest next pass.
+    pub accepted: usize,
+}
+
+/// Batch sibling of [`handle_hook`]. Accepts many spooled events in ONE request
+/// so a draining client amortizes the per-request cost (TLS + network RTT + the
+/// edge auth hop) over the whole batch instead of paying it per event — the
+/// dominant cost when a backlog drains to a remote, gated server, and the reason
+/// a sequential per-event drain falls behind under parallel load.
+///
+/// Unlike `handle_hook` (which spawns and answers `202` immediately), the batch
+/// is processed INLINE and FAIL-FAST: items run in order and the first error
+/// stops the batch, returning `accepted = <committed prefix>`. Inline + fail-fast
+/// keeps every item's side effects (a SessionEnd writes a session page + a
+/// handoff) inside the response window, so a partially-applied batch never
+/// commits beyond what `accepted` reports — the client deletes only that prefix.
+async fn handle_hook_batch(
+    State(state): State<Arc<HookState>>,
+    actor_ext: Option<axum::Extension<ai_memory_core::ActorContext>>,
+    Json(items): Json<Vec<HookBatchItem>>,
+) -> impl IntoResponse {
+    // All items in a batch share the drain's single identity, so the actor is
+    // captured once from the batch request (mirrors `handle_hook`).
+    let actor_user = actor_ext
+        .map(|axum::Extension(ctx)| ctx.user)
+        .unwrap_or_default();
+    // One permit for the whole batch — it holds ingest capacity for its
+    // duration, exactly as a single in-flight `/hook` request would.
+    let Ok(permit) = state.ingest_semaphore.clone().try_acquire_owned() else {
+        warn!("hook batch ingest saturated; rejecting with 429");
+        return (
+            StatusCode::TOO_MANY_REQUESTS,
+            Json(HookBatchAck { accepted: 0 }),
+        );
+    };
+    let _permit = permit;
+    let mut accepted = 0usize;
+    for item in items {
+        let query = parse_hook_query(&item.url);
+        let env = HookEnvelope::from_query_and_body(query, item.body);
+        if let Err(e) = process(&state, env, actor_user.clone()).await {
+            warn!(error = %e, accepted, "hook batch item failed; stopping (fail-fast)");
+            break;
+        }
+        accepted += 1;
+    }
+    (StatusCode::OK, Json(HookBatchAck { accepted }))
+}
+
+/// Parse the `?event=…&agent=…` query of a spooled hook URL into [`HookQuery`],
+/// mirroring axum's `Query` extractor (both use `serde_urlencoded`). A URL with
+/// no query, or an unparseable one, yields the default (empty `event`) — which
+/// `from_query_and_body` maps to an unknown event that `process` skips, so a
+/// malformed item can't error the whole batch.
+fn parse_hook_query(url: &str) -> HookQuery {
+    let qs = url.split_once('?').map_or("", |(_, q)| q);
+    serde_urlencoded::from_str(qs).unwrap_or_default()
 }
 
 /// Query params for `GET /handoff`.
@@ -1112,6 +1191,64 @@ mod tests {
         .into_response();
 
         assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+    }
+
+    #[tokio::test]
+    async fn handle_hook_batch_acks_processed_count() {
+        let tmp = TempDir::new().unwrap();
+        let state = make_state(&tmp).await;
+        // Two events sharing a session, carried in ONE batch request — the per
+        // event `?event=…&agent=…` query is parsed from each item's `url`.
+        let items = vec![
+            HookBatchItem {
+                url: "http://h/hook?event=session-start&agent=claude-code".into(),
+                body: serde_json::json!({ "session_id": "batch-s1" }),
+            },
+            HookBatchItem {
+                url: "http://h/hook?event=user-prompt-submit&agent=claude-code".into(),
+                body: serde_json::json!({ "session_id": "batch-s1", "prompt": "hello" }),
+            },
+        ];
+
+        let response = handle_hook_batch(State(Arc::new(state)), None, Json(items))
+            .await
+            .into_response();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let ack: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(ack["accepted"], 2, "both events committed, oldest-first");
+    }
+
+    #[tokio::test]
+    async fn handle_hook_batch_returns_429_when_saturated() {
+        let tmp = TempDir::new().unwrap();
+        let mut state = make_state(&tmp).await;
+        state.ingest_semaphore = Arc::new(tokio::sync::Semaphore::new(0));
+
+        let response = handle_hook_batch(
+            State(Arc::new(state)),
+            None,
+            Json(vec![HookBatchItem {
+                url: "http://h/hook?event=session-start&agent=claude-code".into(),
+                body: serde_json::json!({}),
+            }]),
+        )
+        .await
+        .into_response();
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+    }
+
+    #[test]
+    fn parse_hook_query_reads_event_and_agent() {
+        let q = parse_hook_query("http://h/hook?event=stop&agent=claude-code&cwd=%2Ftmp");
+        assert_eq!(q.event, "stop");
+        assert_eq!(q.agent.as_deref(), Some("claude-code"));
+        assert_eq!(q.cwd.as_deref(), Some("/tmp"));
+        // No query string at all → default (empty event), which `process` skips.
+        assert_eq!(parse_hook_query("http://h/hook").event, "");
     }
 
     /// An event without a cwd must fall back to the server defaults.

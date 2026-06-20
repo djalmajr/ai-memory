@@ -177,6 +177,75 @@ pub async fn post_hook(
     }
 }
 
+/// Outcome of one `POST /hook/batch` request — many spooled events delivered in
+/// a single round-trip, so a draining client amortizes TLS + network RTT + the
+/// edge auth hop over the whole batch instead of paying it per event.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BatchOutcome {
+    /// Server committed the leading `usize` items (contiguous prefix, oldest
+    /// first). Equals the request length on full success; a smaller value means
+    /// the server stopped on that item (fail-fast) — the caller deletes the
+    /// prefix and charges the next item a retry.
+    Accepted(usize),
+    /// `429` — ingest saturated; nothing was processed. Keep the whole batch and
+    /// retry it later WITHOUT bumping attempts (saturation isn't a failure).
+    Saturated,
+    /// `404`/`405` — the server has no `/hook/batch` (a pre-upgrade build). The
+    /// caller falls back to per-event `POST /hook` for the rest of the drain.
+    Unsupported,
+    /// Transport error or any other non-2xx: the batch didn't land. Treated as a
+    /// failed attempt for each item it carried (bounded by `MAX_ATTEMPTS`).
+    Failed,
+}
+
+/// POST a pre-serialized JSON array of `{url, body}` events to `<batch_url>`.
+/// `bearer` authenticates the whole batch (every item shares the drain's single
+/// identity). Best-effort: never errors. Reads `{"accepted": K}` from a 2xx
+/// body; a 2xx whose body can't be read is treated as `Failed` (re-send rather
+/// than risk dropping undelivered events).
+pub async fn post_batch(
+    client: &reqwest::Client,
+    batch_url: &str,
+    payload: &str,
+    token: Option<&str>,
+    timeout: Duration,
+) -> BatchOutcome {
+    let mut req = client
+        .post(batch_url)
+        .header("Content-Type", "application/json")
+        .timeout(timeout)
+        .body(payload.to_owned());
+    if let Some(t) = token {
+        req = req.bearer_auth(t);
+    }
+    match req.send().await {
+        Ok(resp) => {
+            let status = resp.status();
+            if status.is_success() {
+                match resp.json::<serde_json::Value>().await {
+                    Ok(v) => {
+                        let accepted = v
+                            .get("accepted")
+                            .and_then(serde_json::Value::as_u64)
+                            .unwrap_or(0) as usize;
+                        BatchOutcome::Accepted(accepted)
+                    }
+                    Err(_) => BatchOutcome::Failed,
+                }
+            } else if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+                BatchOutcome::Saturated
+            } else if status == reqwest::StatusCode::NOT_FOUND
+                || status == reqwest::StatusCode::METHOD_NOT_ALLOWED
+            {
+                BatchOutcome::Unsupported
+            } else {
+                BatchOutcome::Failed
+            }
+        }
+        Err(_) => BatchOutcome::Failed,
+    }
+}
+
 /// GET the handoff text with a caller-chosen budget. Returns None on any error
 /// or an empty body. This is the one synchronous read on the agent's critical
 /// path (session-start injects it as context), so the budget is larger than a

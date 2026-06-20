@@ -25,7 +25,7 @@ use ai_memory_llm::{OidcToken, refresh_access_token};
 use secrecy::ExposeSecret as _;
 use serde::{Deserialize, Serialize};
 
-use super::hook_capture::{PostOutcome, build_client, post_hook};
+use super::hook_capture::{BatchOutcome, PostOutcome, build_client, post_batch, post_hook};
 
 /// Drop a spooled event after this many failed drain passes — bounds retries of
 /// a permanently-undeliverable event (e.g. a server URL that never comes back).
@@ -39,6 +39,15 @@ const MAX_AGE_MS: u64 = 7 * 24 * 60 * 60 * 1000;
 const MAX_SPOOL_FILES: usize = 10_000;
 #[cfg(test)]
 const MAX_SPOOL_FILES: usize = 3;
+
+/// Max events per `POST /hook/batch` request (count bound; the byte bound below
+/// also applies). Caps the blast radius of a failed batch and keeps one request
+/// well under the server's body limit even with many small events.
+const MAX_BATCH_ITEMS: usize = 256;
+/// Soft byte budget for one `/hook/batch` body — stays under the server's 10 MiB
+/// `DefaultBodyLimit` with margin for JSON framing. A chunk always carries at
+/// least one event even if that event alone exceeds this.
+const MAX_BATCH_BYTES: usize = 8 * 1024 * 1024;
 
 /// How a spooled event authenticates to the server when drained.
 #[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug)]
@@ -55,7 +64,7 @@ pub enum AuthMode {
 }
 
 /// One spooled hook event: the full request plus how to authenticate it.
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct SpoolEntry {
     /// Full hook URL including the `?event=…&agent=…[&cwd&workspace&project]`
     /// query the agent's payload resolved to.
@@ -167,9 +176,21 @@ pub struct DrainResult {
     pub dropped: usize,
 }
 
-/// Drain the spool to the server, oldest-first, within `total_budget`. Each
-/// event that gets a 2xx is deleted; failures stay for the next boundary.
-/// OIDC bearer is resolved + refreshed at most once per drain and cached.
+/// Drain the spool to the server, oldest-first, within `total_budget`.
+///
+/// Events are delivered in **batches** via `POST /hook/batch`: one request
+/// carries many spooled events, so the per-request cost (TLS + network RTT + the
+/// edge auth hop) is amortized over the whole batch instead of paid per event.
+/// That is the throughput fix — a sequential per-event drain falls behind when
+/// many parallel sessions share one spool against a remote, gated server, and
+/// the spool then grows to its cap and evicts undelivered events. A server
+/// without `/hook/batch` (a pre-upgrade build) answers `404`/`405`, and the
+/// drain transparently falls back to per-event `POST /hook`.
+///
+/// A delivered event is deleted; a failed one is charged a retry attempt
+/// (dropped at `MAX_ATTEMPTS`); a `429` (saturation) is retried untouched so it
+/// never burns the retry budget. OIDC bearer is resolved + refreshed at most
+/// once per drain and cached.
 ///
 /// Best-effort: returns counts and never errors, so a session boundary is never
 /// blocked beyond the budget and never fails the agent.
@@ -190,74 +211,199 @@ pub async fn drain(
     let mut oidc_cache: Option<Option<String>> = None; // outer None = not yet resolved
     let mut result = DrainResult::default();
 
+    // Load entries oldest-first, dropping unparseable / too-old files up front
+    // (a long-dead instance must not keep the spool growing). The batch path
+    // then only ever sees live, parseable events.
+    let mut items: Vec<(PathBuf, SpoolEntry)> = Vec::with_capacity(files.len());
     for path in files {
-        if started.elapsed() >= total_budget {
-            result.remaining += 1;
-            continue;
-        }
         let Ok(bytes) = std::fs::read(&path) else {
             result.remaining += 1;
             continue;
         };
-        let Ok(mut entry) = serde_json::from_slice::<SpoolEntry>(&bytes) else {
+        let Ok(entry) = serde_json::from_slice::<SpoolEntry>(&bytes) else {
             // Unparseable spool file: drop it so it can't wedge the queue.
             let _ = std::fs::remove_file(&path);
             result.dropped += 1;
             continue;
         };
-
-        // Prune events too old to be worth retrying (a long-dead instance).
         if now_ms().saturating_sub(entry.created_ms) > MAX_AGE_MS {
             let _ = std::fs::remove_file(&path);
             result.dropped += 1;
             continue;
         }
+        items.push((path, entry));
+    }
 
-        let bearer: Option<String> = match entry.auth_mode {
-            AuthMode::Static => entry.token.clone(),
-            AuthMode::Anonymous => None,
-            AuthMode::Oidc => {
-                if oidc_cache.is_none() {
-                    oidc_cache = Some(resolve_oidc(&client, data_dir).await);
+    let mut idx = 0;
+    let mut batch_supported = true;
+    while idx < items.len() {
+        if started.elapsed() >= total_budget {
+            result.remaining += items.len() - idx;
+            break;
+        }
+
+        let bearer = entry_bearer(&items[idx].1, &client, data_dir, &mut oidc_cache).await;
+
+        if batch_supported {
+            // Extend the chunk over consecutive entries sharing the same batch
+            // endpoint AND bearer (one request carries one Authorization header),
+            // bounded by item count and body bytes.
+            let base = batch_endpoint(&items[idx].1.url);
+            let mut end = idx + 1;
+            let mut bytes = entry_wire_len(&items[idx].1);
+            while end < items.len() && end - idx < MAX_BATCH_ITEMS {
+                if batch_endpoint(&items[end].1.url) != base {
+                    break;
                 }
-                oidc_cache.clone().flatten()
+                let next_bearer =
+                    entry_bearer(&items[end].1, &client, data_dir, &mut oidc_cache).await;
+                if next_bearer != bearer {
+                    break;
+                }
+                let next_len = entry_wire_len(&items[end].1);
+                if bytes + next_len > MAX_BATCH_BYTES {
+                    break;
+                }
+                bytes += next_len;
+                end += 1;
             }
-        };
 
-        match post_hook(
-            &client,
-            &entry.url,
-            &entry.body,
-            bearer.as_deref(),
-            per_event_timeout,
-        )
-        .await
-        {
-            PostOutcome::Delivered => {
-                let _ = std::fs::remove_file(&path);
-                result.sent += 1;
+            let payload = batch_payload(&items[idx..end]);
+            match post_batch(&client, &base, &payload, bearer.as_deref(), per_event_timeout).await {
+                BatchOutcome::Accepted(k) => {
+                    let k = k.min(end - idx);
+                    for (path, _) in &items[idx..idx + k] {
+                        let _ = std::fs::remove_file(path);
+                    }
+                    result.sent += k;
+                    if idx + k < end {
+                        // The (idx+k)th event is the one the server stopped on
+                        // (fail-fast). Charge it a failed attempt and skip past it
+                        // so a single bad event can't wedge the rest — the
+                        // per-event loop also advances past a failed entry.
+                        bump_or_drop(&items[idx + k].0, &items[idx + k].1, &mut result);
+                        idx += k + 1;
+                    } else {
+                        idx = end;
+                    }
+                }
+                BatchOutcome::Saturated => {
+                    // Server ingest is full; further batches would 429 too. Leave
+                    // everything queued, no attempt bump (parity with per-event).
+                    result.remaining += items.len() - idx;
+                    break;
+                }
+                BatchOutcome::Unsupported => {
+                    // Pre-upgrade server with no /hook/batch: fall back to the
+                    // per-event path for the rest of the drain. Retry items[idx]
+                    // below (don't advance).
+                    batch_supported = false;
+                }
+                BatchOutcome::Failed => {
+                    // The batch didn't land (transport error / unexpected status).
+                    // Charge each item a failed attempt so a dead server still
+                    // bounds retries via MAX_ATTEMPTS, then move past the chunk.
+                    for (path, entry) in &items[idx..end] {
+                        bump_or_drop(path, entry, &mut result);
+                    }
+                    idx = end;
+                }
             }
-            // Transient server backpressure (429 `hook queue full`): the event
-            // was never processed, so leave it untouched — no attempt bump, no
-            // rewrite — and saturation never burns the entry's retry budget. It
-            // rides the next pass unchanged; `MAX_AGE_MS` still bounds it.
-            PostOutcome::Saturated => {
-                result.remaining += 1;
-            }
-            PostOutcome::Failed => {
-                entry.attempts = entry.attempts.saturating_add(1);
-                if entry.attempts >= MAX_ATTEMPTS {
-                    let _ = std::fs::remove_file(&path);
-                    result.dropped += 1;
-                } else {
-                    // Persist the bumped attempt count for the next boundary.
-                    let _ = note_retry_persist(rewrite_entry(&path, &entry));
+        } else {
+            // Per-event fallback (server without /hook/batch). Mirrors the
+            // original drain's per-entry semantics exactly.
+            let path = &items[idx].0;
+            let entry = &items[idx].1;
+            match post_hook(
+                &client,
+                &entry.url,
+                &entry.body,
+                bearer.as_deref(),
+                per_event_timeout,
+            )
+            .await
+            {
+                PostOutcome::Delivered => {
+                    let _ = std::fs::remove_file(path);
+                    result.sent += 1;
+                }
+                PostOutcome::Saturated => {
                     result.remaining += 1;
                 }
+                PostOutcome::Failed => {
+                    bump_or_drop(path, entry, &mut result);
+                }
             }
+            idx += 1;
         }
     }
     result
+}
+
+/// Resolve the bearer for a spooled entry at drain time: a `Static` token is
+/// stored inline; an `Oidc` entry resolves (and refreshes) the stored token
+/// once per drain via `oidc_cache`; `Anonymous` is None.
+async fn entry_bearer(
+    entry: &SpoolEntry,
+    client: &reqwest::Client,
+    data_dir: &Path,
+    oidc_cache: &mut Option<Option<String>>,
+) -> Option<String> {
+    match entry.auth_mode {
+        AuthMode::Static => entry.token.clone(),
+        AuthMode::Anonymous => None,
+        AuthMode::Oidc => {
+            if oidc_cache.is_none() {
+                *oidc_cache = Some(resolve_oidc(client, data_dir).await);
+            }
+            oidc_cache.clone().flatten()
+        }
+    }
+}
+
+/// The `/hook/batch` URL for a spooled per-event URL: strip the `?…` query and
+/// append `/batch` (a spooled URL ends in `…/hook` before its query). Entries
+/// whose endpoint string matches can ride one batch request.
+fn batch_endpoint(url: &str) -> String {
+    let path = url.split('?').next().unwrap_or(url);
+    format!("{path}/batch")
+}
+
+/// Rough wire size of one event inside a batch body (`{"url":…,"body":…}` plus
+/// framing) — used only to keep a chunk under [`MAX_BATCH_BYTES`].
+fn entry_wire_len(entry: &SpoolEntry) -> usize {
+    entry.url.len() + entry.body.len() + 32
+}
+
+/// Serialize a chunk of entries into the `/hook/batch` request body — a JSON
+/// array of `{url, body}`. Each `body` is re-parsed from its stored text so a
+/// malformed one becomes `null` (skipped server-side) instead of poisoning the
+/// whole batch.
+fn batch_payload(items: &[(PathBuf, SpoolEntry)]) -> String {
+    let arr: Vec<serde_json::Value> = items
+        .iter()
+        .map(|(_, e)| {
+            let body = serde_json::from_str::<serde_json::Value>(&e.body)
+                .unwrap_or(serde_json::Value::Null);
+            serde_json::json!({ "url": e.url, "body": body })
+        })
+        .collect();
+    serde_json::to_string(&arr).unwrap_or_else(|_| "[]".to_string())
+}
+
+/// Charge a spooled entry a failed delivery attempt: drop it once it reaches
+/// `MAX_ATTEMPTS`, else persist the bumped count for the next boundary. Updates
+/// `result.dropped` / `result.remaining` accordingly.
+fn bump_or_drop(path: &Path, entry: &SpoolEntry, result: &mut DrainResult) {
+    let mut bumped = entry.clone();
+    bumped.attempts = bumped.attempts.saturating_add(1);
+    if bumped.attempts >= MAX_ATTEMPTS {
+        let _ = std::fs::remove_file(path);
+        result.dropped += 1;
+    } else {
+        let _ = note_retry_persist(rewrite_entry(path, &bumped));
+        result.remaining += 1;
+    }
 }
 
 /// Overwrite a spool file in place with the updated entry (atomic temp+rename),
@@ -325,6 +471,14 @@ fn prune_spool_file_count(spool: &Path) {
         return;
     }
     files.sort();
+    // The spool is at its hard cap: the oldest events are about to be deleted
+    // WITHOUT ever reaching the server — silent capture loss otherwise. Surface
+    // it on stderr (never stdout, which carries the hook's JSON protocol output)
+    // so a sustained backlog dropping events is visible, not invisible.
+    eprintln!(
+        "ai-memory: hook-spool at capacity ({} > {MAX_SPOOL_FILES}); evicting {excess} oldest UNDELIVERED event(s)",
+        files.len()
+    );
     for path in files.into_iter().take(excess) {
         let _ = std::fs::remove_file(path);
     }
@@ -560,6 +714,124 @@ mod tests {
         let loaded: SpoolEntry =
             serde_json::from_slice(&std::fs::read(&files[0]).unwrap()).unwrap();
         assert_eq!(loaded.attempts, 0, "429 must not consume the retry budget");
+    }
+
+    /// A mock hook server: answers `200 {"accepted":N}` to `POST /hook/batch`
+    /// (N = array length in the body) and `202 queued` to a per-event
+    /// `POST /hook`. Counts every request so a test can assert batching. Reads
+    /// the whole request in one shot (small test payloads), mirroring the other
+    /// raw-TCP mocks in this module.
+    async fn serve_counting_hook(
+        req_count: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        batch_status: &'static str,
+    ) -> String {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((mut s, _)) = listener.accept().await {
+                let rc = req_count.clone();
+                tokio::spawn(async move {
+                    let mut buf = vec![0_u8; 65536];
+                    let n = s.read(&mut buf).await.unwrap_or(0);
+                    rc.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    let req = String::from_utf8_lossy(&buf[..n]);
+                    let is_batch = req
+                        .lines()
+                        .next()
+                        .is_some_and(|l| l.contains("/hook/batch"));
+                    let (status, body) = if is_batch {
+                        let payload = req.split("\r\n\r\n").nth(1).unwrap_or("");
+                        let accepted = serde_json::from_str::<serde_json::Value>(payload)
+                            .ok()
+                            .and_then(|v| v.as_array().map(Vec::len))
+                            .unwrap_or(0);
+                        (batch_status, format!("{{\"accepted\":{accepted}}}"))
+                    } else {
+                        ("202 Accepted", "queued".to_string())
+                    };
+                    let resp = format!(
+                        "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ = s.write_all(resp.as_bytes()).await;
+                });
+            }
+        });
+        addr.to_string()
+    }
+
+    fn write_spool_entry(spool: &Path, name: &str, url: String) {
+        std::fs::create_dir_all(spool).unwrap();
+        let e = entry_for(url, "{}".into(), None, false);
+        std::fs::write(spool.join(name), serde_json::to_vec(&e).unwrap()).unwrap();
+    }
+
+    #[tokio::test]
+    async fn drain_delivers_all_events_in_one_batch() {
+        let req_count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let addr = serve_counting_hook(req_count.clone(), "200 OK").await;
+        let tmp = tempfile::tempdir().unwrap();
+        let spool = spool_dir(tmp.path());
+        for i in 0..3 {
+            write_spool_entry(&spool, &format!("evt-{i}.json"), format!("http://{addr}/hook?event=e{i}"));
+        }
+
+        let r = drain(
+            &spool,
+            tmp.path(),
+            Duration::from_secs(5),
+            Duration::from_secs(2),
+        )
+        .await;
+
+        assert_eq!(r.sent, 3, "all three events delivered");
+        assert_eq!(r.remaining, 0);
+        assert!(list_entries(&spool).unwrap().is_empty(), "spool emptied");
+        assert_eq!(
+            req_count.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "three events ride ONE /hook/batch request (RTT amortized)"
+        );
+    }
+
+    #[tokio::test]
+    async fn drain_falls_back_to_per_event_when_batch_unsupported() {
+        // Pre-upgrade server: /hook/batch is 404, per-event /hook is 202.
+        let req_count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let addr = serve_counting_hook(req_count.clone(), "404 Not Found").await;
+        let tmp = tempfile::tempdir().unwrap();
+        let spool = spool_dir(tmp.path());
+        for i in 0..2 {
+            write_spool_entry(&spool, &format!("evt-{i}.json"), format!("http://{addr}/hook?event=e{i}"));
+        }
+
+        let r = drain(
+            &spool,
+            tmp.path(),
+            Duration::from_secs(5),
+            Duration::from_secs(2),
+        )
+        .await;
+
+        assert_eq!(r.sent, 2, "both events delivered via per-event fallback");
+        assert_eq!(r.remaining, 0);
+        assert!(list_entries(&spool).unwrap().is_empty());
+        // 1 rejected batch probe + 2 per-event POSTs.
+        assert_eq!(
+            req_count.load(std::sync::atomic::Ordering::SeqCst),
+            3,
+            "one /hook/batch 404, then a per-event POST per remaining event"
+        );
+    }
+
+    #[test]
+    fn batch_endpoint_derives_from_event_url() {
+        assert_eq!(
+            batch_endpoint("https://h/hook?event=stop&agent=claude-code"),
+            "https://h/hook/batch"
+        );
+        assert_eq!(batch_endpoint("https://h/hook"), "https://h/hook/batch");
     }
 
     #[test]
