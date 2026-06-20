@@ -135,9 +135,8 @@ impl HookEvent {
             "session-start" | "session_start" | "SessionStart" | "sessionStart" => {
                 Self::SessionStart
             }
-            "user-prompt" | "user_prompt" | "UserPromptSubmit" | "beforeSubmitPrompt" => {
-                Self::UserPrompt
-            }
+            "user-prompt" | "user_prompt" | "user-prompt-submit" | "user_prompt_submit"
+            | "UserPromptSubmit" | "beforeSubmitPrompt" => Self::UserPrompt,
             "pre-tool-use" | "pre_tool_use" | "PreToolUse" | "preToolUse" | "BeforeTool" => {
                 Self::PreToolUse
             }
@@ -418,21 +417,72 @@ fn extension_body_excerpt(raw: &serde_json::Value) -> Option<String> {
     .map(|s| truncate_excerpt(&s))
 }
 
+/// Extract human-readable text content for an observation body, accepting the
+/// shapes agents actually send: a plain string, an **array of content blocks**
+/// (`[{ "type": "text", "text": "…" }]` — the shape Claude Code uses for
+/// `tool_response`), or a structured object (rendered as compact JSON). Unlike
+/// [`extract_string`], which only matches a JSON string and silently drops
+/// everything else, this keeps tool outputs / inputs that arrive as
+/// arrays/objects.
+fn extract_content(value: &serde_json::Value, keys: &[&str]) -> Option<String> {
+    for key in keys {
+        for candidate in extraction_candidates(value) {
+            if let Some(found) = candidate.get(*key).and_then(value_to_text)
+                && !found.is_empty()
+            {
+                return Some(found);
+            }
+        }
+    }
+    None
+}
+
+/// Flatten a JSON value into text. Strings pass through; arrays concatenate
+/// their flattened items (one per line); objects prefer a `text` / `content`
+/// field and otherwise fall back to compact JSON. `null` yields `None`.
+fn value_to_text(value: &serde_json::Value) -> Option<String> {
+    match value {
+        serde_json::Value::String(s) => (!s.is_empty()).then(|| s.clone()),
+        serde_json::Value::Array(items) => {
+            let joined = items
+                .iter()
+                .filter_map(value_to_text)
+                .collect::<Vec<_>>()
+                .join("\n");
+            (!joined.is_empty()).then_some(joined)
+        }
+        serde_json::Value::Object(_) => value
+            .get("text")
+            .and_then(serde_json::Value::as_str)
+            .map(ToString::to_string)
+            .or_else(|| value.get("content").and_then(value_to_text))
+            .or_else(|| {
+                serde_json::to_string(value)
+                    .ok()
+                    .filter(|s| s != "{}" && s != "null")
+            }),
+        serde_json::Value::Number(n) => Some(n.to_string()),
+        serde_json::Value::Bool(b) => Some(b.to_string()),
+        serde_json::Value::Null => None,
+    }
+}
+
 fn best_body_excerpt(event: HookEvent, raw: &serde_json::Value) -> Option<String> {
     match event {
-        HookEvent::UserPrompt => extract_string(raw, &["prompt", "message", "text"]),
+        HookEvent::UserPrompt => extract_content(raw, &["prompt", "message", "text"]),
         HookEvent::PostToolUse => {
             let tool = extract_string(raw, &["tool", "tool_name", "name"])
                 .or_else(|| extract_string_path(raw, &[&["toolCall", "name"]]))
                 .or_else(|| {
                     extract_scalar_string(raw, &["stepIdx"]).map(|step| format!("step {step}"))
                 })?;
-            let result = extract_string(raw, &["tool_response", "tool_output", "output", "result"])
-                .or_else(|| extract_string(raw, &["error"]))
-                .unwrap_or_else(|| "(no output captured)".into());
+            let result =
+                extract_content(raw, &["tool_response", "tool_output", "output", "result"])
+                    .or_else(|| extract_content(raw, &["error"]))
+                    .unwrap_or_else(|| "(no output captured)".into());
             Some(format!("tool: {tool}\n---\n{}", truncate_excerpt(&result)))
         }
-        HookEvent::Notification => extract_string(raw, &["message", "text"]),
+        HookEvent::Notification => extract_content(raw, &["message", "text"]),
         _ => None,
     }
 }
@@ -891,5 +941,90 @@ mod tests {
         let excerpt = env.body_excerpt.unwrap();
         assert!(excerpt.ends_with('…'));
         assert!(excerpt.starts_with("tool: bash\n---\n"));
+    }
+
+    /// Regression: the native-binary hook command sends the script stem
+    /// `user-prompt-submit` as the event token (rendered by `render_shared.rs`,
+    /// forwarded verbatim by `ai-memory hook`). The parser must map it to
+    /// `UserPrompt`; otherwise native installs (the Windows / posix-native
+    /// default) bucket every prompt as `Other` and drop its text.
+    #[test]
+    fn parses_native_user_prompt_submit_event_token() {
+        assert_eq!(
+            HookEvent::parse("user-prompt-submit"),
+            HookEvent::UserPrompt
+        );
+        assert_eq!(
+            HookEvent::parse("user_prompt_submit"),
+            HookEvent::UserPrompt
+        );
+    }
+
+    /// Claude Code sends `tool_response` as an array of content blocks
+    /// (`[{ "type": "text", "text": "…" }]`). The body excerpt must capture
+    /// that text instead of falling back to "(no output captured)".
+    #[test]
+    fn post_tool_excerpt_captures_array_tool_response() {
+        let q = HookQuery {
+            event: "post-tool-use".into(),
+            agent: Some("claude-code".into()),
+            ..Default::default()
+        };
+        let env = HookEnvelope::from_query_and_body(
+            q,
+            serde_json::json!({
+                "tool_name": "Bash",
+                "tool_response": [{"type": "text", "text": "MARKER_OUTPUT_123"}],
+            }),
+        );
+        let body = env.body_excerpt.expect("post-tool body");
+        assert!(
+            body.contains("MARKER_OUTPUT_123"),
+            "array tool_response text should be captured: {body:?}"
+        );
+        assert!(
+            !body.contains("(no output captured)"),
+            "should not fall back when output is present: {body:?}"
+        );
+    }
+
+    /// An object-shaped `tool_response` is serialized into the body rather than
+    /// dropped.
+    #[test]
+    fn post_tool_excerpt_captures_object_tool_response() {
+        let q = HookQuery {
+            event: "post-tool-use".into(),
+            agent: Some("claude-code".into()),
+            ..Default::default()
+        };
+        let env = HookEnvelope::from_query_and_body(
+            q,
+            serde_json::json!({
+                "tool_name": "Read",
+                "tool_response": {"stdout": "MARKER_OBJ_456"},
+            }),
+        );
+        let body = env.body_excerpt.expect("post-tool body");
+        assert!(
+            body.contains("MARKER_OBJ_456"),
+            "object tool_response should be serialized into the body: {body:?}"
+        );
+    }
+
+    /// End-to-end: a native-hook user prompt (`event=user-prompt-submit`,
+    /// string `prompt`) maps to `UserPrompt` and keeps its body text.
+    #[test]
+    fn native_user_prompt_submit_keeps_prompt_body() {
+        let q = HookQuery {
+            event: "user-prompt-submit".into(),
+            agent: Some("claude-code".into()),
+            ..Default::default()
+        };
+        let env = HookEnvelope::from_query_and_body(
+            q,
+            serde_json::json!({ "session_id": "s1", "prompt": "MARKER_PROMPT_789" }),
+        );
+        assert_eq!(env.event, HookEvent::UserPrompt);
+        assert_eq!(env.body_excerpt.as_deref(), Some("MARKER_PROMPT_789"));
     }
 }
