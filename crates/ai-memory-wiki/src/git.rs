@@ -150,7 +150,12 @@ impl GitAdapter {
             let commit = repo.find_commit(oid).map_err(map_git_err)?;
             out.push(Checkpoint {
                 oid: oid.to_string(),
-                summary: commit.summary().unwrap_or("(no summary)").to_string(),
+                summary: commit
+                    .summary()
+                    .ok()
+                    .flatten()
+                    .unwrap_or("(no summary)")
+                    .to_string(),
                 time: commit.time().seconds(),
             });
         }

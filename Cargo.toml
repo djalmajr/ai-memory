@@ -108,7 +108,7 @@ flate2 = "1"
 regex = "1"
 
 # Wiki git versioning.
-git2 = { version = "0.20", default-features = false, features = ["vendored-libgit2"] }
+git2 = { version = "0.21", default-features = false, features = ["vendored-libgit2"] }
 
 # LLM provider HTTP.
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }

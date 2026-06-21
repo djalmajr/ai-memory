@@ -497,7 +497,11 @@ async fn resolve_project_ids(
         // (issue #103). A subdir cwd therefore stores None.
         ai_memory_consolidate::derive_project_name(path, strat).map(|(name, root)| {
             let repo_path = root
-                .map(|p| p.to_string_lossy().into_owned())
+                .map(|p| {
+                    repo_root_in_cwd_namespace(path, &p)
+                        .to_string_lossy()
+                        .into_owned()
+                })
                 .or_else(|| repo_path_from_cwd(cwd));
             (name, repo_path)
         })
@@ -506,7 +510,41 @@ async fn resolve_project_ids(
     fn repo_path_from_cwd(cwd: &str) -> Option<String> {
         let path = std::path::Path::new(cwd);
         let repo_root = ai_memory_consolidate::discover_repo_root(path).ok()?;
-        cwd_is_repo_root(path, &repo_root).then(|| repo_root.to_string_lossy().into_owned())
+        cwd_is_repo_root(path, &repo_root).then(|| {
+            repo_root_in_cwd_namespace(path, &repo_root)
+                .to_string_lossy()
+                .into_owned()
+        })
+    }
+
+    fn repo_root_in_cwd_namespace(
+        cwd: &std::path::Path,
+        repo_root: &std::path::Path,
+    ) -> std::path::PathBuf {
+        // On macOS, temp paths often arrive from the host as `/var/...` while
+        // libgit2 reports the same directory as `/private/var/...`. Prefix
+        // matching later compares the stored `repo_path` against the raw hook
+        // cwd, so keep the repo root in the same spelling/namespace as `cwd`
+        // whenever canonical paths prove that `cwd` is inside `repo_root`.
+        if let (Ok(cwd_canon), Ok(root_canon)) =
+            (std::fs::canonicalize(cwd), std::fs::canonicalize(repo_root))
+            && let Ok(rel) = cwd_canon.strip_prefix(&root_canon)
+        {
+            let mut visible_root = cwd.to_path_buf();
+            for component in rel.components() {
+                match component {
+                    std::path::Component::Normal(_) => {
+                        if !visible_root.pop() {
+                            return repo_root.to_path_buf();
+                        }
+                    }
+                    std::path::Component::CurDir => {}
+                    _ => return repo_root.to_path_buf(),
+                }
+            }
+            return visible_root;
+        }
+        repo_root.to_path_buf()
     }
 
     fn repo_path_from_project_override(
@@ -2646,6 +2684,51 @@ mod tests {
         assert_eq!(
             proj_from_sibling, proj_from_host_override,
             "host-resolved repo-root override should still record repo_path so sibling cwd prefix-matches the repo project",
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn repo_root_override_stores_repo_path_in_cwd_namespace() {
+        let tmp = TempDir::new().unwrap();
+        let state = make_state(&tmp).await;
+
+        let real_root = tmp.path().join("real");
+        let real_repo = real_root.join("repo");
+        init_repo_with_commit(&real_repo);
+        std::fs::create_dir_all(real_repo.join("app")).unwrap();
+        std::fs::create_dir_all(real_repo.join("sibling")).unwrap();
+
+        let alias_root = tmp.path().join("alias");
+        std::os::unix::fs::symlink(&real_root, &alias_root).unwrap();
+        let alias_app = alias_root.join("repo/app");
+        let alias_sibling = alias_root.join("repo/sibling");
+
+        let (_, proj_from_alias_override) = resolve_project_ids(
+            &state,
+            Some(alias_app.to_str().unwrap()),
+            None,
+            Some("repo"),
+            ProjectStrategy::RepoRoot,
+            &ai_memory_core::ActorKey::default(),
+        )
+        .await
+        .unwrap();
+
+        let (_, proj_from_alias_sibling) = resolve_project_ids(
+            &state,
+            Some(alias_sibling.to_str().unwrap()),
+            None,
+            None,
+            ProjectStrategy::Basename,
+            &ai_memory_core::ActorKey::default(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            proj_from_alias_sibling, proj_from_alias_override,
+            "stored repo_path must use the incoming cwd spelling so raw prefix matching works across symlink aliases",
         );
     }
 

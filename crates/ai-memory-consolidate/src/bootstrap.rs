@@ -653,8 +653,8 @@ fn collect_git_commits(
         {
             break; // revwalk is time-sorted; older commits come next
         }
-        let summary = commit.summary().unwrap_or("(no summary)");
-        let body = commit.body().unwrap_or("");
+        let summary = commit.summary().ok().flatten().unwrap_or("(no summary)");
+        let body = commit.body().ok().flatten().unwrap_or("");
         let combined_len = summary.len() + body.len();
         // Skip trivial commits.
         if combined_len < 120 && !is_conventional_substantive(summary) {

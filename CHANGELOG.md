@@ -30,6 +30,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   cap stdout at 64 KiB, cap eval rejection evidence, and make direct root admin
   requests inherit server eval defaults unless the request explicitly overrides
   them.
+- Hook project routing now stores git repo paths using the incoming cwd's visible
+  path spelling, so macOS `/var` vs `/private/var` aliases and symlinked cwd
+  aliases still prefix-match later events into the same project.
+- Updated `git2` to the patched 0.21 line to clear new RustSec unsoundness
+  advisories in libgit2 bindings.
 
 ## [1.1.3] - 2026-06-20
 
