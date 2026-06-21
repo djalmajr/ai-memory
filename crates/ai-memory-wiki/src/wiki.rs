@@ -1366,6 +1366,16 @@ fn canonicalize_index_frontmatter(
 
 fn render_auto_improve_sidecar(detail: &AutoImproveProposalDetail) -> WikiResult<String> {
     let evidence = serde_json::to_string_pretty(&detail.evidence_json)?;
+    let patch = detail
+        .patch_json
+        .as_ref()
+        .map(serde_json::to_string_pretty)
+        .transpose()?
+        .unwrap_or_else(|| "null".into());
+    let expected_base = detail
+        .expected_base_body_sha256
+        .map(|hash| hash.iter().map(|b| format!("{b:02x}")).collect::<String>())
+        .unwrap_or_else(|| "none".into());
     Ok(format!(
         "# Pending auto-improvement proposal\n\n\
          - proposal_id: `{}`\n\
@@ -1376,9 +1386,12 @@ fn render_auto_improve_sidecar(detail: &AutoImproveProposalDetail) -> WikiResult
          - kind: `{}`\n\
          - title: `{}`\n\
          - confidence: `{}`\n\
+         - edit_mode: `{}`\n\
+         - expected_base_body_sha256: `{}`\n\
          - staged_at: `{}`\n\n\
          ## Rationale\n\n{}\n\n\
          ## Evidence\n\n```json\n{}\n```\n\n\
+         ## Patch metadata\n\n```json\n{}\n```\n\n\
          ## Proposed body\n\n{}\n",
         detail.summary.id,
         detail.summary.run_id,
@@ -1388,9 +1401,12 @@ fn render_auto_improve_sidecar(detail: &AutoImproveProposalDetail) -> WikiResult
         detail.summary.kind,
         detail.summary.title,
         detail.summary.confidence,
+        detail.edit_mode,
+        expected_base,
         detail.summary.staged_at,
         detail.rationale,
         evidence,
+        patch,
         detail.body_markdown,
     ))
 }
@@ -1663,6 +1679,9 @@ mod tests {
             evidence_json: serde_json::json!([{ "source": "test" }]),
             body_markdown: body.into(),
             artifact_sha256: None,
+            edit_mode: None,
+            patch_json: None,
+            expected_base_body_sha256: None,
         }
     }
 

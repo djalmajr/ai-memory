@@ -189,6 +189,9 @@ pub async fn run(config: &Config, args: ServeArgs) -> Result<()> {
         .with_wiki(wiki.clone())
         .with_decay_params(config.decay)
         .with_auto_improve_require_approval(config.auto_improve.require_approval)
+        .with_auto_improve_review_config(auto_improve_review_config_from_settings(
+            &config.auto_improve,
+        ))
         .with_active_project(active_project.clone())
         .with_sanitizer(sanitizer.clone());
     if let Some(e) = embedder.clone() {
@@ -291,6 +294,9 @@ pub async fn run(config: &Config, args: ServeArgs) -> Result<()> {
                 wiki: wiki.clone(),
                 llm: admin_llm,
                 auto_improve_require_approval: config.auto_improve.require_approval,
+                auto_improve_review_config: auto_improve_review_config_from_settings(
+                    &config.auto_improve,
+                ),
                 embedder: embedder.clone(),
                 provider_health: provider_health.clone(),
                 decay_params: config.decay,
@@ -872,16 +878,7 @@ async fn run_scheduled_auto_improve(
     ctx: &ScheduledAutoImproveContext<'_>,
     session_id: SessionId,
 ) -> Result<ScheduledAutoImproveOutcome> {
-    let cfg = AutoImproveReviewConfig {
-        min_observations: ctx.settings.min_observations,
-        min_session_duration_secs: ctx.settings.min_session_duration_secs,
-        min_confidence: ctx.settings.min_confidence,
-        max_input_tokens: ctx.settings.max_input_tokens,
-        max_proposals_per_run: ctx.settings.max_proposals_per_run,
-        include_raw_fallback: ctx.settings.include_raw_fallback,
-        proposal_actor: ctx.settings.proposal_actor.clone(),
-        pending_path: ctx.settings.pending_path.clone(),
-    };
+    let cfg = auto_improve_review_config_from_settings(ctx.settings);
     let report = run_auto_improve_review(
         ctx.reader,
         &**ctx.llm,
@@ -915,6 +912,18 @@ async fn run_scheduled_auto_improve(
                 "max_input_tokens": cfg.max_input_tokens,
                 "max_proposals_per_run": cfg.max_proposals_per_run,
                 "include_raw_fallback": cfg.include_raw_fallback,
+                "max_patchable_pages": cfg.max_patchable_pages,
+                "max_patchable_body_chars": cfg.max_patchable_body_chars,
+                "max_edits_per_proposal": cfg.max_edits_per_proposal,
+                "max_edit_content_chars": cfg.max_edit_content_chars,
+                "max_changed_chars_per_proposal": cfg.max_changed_chars_per_proposal,
+                "max_patch_edits_per_run": cfg.max_patch_edits_per_run,
+                "max_rejection_context": cfg.max_rejection_context,
+                "rejection_context_days": cfg.rejection_context_days,
+                "max_final_body_chars": cfg.max_final_body_chars,
+                "max_rule_page_tokens": cfg.max_rule_page_tokens,
+                "max_procedure_page_tokens": cfg.max_procedure_page_tokens,
+                "eval": cfg.eval,
                 "require_approval": ctx.settings.require_approval,
             }),
             proposal_actor: ActorContext {
@@ -971,6 +980,39 @@ async fn run_scheduled_auto_improve(
     })
 }
 
+fn auto_improve_review_config_from_settings(
+    settings: &AutoImproveSettings,
+) -> AutoImproveReviewConfig {
+    AutoImproveReviewConfig {
+        min_observations: settings.min_observations,
+        min_session_duration_secs: settings.min_session_duration_secs,
+        min_confidence: settings.min_confidence,
+        max_input_tokens: settings.max_input_tokens,
+        max_proposals_per_run: settings.max_proposals_per_run,
+        include_raw_fallback: settings.include_raw_fallback,
+        proposal_actor: settings.proposal_actor.clone(),
+        pending_path: settings.pending_path.clone(),
+        max_patchable_pages: settings.max_patchable_pages,
+        max_patchable_body_chars: settings.max_patchable_body_chars,
+        max_edits_per_proposal: settings.max_edits_per_proposal,
+        max_edit_content_chars: settings.max_edit_content_chars,
+        max_changed_chars_per_proposal: settings.max_changed_chars_per_proposal,
+        max_patch_edits_per_run: settings.max_patch_edits_per_run,
+        max_rejection_context: settings.max_rejection_context,
+        rejection_context_days: settings.rejection_context_days,
+        max_final_body_chars: settings.max_final_body_chars,
+        max_rule_page_tokens: settings.max_rule_page_tokens,
+        max_procedure_page_tokens: settings.max_procedure_page_tokens,
+        eval: ai_memory_consolidate::AutoImproveEvalConfig {
+            enabled: settings.eval.enabled,
+            command: settings.eval.command.clone(),
+            timeout_secs: settings.eval.timeout_secs,
+            targets: settings.eval.targets.clone(),
+            min_delta: settings.eval.min_delta,
+        },
+    }
+}
+
 async fn scheduled_auto_improve_new_proposals(
     reader: &ReaderPool,
     workspace_id: WorkspaceId,
@@ -980,15 +1022,23 @@ async fn scheduled_auto_improve_new_proposals(
     let mut proposals = Vec::with_capacity(report.proposals.len());
     for p in &report.proposals {
         let path = PagePath::new(p.path.clone())?;
-        let operation = if reader
+        let target_exists = reader
             .page_body_by_ids(workspace_id, project_id, path.as_str())
             .await?
-            .is_some()
+            .is_some();
+        let operation = if p.edit_mode == "patch"
+            || (target_exists && path.as_str() == "_slots/current-focus.md")
         {
             AutoImproveProposalOperation::Update
         } else {
             AutoImproveProposalOperation::Create
         };
+        let expected_base_body_sha256 = p
+            .expected_base_body_sha256
+            .as_deref()
+            .map(hex_to_sha256)
+            .transpose()
+            .map_err(|e| anyhow::anyhow!("invalid expected_base_body_sha256: {e}"))?;
         proposals.push(NewAutoImproveProposal {
             operation,
             target_path: path,
@@ -1000,9 +1050,24 @@ async fn scheduled_auto_improve_new_proposals(
                 .unwrap_or_else(|_| serde_json::json!([])),
             body_markdown: p.body_markdown.clone(),
             artifact_sha256: None,
+            edit_mode: Some(p.edit_mode.clone()),
+            patch_json: serde_json::to_value(&p.edits).ok(),
+            expected_base_body_sha256,
         });
     }
     Ok(proposals)
+}
+
+fn hex_to_sha256(hex: &str) -> Result<[u8; 32], String> {
+    if hex.len() != 64 {
+        return Err("expected 64 hex chars".into());
+    }
+    let mut out = [0_u8; 32];
+    for (idx, chunk) in hex.as_bytes().chunks_exact(2).enumerate() {
+        let s = std::str::from_utf8(chunk).map_err(|e| e.to_string())?;
+        out[idx] = u8::from_str_radix(s, 16).map_err(|e| e.to_string())?;
+    }
+    Ok(out)
 }
 
 async fn configure_embedder(

@@ -378,6 +378,8 @@ pub struct AutoImproveSettings {
     /// Background scheduler settings. This controls whether reviews are launched
     /// automatically; it does not control whether accepted proposals are applied.
     pub scheduler: AutoImproveSchedulerSettings,
+    /// Optional executable evaluation gate for selected proposal targets.
+    pub eval: AutoImproveEvalSettings,
     /// Require manual pending-writes approval. Defaults false so validated
     /// proposals are staged for audit and immediately approved through the
     /// normal wiki write path.
@@ -395,12 +397,62 @@ pub struct AutoImproveSettings {
     pub max_input_tokens: usize,
     /// Maximum validated proposals returned from one run.
     pub max_proposals_per_run: usize,
+    /// Maximum existing _rules/ and procedures/ pages included for patch proposals.
+    pub max_patchable_pages: usize,
+    /// Maximum body chars rendered per patchable target page.
+    pub max_patchable_body_chars: usize,
+    /// Maximum patch edits per proposal.
+    pub max_edits_per_proposal: usize,
+    /// Maximum content chars in one patch edit.
+    pub max_edit_content_chars: usize,
+    /// Maximum aggregate changed chars in one patch proposal.
+    pub max_changed_chars_per_proposal: usize,
+    /// Maximum patch edits accepted across one review run.
+    pub max_patch_edits_per_run: usize,
+    /// Maximum recent rejection-buffer entries rendered into prompt context.
+    pub max_rejection_context: usize,
+    /// Maximum age in days for rejection-buffer prompt context.
+    pub rejection_context_days: u32,
+    /// Maximum materialized final body size.
+    pub max_final_body_chars: usize,
+    /// Maximum approximate tokens allowed in one _rules/ page.
+    pub max_rule_page_tokens: usize,
+    /// Maximum approximate tokens allowed in one procedures/ page.
+    pub max_procedure_page_tokens: usize,
     /// Whether future reviewers may include raw observation fallback details.
     pub include_raw_fallback: bool,
     /// Synthetic actor used for autonomous proposal provenance.
     pub proposal_actor: String,
     /// Wiki-relative folder for non-indexed pending proposal sidecars.
     pub pending_path: String,
+}
+
+/// `[auto_improve.eval]` optional executable proposal gate settings.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct AutoImproveEvalSettings {
+    /// Whether the eval command gate is enabled.
+    pub enabled: bool,
+    /// Executable command plus whitespace-separated args. Executed directly, not through a shell.
+    pub command: String,
+    /// Timeout per proposal eval command.
+    pub timeout_secs: u64,
+    /// Wiki path prefixes that require eval when enabled.
+    pub targets: Vec<String>,
+    /// Required score_after - score_before when scores are present.
+    pub min_delta: f64,
+}
+
+impl Default for AutoImproveEvalSettings {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            command: String::new(),
+            timeout_secs: 120,
+            targets: ai_memory_consolidate::default_auto_improve_eval_targets(),
+            min_delta: 0.0,
+        }
+    }
 }
 
 /// `[auto_improve.scheduler]` background learning loop settings.
@@ -432,6 +484,7 @@ impl Default for AutoImproveSettings {
     fn default() -> Self {
         Self {
             scheduler: AutoImproveSchedulerSettings::default(),
+            eval: AutoImproveEvalSettings::default(),
             require_approval: false,
             on_session_end: false,
             min_observations: ai_memory_consolidate::DEFAULT_AUTO_IMPROVE_MIN_OBSERVATIONS,
@@ -440,6 +493,25 @@ impl Default for AutoImproveSettings {
             min_confidence: DEFAULT_AUTO_IMPROVE_MIN_CONFIDENCE,
             max_input_tokens: ai_memory_consolidate::DEFAULT_AUTO_IMPROVE_MAX_INPUT_TOKENS,
             max_proposals_per_run: ai_memory_consolidate::DEFAULT_AUTO_IMPROVE_MAX_PROPOSALS,
+            max_patchable_pages: ai_memory_consolidate::DEFAULT_AUTO_IMPROVE_MAX_PATCHABLE_PAGES,
+            max_patchable_body_chars:
+                ai_memory_consolidate::DEFAULT_AUTO_IMPROVE_MAX_PATCHABLE_BODY_CHARS,
+            max_edits_per_proposal:
+                ai_memory_consolidate::DEFAULT_AUTO_IMPROVE_MAX_EDITS_PER_PROPOSAL,
+            max_edit_content_chars:
+                ai_memory_consolidate::DEFAULT_AUTO_IMPROVE_MAX_EDIT_CONTENT_CHARS,
+            max_changed_chars_per_proposal:
+                ai_memory_consolidate::DEFAULT_AUTO_IMPROVE_MAX_CHANGED_CHARS_PER_PROPOSAL,
+            max_patch_edits_per_run:
+                ai_memory_consolidate::DEFAULT_AUTO_IMPROVE_MAX_PATCH_EDITS_PER_RUN,
+            max_rejection_context:
+                ai_memory_consolidate::DEFAULT_AUTO_IMPROVE_MAX_REJECTION_CONTEXT,
+            rejection_context_days:
+                ai_memory_consolidate::DEFAULT_AUTO_IMPROVE_REJECTION_CONTEXT_DAYS,
+            max_final_body_chars: ai_memory_consolidate::DEFAULT_AUTO_IMPROVE_MAX_FINAL_BODY_CHARS,
+            max_rule_page_tokens: ai_memory_consolidate::DEFAULT_AUTO_IMPROVE_MAX_RULE_PAGE_TOKENS,
+            max_procedure_page_tokens:
+                ai_memory_consolidate::DEFAULT_AUTO_IMPROVE_MAX_PROCEDURE_PAGE_TOKENS,
             include_raw_fallback: false,
             proposal_actor: ai_memory_consolidate::DEFAULT_AUTO_IMPROVE_PROPOSAL_ACTOR.into(),
             pending_path: ai_memory_consolidate::DEFAULT_AUTO_IMPROVE_PENDING_PATH.into(),
@@ -860,6 +932,22 @@ mod tests {
         );
         assert_eq!(cfg.auto_improve.max_input_tokens, 24_000);
         assert_eq!(cfg.auto_improve.max_proposals_per_run, 5);
+        assert_eq!(cfg.auto_improve.max_patchable_pages, 8);
+        assert_eq!(cfg.auto_improve.max_patchable_body_chars, 8_000);
+        assert_eq!(cfg.auto_improve.max_edits_per_proposal, 5);
+        assert_eq!(cfg.auto_improve.max_edit_content_chars, 4_000);
+        assert_eq!(cfg.auto_improve.max_changed_chars_per_proposal, 12_000);
+        assert_eq!(cfg.auto_improve.max_patch_edits_per_run, 8);
+        assert_eq!(cfg.auto_improve.max_rejection_context, 50);
+        assert_eq!(cfg.auto_improve.rejection_context_days, 180);
+        assert_eq!(cfg.auto_improve.max_final_body_chars, 32_000);
+        assert_eq!(cfg.auto_improve.max_rule_page_tokens, 2_000);
+        assert_eq!(cfg.auto_improve.max_procedure_page_tokens, 2_000);
+        assert!(!cfg.auto_improve.eval.enabled);
+        assert_eq!(cfg.auto_improve.eval.command, "");
+        assert_eq!(cfg.auto_improve.eval.timeout_secs, 120);
+        assert_eq!(cfg.auto_improve.eval.targets, vec!["_rules", "procedures"]);
+        assert_eq!(cfg.auto_improve.eval.min_delta, 0.0);
         assert!(!cfg.auto_improve.include_raw_fallback);
         assert_eq!(cfg.auto_improve.proposal_actor, "auto_improve");
         assert_eq!(cfg.auto_improve.pending_path, "_pending/auto-improve");
@@ -936,6 +1024,17 @@ mod tests {
             min_confidence = 0.9
             max_input_tokens = 12000
             max_proposals_per_run = 2
+            max_patchable_pages = 3
+            max_patchable_body_chars = 4096
+            max_edits_per_proposal = 4
+            max_edit_content_chars = 1024
+            max_changed_chars_per_proposal = 2048
+            max_patch_edits_per_run = 6
+            max_rejection_context = 7
+            rejection_context_days = 14
+            max_final_body_chars = 8192
+            max_rule_page_tokens = 1000
+            max_procedure_page_tokens = 1500
             include_raw_fallback = true
             proposal_actor = "review_bot"
             pending_path = "_pending/review-bot"
@@ -945,6 +1044,13 @@ mod tests {
             interval_secs = 1800
             max_sessions_per_tick = 4
             min_session_age_secs = 30
+
+            [auto_improve.eval]
+            enabled = true
+            command = "/usr/local/bin/auto-improve-eval --json"
+            timeout_secs = 9
+            targets = ["_rules"]
+            min_delta = 0.05
             "#,
         )
         .unwrap();
@@ -967,6 +1073,25 @@ mod tests {
         assert_eq!(cfg.auto_improve.min_confidence, 0.9);
         assert_eq!(cfg.auto_improve.max_input_tokens, 12_000);
         assert_eq!(cfg.auto_improve.max_proposals_per_run, 2);
+        assert_eq!(cfg.auto_improve.max_patchable_pages, 3);
+        assert_eq!(cfg.auto_improve.max_patchable_body_chars, 4_096);
+        assert_eq!(cfg.auto_improve.max_edits_per_proposal, 4);
+        assert_eq!(cfg.auto_improve.max_edit_content_chars, 1_024);
+        assert_eq!(cfg.auto_improve.max_changed_chars_per_proposal, 2_048);
+        assert_eq!(cfg.auto_improve.max_patch_edits_per_run, 6);
+        assert_eq!(cfg.auto_improve.max_rejection_context, 7);
+        assert_eq!(cfg.auto_improve.rejection_context_days, 14);
+        assert_eq!(cfg.auto_improve.max_final_body_chars, 8_192);
+        assert_eq!(cfg.auto_improve.max_rule_page_tokens, 1_000);
+        assert_eq!(cfg.auto_improve.max_procedure_page_tokens, 1_500);
+        assert!(cfg.auto_improve.eval.enabled);
+        assert_eq!(
+            cfg.auto_improve.eval.command,
+            "/usr/local/bin/auto-improve-eval --json"
+        );
+        assert_eq!(cfg.auto_improve.eval.timeout_secs, 9);
+        assert_eq!(cfg.auto_improve.eval.targets, vec!["_rules"]);
+        assert_eq!(cfg.auto_improve.eval.min_delta, 0.05);
         assert!(cfg.auto_improve.include_raw_fallback);
         assert_eq!(cfg.auto_improve.proposal_actor, "review_bot");
         assert_eq!(cfg.auto_improve.pending_path, "_pending/review-bot");

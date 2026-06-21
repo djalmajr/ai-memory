@@ -32,6 +32,36 @@ const HANDOFF_TEXT_LIST_MAX_CHARS: usize = 6_000;
 const HANDOFF_FILE_LIST_MAX_CHARS: usize = 4_096;
 const HANDOFF_LIST_MAX_ITEMS: usize = 20;
 
+fn default_auto_improve_review_config() -> AutoImproveReviewConfig {
+    AutoImproveReviewConfig {
+        min_observations: ai_memory_consolidate::DEFAULT_AUTO_IMPROVE_MIN_OBSERVATIONS,
+        min_session_duration_secs:
+            ai_memory_consolidate::DEFAULT_AUTO_IMPROVE_MIN_SESSION_DURATION_SECS,
+        min_confidence: ai_memory_consolidate::DEFAULT_AUTO_IMPROVE_MIN_CONFIDENCE,
+        max_input_tokens: ai_memory_consolidate::DEFAULT_AUTO_IMPROVE_MAX_INPUT_TOKENS,
+        max_proposals_per_run: ai_memory_consolidate::DEFAULT_AUTO_IMPROVE_MAX_PROPOSALS,
+        include_raw_fallback: false,
+        proposal_actor: ai_memory_consolidate::DEFAULT_AUTO_IMPROVE_PROPOSAL_ACTOR.into(),
+        pending_path: ai_memory_consolidate::DEFAULT_AUTO_IMPROVE_PENDING_PATH.into(),
+        max_patchable_pages: ai_memory_consolidate::DEFAULT_AUTO_IMPROVE_MAX_PATCHABLE_PAGES,
+        max_patchable_body_chars:
+            ai_memory_consolidate::DEFAULT_AUTO_IMPROVE_MAX_PATCHABLE_BODY_CHARS,
+        max_edits_per_proposal: ai_memory_consolidate::DEFAULT_AUTO_IMPROVE_MAX_EDITS_PER_PROPOSAL,
+        max_edit_content_chars: ai_memory_consolidate::DEFAULT_AUTO_IMPROVE_MAX_EDIT_CONTENT_CHARS,
+        max_changed_chars_per_proposal:
+            ai_memory_consolidate::DEFAULT_AUTO_IMPROVE_MAX_CHANGED_CHARS_PER_PROPOSAL,
+        max_patch_edits_per_run:
+            ai_memory_consolidate::DEFAULT_AUTO_IMPROVE_MAX_PATCH_EDITS_PER_RUN,
+        max_rejection_context: ai_memory_consolidate::DEFAULT_AUTO_IMPROVE_MAX_REJECTION_CONTEXT,
+        rejection_context_days: ai_memory_consolidate::DEFAULT_AUTO_IMPROVE_REJECTION_CONTEXT_DAYS,
+        max_final_body_chars: ai_memory_consolidate::DEFAULT_AUTO_IMPROVE_MAX_FINAL_BODY_CHARS,
+        max_rule_page_tokens: ai_memory_consolidate::DEFAULT_AUTO_IMPROVE_MAX_RULE_PAGE_TOKENS,
+        max_procedure_page_tokens:
+            ai_memory_consolidate::DEFAULT_AUTO_IMPROVE_MAX_PROCEDURE_PAGE_TOKENS,
+        eval: ai_memory_consolidate::AutoImproveEvalConfig::default(),
+    }
+}
+
 fn cap_handoff_list<I>(
     items: I,
     item_max_chars: usize,
@@ -286,6 +316,10 @@ pub struct AiMemoryServer {
     /// otherwise it immediately approves validated proposals through the normal
     /// wiki write path.
     auto_improve_require_approval: bool,
+    /// Server-configured defaults used by manual MCP auto-improvement. This
+    /// keeps manual runs at least as strict as the operator's configured
+    /// Phase 1/2 budgets instead of falling back to compiled defaults.
+    auto_improve_review_config: AutoImproveReviewConfig,
     // Read by the `#[tool_handler]` macro expansion; rustc's dead-code
     // analysis can't see that, so the lint must be allowed explicitly.
     #[allow(dead_code)]
@@ -695,6 +729,7 @@ impl AiMemoryServer {
             embedder: None,
             sanitizer: ai_memory_core::Sanitizer::builtin(),
             auto_improve_require_approval: false,
+            auto_improve_review_config: default_auto_improve_review_config(),
             tool_router: Self::tool_router(),
         }
     }
@@ -703,6 +738,13 @@ impl AiMemoryServer {
     #[must_use]
     pub fn with_auto_improve_require_approval(mut self, require_approval: bool) -> Self {
         self.auto_improve_require_approval = require_approval;
+        self
+    }
+
+    /// Configure manual MCP auto-improve review budgets from server config.
+    #[must_use]
+    pub fn with_auto_improve_review_config(mut self, config: AutoImproveReviewConfig) -> Self {
+        self.auto_improve_review_config = config;
         self
     }
 
@@ -1304,25 +1346,32 @@ impl AiMemoryServer {
                     )
                 })?,
         };
+        let defaults = &self.auto_improve_review_config;
         let cfg = AutoImproveReviewConfig {
-            min_observations: args
-                .min_observations
-                .unwrap_or(ai_memory_consolidate::DEFAULT_AUTO_IMPROVE_MIN_OBSERVATIONS),
+            min_observations: args.min_observations.unwrap_or(defaults.min_observations),
             min_session_duration_secs: args
                 .min_session_duration_secs
-                .unwrap_or(ai_memory_consolidate::DEFAULT_AUTO_IMPROVE_MIN_SESSION_DURATION_SECS),
-            min_confidence: args
-                .min_confidence
-                .unwrap_or(ai_memory_consolidate::DEFAULT_AUTO_IMPROVE_MIN_CONFIDENCE),
-            max_input_tokens: args
-                .max_input_tokens
-                .unwrap_or(ai_memory_consolidate::DEFAULT_AUTO_IMPROVE_MAX_INPUT_TOKENS),
-            max_proposals_per_run: args
-                .max_proposals
-                .unwrap_or(ai_memory_consolidate::DEFAULT_AUTO_IMPROVE_MAX_PROPOSALS),
-            include_raw_fallback: args.include_raw_fallback.unwrap_or(false),
-            proposal_actor: ai_memory_consolidate::DEFAULT_AUTO_IMPROVE_PROPOSAL_ACTOR.into(),
-            pending_path: ai_memory_consolidate::DEFAULT_AUTO_IMPROVE_PENDING_PATH.into(),
+                .unwrap_or(defaults.min_session_duration_secs),
+            min_confidence: args.min_confidence.unwrap_or(defaults.min_confidence),
+            max_input_tokens: args.max_input_tokens.unwrap_or(defaults.max_input_tokens),
+            max_proposals_per_run: args.max_proposals.unwrap_or(defaults.max_proposals_per_run),
+            include_raw_fallback: args
+                .include_raw_fallback
+                .unwrap_or(defaults.include_raw_fallback),
+            proposal_actor: defaults.proposal_actor.clone(),
+            pending_path: defaults.pending_path.clone(),
+            max_patchable_pages: defaults.max_patchable_pages,
+            max_patchable_body_chars: defaults.max_patchable_body_chars,
+            max_edits_per_proposal: defaults.max_edits_per_proposal,
+            max_edit_content_chars: defaults.max_edit_content_chars,
+            max_changed_chars_per_proposal: defaults.max_changed_chars_per_proposal,
+            max_patch_edits_per_run: defaults.max_patch_edits_per_run,
+            max_rejection_context: defaults.max_rejection_context,
+            rejection_context_days: defaults.rejection_context_days,
+            max_final_body_chars: defaults.max_final_body_chars,
+            max_rule_page_tokens: defaults.max_rule_page_tokens,
+            max_procedure_page_tokens: defaults.max_procedure_page_tokens,
+            eval: defaults.eval.clone(),
         };
 
         let report =
@@ -1334,17 +1383,30 @@ impl AiMemoryServer {
             let path = PagePath::new(p.path.clone()).map_err(|e| {
                 McpError::invalid_params(format!("invalid proposal path: {e}"), None)
             })?;
-            let operation = if self
+            let target_exists = self
                 .reader
                 .page_body_by_ids(ws, proj, path.as_str())
                 .await
                 .map_err(|e| McpError::internal_error(e.to_string(), None))?
-                .is_some()
+                .is_some();
+            let operation = if p.edit_mode == "patch"
+                || (target_exists && path.as_str() == "_slots/current-focus.md")
             {
                 AutoImproveProposalOperation::Update
             } else {
                 AutoImproveProposalOperation::Create
             };
+            let expected_base_body_sha256 = p
+                .expected_base_body_sha256
+                .as_deref()
+                .map(hex_to_sha256)
+                .transpose()
+                .map_err(|e| {
+                    McpError::internal_error(
+                        format!("invalid expected_base_body_sha256: {e}"),
+                        None,
+                    )
+                })?;
             proposals.push(NewAutoImproveProposal {
                 operation,
                 target_path: path,
@@ -1356,6 +1418,9 @@ impl AiMemoryServer {
                     .map_err(|e| McpError::internal_error(e.to_string(), None))?,
                 body_markdown: p.body_markdown.clone(),
                 artifact_sha256: None,
+                edit_mode: Some(p.edit_mode.clone()),
+                patch_json: serde_json::to_value(&p.edits).ok(),
+                expected_base_body_sha256,
             });
         }
         let staged = self
@@ -1378,6 +1443,18 @@ impl AiMemoryServer {
                     "max_input_tokens": cfg.max_input_tokens,
                     "max_proposals_per_run": cfg.max_proposals_per_run,
                     "include_raw_fallback": cfg.include_raw_fallback,
+                    "max_patchable_pages": cfg.max_patchable_pages,
+                    "max_patchable_body_chars": cfg.max_patchable_body_chars,
+                    "max_edits_per_proposal": cfg.max_edits_per_proposal,
+                    "max_edit_content_chars": cfg.max_edit_content_chars,
+                    "max_changed_chars_per_proposal": cfg.max_changed_chars_per_proposal,
+                    "max_patch_edits_per_run": cfg.max_patch_edits_per_run,
+                    "max_rejection_context": cfg.max_rejection_context,
+                    "rejection_context_days": cfg.rejection_context_days,
+                    "max_final_body_chars": cfg.max_final_body_chars,
+                    "max_rule_page_tokens": cfg.max_rule_page_tokens,
+                    "max_procedure_page_tokens": cfg.max_procedure_page_tokens,
+                    "eval": cfg.eval,
                 }),
                 proposal_actor: ai_memory_core::ActorContext {
                     agent: Some(cfg.proposal_actor.clone()),
@@ -2096,6 +2173,18 @@ impl AiMemoryServer {
         });
         ok_json(&response)
     }
+}
+
+fn hex_to_sha256(hex: &str) -> Result<[u8; 32], String> {
+    if hex.len() != 64 {
+        return Err("expected 64 hex chars".into());
+    }
+    let mut out = [0_u8; 32];
+    for (idx, chunk) in hex.as_bytes().chunks_exact(2).enumerate() {
+        let s = std::str::from_utf8(chunk).map_err(|e| e.to_string())?;
+        out[idx] = u8::from_str_radix(s, 16).map_err(|e| e.to_string())?;
+    }
+    Ok(out)
 }
 
 #[tool_handler]

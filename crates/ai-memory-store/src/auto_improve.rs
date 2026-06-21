@@ -10,6 +10,7 @@ use jiff::Timestamp;
 use rusqlite::{Connection, OptionalExtension, Row, params};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use uuid::Uuid;
 
 use crate::error::{StoreError, StoreResult};
 use crate::ops;
@@ -107,6 +108,9 @@ pub struct NewAutoImproveProposal {
     pub evidence_json: serde_json::Value,
     pub body_markdown: String,
     pub artifact_sha256: Option<[u8; 32]>,
+    pub edit_mode: Option<String>,
+    pub patch_json: Option<serde_json::Value>,
+    pub expected_base_body_sha256: Option<[u8; 32]>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -148,6 +152,10 @@ pub struct AutoImproveProposalDetail {
     pub decided_by_actor_json: Option<serde_json::Value>,
     pub applied_page_id: Option<PageId>,
     pub checkpoint: Option<String>,
+    pub edit_mode: String,
+    pub patch_json: Option<serde_json::Value>,
+    pub expected_base_body_sha256: Option<[u8; 32]>,
+    pub materialized_base_body_sha256: Option<[u8; 32]>,
     pub events: Vec<AutoImproveProposalEvent>,
 }
 
@@ -160,6 +168,24 @@ pub struct AutoImproveProposalEvent {
     pub author_id: Option<UserId>,
     pub detail_json: serde_json::Value,
     pub at: i64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct AutoImproveRejectionSummary {
+    pub id: String,
+    pub workspace_id: WorkspaceId,
+    pub project_id: ProjectId,
+    pub target_path: Option<String>,
+    pub kind: Option<String>,
+    pub operation: Option<String>,
+    pub edit_mode: Option<String>,
+    pub reason: String,
+    pub normalized_fingerprint: String,
+    pub summary: String,
+    pub evidence_json: serde_json::Value,
+    pub source_run_id: Option<AutoImproveRunId>,
+    pub source_proposal_id: Option<AutoImproveProposalId>,
+    pub created_at: i64,
 }
 
 #[derive(Debug, Clone)]
@@ -326,12 +352,19 @@ pub fn stage_run(
             now,
         ],
     )?;
+    insert_rejected_candidates_in_tx(&tx, input, run_id, now)?;
     let mut proposal_ids = Vec::with_capacity(input.proposals.len());
     for proposal in &input.proposals {
         let id = AutoImproveProposalId::new();
         let artifact_path = artifact_path_for(id);
         let evidence_json = serde_json::to_string(&proposal.evidence_json)?;
         let body_sha256 = sha256(proposal.body_markdown.as_bytes());
+        let edit_mode = proposal.edit_mode.as_deref().unwrap_or("full_page");
+        let patch_json = proposal
+            .patch_json
+            .as_ref()
+            .map(serde_json::to_string)
+            .transpose()?;
         let target_snapshot = latest_target_snapshot(
             &tx,
             input.workspace_id,
@@ -360,14 +393,50 @@ pub fn stage_run(
                 )));
             }
         };
+        if edit_mode == "patch" {
+            if proposal.operation != AutoImproveProposalOperation::Update {
+                return Err(StoreError::InvalidState(format!(
+                    "patch proposal must use update operation: {}",
+                    proposal.target_path
+                )));
+            }
+            if patch_json.is_none() {
+                return Err(StoreError::InvalidState(format!(
+                    "patch proposal missing patch_json: {}",
+                    proposal.target_path
+                )));
+            }
+            let Some(expected) = proposal.expected_base_body_sha256 else {
+                return Err(StoreError::InvalidState(format!(
+                    "patch proposal missing expected base body hash: {}",
+                    proposal.target_path
+                )));
+            };
+            match target_body_sha256_at_stage {
+                Some(current) if current == expected => {}
+                Some(_) => {
+                    return Err(StoreError::InvalidState(format!(
+                        "auto-improve proposal target changed since patch materialization: {}",
+                        proposal.target_path
+                    )));
+                }
+                None => {
+                    return Err(StoreError::InvalidState(format!(
+                        "patch proposal target does not exist: {}",
+                        proposal.target_path
+                    )));
+                }
+            }
+        }
         tx.execute(
             "INSERT INTO auto_improve_proposals \
              (id, run_id, workspace_id, project_id, status, operation, target_path, kind, title, \
               confidence, rationale, evidence_json, body_markdown, body_sha256, artifact_path, \
               artifact_sha256, target_latest_page_id_at_stage, target_body_sha256_at_stage, \
-              target_updated_at_at_stage, staged_at) \
+              target_updated_at_at_stage, staged_at, edit_mode, patch_json, \
+              expected_base_body_sha256, materialized_base_body_sha256) \
              VALUES (?1, ?2, ?3, ?4, 'pending', ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, \
-                     ?15, ?16, ?17, ?18, ?19)",
+                     ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23)",
             params![
                 id.as_bytes(),
                 run_id.as_bytes(),
@@ -388,6 +457,10 @@ pub fn stage_run(
                 target_body_sha256_at_stage.map(|h| h.to_vec()),
                 target_updated_at_at_stage,
                 now,
+                edit_mode,
+                patch_json,
+                proposal.expected_base_body_sha256.map(|h| h.to_vec()),
+                proposal.expected_base_body_sha256.map(|h| h.to_vec()),
             ],
         )?;
         insert_event_in_tx(
@@ -432,6 +505,7 @@ pub fn fail_proposal(conn: &mut Connection, input: &FailAutoImproveProposal) -> 
             "auto-improve proposal is not pending or not in scope".into(),
         ));
     }
+    insert_rejection_for_proposal_in_tx(&tx, input.proposal_id, &input.reason, now)?;
     insert_event_in_tx(
         &tx,
         input.proposal_id,
@@ -472,6 +546,7 @@ pub fn reject_proposal(
             "auto-improve proposal is not pending or not in scope".into(),
         ));
     }
+    insert_rejection_for_proposal_in_tx(&tx, input.proposal_id, &input.reason, now)?;
     insert_event_in_tx(
         &tx,
         input.proposal_id,
@@ -549,6 +624,12 @@ pub fn approve_proposal(
         },
     };
     if conflict {
+        insert_rejection_for_proposal_in_tx(
+            &tx,
+            input.proposal_id,
+            "target changed since proposal was staged",
+            now,
+        )?;
         mark_decision_in_tx(
             &tx,
             input,
@@ -661,6 +742,180 @@ fn insert_event_in_tx(
         ],
     )?;
     Ok(())
+}
+
+fn insert_rejected_candidates_in_tx(
+    tx: &rusqlite::Transaction<'_>,
+    input: &StageAutoImproveRun,
+    run_id: AutoImproveRunId,
+    now: i64,
+) -> StoreResult<()> {
+    let Some(candidates) = input.rejected_candidates_json.as_array() else {
+        return Ok(());
+    };
+    for candidate in candidates {
+        let reason = candidate
+            .get("reason")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("")
+            .trim();
+        if reason.is_empty() {
+            continue;
+        }
+        let target_path = string_field(candidate, "target_path")
+            .or_else(|| string_field(candidate, "path"))
+            .or_else(|| {
+                string_field(candidate, "evidence").filter(|value| PagePath::new(value).is_ok())
+            });
+        let summary = string_field(candidate, "summary")
+            .or_else(|| string_field(candidate, "evidence"))
+            .unwrap_or_else(|| reason.to_string());
+        let record = NewAutoImproveRejectionRecord {
+            workspace_id: input.workspace_id,
+            project_id: input.project_id,
+            target_path,
+            kind: string_field(candidate, "kind"),
+            operation: string_field(candidate, "operation"),
+            edit_mode: string_field(candidate, "edit_mode"),
+            reason: reason.to_string(),
+            summary,
+            evidence_json: candidate.clone(),
+            source_run_id: Some(run_id),
+            source_proposal_id: None,
+        };
+        insert_rejection_record_in_tx(tx, &record, now)?;
+    }
+    Ok(())
+}
+
+fn string_field(value: &serde_json::Value, key: &str) -> Option<String> {
+    value
+        .get(key)
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(ToOwned::to_owned)
+}
+
+struct NewAutoImproveRejectionRecord {
+    workspace_id: WorkspaceId,
+    project_id: ProjectId,
+    target_path: Option<String>,
+    kind: Option<String>,
+    operation: Option<String>,
+    edit_mode: Option<String>,
+    reason: String,
+    summary: String,
+    evidence_json: serde_json::Value,
+    source_run_id: Option<AutoImproveRunId>,
+    source_proposal_id: Option<AutoImproveProposalId>,
+}
+
+fn insert_rejection_for_proposal_in_tx(
+    tx: &rusqlite::Transaction<'_>,
+    proposal_id: AutoImproveProposalId,
+    reason: &str,
+    now: i64,
+) -> StoreResult<()> {
+    let record = tx.query_row(
+        "SELECT run_id, workspace_id, project_id, operation, target_path, kind, title, rationale, \
+                evidence_json, edit_mode \
+         FROM auto_improve_proposals WHERE id = ?1",
+        params![proposal_id.as_bytes()],
+        |row| {
+            let run_id =
+                AutoImproveRunId::from_slice(&row.get::<_, Vec<u8>>(0)?).map_err(to_sql_err)?;
+            let workspace_id =
+                WorkspaceId::from_slice(&row.get::<_, Vec<u8>>(1)?).map_err(to_sql_err)?;
+            let project_id =
+                ProjectId::from_slice(&row.get::<_, Vec<u8>>(2)?).map_err(to_sql_err)?;
+            let evidence_raw: String = row.get(8)?;
+            let title: String = row.get(6)?;
+            let rationale: String = row.get(7)?;
+            Ok(NewAutoImproveRejectionRecord {
+                workspace_id,
+                project_id,
+                target_path: Some(row.get(4)?),
+                kind: Some(row.get(5)?),
+                operation: Some(row.get(3)?),
+                edit_mode: Some(row.get(9)?),
+                reason: reason.to_string(),
+                summary: if title.trim().is_empty() {
+                    rationale
+                } else {
+                    title
+                },
+                evidence_json: serde_json::from_str(&evidence_raw).map_err(to_sql_err)?,
+                source_run_id: Some(run_id),
+                source_proposal_id: Some(proposal_id),
+            })
+        },
+    )?;
+    insert_rejection_record_in_tx(tx, &record, now)
+}
+
+fn insert_rejection_record_in_tx(
+    tx: &rusqlite::Transaction<'_>,
+    record: &NewAutoImproveRejectionRecord,
+    now: i64,
+) -> StoreResult<()> {
+    let id = Uuid::new_v4();
+    let evidence_json = serde_json::to_string(&record.evidence_json)?;
+    let fingerprint = rejection_fingerprint(record);
+    tx.execute(
+        "INSERT INTO auto_improve_rejections \
+         (id, workspace_id, project_id, target_path, kind, operation, edit_mode, reason, \
+          normalized_fingerprint, summary, evidence_json, source_run_id, source_proposal_id, created_at) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+        params![
+            id.as_bytes().as_slice(),
+            record.workspace_id.as_bytes(),
+            record.project_id.as_bytes(),
+            record.target_path.as_deref(),
+            record.kind.as_deref(),
+            record.operation.as_deref(),
+            record.edit_mode.as_deref(),
+            record.reason.as_str(),
+            fingerprint,
+            record.summary.as_str(),
+            evidence_json,
+            record.source_run_id.map(|id| id.as_bytes().to_vec()),
+            record.source_proposal_id.map(|id| id.as_bytes().to_vec()),
+            now,
+        ],
+    )?;
+    Ok(())
+}
+
+fn rejection_fingerprint(record: &NewAutoImproveRejectionRecord) -> String {
+    let input = [
+        normalize_fp(record.target_path.as_deref().unwrap_or("")),
+        normalize_fp(record.kind.as_deref().unwrap_or("")),
+        normalize_fp(record.operation.as_deref().unwrap_or("")),
+        normalize_fp(record.edit_mode.as_deref().unwrap_or("")),
+        normalize_fp(&record.reason),
+        normalize_fp(&record.summary),
+    ]
+    .join("\n");
+    hex_sha256(input.as_bytes())
+}
+
+fn normalize_fp(value: &str) -> String {
+    value
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_ascii_lowercase()
+}
+
+fn hex_sha256(bytes: &[u8]) -> String {
+    let hash = Sha256::digest(bytes);
+    let mut out = String::with_capacity(64);
+    for byte in hash {
+        use std::fmt::Write as _;
+        let _ = write!(&mut out, "{byte:02x}");
+    }
+    out
 }
 
 fn sha256(bytes: &[u8]) -> [u8; 32] {

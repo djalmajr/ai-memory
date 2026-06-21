@@ -36,7 +36,10 @@ non-overlapping; long all-project review passes delay the next tick instead of
 starting another copy. Scheduling and approval are separate. Admins can set
 `[auto_improve.scheduler] enabled = false` to stop background review, or
 `[auto_improve] require_approval = true` to leave scheduled and manual proposals
-pending for review.
+pending for review. Operators can additionally set `[auto_improve.eval]` to run
+a project-supplied executable gate for selected proposal prefixes after LLM
+validation and before staging/approval; it is disabled by default and never runs
+from hook paths.
 
 **Steady-state loop:**
 
@@ -70,7 +73,10 @@ pending for review.
    not retry forever. Explicit CLI/admin/MCP auto-improve calls use the same
    pipeline for targeted reruns or catch-up. With `[auto_improve]
    require_approval = true`, scheduled and manual proposals remain pending until
-   explicit pending-writes approval.
+   explicit pending-writes approval. If `[auto_improve.eval] enabled = true`,
+   targeted proposals (default `_rules/` and `procedures/`) must pass the
+   configured executable JSON contract before they are staged; failures become
+   rejected candidates/rejection-buffer entries rather than wiki writes.
 6. `memory_query` answers via FTS5 + link-neighbour RRF; when an
    embedder is configured, vector cosine over `page_embeddings` joins
    the same RRF. If compiled wiki pages miss entirely, bounded raw
@@ -335,6 +341,17 @@ min_session_duration_secs = 120
 min_confidence = 0.75
 max_input_tokens = 24000
 max_proposals_per_run = 5
+max_patchable_pages = 8
+max_patchable_body_chars = 8000
+max_edits_per_proposal = 5
+max_edit_content_chars = 4000
+max_changed_chars_per_proposal = 12000
+max_patch_edits_per_run = 8
+max_rejection_context = 50
+rejection_context_days = 180
+max_final_body_chars = 32000
+max_rule_page_tokens = 2000
+max_procedure_page_tokens = 2000
 include_raw_fallback = false
 proposal_actor = "auto_improve"
 pending_path = "_pending/auto-improve"

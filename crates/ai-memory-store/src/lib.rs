@@ -28,8 +28,9 @@ pub use fts_query::prepare_fts5_query;
 pub use auto_improve::{
     ApproveAutoImproveProposal, ApproveAutoImproveProposalResult, AutoImproveProposalDetail,
     AutoImproveProposalEvent, AutoImproveProposalOperation, AutoImproveProposalStatus,
-    AutoImproveProposalSummary, FailAutoImproveProposal, NewAutoImproveProposal,
-    RejectAutoImproveProposal, StageAutoImproveRun, StagedAutoImproveRun, artifact_path_for,
+    AutoImproveProposalSummary, AutoImproveRejectionSummary, FailAutoImproveProposal,
+    NewAutoImproveProposal, RejectAutoImproveProposal, StageAutoImproveRun, StagedAutoImproveRun,
+    artifact_path_for,
 };
 pub use decay::{DecayParams, retention_score};
 pub use error::{StoreError, StoreResult};
@@ -146,6 +147,9 @@ mod tests {
             evidence_json: serde_json::json!([{"source":"test"}]),
             body_markdown: body.into(),
             artifact_sha256: None,
+            edit_mode: None,
+            patch_json: None,
+            expected_base_body_sha256: None,
         }
     }
 
@@ -253,6 +257,9 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(detail.events.len(), 1);
+        assert_eq!(detail.edit_mode, "full_page");
+        assert!(detail.patch_json.is_none());
+        assert!(detail.expected_base_body_sha256.is_none());
         assert_eq!(
             detail.artifact_path,
             format!("_pending/auto-improve/{}.md", staged.proposal_ids[0])
@@ -331,6 +338,16 @@ mod tests {
         assert_eq!(detail.summary.status, AutoImproveProposalStatus::Rejected);
         assert_eq!(detail.decision_reason.as_deref(), Some("nope"));
         assert_eq!(detail.events.last().unwrap().event, "rejected");
+        let rejections = store
+            .reader
+            .recent_auto_improve_rejections(ws, proj, 10, None)
+            .await
+            .unwrap();
+        assert_eq!(rejections.len(), 1);
+        assert_eq!(rejections[0].target_path.as_deref(), Some("notes/r.md"));
+        assert_eq!(rejections[0].reason, "nope");
+        assert_eq!(rejections[0].source_proposal_id, Some(id));
+        assert_eq!(rejections[0].normalized_fingerprint.len(), 64);
         assert!(
             store
                 .writer
@@ -344,6 +361,65 @@ mod tests {
                 })
                 .await
                 .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn auto_improve_old_pending_proposal_survives_rejection_buffer_migration() {
+        let tmp = TempDir::new().unwrap();
+        let db_dir = tmp.path().join("db");
+        std::fs::create_dir_all(&db_dir).unwrap();
+        let db_path = db_dir.join(DB_FILENAME);
+        let mut conn = Connection::open(&db_path).unwrap();
+        migrations::run_to(&mut conn, 23).unwrap();
+        let ws = ops::get_or_create_workspace(&mut conn, "default").unwrap();
+        let proj = ops::get_or_create_project(&mut conn, &ws, "app", None).unwrap();
+        let id = auto_improve::stage_run(
+            &mut conn,
+            &stage_input(
+                ws,
+                proj,
+                vec![proposal(
+                    "notes/old.md",
+                    AutoImproveProposalOperation::Create,
+                    "old",
+                )],
+            ),
+        )
+        .unwrap()
+        .proposal_ids[0];
+        drop(conn);
+
+        let store = Store::open(tmp.path()).unwrap();
+        store
+            .writer
+            .reject_auto_improve_proposal(RejectAutoImproveProposal {
+                workspace_id: ws,
+                project_id: proj,
+                proposal_id: id,
+                reason: "old pending still rejectable".into(),
+                actor: ActorContext::default(),
+                author_id: None,
+            })
+            .await
+            .unwrap();
+
+        let detail = store
+            .reader
+            .auto_improve_proposal_detail(ws, proj, id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(detail.summary.status, AutoImproveProposalStatus::Rejected);
+        assert_eq!(detail.edit_mode, "full_page");
+        assert_eq!(
+            store
+                .reader
+                .recent_auto_improve_rejections(ws, proj, 10, None)
+                .await
+                .unwrap()
+                .len(),
+            1
         );
     }
 
@@ -493,6 +569,60 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn auto_improve_stage_persists_validator_rejections_with_scope_isolation() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let ws = store
+            .writer
+            .get_or_create_workspace("default")
+            .await
+            .unwrap();
+        let proj = store
+            .writer
+            .get_or_create_project(ws, "app", None)
+            .await
+            .unwrap();
+        let other = store
+            .writer
+            .get_or_create_project(ws, "other", None)
+            .await
+            .unwrap();
+
+        let mut input = stage_input(ws, proj, Vec::new());
+        input.rejected_candidates_json = serde_json::json!([{
+            "reason": "duplicate_existing_path",
+            "evidence": "notes/repeat.md",
+            "target_path": "notes/repeat.md",
+            "kind": "note",
+            "operation": "create_or_update",
+            "edit_mode": "full_page"
+        }]);
+        let staged = store.writer.stage_auto_improve_run(input).await.unwrap();
+
+        let rejections = store
+            .reader
+            .recent_auto_improve_rejections(ws, proj, 10, None)
+            .await
+            .unwrap();
+        assert_eq!(rejections.len(), 1);
+        assert_eq!(
+            rejections[0].target_path.as_deref(),
+            Some("notes/repeat.md")
+        );
+        assert_eq!(rejections[0].kind.as_deref(), Some("note"));
+        assert_eq!(rejections[0].source_run_id, Some(staged.run_id));
+        assert_eq!(rejections[0].source_proposal_id, None);
+        assert!(
+            store
+                .reader
+                .recent_auto_improve_rejections(ws, other, 10, None)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
     async fn auto_improve_fail_pending_only_records_event() {
         let tmp = TempDir::new().unwrap();
         let store = Store::open(tmp.path()).unwrap();
@@ -544,6 +674,14 @@ mod tests {
             .unwrap();
         assert_eq!(detail.summary.status, AutoImproveProposalStatus::Failed);
         assert_eq!(detail.events.last().unwrap().event, "failed");
+        let rejections = store
+            .reader
+            .recent_auto_improve_rejections(ws, proj, 10, None)
+            .await
+            .unwrap();
+        assert_eq!(rejections.len(), 1);
+        assert_eq!(rejections[0].target_path.as_deref(), Some("notes/fail.md"));
+        assert_eq!(rejections[0].reason, "admission denied");
         assert!(
             store
                 .writer
@@ -662,6 +800,16 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(conflict, ApproveAutoImproveProposalResult::Conflict);
+        let rejections = store
+            .reader
+            .recent_auto_improve_rejections(ws, proj, 10, None)
+            .await
+            .unwrap();
+        assert!(rejections.iter().any(|rejection| {
+            rejection.target_path.as_deref() == Some("notes/existing.md")
+                && rejection.reason == "target changed since proposal was staged"
+                && rejection.source_proposal_id == Some(stale_create)
+        }));
         assert_eq!(
             store
                 .reader
@@ -726,6 +874,107 @@ mod tests {
         assert_eq!(
             sha256("approved body"),
             latest_snapshot(store.db_path(), ws, proj, "notes/new.md").1
+        );
+    }
+
+    #[tokio::test]
+    async fn auto_improve_stage_rejects_patch_base_hash_mismatch() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let ws = store
+            .writer
+            .get_or_create_workspace("default")
+            .await
+            .unwrap();
+        let proj = store
+            .writer
+            .get_or_create_project(ws, "app", None)
+            .await
+            .unwrap();
+        store
+            .writer
+            .upsert_page(sample_page(ws, proj, "procedures/release.md", "old"))
+            .await
+            .unwrap();
+        let mut patch = proposal(
+            "procedures/release.md",
+            AutoImproveProposalOperation::Update,
+            "new",
+        );
+        patch.edit_mode = Some("patch".into());
+        patch.patch_json =
+            Some(serde_json::json!([{ "op": "append", "anchor": "## Steps", "content": "new" }]));
+        patch.expected_base_body_sha256 = Some(sha256("different old body"));
+
+        let err = store
+            .writer
+            .stage_auto_improve_run(stage_input(ws, proj, vec![patch]))
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("target changed since patch materialization")
+        );
+        assert!(
+            store
+                .reader
+                .list_auto_improve_proposals(ws, proj, None, 10)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn auto_improve_stage_rejects_patch_missing_base_hash_and_create() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let ws = store
+            .writer
+            .get_or_create_workspace("default")
+            .await
+            .unwrap();
+        let proj = store
+            .writer
+            .get_or_create_project(ws, "app", None)
+            .await
+            .unwrap();
+        store
+            .writer
+            .upsert_page(sample_page(ws, proj, "procedures/release.md", "old"))
+            .await
+            .unwrap();
+
+        let mut missing_hash = proposal(
+            "procedures/release.md",
+            AutoImproveProposalOperation::Update,
+            "new",
+        );
+        missing_hash.edit_mode = Some("patch".into());
+        missing_hash.patch_json = Some(serde_json::json!([{ "op": "append" }]));
+        let err = store
+            .writer
+            .stage_auto_improve_run(stage_input(ws, proj, vec![missing_hash]))
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("missing expected base body hash"));
+
+        let mut create_patch = proposal(
+            "procedures/new.md",
+            AutoImproveProposalOperation::Create,
+            "new",
+        );
+        create_patch.edit_mode = Some("patch".into());
+        create_patch.patch_json = Some(serde_json::json!([{ "op": "append" }]));
+        create_patch.expected_base_body_sha256 = Some(sha256("old"));
+        let err = store
+            .writer
+            .stage_auto_improve_run(stage_input(ws, proj, vec![create_patch]))
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("patch proposal must use update operation")
         );
     }
 

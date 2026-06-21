@@ -11,21 +11,24 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use ai_memory_core::{
-    AgentKind, AutoImproveProposalId, Handoff, HandoffId, HandoffState, Observation, ObservationId,
-    ObservationKind, PageId, PagePath, ProjectId, SessionId, User, UserId, WorkspaceId,
+    AgentKind, AutoImproveProposalId, AutoImproveRunId, Handoff, HandoffId, HandoffState,
+    Observation, ObservationId, ObservationKind, PageId, PagePath, ProjectId, SessionId, User,
+    UserId, WorkspaceId,
 };
 use jiff::Timestamp;
 use parking_lot::Mutex;
 use rusqlite::types::Value;
 use rusqlite::{Connection, OpenFlags, OptionalExtension, params, params_from_iter};
 use serde::Serialize;
+use uuid::Uuid;
 // `ai_memory_core::Tier` is referenced via fully-qualified path inside the
 // DecayCandidate struct definition above to avoid a top-level import
 // for a single use-site.
 
 use crate::auto_improve::{
     AutoImproveProposalDetail, AutoImproveProposalEvent, AutoImproveProposalStatus,
-    AutoImproveProposalSummary, bytes32, opt_bytes32, summary_from_row, to_sql_err,
+    AutoImproveProposalSummary, AutoImproveRejectionSummary, bytes32, opt_bytes32,
+    summary_from_row, to_sql_err,
 };
 use crate::error::{StoreError, StoreResult};
 use crate::fts_query::prepare_fts5_query;
@@ -3104,7 +3107,8 @@ impl ReaderPool {
                             artifact_sha256, target_latest_page_id_at_stage, \
                             target_body_sha256_at_stage, target_updated_at_at_stage, \
                             decision_reason, decided_by_author_id, decided_by_actor_json, \
-                            applied_page_id, checkpoint \
+                            applied_page_id, checkpoint, edit_mode, patch_json, \
+                            expected_base_body_sha256, materialized_base_body_sha256 \
                      FROM auto_improve_proposals \
                      WHERE id = ?1 AND workspace_id = ?2 AND project_id = ?3",
                     params![
@@ -3134,6 +3138,7 @@ impl ReaderPool {
                             .map(|b| PageId::from_slice(&b))
                             .transpose()
                             .map_err(to_sql_err)?;
+                        let patch_raw: Option<String> = row.get(27)?;
                         Ok(AutoImproveProposalDetail {
                             summary,
                             rationale: row.get(12)?,
@@ -3154,6 +3159,15 @@ impl ReaderPool {
                                 .map_err(to_sql_err)?,
                             applied_page_id,
                             checkpoint: row.get(25)?,
+                            edit_mode: row.get(26)?,
+                            patch_json: patch_raw
+                                .map(|raw| serde_json::from_str(&raw))
+                                .transpose()
+                                .map_err(to_sql_err)?,
+                            expected_base_body_sha256: opt_bytes32(row.get(28)?)
+                                .map_err(to_sql_err)?,
+                            materialized_base_body_sha256: opt_bytes32(row.get(29)?)
+                                .map_err(to_sql_err)?,
                             events: Vec::new(),
                         })
                     },
@@ -3191,6 +3205,72 @@ impl ReaderPool {
                 detail.events.push(row?);
             }
             Ok(Some(detail))
+        })
+        .await
+    }
+
+    /// Read recent rejection-buffer entries for one workspace/project scope.
+    pub async fn recent_auto_improve_rejections(
+        &self,
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+        limit: usize,
+        since_created_at: Option<i64>,
+    ) -> StoreResult<Vec<AutoImproveRejectionSummary>> {
+        self.with_conn(move |conn| {
+            let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+            let since = since_created_at.unwrap_or(0);
+            let mut stmt = conn.prepare(
+                "SELECT id, workspace_id, project_id, target_path, kind, operation, edit_mode, \
+                        reason, normalized_fingerprint, summary, evidence_json, source_run_id, \
+                        source_proposal_id, created_at \
+                 FROM auto_improve_rejections \
+                 WHERE workspace_id = ?1 AND project_id = ?2 AND created_at >= ?3 \
+                 ORDER BY created_at DESC LIMIT ?4",
+            )?;
+            let rows = stmt.query_map(
+                params![workspace_id.as_bytes(), project_id.as_bytes(), since, limit],
+                |row| {
+                    let id_bytes: Vec<u8> = row.get(0)?;
+                    let id = Uuid::from_slice(&id_bytes).map_err(to_sql_err)?.to_string();
+                    let workspace_id =
+                        WorkspaceId::from_slice(&row.get::<_, Vec<u8>>(1)?).map_err(to_sql_err)?;
+                    let project_id =
+                        ProjectId::from_slice(&row.get::<_, Vec<u8>>(2)?).map_err(to_sql_err)?;
+                    let evidence_raw: String = row.get(10)?;
+                    let source_run_id = row
+                        .get::<_, Option<Vec<u8>>>(11)?
+                        .map(|b| AutoImproveRunId::from_slice(&b))
+                        .transpose()
+                        .map_err(to_sql_err)?;
+                    let source_proposal_id = row
+                        .get::<_, Option<Vec<u8>>>(12)?
+                        .map(|b| AutoImproveProposalId::from_slice(&b))
+                        .transpose()
+                        .map_err(to_sql_err)?;
+                    Ok(AutoImproveRejectionSummary {
+                        id,
+                        workspace_id,
+                        project_id,
+                        target_path: row.get(3)?,
+                        kind: row.get(4)?,
+                        operation: row.get(5)?,
+                        edit_mode: row.get(6)?,
+                        reason: row.get(7)?,
+                        normalized_fingerprint: row.get(8)?,
+                        summary: row.get(9)?,
+                        evidence_json: serde_json::from_str(&evidence_raw).map_err(to_sql_err)?,
+                        source_run_id,
+                        source_proposal_id,
+                        created_at: row.get(13)?,
+                    })
+                },
+            )?;
+            let mut out = Vec::new();
+            for row in rows {
+                out.push(row?);
+            }
+            Ok(out)
         })
         .await
     }

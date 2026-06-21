@@ -175,12 +175,25 @@ The shipped feature is an audit-first learning reviewer:
 3. Produces a structured proposal containing small page creates or updates.
 4. Stores the proposal in a pending-review queue with evidence and diffs.
 5. Applies approved proposals through `Wiki::apply_batch`, admission webhooks,
-   auth capabilities, audit logging, and the single writer actor.
+    auth capabilities, audit logging, and the single writer actor.
 
 Auto-approval is the default, but it still records staged proposals and applies
 them through the same approval path. Admins who want a human queue set
 `[auto_improve] require_approval = true`; admins who want no automatic review set
 `[auto_improve.scheduler] enabled = false`.
+
+High-impact targets can also be guarded by an operator-supplied executable eval
+gate. `[auto_improve.eval]` defaults to disabled; when enabled, proposals whose
+paths match the configured prefixes (default `_rules` and `procedures`) are sent
+to the configured command after LLM review validation and before staging or
+auto-approval. The command receives JSON on stdin with proposal metadata plus
+before/after bodies and must return JSON like
+`{ "score_before": 0.72, "score_after": 0.76, "passed": true }`. Command errors,
+timeouts, invalid JSON, `passed = false`, missing `passed`, or score deltas below
+`min_delta` reject only that targeted proposal. Non-targeted proposals bypass the
+gate. If all proposals fail eval, the run is still staged with zero proposals and
+the rejected candidates so the rejection buffer can remember the failed attempt.
+Hooks never run the eval command.
 
 ## Proposed Page Targets
 
@@ -280,6 +293,17 @@ min_session_duration_secs = 120
 min_confidence = 0.75
 max_input_tokens = 24000
 max_proposals_per_run = 5
+max_patchable_pages = 8
+max_patchable_body_chars = 8000
+max_edits_per_proposal = 5
+max_edit_content_chars = 4000
+max_changed_chars_per_proposal = 12000
+max_patch_edits_per_run = 8
+max_rejection_context = 50
+rejection_context_days = 180
+max_final_body_chars = 32000
+max_rule_page_tokens = 2000
+max_procedure_page_tokens = 2000
 include_raw_fallback = false
 proposal_actor = "auto_improve"
 pending_path = "_pending/auto-improve"
@@ -295,6 +319,12 @@ min_session_age_secs = 600
 background review. `[auto_improve] require_approval` controls whether validated
 proposals are applied automatically or left pending. They intentionally do not
 imply each other.
+
+`max_rejection_context` and `rejection_context_days` bound the persistent
+rejection-buffer summary included in future reviewer prompts. The buffer is
+scoped by `workspace_id` + `project_id` and stores human rejects, approval
+conflicts/failures, and validator/model rejected candidates when they carry a
+reason.
 
 ## Proposal Format
 

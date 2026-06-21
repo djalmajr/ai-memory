@@ -81,6 +81,10 @@ pub struct AdminState {
     /// approval; otherwise it approves them immediately through the normal wiki
     /// write path.
     pub auto_improve_require_approval: bool,
+    /// Server-configured defaults used by direct admin auto-improvement.
+    /// Request fields remain explicit overrides; omitted eval settings inherit
+    /// this operator policy instead of disabling eval silently.
+    pub auto_improve_review_config: AutoImproveReviewConfig,
     /// Optional embedder. When `None`, `/admin/embed` returns 503.
     pub embedder: Option<Arc<dyn Embedder>>,
     /// Passive process-scoped health recorder for configured providers.
@@ -191,12 +195,50 @@ struct AutoImproveRequest {
     /// Whether future raw fallback details may be considered.
     #[serde(default)]
     include_raw_fallback: bool,
+    /// Maximum existing _rules/ and procedures/ pages included for patch proposals.
+    #[serde(default = "default_auto_improve_max_patchable_pages")]
+    max_patchable_pages: usize,
+    /// Maximum body chars rendered per patchable target page.
+    #[serde(default = "default_auto_improve_max_patchable_body_chars")]
+    max_patchable_body_chars: usize,
+    /// Maximum patch edits per proposal.
+    #[serde(default = "default_auto_improve_max_edits_per_proposal")]
+    max_edits_per_proposal: usize,
+    /// Maximum content chars in one patch edit.
+    #[serde(default = "default_auto_improve_max_edit_content_chars")]
+    max_edit_content_chars: usize,
+    /// Maximum aggregate changed chars in one patch proposal.
+    #[serde(default = "default_auto_improve_max_changed_chars_per_proposal")]
+    max_changed_chars_per_proposal: usize,
+    /// Maximum patch edits accepted across one review run.
+    #[serde(default = "default_auto_improve_max_patch_edits_per_run")]
+    max_patch_edits_per_run: usize,
+    /// Maximum recent rejection-buffer entries rendered into prompt context.
+    #[serde(default = "default_auto_improve_max_rejection_context")]
+    max_rejection_context: usize,
+    /// Maximum age in days for rejection-buffer prompt context.
+    #[serde(default = "default_auto_improve_rejection_context_days")]
+    rejection_context_days: u32,
+    /// Maximum materialized final body size.
+    #[serde(default = "default_auto_improve_max_final_body_chars")]
+    max_final_body_chars: usize,
+    /// Maximum approximate tokens allowed in one _rules/ page.
+    #[serde(default = "default_auto_improve_max_rule_page_tokens")]
+    max_rule_page_tokens: usize,
+    /// Maximum approximate tokens allowed in one procedures/ page.
+    #[serde(default = "default_auto_improve_max_procedure_page_tokens")]
+    max_procedure_page_tokens: usize,
     /// Synthetic actor used for staged proposal provenance.
     #[serde(default = "default_auto_improve_proposal_actor")]
     proposal_actor: String,
     /// Pending proposal sidecar folder.
     #[serde(default = "default_auto_improve_pending_path")]
     pending_path: String,
+    /// Optional executable proposal eval gate. When omitted, direct admin
+    /// requests inherit the server's configured eval policy; CLI requests send
+    /// their local config explicitly.
+    #[serde(default)]
+    eval: Option<ai_memory_consolidate::AutoImproveEvalConfig>,
     /// Removed compatibility field. Requests that still send it fail closed so
     /// old preview callers cannot accidentally write pages.
     #[serde(default)]
@@ -303,12 +345,68 @@ fn default_auto_improve_max_proposals() -> usize {
     ai_memory_consolidate::DEFAULT_AUTO_IMPROVE_MAX_PROPOSALS
 }
 
+fn default_auto_improve_max_patchable_pages() -> usize {
+    ai_memory_consolidate::DEFAULT_AUTO_IMPROVE_MAX_PATCHABLE_PAGES
+}
+
+fn default_auto_improve_max_patchable_body_chars() -> usize {
+    ai_memory_consolidate::DEFAULT_AUTO_IMPROVE_MAX_PATCHABLE_BODY_CHARS
+}
+
+fn default_auto_improve_max_edits_per_proposal() -> usize {
+    ai_memory_consolidate::DEFAULT_AUTO_IMPROVE_MAX_EDITS_PER_PROPOSAL
+}
+
+fn default_auto_improve_max_edit_content_chars() -> usize {
+    ai_memory_consolidate::DEFAULT_AUTO_IMPROVE_MAX_EDIT_CONTENT_CHARS
+}
+
+fn default_auto_improve_max_changed_chars_per_proposal() -> usize {
+    ai_memory_consolidate::DEFAULT_AUTO_IMPROVE_MAX_CHANGED_CHARS_PER_PROPOSAL
+}
+
+fn default_auto_improve_max_patch_edits_per_run() -> usize {
+    ai_memory_consolidate::DEFAULT_AUTO_IMPROVE_MAX_PATCH_EDITS_PER_RUN
+}
+
+fn default_auto_improve_max_rejection_context() -> usize {
+    ai_memory_consolidate::DEFAULT_AUTO_IMPROVE_MAX_REJECTION_CONTEXT
+}
+
+fn default_auto_improve_rejection_context_days() -> u32 {
+    ai_memory_consolidate::DEFAULT_AUTO_IMPROVE_REJECTION_CONTEXT_DAYS
+}
+
+fn default_auto_improve_max_final_body_chars() -> usize {
+    ai_memory_consolidate::DEFAULT_AUTO_IMPROVE_MAX_FINAL_BODY_CHARS
+}
+
+fn default_auto_improve_max_rule_page_tokens() -> usize {
+    ai_memory_consolidate::DEFAULT_AUTO_IMPROVE_MAX_RULE_PAGE_TOKENS
+}
+
+fn default_auto_improve_max_procedure_page_tokens() -> usize {
+    ai_memory_consolidate::DEFAULT_AUTO_IMPROVE_MAX_PROCEDURE_PAGE_TOKENS
+}
+
 fn default_auto_improve_proposal_actor() -> String {
     ai_memory_consolidate::DEFAULT_AUTO_IMPROVE_PROPOSAL_ACTOR.into()
 }
 
 fn default_auto_improve_pending_path() -> String {
     ai_memory_consolidate::DEFAULT_AUTO_IMPROVE_PENDING_PATH.into()
+}
+
+fn hex_to_sha256(hex: &str) -> Result<[u8; 32], String> {
+    if hex.len() != 64 {
+        return Err("expected 64 hex chars".into());
+    }
+    let mut out = [0_u8; 32];
+    for (idx, chunk) in hex.as_bytes().chunks_exact(2).enumerate() {
+        let s = std::str::from_utf8(chunk).map_err(|e| e.to_string())?;
+        out[idx] = u8::from_str_radix(s, 16).map_err(|e| e.to_string())?;
+    }
+    Ok(out)
 }
 
 /// Build the admin axum [`Router`]. Mounts:
@@ -1114,14 +1212,30 @@ async fn handle_auto_improve(
         include_raw_fallback: req.include_raw_fallback,
         proposal_actor: req.proposal_actor.clone(),
         pending_path: req.pending_path.clone(),
+        max_patchable_pages: req.max_patchable_pages,
+        max_patchable_body_chars: req.max_patchable_body_chars,
+        max_edits_per_proposal: req.max_edits_per_proposal,
+        max_edit_content_chars: req.max_edit_content_chars,
+        max_changed_chars_per_proposal: req.max_changed_chars_per_proposal,
+        max_patch_edits_per_run: req.max_patch_edits_per_run,
+        max_rejection_context: req.max_rejection_context,
+        rejection_context_days: req.rejection_context_days,
+        max_final_body_chars: req.max_final_body_chars,
+        max_rule_page_tokens: req.max_rule_page_tokens,
+        max_procedure_page_tokens: req.max_procedure_page_tokens,
+        eval: req
+            .eval
+            .clone()
+            .unwrap_or_else(|| state.auto_improve_review_config.eval.clone()),
     };
 
-    let report = run_auto_improve_review(&state.reader, &*llm, ws, proj, req.session_id, cfg)
-        .await
-        .map_err(auto_improve_error_response)?;
+    let report =
+        run_auto_improve_review(&state.reader, &*llm, ws, proj, req.session_id, cfg.clone())
+            .await
+            .map_err(auto_improve_error_response)?;
     let proposals = auto_improve_new_proposals(&state, ws, proj, &report).await?;
     let staged =
-        stage_auto_improve_report(&state, ws, proj, req.session_id, &req, &report, proposals)
+        stage_auto_improve_report(&state, ws, proj, req.session_id, &cfg, &report, proposals)
             .await?;
     let actor = actor_ext
         .map(|axum::Extension(actor)| actor)
@@ -1249,17 +1363,25 @@ async fn auto_improve_new_proposals(
                 Json(serde_json::json!({ "error": format!("invalid proposal path: {e}") })),
             )
         })?;
-        let operation = if state
+        let target_exists = state
             .reader
             .page_body_by_ids(ws, proj, path.as_str())
             .await
             .map_err(|e| internal_err(e.to_string()))?
-            .is_some()
+            .is_some();
+        let operation = if p.edit_mode == "patch"
+            || (target_exists && path.as_str() == "_slots/current-focus.md")
         {
             AutoImproveProposalOperation::Update
         } else {
             AutoImproveProposalOperation::Create
         };
+        let expected_base_body_sha256 = p
+            .expected_base_body_sha256
+            .as_deref()
+            .map(hex_to_sha256)
+            .transpose()
+            .map_err(|e| internal_err(format!("invalid expected_base_body_sha256: {e}")))?;
         proposals.push(NewAutoImproveProposal {
             operation,
             target_path: path,
@@ -1271,6 +1393,9 @@ async fn auto_improve_new_proposals(
                 .map_err(|e| internal_err(e.to_string()))?,
             body_markdown: p.body_markdown.clone(),
             artifact_sha256: None,
+            edit_mode: Some(p.edit_mode.clone()),
+            patch_json: serde_json::to_value(&p.edits).ok(),
+            expected_base_body_sha256,
         });
     }
     Ok(proposals)
@@ -1287,7 +1412,7 @@ async fn stage_auto_improve_report(
     ws: WorkspaceId,
     proj: ProjectId,
     session_id: SessionId,
-    req: &AutoImproveRequest,
+    cfg: &AutoImproveReviewConfig,
     report: &ai_memory_consolidate::AutoImproveReport,
     proposals: Vec<NewAutoImproveProposal>,
 ) -> Result<StagedAutoImproveData, (StatusCode, Json<serde_json::Value>)> {
@@ -1305,15 +1430,27 @@ async fn stage_auto_improve_report(
             rejected_candidates_json: serde_json::to_value(&report.rejected_candidates)
                 .unwrap_or_else(|_| serde_json::json!([])),
             config_json: serde_json::json!({
-                "min_observations": req.min_observations,
-                "min_session_duration_secs": req.min_session_duration_secs,
-                "min_confidence": req.min_confidence,
-                "max_input_tokens": req.max_input_tokens,
-                "max_proposals_per_run": req.max_proposals_per_run,
-                "include_raw_fallback": req.include_raw_fallback,
+                "min_observations": cfg.min_observations,
+                "min_session_duration_secs": cfg.min_session_duration_secs,
+                "min_confidence": cfg.min_confidence,
+                "max_input_tokens": cfg.max_input_tokens,
+                "max_proposals_per_run": cfg.max_proposals_per_run,
+                "include_raw_fallback": cfg.include_raw_fallback,
+                "max_patchable_pages": cfg.max_patchable_pages,
+                "max_patchable_body_chars": cfg.max_patchable_body_chars,
+                "max_edits_per_proposal": cfg.max_edits_per_proposal,
+                "max_edit_content_chars": cfg.max_edit_content_chars,
+                "max_changed_chars_per_proposal": cfg.max_changed_chars_per_proposal,
+                "max_patch_edits_per_run": cfg.max_patch_edits_per_run,
+                "max_rejection_context": cfg.max_rejection_context,
+                "rejection_context_days": cfg.rejection_context_days,
+                "max_final_body_chars": cfg.max_final_body_chars,
+                "max_rule_page_tokens": cfg.max_rule_page_tokens,
+                "max_procedure_page_tokens": cfg.max_procedure_page_tokens,
+                "eval": cfg.eval,
             }),
             proposal_actor: ai_memory_core::ActorContext {
-                agent: Some(req.proposal_actor.clone()),
+                agent: Some(cfg.proposal_actor.clone()),
                 ..ai_memory_core::ActorContext::default()
             },
             proposals,
@@ -1344,6 +1481,7 @@ fn auto_improve_error_response(
         AutoImproveError::SessionNotFound(_) => StatusCode::NOT_FOUND,
         AutoImproveError::SessionOutOfScope { .. } => StatusCode::UNPROCESSABLE_ENTITY,
         AutoImproveError::Llm(_) => StatusCode::BAD_GATEWAY,
+        AutoImproveError::Eval(_) => StatusCode::BAD_GATEWAY,
         AutoImproveError::Memory(_) => StatusCode::BAD_REQUEST,
         AutoImproveError::Store(_) => StatusCode::INTERNAL_SERVER_ERROR,
     };
@@ -1451,6 +1589,9 @@ async fn handle_curator(
                 }),
                 body_markdown,
                 artifact_sha256: None,
+                edit_mode: None,
+                patch_json: None,
+                expected_base_body_sha256: None,
             }],
         })
         .await
@@ -4266,6 +4407,7 @@ mod tests {
             wiki,
             llm: None,
             auto_improve_require_approval: false,
+            auto_improve_review_config: Default::default(),
             embedder: None,
             provider_health: ProviderHealth::default(),
             decay_params: DecayParams::default(),
@@ -4308,6 +4450,7 @@ mod tests {
             wiki,
             llm: None,
             auto_improve_require_approval: false,
+            auto_improve_review_config: Default::default(),
             embedder: None,
             provider_health: ProviderHealth::default(),
             decay_params: DecayParams::default(),
@@ -4339,6 +4482,7 @@ mod tests {
             wiki,
             llm,
             auto_improve_require_approval: false,
+            auto_improve_review_config: Default::default(),
             embedder: None,
             provider_health: ProviderHealth::default(),
             decay_params: DecayParams::default(),
@@ -4396,6 +4540,9 @@ mod tests {
                     evidence_json: serde_json::json!([{"source":"test"}]),
                     body_markdown: body.into(),
                     artifact_sha256: None,
+                    edit_mode: None,
+                    patch_json: None,
+                    expected_base_body_sha256: None,
                 }],
             })
             .await
@@ -4716,6 +4863,101 @@ mod tests {
         assert_eq!(
             note_page.body,
             "# New Auto Improve Lesson\n\nnew page proposal"
+        );
+    }
+
+    #[tokio::test]
+    async fn auto_improve_admin_omitted_eval_inherits_server_defaults() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let wiki = Wiki::new(tmp.path(), store.writer.clone())
+            .unwrap()
+            .with_store_reader(store.reader.clone());
+        let ws = store
+            .writer
+            .get_or_create_workspace("default")
+            .await
+            .unwrap();
+        let proj = store
+            .writer
+            .get_or_create_project(ws, "scratch", None)
+            .await
+            .unwrap();
+        let session_id = SessionId::new();
+        store
+            .writer
+            .begin_session(NewSession {
+                id: session_id,
+                workspace_id: ws,
+                project_id: proj,
+                agent_kind: AgentKind::Other,
+                cwd: None,
+            })
+            .await
+            .unwrap();
+        store
+            .writer
+            .insert_observation(NewObservation {
+                session_id,
+                workspace_id: ws,
+                project_id: proj,
+                kind: ObservationKind::UserPrompt,
+                extension: None,
+                source_event: None,
+                title: "prompt".into(),
+                body: "focus changed and durable lesson".into(),
+                importance: 5,
+            })
+            .await
+            .unwrap();
+        let mut state =
+            admin_state_for_store_with_llm(&tmp, &store, wiki, Some(Arc::new(FakeAutoImproveLlm)));
+        state.auto_improve_review_config.eval = ai_memory_consolidate::AutoImproveEvalConfig {
+            enabled: true,
+            command: String::new(),
+            timeout_secs: 1,
+            targets: vec!["notes".into()],
+            min_delta: 0.0,
+        };
+        let router = admin_router(state);
+
+        let resp = router
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/admin/auto-improve")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&serde_json::json!({
+                            "workspace": "default",
+                            "project": "scratch",
+                            "session_id": session_id.to_string(),
+                            "min_observations": 1,
+                            "min_session_duration_secs": 0,
+                            "min_confidence": 0.75,
+                            "max_proposals_per_run": 5
+                        }))
+                        .unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["rejected_candidates_count"], 1);
+        let proposals = json["proposals"].as_array().unwrap();
+        assert_eq!(proposals.len(), 1);
+        assert_eq!(
+            store
+                .reader
+                .list_auto_improve_proposals(ws, proj, None, 10)
+                .await
+                .unwrap()
+                .len(),
+            1
         );
     }
 
@@ -5289,6 +5531,7 @@ mod tests {
             wiki,
             llm: None,
             auto_improve_require_approval: false,
+            auto_improve_review_config: Default::default(),
             embedder: None,
             provider_health: ProviderHealth::default(),
             decay_params: DecayParams::default(),
@@ -5396,6 +5639,7 @@ mod tests {
             wiki,
             llm: None,
             auto_improve_require_approval: false,
+            auto_improve_review_config: Default::default(),
             embedder: None,
             provider_health: ProviderHealth::default(),
             decay_params: DecayParams::default(),
@@ -5496,6 +5740,7 @@ mod tests {
             wiki,
             llm: None,
             auto_improve_require_approval: false,
+            auto_improve_review_config: Default::default(),
             embedder: None,
             provider_health: ProviderHealth::default(),
             decay_params: DecayParams::default(),
@@ -5602,6 +5847,7 @@ mod tests {
             wiki,
             llm: None,
             auto_improve_require_approval: false,
+            auto_improve_review_config: Default::default(),
             embedder: None,
             provider_health: ProviderHealth::default(),
             decay_params: DecayParams::default(),
@@ -5687,6 +5933,7 @@ mod tests {
             wiki,
             llm: None,
             auto_improve_require_approval: false,
+            auto_improve_review_config: Default::default(),
             embedder: None,
             provider_health: ProviderHealth::default(),
             decay_params: DecayParams::default(),
@@ -6191,6 +6438,7 @@ mod tests {
             wiki,
             llm: None,
             auto_improve_require_approval: false,
+            auto_improve_review_config: Default::default(),
             embedder: None,
             provider_health: ProviderHealth::default(),
             decay_params: DecayParams::default(),

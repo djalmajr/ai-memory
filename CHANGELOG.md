@@ -7,6 +7,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- Auto-improvement reviews can now stage bounded patch proposals for existing
+  `_rules/` and `procedures/` pages using append, add-section, and checked
+  replace-section edits, with base-body hashes guarding materialize-to-stage
+  races.
+- Auto-improvement patch proposals now honor a per-run edit budget, and final
+  `_rules/` / `procedures/` pages have configurable token budgets to prevent
+  reviewer runs from growing policy or procedure pages too aggressively.
+- Auto-improvement now keeps a scoped rejection buffer for human rejects,
+  approval conflicts/failures, and validator rejected candidates, then feeds a
+  bounded summary into future reviewer prompts to avoid repeated failed edits.
+- Auto-improvement can now run an optional operator-supplied executable eval gate
+  under `[auto_improve.eval]` after LLM validation and before staging/approval for
+  selected targets (default `_rules` and `procedures`). The gate is disabled by
+  default, receives proposal JSON on stdin, fails closed on command/timeout/JSON
+  errors or insufficient score delta, and records eval failures as rejected
+  candidates without running from hook paths.
+
+### Fixed
+- Auto-improvement eval gates now apply timeouts to the full child interaction,
+  cap stdout at 64 KiB, cap eval rejection evidence, and make direct root admin
+  requests inherit server eval defaults unless the request explicitly overrides
+  them.
+
 ## [1.1.3] - 2026-06-20
 
 ### Fixed

@@ -29,6 +29,7 @@ async fn make_state(tmp: &TempDir) -> (AdminState, Store) {
         wiki,
         llm: None,
         auto_improve_require_approval: false,
+        auto_improve_review_config: Default::default(),
         embedder: None,
         provider_health: ai_memory_llm::ProviderHealth::default(),
         decay_params: DecayParams::default(),
