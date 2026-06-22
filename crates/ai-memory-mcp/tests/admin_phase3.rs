@@ -8,11 +8,15 @@
 //! `tower::ServiceExt::oneshot`.
 
 use ai_memory_core::{
-    AgentKind, NewObservation, NewPage, NewSession, ObservationKind, PagePath, SessionId, Tier,
+    ActorContext, AgentKind, NewObservation, NewPage, NewSession, ObservationKind, PagePath,
+    SessionId, Tier,
 };
 use ai_memory_llm::SyntheticEmbedder;
 use ai_memory_mcp::{AdminState, admin_router};
-use ai_memory_store::{DecayParams, Store};
+use ai_memory_store::{
+    AutoImproveProposalOperation, AutoImproveProposalStatus, DecayParams, NewAutoImproveProposal,
+    StageAutoImproveRun, Store,
+};
 use ai_memory_wiki::Wiki;
 use ai_memory_wiki::WritePageRequest;
 use axum::body::Body;
@@ -79,6 +83,122 @@ async fn get(state: AdminState, uri: &str) -> axum::response::Response {
         .body(Body::empty())
         .unwrap();
     router.oneshot(req).await.unwrap()
+}
+
+fn telemetry_stage_input(
+    ws: ai_memory_core::WorkspaceId,
+    proj: ai_memory_core::ProjectId,
+) -> StageAutoImproveRun {
+    StageAutoImproveRun {
+        workspace_id: ws,
+        project_id: proj,
+        session_id: None,
+        provider: Some("test".into()),
+        model: Some("test-model".into()),
+        summary: Some("test telemetry seed".into()),
+        warnings_json: serde_json::json!([]),
+        rejected_candidates_json: serde_json::json!([]),
+        config_json: serde_json::json!({}),
+        proposal_actor: ActorContext::default(),
+        proposals: vec![NewAutoImproveProposal {
+            operation: AutoImproveProposalOperation::Create,
+            target_path: PagePath::new("notes/telemetry.md").unwrap(),
+            kind: "note".into(),
+            title: "Telemetry seed".into(),
+            confidence: 0.9,
+            rationale: "seed report telemetry".into(),
+            evidence_json: serde_json::json!([]),
+            body_markdown: "# Telemetry".into(),
+            artifact_sha256: None,
+            edit_mode: None,
+            patch_json: None,
+            expected_base_body_sha256: None,
+        }],
+    }
+}
+
+#[tokio::test]
+async fn auto_improve_report_returns_telemetry_without_creating_proposals() {
+    let tmp = TempDir::new().unwrap();
+    let (state, store) = make_state(&tmp).await;
+    let ws = store
+        .writer
+        .get_or_create_workspace("default")
+        .await
+        .unwrap();
+    let proj = store
+        .writer
+        .get_or_create_project(ws, "scratch", None)
+        .await
+        .unwrap();
+    store
+        .writer
+        .stage_auto_improve_run(telemetry_stage_input(ws, proj))
+        .await
+        .unwrap();
+    let before = store
+        .reader
+        .list_auto_improve_proposals(ws, proj, None, 50)
+        .await
+        .unwrap()
+        .len();
+
+    let resp = post(
+        state,
+        "/admin/auto-improve/report",
+        json!({ "workspace": "default", "project": "scratch", "since_days": 30, "limit": 3 }),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = body_json(resp).await;
+    assert!(body["summary"].as_str().unwrap().contains("run(s)"));
+    assert_eq!(body["aggregate"]["run_count"].as_u64().unwrap(), 1);
+    assert_eq!(
+        body["aggregate"]["proposals_by_status"][0]["key"]
+            .as_str()
+            .unwrap(),
+        "pending"
+    );
+    assert_eq!(body["terminal_rates"]["denominator"].as_u64().unwrap(), 0);
+
+    let after = store
+        .reader
+        .list_auto_improve_proposals(ws, proj, None, 50)
+        .await
+        .unwrap()
+        .len();
+    assert_eq!(after, before, "report endpoint must not stage proposals");
+    let pending = store
+        .reader
+        .list_auto_improve_proposals(ws, proj, Some(AutoImproveProposalStatus::Pending), 50)
+        .await
+        .unwrap()
+        .len();
+    assert_eq!(pending, before);
+}
+
+#[tokio::test]
+async fn auto_improve_report_missing_scope_fails_closed() {
+    let tmp = TempDir::new().unwrap();
+    let (state, store) = make_state(&tmp).await;
+    let ws = store
+        .writer
+        .get_or_create_workspace("default")
+        .await
+        .unwrap();
+    store
+        .writer
+        .get_or_create_project(ws, "scratch", None)
+        .await
+        .unwrap();
+
+    let resp = post(
+        state,
+        "/admin/auto-improve/report",
+        json!({ "workspace": "default", "project": "missing" }),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
 }
 
 // ---------------------------------------------------------------------------

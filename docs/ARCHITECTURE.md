@@ -266,7 +266,7 @@ restore              reindex              install-hooks
 hook                 install-mcp          commit
 checkpoints          restore-page         llm-test
 forget-sweep         lint                 auto-improve
-curator              pending-writes       embed
+auto-improve-report  curator              pending-writes       embed
 generate-auth-token  setup-agent          bootstrap
 install-instructions reorg                purge-project
 rename-project       move-project         audit-contamination

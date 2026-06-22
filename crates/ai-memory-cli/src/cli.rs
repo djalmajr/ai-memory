@@ -85,6 +85,8 @@ pub enum Command {
     Lint(LintArgs),
     /// Run the rule-based curator report.
     Curator(CuratorArgs),
+    /// Run a read-only auto-improvement telemetry report.
+    AutoImproveReport(AutoImproveReportArgs),
     /// Run auto-improvement for one completed session.
     AutoImprove(AutoImproveArgs),
     /// Review, approve, or reject staged auto-improvement proposals.
@@ -897,6 +899,27 @@ pub struct CuratorArgs {
     pub json: bool,
 }
 
+/// Arguments for `auto-improve-report`.
+#[derive(Debug, Args)]
+pub struct AutoImproveReportArgs {
+    /// Workspace name. Defaults to `default`.
+    #[arg(long, default_value_t = crate::config::DEFAULT_WORKSPACE.to_string())]
+    pub workspace: String,
+    /// Project name. When omitted, auto-derived from the basename of
+    /// the current git repo root (or CWD if no git repo).
+    #[arg(long)]
+    pub project: Option<String>,
+    /// Lookback window in days.
+    #[arg(long, default_value_t = ai_memory_consolidate::DEFAULT_AUTO_IMPROVE_TELEMETRY_SINCE_DAYS)]
+    pub days: u32,
+    /// Maximum rows in each top-N count table.
+    #[arg(long, default_value_t = ai_memory_consolidate::DEFAULT_AUTO_IMPROVE_TELEMETRY_TOP_LIMIT)]
+    pub limit: usize,
+    /// Emit only machine-readable JSON.
+    #[arg(long)]
+    pub json: bool,
+}
+
 /// Arguments for `auto-improve`.
 #[derive(Debug, Args)]
 pub struct AutoImproveArgs {
@@ -1340,6 +1363,30 @@ mod tests {
         };
         assert!(args.stage);
         assert!(!args.dry_run);
+    }
+
+    #[test]
+    fn auto_improve_report_parses_scope_window_limit_and_json() {
+        let cli = Cli::try_parse_from([
+            "ai-memory",
+            "auto-improve-report",
+            "--project",
+            "scratch",
+            "--days",
+            "14",
+            "--limit",
+            "3",
+            "--json",
+        ])
+        .expect("auto-improve-report parses");
+
+        let Command::AutoImproveReport(args) = cli.command else {
+            panic!("expected auto-improve-report command");
+        };
+        assert_eq!(args.project.as_deref(), Some("scratch"));
+        assert_eq!(args.days, 14);
+        assert_eq!(args.limit, 3);
+        assert!(args.json);
     }
 
     #[test]

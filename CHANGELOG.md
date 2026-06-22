@@ -27,6 +27,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   default, receives proposal JSON on stdin, fails closed on command/timeout/JSON
   errors or insufficient score delta, and records eval failures as rejected
   candidates without running from hook paths.
+- Added read-only auto-improvement telemetry reporting via
+  `POST /admin/auto-improve/report` and `ai-memory auto-improve-report`, with
+  JSON and human CLI output for recent run counts, proposal outcomes, terminal
+  rates, and operational findings without staging pending proposals.
 - Hook spool drains now use `POST /hook/batch` when the server supports it,
   grouping compatible queued lifecycle events into bounded batches to amortize
   remote request latency. Older servers fall back to the existing per-event

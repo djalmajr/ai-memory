@@ -3,7 +3,7 @@
 use ai_memory_core::{ProjectId, WorkspaceId};
 use ai_memory_store::{AutoImproveTelemetryAggregate, AutoImproveTelemetryCount, ReaderPool};
 use jiff::Timestamp;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 const US_PER_DAY: i64 = 86_400_000_000;
 
@@ -13,7 +13,7 @@ pub const DEFAULT_AUTO_IMPROVE_TELEMETRY_SINCE_DAYS: u32 = 30;
 pub const DEFAULT_AUTO_IMPROVE_TELEMETRY_TOP_LIMIT: usize = 10;
 
 /// Parameters for an auto-improve telemetry report.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct AutoImproveTelemetryParams {
     /// Lookback window in days.
     pub since_days: u32,
@@ -31,7 +31,7 @@ impl Default for AutoImproveTelemetryParams {
 }
 
 /// Terminal-rate denominator and rates for learning proposals.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct AutoImproveTerminalRates {
     /// Terminal learning proposals only: approved + rejected + conflict + failed.
     pub denominator: usize,
@@ -46,7 +46,7 @@ pub struct AutoImproveTerminalRates {
 }
 
 /// One bounded operational signal in the telemetry report.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct AutoImproveTelemetryFinding {
     /// Machine-readable finding kind.
     pub kind: String,
@@ -60,7 +60,7 @@ pub struct AutoImproveTelemetryFinding {
 }
 
 /// Structured report-only auto-improve telemetry.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct AutoImproveTelemetryReport {
     /// Workspace reviewed.
     pub workspace: String,

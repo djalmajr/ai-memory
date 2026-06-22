@@ -8,6 +8,7 @@ pub mod apply_shared;
 pub mod audit_contamination;
 pub mod auth;
 pub mod auto_improve;
+pub mod auto_improve_report;
 pub mod backup;
 pub mod bootstrap;
 pub mod checkpoints;

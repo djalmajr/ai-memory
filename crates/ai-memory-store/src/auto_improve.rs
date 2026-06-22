@@ -189,7 +189,7 @@ pub struct AutoImproveRejectionSummary {
 }
 
 /// Aggregate telemetry for auto-improvement runs in one scope.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct AutoImproveTelemetryAggregate {
     /// Number of auto-improve runs in the window.
     pub run_count: usize,
@@ -216,7 +216,7 @@ pub struct AutoImproveTelemetryAggregate {
 }
 
 /// Generic `(key, count)` telemetry row.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct AutoImproveTelemetryCount {
     /// Aggregated key; field-specific meaning depends on the source vector.
     pub key: String,

@@ -5,6 +5,7 @@
 //! - `POST /admin/bootstrap`      — ingest a pre-collected source bundle
 //!   into seed wiki pages via the configured LLM provider.
 //! - `POST /admin/auto-improve`   — review one session and apply or stage proposals.
+//! - `POST /admin/auto-improve/report` — read-only auto-improve telemetry report.
 //! - `POST /admin/curator`        — dry-run or stage a rule-based curator report.
 //! - `GET  /admin/status`         — lifetime counts + server data-dir info.
 //! - `GET  /admin/search?q=`      — FTS5 hits against the wiki index.
@@ -33,10 +34,10 @@ use std::io::Seek;
 use std::path::PathBuf;
 
 use ai_memory_consolidate::{
-    AutoImproveReviewConfig, Bootstrap, BootstrapConfig, BootstrapOutcome, BootstrapSource,
-    CuratorParams, CuratorReport, SourceCounts, prune_sources_to_budget,
-    render_curator_report_markdown, run_auto_improve_review, run_curator_report, run_lint,
-    run_sweep,
+    AutoImproveReviewConfig, AutoImproveTelemetryParams, Bootstrap, BootstrapConfig,
+    BootstrapOutcome, BootstrapSource, CuratorParams, CuratorReport, SourceCounts,
+    prune_sources_to_budget, render_curator_report_markdown, run_auto_improve_review,
+    run_auto_improve_telemetry_report, run_curator_report, run_lint, run_sweep,
 };
 use ai_memory_core::{
     ActiveProject, AutoImproveProposalId, Capability, DEFAULT_PROJECT_NAME, DEFAULT_WORKSPACE_NAME,
@@ -271,6 +272,23 @@ struct AutoImproveProposalOutcome {
     page_id: Option<String>,
 }
 
+/// JSON request body for `POST /admin/auto-improve/report`.
+#[derive(Deserialize)]
+struct AutoImproveTelemetryReportRequest {
+    /// Workspace name (must already exist).
+    #[serde(default = "default_workspace")]
+    workspace: String,
+    /// Project name (must already exist).
+    #[serde(default = "default_project")]
+    project: String,
+    /// Lookback window in days.
+    #[serde(default = "default_auto_improve_telemetry_since_days")]
+    since_days: u32,
+    /// Maximum rows in each top-N count table.
+    #[serde(default = "default_auto_improve_telemetry_top_limit")]
+    limit: usize,
+}
+
 /// JSON request body for `POST /admin/curator`.
 #[derive(Deserialize)]
 struct CuratorRequest {
@@ -397,6 +415,14 @@ fn default_auto_improve_pending_path() -> String {
     ai_memory_consolidate::DEFAULT_AUTO_IMPROVE_PENDING_PATH.into()
 }
 
+fn default_auto_improve_telemetry_since_days() -> u32 {
+    ai_memory_consolidate::DEFAULT_AUTO_IMPROVE_TELEMETRY_SINCE_DAYS
+}
+
+fn default_auto_improve_telemetry_top_limit() -> usize {
+    ai_memory_consolidate::DEFAULT_AUTO_IMPROVE_TELEMETRY_TOP_LIMIT
+}
+
 fn hex_to_sha256(hex: &str) -> Result<[u8; 32], String> {
     if hex.len() != 64 {
         return Err("expected 64 hex chars".into());
@@ -413,6 +439,7 @@ fn hex_to_sha256(hex: &str) -> Result<[u8; 32], String> {
 /// - `POST /admin/backup`
 /// - `POST /admin/bootstrap`
 /// - `POST /admin/auto-improve`
+/// - `POST /admin/auto-improve/report`
 /// - `POST /admin/curator`
 /// - `GET  /admin/status`
 /// - `GET  /admin/audit-contamination`
@@ -437,6 +464,10 @@ pub fn admin_router(state: AdminState) -> Router {
         .route("/admin/backup", post(handle_backup))
         .route("/admin/bootstrap", post(handle_bootstrap))
         .route("/admin/auto-improve", post(handle_auto_improve))
+        .route(
+            "/admin/auto-improve/report",
+            post(handle_auto_improve_report),
+        )
         .route("/admin/curator", post(handle_curator))
         .route("/admin/pending-writes", get(handle_pending_writes_list))
         .route(
@@ -1491,6 +1522,31 @@ fn auto_improve_error_response(
 // ---------------------------------------------------------------------
 // curator report
 // ---------------------------------------------------------------------
+
+async fn handle_auto_improve_report(
+    State(state): State<Arc<AdminState>>,
+    Json(req): Json<AutoImproveTelemetryReportRequest>,
+) -> Result<impl IntoResponse, (StatusCode, Json<serde_json::Value>)> {
+    let (ws, proj) = lookup_ws_proj_no_create(&state, &req.workspace, &req.project).await?;
+    let params = AutoImproveTelemetryParams {
+        since_days: req.since_days,
+        top_limit: req.limit.clamp(1, 100),
+    };
+    let report = run_auto_improve_telemetry_report(
+        &state.reader,
+        ws,
+        proj,
+        &req.workspace,
+        &req.project,
+        params,
+    )
+    .await
+    .map_err(|e| internal_err(e.to_string()))?;
+    Ok((
+        StatusCode::OK,
+        Json(serde_json::to_value(&report).unwrap_or_else(|_| serde_json::json!({}))),
+    ))
+}
 
 async fn handle_curator(
     State(state): State<Arc<AdminState>>,
@@ -6014,6 +6070,11 @@ mod tests {
                     "session_id": "00000000-0000-0000-0000-000000000000",
                     "dry_run": true
                 }),
+            ),
+            (
+                "POST",
+                "/admin/auto-improve/report",
+                serde_json::json!({"workspace": "default", "project": "scratch"}),
             ),
             ("GET", "/admin/status", serde_json::Value::Null),
             ("GET", "/admin/audit-contamination", serde_json::Value::Null),

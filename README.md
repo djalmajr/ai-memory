@@ -89,8 +89,8 @@ priors are at the [bottom](#influences-and-prior-art).
   session-aware current-project routing.
 - **Thin-client CLI.** `ai-memory status`, `bootstrap`, `checkpoints`,
   `restore-page`, `purge-project`, `rename-project`, `move-project`,
-  `audit-contamination`, `lint`, `curator`, `auto-improve`, `pending-writes`,
-  `embed`, `forget-sweep`, `backup` are
+  `audit-contamination`, `lint`, `curator`, `auto-improve`,
+  `auto-improve-report`, `pending-writes`, `embed`, `forget-sweep`, `backup` are
   all HTTP clients of the running server - never touch SQLite or
   wiki files directly. `status` also reports passive LLM/embedding
   provider health from the last real provider call. Server is the
@@ -140,7 +140,10 @@ priors are at the [bottom](#influences-and-prior-art).
   automatic review, or set `[auto_improve] require_approval = true` to keep both
   scheduled and manual proposals pending for human review. `ai-memory
   auto-improve --session-id <uuid>` and MCP `memory_auto_improve` remain
-  available for manual catch-up or targeted reruns.
+  available for manual catch-up or targeted reruns. `ai-memory
+  auto-improve-report --workspace <w> --project <p>` returns a read-only
+  telemetry report for recent auto-improvement outcomes without staging or
+  creating proposals.
 
   Existing installs do not need per-project migration. The scheduler initializes
   a per-project first-run watermark so historical sessions are not reviewed
