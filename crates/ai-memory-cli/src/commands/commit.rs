@@ -29,7 +29,7 @@ struct CommitResponse {
 /// Returns an error if the server is unreachable or returns a non-2xx
 /// response.
 pub async fn run(config: &Config, args: CommitArgs) -> Result<()> {
-    let endpoint = ServerEndpoint::from_config(config);
+    let endpoint = ServerEndpoint::from_config_resolving_auth(config).await;
     let resp: CommitResponse = post_json(
         &endpoint,
         "/admin/commit",

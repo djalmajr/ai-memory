@@ -87,6 +87,11 @@ AI_MEMORY_AUTO_SCOPE__MAX_ENTRIES=8192
 | MCP request header `Mcp-Session-Id`                | fallback `session_id` for tool calls |
 | Anonymous / no token                               | empty actor → single slot  |
 
+`X-Memory-Actor-Session-Id` means the agent-run session id from the
+lifecycle-hook payload. It is not an OIDC/Keycloak login session: the
+provider's JWT `sid` claim identifies an IdP browser/device session and
+must not be used as ai-memory's actor session key.
+
 `per_session` reads from `session_id`; `per_actor` reads from both
 `user` and `session_id`. In `per_actor`, a request that has `user` but
 no session id can use that user's latest no-session slot instead of the
@@ -109,6 +114,13 @@ opaque session id from the hook payload on each MCP request as
 requests that carry a different MCP session id fail closed to the baked
 default, while requests with no usable actor identity still degrade to
 the legacy single slot.
+
+OIDC/Keycloak authentication can identify the human user, client, and
+agent, but it does not automatically identify the current coding-agent
+session. If a gateway validates a Keycloak JWT, it should propagate
+`X-Memory-Actor-User` / `Sub` / `Client` / `Agent`; it should only emit
+`X-Memory-Actor-Session-Id` when a real agent session id has been
+forwarded by a session-aware bridge.
 
 For built-in installs that use static MCP config, prefer:
 

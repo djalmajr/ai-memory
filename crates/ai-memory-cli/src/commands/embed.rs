@@ -27,7 +27,7 @@ struct EmbedRequest {
 /// Returns an error if the server is unreachable or returns a non-2xx
 /// response.
 pub async fn run(config: &Config, args: EmbedArgs) -> Result<()> {
-    let endpoint = ServerEndpoint::from_config(config);
+    let endpoint = ServerEndpoint::from_config_resolving_auth(config).await;
     // Model migrations must reach stale rows in every project namespace.
     // Without an explicit `--project`, `--force` / `--reembed` fans out
     // across the whole workspace instead of the CWD-derived project only.

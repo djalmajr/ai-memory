@@ -43,6 +43,12 @@ handoff and the SessionStart auto-fetched block is already in your
 context, just answer from it; do not re-call the tool to "find it again"
 in another project.
 
+This default assumes the MCP client can identify the current agent
+session. Static MCP clients in parallel sessions for the same user cannot
+forward the real agent session id automatically; pass explicit
+`workspace` + `project` / `scopes`, or use a session-aware bridge that
+forwards the lifecycle-hook session id on MCP calls.
+
 **Lifecycle hooks already capture every prompt + tool call
 automatically.** You never need to manually write routine notes; the
 SessionStart hook auto-fetches pending handoffs, and on session end

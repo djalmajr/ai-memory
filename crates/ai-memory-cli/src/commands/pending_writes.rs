@@ -35,7 +35,7 @@ struct DiffResponse {
 }
 
 pub async fn run(config: &Config, args: PendingWritesArgs) -> Result<()> {
-    let ep = ServerEndpoint::from_config(config);
+    let ep = ServerEndpoint::from_config_resolving_auth(config).await;
     match args.command {
         PendingWritesCommand::List(args) => list(config, &ep, args).await,
         PendingWritesCommand::Show(args) => show(config, &ep, args).await,

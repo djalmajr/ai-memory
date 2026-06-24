@@ -319,6 +319,17 @@ ai-memory auth login oidc-device \
   --client-id "ai-memory-cli"
 ```
 
+The stored OIDC access token is also used by thin-client HTTP commands
+(`status`, `search`, `read-page`, `write-page`, `backup`, `embed`, and
+similar) when no static `AI_MEMORY_AUTH_TOKEN` / `[auth].bearer_token` is
+configured. Static bearer auth still has precedence.
+
+OIDC/Keycloak `sid` claims describe the login provider's session, not the
+coding-agent session ai-memory uses for `[auto_scope]` isolation. Gateways may
+propagate the authenticated user/client/agent headers, but
+`X-Memory-Actor-Session-Id` should only contain a real lifecycle-hook session id
+from a session-aware bridge.
+
 Restart the service after changing provider settings:
 
 ```bash
@@ -939,7 +950,7 @@ docker run --rm akitaonrails/ai-memory:latest --help     # full subcommand tree
 | `generate-auth-token` | `docker run --rm` | Print a random hex bearer token |
 | `auth login openai-oauth` | same data volume as the server | Store a ChatGPT/Codex OAuth refresh token for the optional `openai-oauth` LLM provider |
 | `auth login copilot` | same data volume as the server | Store a GitHub token for the optional `copilot` LLM provider |
-| `auth login oidc-device` | same developer data dir as native hooks | Store a per-developer OIDC device token for native hook authentication |
+| `auth login oidc-device` | same developer data dir as native hooks and thin-client CLI commands | Store a per-developer OIDC device token for native hook authentication and HTTP CLI fallback auth |
 | `install-mcp --client` | `docker run --rm` | MCP-config snippet per client |
 | `install-hooks --agent` | `docker run --rm` | Hook-config snippet for an existing hooks dir |
 | `setup-agent --agent --to --host-prefix` | `docker run --rm -v` | Extract bundled scripts + print config (one-shot) |

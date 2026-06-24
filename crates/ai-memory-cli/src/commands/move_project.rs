@@ -50,7 +50,7 @@ pub async fn run(config: &Config, args: MoveProjectArgs) -> Result<()> {
         );
     }
 
-    let endpoint = ServerEndpoint::from_config(config);
+    let endpoint = ServerEndpoint::from_config_resolving_auth(config).await;
     let report: serde_json::Value = post_json(
         &endpoint,
         "/admin/move-project",

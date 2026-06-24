@@ -301,7 +301,10 @@ the bearer authenticates, attribution flows from the token's owner
 - **Root token is single.** `[auth].bearer_token` is the admin token
   for every `/admin/*` endpoint. DB users created with `user add` are
   normal users, not additional admins.
-- **OIDC is hook authentication, not page authorization.** Native hooks can use
-  a per-developer OIDC device token, but ai-memory still has one shared wiki per
-  server and no per-page RBAC. If you need data isolation, run separate
-  ai-memory servers or isolate at a reverse proxy.
+- **OIDC is request authentication, not page authorization.** Native hooks and
+  thin-client CLI commands can use a per-developer OIDC device token, but
+  ai-memory still has one shared wiki per server and no per-page RBAC. The
+  Keycloak/OIDC `sid` claim is also not an ai-memory agent session id; session
+  auto-scope needs the lifecycle-hook session id or explicit `workspace` +
+  `project` / `scopes`. If you need data isolation, run separate ai-memory
+  servers or isolate at a reverse proxy.

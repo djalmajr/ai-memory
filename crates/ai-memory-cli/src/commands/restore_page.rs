@@ -33,7 +33,7 @@ struct RestorePageResponse {
 /// restored, or the restored page cannot be reindexed.
 pub async fn run(config: &Config, args: RestorePageArgs) -> Result<()> {
     let project = super::resolve_project_name(config, args.project.as_deref())?;
-    let endpoint = ServerEndpoint::from_config(config);
+    let endpoint = ServerEndpoint::from_config_resolving_auth(config).await;
     let resp: RestorePageResponse = post_json(
         &endpoint,
         "/admin/restore-page",

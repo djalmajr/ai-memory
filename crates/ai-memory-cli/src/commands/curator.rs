@@ -34,7 +34,7 @@ pub async fn run(config: &Config, args: CuratorArgs) -> Result<()> {
         bail!("choose either --dry-run or --stage, not both");
     }
     let dry_run = args.dry_run || !args.stage;
-    let endpoint = ServerEndpoint::from_config(config);
+    let endpoint = ServerEndpoint::from_config_resolving_auth(config).await;
     let project = super::resolve_project_name(config, args.project.as_deref())?;
     let request = CuratorRequest {
         workspace: args.workspace,

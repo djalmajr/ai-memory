@@ -158,6 +158,12 @@ asks about a handoff and the SessionStart auto-fetched block is already \
 in your context, answer from it; do NOT re-call the tool to look for it \
 in another project.\n\
 \n\
+This default assumes the MCP client can identify the current agent \
+session. Static MCP clients in parallel sessions for the same user \
+cannot forward the real agent session id automatically; pass explicit \
+`workspace` + `project` / `scopes`, or use a session-aware bridge that \
+forwards the lifecycle-hook session id on MCP calls.\n\
+\n\
 Lifecycle hooks already capture every prompt + tool call automatically \
 — you do NOT need to write routine notes by hand. When the user \
 explicitly asks to remember a permanent annotation/fact/rule, write a \
@@ -2566,6 +2572,30 @@ mod tests {
                     "prompt must not contain the contradictory phrase {phrase:?}"
                 );
             }
+        }
+    }
+
+    #[test]
+    fn prompts_warn_static_mcp_parallel_sessions_need_explicit_scope() {
+        for prompt in [MEMORY_INSTRUCTIONS, ai_memory_core::SNIPPET_BODY] {
+            let lower = prompt.to_ascii_lowercase();
+            assert!(
+                lower.contains("static mcp") && lower.contains("parallel sessions"),
+                "prompt must warn about static MCP clients in parallel sessions"
+            );
+            assert!(
+                lower.contains("real agent session id")
+                    && (lower.contains("session-aware bridge")
+                        || lower.contains("session aware bridge")),
+                "prompt must distinguish real agent session id from static MCP config"
+            );
+            assert!(
+                lower.contains("explicit")
+                    && lower.contains("workspace")
+                    && lower.contains("project")
+                    && lower.contains("scopes"),
+                "prompt must tell agents to use explicit scope when session id is unavailable"
+            );
         }
     }
 

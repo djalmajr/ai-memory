@@ -39,7 +39,7 @@ pub async fn run(config: &Config, args: DeletePageArgs) -> Result<()> {
     // root. Keeps delete + read-back pairs targeting the same project.
     let project = super::resolve_project_name(config, args.project.as_deref())?;
 
-    let endpoint = ServerEndpoint::from_config(config);
+    let endpoint = ServerEndpoint::from_config_resolving_auth(config).await;
     let resp: DeletePageResponseBody = post_json(
         &endpoint,
         "/admin/delete-page",

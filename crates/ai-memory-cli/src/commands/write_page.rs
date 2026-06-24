@@ -55,7 +55,7 @@ pub async fn run(config: &Config, args: WritePageArgs) -> Result<()> {
     // write + read-back pairs from silently targeting different projects.
     let project = super::resolve_project_name(config, args.project.as_deref())?;
 
-    let endpoint = ServerEndpoint::from_config(config);
+    let endpoint = ServerEndpoint::from_config_resolving_auth(config).await;
     let resp: WritePageResponseBody = post_json(
         &endpoint,
         "/admin/write-page",

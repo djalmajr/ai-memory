@@ -7,8 +7,8 @@
 //! ## Configuration
 //!
 //! [`crate::config::Config`] captures `AI_MEMORY_SERVER_URL` and
-//! `AI_MEMORY_AUTH_TOKEN` exactly once; this module only consumes the
-//! resolved values.
+//! `AI_MEMORY_AUTH_TOKEN` exactly once; this module consumes those values
+//! and can fall back to the stored OIDC device-flow token used by native hooks.
 
 use std::io::{BufWriter, Write as _};
 use std::path::Path;
@@ -36,9 +36,12 @@ pub struct ServerEndpoint {
 }
 
 impl ServerEndpoint {
-    /// Build the endpoint from the already-loaded process config.
+    /// Build the endpoint from config, resolving bearer auth and base path.
     ///
-    /// The base-path prefix the server is mounted under (so client routes
+    /// Bearer precedence matches hooks: static config/env token first, stored
+    /// OIDC device token second, no token last.
+    ///
+    /// The base-path prefix the server is mounted under, so client routes
     /// resolve as `<origin><base><path>` instead of 404ing) is resolved
     /// from, in order of precedence:
     /// 1. the **path component of `AI_MEMORY_SERVER_URL`** (the remote-client
@@ -49,11 +52,17 @@ impl ServerEndpoint {
     ///    "one config-read path" invariant; the CLI runs in the same
     ///    container as `serve`, which already reads the same env var via
     ///    clap to nest its router).
-    #[must_use]
-    pub fn from_config(config: &Config) -> Self {
+    pub async fn from_config_resolving_auth(config: &Config) -> Self {
+        let client = reqwest::Client::new();
+        let token = crate::auth_bearer::resolve_bearer(
+            &client,
+            &config.oidc_device_token_path(),
+            config.auth.bearer_token.as_deref(),
+        )
+        .await;
         Self::build(
             Some(config.server_url.clone()),
-            config.auth.bearer_token.clone(),
+            token,
             config.server_url_configured(),
             Some(config.base_path.clone()).filter(|s| !s.is_empty()),
         )
@@ -563,5 +572,40 @@ mod tests {
             .to_str()
             .unwrap();
         assert_eq!(auth, "Bearer tok123");
+    }
+
+    #[tokio::test]
+    async fn from_config_resolving_auth_uses_stored_oidc_for_authorization_header() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut config = Config {
+            data_dir: tmp.path().to_path_buf(),
+            ..Config::default()
+        };
+        config.auth.bearer_token = None;
+        ai_memory_llm::OidcToken {
+            access: secrecy::SecretString::from("oidc-access".to_string()),
+            refresh: secrecy::SecretString::from("refresh-token".to_string()),
+            expires_at_ms: u64::MAX,
+            issuer: "https://issuer.example.com/realms/team".to_string(),
+            client_id: "ai-memory-cli".to_string(),
+            token_endpoint: "https://issuer.example.com/token".to_string(),
+        }
+        .save(&config.oidc_device_token_path())
+        .expect("save test OIDC token");
+
+        let ep = ServerEndpoint::from_config_resolving_auth(&config).await;
+        let client = reqwest::Client::new();
+        let req = ep
+            .authenticate(client.get("http://localhost"))
+            .build()
+            .unwrap();
+        let auth = req
+            .headers()
+            .get("authorization")
+            .expect("Authorization header must be set")
+            .to_str()
+            .unwrap();
+
+        assert_eq!(auth, "Bearer oidc-access");
     }
 }

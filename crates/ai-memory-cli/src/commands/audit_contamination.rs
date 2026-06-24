@@ -50,7 +50,7 @@ struct Finding {
 /// Returns an error if the server is unreachable, returns non-2xx, or the
 /// response can't be parsed.
 pub async fn run(config: &Config, args: AuditContaminationArgs) -> Result<()> {
-    let ep = ServerEndpoint::from_config(config);
+    let ep = ServerEndpoint::from_config_resolving_auth(config).await;
     let query = scope_query(&args)?;
     let report: Report = get_json(&ep, "/admin/audit-contamination", &query).await?;
 

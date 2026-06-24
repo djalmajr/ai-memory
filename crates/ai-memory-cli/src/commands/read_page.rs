@@ -36,7 +36,7 @@ struct PageContent {
 /// Returns an error if the server is unreachable, returns non-2xx,
 /// or neither `--path` nor a query is supplied.
 pub async fn run(config: &Config, args: ReadPageArgs) -> Result<()> {
-    let ep = ServerEndpoint::from_config(config);
+    let ep = ServerEndpoint::from_config_resolving_auth(config).await;
     let project = super::resolve_project_name(config, args.project.as_deref())?;
 
     let page: PageContent = if let Some(ref raw_path) = args.path {

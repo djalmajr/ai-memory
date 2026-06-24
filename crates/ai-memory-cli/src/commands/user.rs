@@ -68,7 +68,7 @@ struct UserList {
 /// Returns an error if the HTTP call fails, the server returns non-2xx,
 /// or the response body can't be deserialised.
 pub async fn run(config: &Config, args: UserArgs) -> Result<()> {
-    let ep = ServerEndpoint::from_config(config);
+    let ep = ServerEndpoint::from_config_resolving_auth(config).await;
     match args.command {
         UserCommand::Add(args) => add(&ep, args).await,
         UserCommand::List(args) => list(&ep, args).await,

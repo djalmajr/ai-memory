@@ -371,7 +371,15 @@ ai-memory install-hooks --agent claude-code --apply \
 
 OIDC hook auth requires the native `ai-memory hook ...` command path. The Docker
 wrapper keeps shell-script hooks by default; set up OIDC from a native release
-binary or source install.
+binary or source install. Thin-client HTTP commands such as `ai-memory status`
+and `ai-memory search` also use the stored OIDC access token when no static
+`AI_MEMORY_AUTH_TOKEN` / `[auth].bearer_token` is configured; the static bearer
+still wins when present.
+
+OIDC/Keycloak session ids are login-provider sessions, not ai-memory agent
+sessions. Shared servers that rely on `[auto_scope]` session isolation still
+need explicit `workspace` + `project` / `scopes`, or a bridge that forwards the
+real lifecycle-hook session id on MCP requests.
 
 **Want HTTPS?** ai-memory deliberately does not terminate TLS itself —
 the right answer is a battle-tested reverse proxy in front of it.

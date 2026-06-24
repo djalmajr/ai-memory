@@ -24,7 +24,7 @@ struct ForgetSweepRequest {
 /// Returns an error if the server is unreachable or returns a non-2xx
 /// response.
 pub async fn run(config: &Config, args: ForgetSweepArgs) -> Result<()> {
-    let endpoint = ServerEndpoint::from_config(config);
+    let endpoint = ServerEndpoint::from_config_resolving_auth(config).await;
     let project = super::resolve_project_name(config, args.project.as_deref())?;
     let report: serde_json::Value = post_json(
         &endpoint,

@@ -30,7 +30,7 @@ struct AutoImproveReportStageResponse {
 /// # Errors
 /// Returns an error if the server is unreachable or rejects the read-only report request.
 pub async fn run(config: &Config, args: AutoImproveReportArgs) -> Result<()> {
-    let endpoint = ServerEndpoint::from_config(config);
+    let endpoint = ServerEndpoint::from_config_resolving_auth(config).await;
     let project = super::resolve_project_name(config, args.project.as_deref())?;
     let request = AutoImproveReportRequest {
         workspace: args.workspace,

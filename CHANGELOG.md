@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- Thin-client HTTP CLI commands (`status`, `search`, `read-page`, `write-page`,
+  `delete-page`, `backup`, `embed`, `reindex`, and related admin commands) now
+  fall back to a stored OIDC device-flow token from `auth.json` when
+  `AI_MEMORY_AUTH_TOKEN` / `[auth].bearer_token` is absent. Static bearer tokens
+  still take precedence.
+
+### Changed
+- Agent-facing routing prompts and auto-scope docs now call out that static MCP
+  clients running parallel sessions need explicit scope arguments or a
+  session-aware bridge that forwards the real lifecycle-hook session id.
+
 ## [1.3.0] - 2026-06-24
 
 ### Added
