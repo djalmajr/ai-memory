@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- `install-hooks --project-strategy repo-root` bakes a default project strategy
+  into the generated hooks, so every session resolves its project from the main
+  git repo root (collapsing subdirectories and worktrees) without a per-repo
+  `.ai-memory.toml` marker — preventing a persistent `cd` into a subdirectory
+  from forking memory into a phantom project. A marker's own `project_strategy`
+  still takes precedence, and the default (`basename`) bakes nothing, so existing
+  installs are unchanged. Covers every delivery path: POSIX/PowerShell hook
+  scripts, the native `hook` command, and the OpenCode / OMP / OpenClaw
+  TypeScript integrations. (#128)
+
 ## [1.2.2] - 2026-06-23
 
 ### Fixed
