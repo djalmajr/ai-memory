@@ -101,15 +101,25 @@ ai_memory_marker_qs() {
     cwd="$1"
     [ -z "$cwd" ] && return 0
     qs="&cwd=$(ai_memory_url_encode "$cwd")"
+    ws=""
+    pr=""
+    st=""
     marker=$(ai_memory_find_marker "$cwd")
-    [ -z "$marker" ] && { printf '%s' "$qs"; return 0; }
-    ws=$(ai_memory_parse_toml_key "$marker" workspace)
-    pr=$(ai_memory_parse_toml_key "$marker" project)
-    st=$(ai_memory_parse_toml_key "$marker" project_strategy)
+    if [ -n "$marker" ]; then
+        ws=$(ai_memory_parse_toml_key "$marker" workspace)
+        pr=$(ai_memory_parse_toml_key "$marker" project)
+        st=$(ai_memory_parse_toml_key "$marker" project_strategy)
+    fi
+    # Install-time default baked into the hook command by
+    # `install-hooks --project-strategy` fills the strategy only when no marker
+    # pinned one. A marker's explicit project / project_strategy still win.
+    if [ -z "$st" ] && [ -n "${AI_MEMORY_PROJECT_STRATEGY:-}" ]; then
+        st="$AI_MEMORY_PROJECT_STRATEGY"
+    fi
     # The repo-root strategy must be resolved here, on the host: a containerized
     # server cannot see this checkout, so its own libgit2 discovery fails and
-    # falls back to basename(cwd). When the marker selects repo-root and pins no
-    # explicit project, derive the main repo name now and send it as an explicit
+    # falls back to basename(cwd). When repo-root is selected and no explicit
+    # project is pinned, derive the main repo name now and send it as an explicit
     # `project` override. `project_strategy` is still forwarded so native servers
     # keep their existing resolution path.
     if [ -z "$pr" ]; then
