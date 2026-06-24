@@ -142,7 +142,7 @@ pub async fn run(data_dir: Option<PathBuf>, args: HookArgs) -> anyhow::Result<()
     let json: serde_json::Value = serde_json::from_str(&payload).unwrap_or(serde_json::Value::Null);
 
     let qs = extract_cwd(&json)
-        .map(|cwd| marker_query_suffix(&cwd))
+        .map(|cwd| marker_query_suffix(&cwd, args.project_strategy.as_deref()))
         .unwrap_or_default();
     let base = args.server_url.trim_end_matches('/');
     let dd = resolve_data_dir(data_dir.as_deref());

@@ -41,26 +41,35 @@ pub fn url_encode(s: &str) -> String {
 /// Build `&cwd=…[&workspace=…&project=…&project_strategy=…]`, mirroring
 /// `ai_memory_marker_qs`: always include cwd; append marker-declared
 /// fields when a `.ai-memory.toml` is found walking up toward $HOME.
-pub fn marker_query_suffix(cwd: &str) -> String {
+///
+/// `default_strategy` is the install-time default baked into the native hook
+/// command by `install-hooks --project-strategy` (passed via the `hook
+/// --project-strategy` flag). It fills `project_strategy` only when no marker
+/// pinned one — a marker's explicit `project` / `project_strategy` always win
+/// (§3.3). repo-root is resolved here, host-side, because a containerized
+/// server cannot see this checkout.
+pub fn marker_query_suffix(cwd: &str, default_strategy: Option<&str>) -> String {
     let mut qs = format!("&cwd={}", url_encode(cwd));
+    let (mut workspace, mut project, mut strategy) = (None, None, None);
     if let Some(marker) = find_marker(cwd) {
-        let workspace = parse_toml_key(&marker, "workspace");
-        let mut project = parse_toml_key(&marker, "project");
-        let project_strategy = parse_toml_key(&marker, "project_strategy");
-        if project.is_none()
-            && matches!(project_strategy.as_deref(), Some("repo-root" | "repo_root"))
-        {
-            project = repo_root_project(cwd);
-        }
-        if let Some(val) = workspace {
-            qs.push_str(&format!("&workspace={}", url_encode(&val)));
-        }
-        if let Some(val) = project {
-            qs.push_str(&format!("&project={}", url_encode(&val)));
-        }
-        if let Some(val) = project_strategy {
-            qs.push_str(&format!("&project_strategy={}", url_encode(&val)));
-        }
+        workspace = parse_toml_key(&marker, "workspace");
+        project = parse_toml_key(&marker, "project");
+        strategy = parse_toml_key(&marker, "project_strategy");
+    }
+    if strategy.is_none() {
+        strategy = default_strategy.map(str::to_owned);
+    }
+    if project.is_none() && matches!(strategy.as_deref(), Some("repo-root" | "repo_root")) {
+        project = repo_root_project(cwd);
+    }
+    if let Some(val) = workspace {
+        qs.push_str(&format!("&workspace={}", url_encode(&val)));
+    }
+    if let Some(val) = project {
+        qs.push_str(&format!("&project={}", url_encode(&val)));
+    }
+    if let Some(val) = strategy {
+        qs.push_str(&format!("&project_strategy={}", url_encode(&val)));
     }
     qs
 }
@@ -305,7 +314,7 @@ mod tests {
 
     #[test]
     fn query_suffix_without_marker_has_only_cwd() {
-        let qs = marker_query_suffix("/nonexistent/path/xyz");
+        let qs = marker_query_suffix("/nonexistent/path/xyz", None);
         assert_eq!(qs, "&cwd=%2Fnonexistent%2Fpath%2Fxyz");
     }
 
@@ -434,7 +443,7 @@ project_strategy = "repo-root"
         )
         .unwrap();
         let cwd = tmp.path().to_str().unwrap();
-        let qs = marker_query_suffix(cwd);
+        let qs = marker_query_suffix(cwd, None);
         // cwd is encoded first; marker fields follow in the iteration order
         // of the loop in `marker_query_suffix`.
         assert!(qs.contains("&workspace=acme%20corp"), "{qs}");
@@ -452,7 +461,7 @@ project_strategy = "repo-root"
         .unwrap();
         let child = tmp.path().join("plain-dir");
         std::fs::create_dir_all(&child).unwrap();
-        let qs = marker_query_suffix(child.to_str().unwrap());
+        let qs = marker_query_suffix(child.to_str().unwrap(), None);
         assert!(qs.contains("&workspace=oss"), "{qs}");
         assert!(!qs.contains("&project="), "{qs}");
         assert!(qs.contains("&project_strategy=repo-root"), "{qs}");
@@ -519,7 +528,7 @@ project_strategy = "repo-root"
             return;
         }
 
-        let qs = marker_query_suffix(wt.to_str().unwrap());
+        let qs = marker_query_suffix(wt.to_str().unwrap(), None);
         assert!(qs.contains("&workspace=oss"), "{qs}");
         assert!(qs.contains("&project=acme-api"), "{qs}");
         assert!(qs.contains("&project_strategy=repo-root"), "{qs}");
