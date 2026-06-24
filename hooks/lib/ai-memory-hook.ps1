@@ -68,17 +68,27 @@ function Get-AiMemoryMarkerQuery {
     param([string] $Cwd)
     if (-not $Cwd) { return "" }
     $qs = "&cwd=$([uri]::EscapeDataString($Cwd))"
+    $ws = $null
+    $proj = $null
+    $strategy = $null
     $marker = Get-AiMemoryMarkerToml -Cwd $Cwd
-    if (-not $marker) { return $qs }
-    $ws = Get-AiMemoryTomlKey -File $marker -Key "workspace"
-    if ($ws) { $qs += "&workspace=$([uri]::EscapeDataString($ws))" }
-    $proj = Get-AiMemoryTomlKey -File $marker -Key "project"
-    $strategy = Get-AiMemoryTomlKey -File $marker -Key "project_strategy"
+    if ($marker) {
+        $ws = Get-AiMemoryTomlKey -File $marker -Key "workspace"
+        $proj = Get-AiMemoryTomlKey -File $marker -Key "project"
+        $strategy = Get-AiMemoryTomlKey -File $marker -Key "project_strategy"
+    }
+    # Install-time default baked into the hook command by
+    # `install-hooks --project-strategy` fills the strategy only when no marker
+    # pinned one. A marker's explicit project / project_strategy still win.
+    if (-not $strategy -and $env:AI_MEMORY_PROJECT_STRATEGY) {
+        $strategy = $env:AI_MEMORY_PROJECT_STRATEGY
+    }
     # repo-root must be resolved host-side (the server may not see this checkout);
     # only when no explicit project is pinned. Explicit project always wins.
     if (-not $proj -and ($strategy -eq "repo-root" -or $strategy -eq "repo_root")) {
         $proj = Get-AiMemoryRepoRootProject -Cwd $Cwd
     }
+    if ($ws) { $qs += "&workspace=$([uri]::EscapeDataString($ws))" }
     if ($proj) { $qs += "&project=$([uri]::EscapeDataString($proj))" }
     if ($strategy) { $qs += "&project_strategy=$([uri]::EscapeDataString($strategy))" }
     return $qs
