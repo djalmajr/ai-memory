@@ -37,6 +37,11 @@ use ai_memory_core::{MARKER_END, MARKER_START, full_block};
 pub fn run(config: &Config, args: InstallInstructionsArgs) -> Result<()> {
     let block = full_block();
     let targets = resolve_targets(args.target.as_ref())?;
+    let skill_args = if args.no_skills {
+        None
+    } else {
+        Some(skill_args_from_instruction_args(&args, &targets))
+    };
 
     if args.print {
         for t in &targets {
@@ -44,6 +49,9 @@ pub fn run(config: &Config, args: InstallInstructionsArgs) -> Result<()> {
             println!("{block}");
         }
     } else {
+        if let Some(skill_args) = &skill_args {
+            install_skills::preflight_overwrite_safety(skill_args)?;
+        }
         for target in &targets {
             let outcome = apply_atomic(target, |existing| {
                 Ok(merge_instructions_block(existing, &block))
@@ -61,8 +69,8 @@ pub fn run(config: &Config, args: InstallInstructionsArgs) -> Result<()> {
         }
     }
 
-    if !args.no_skills {
-        install_skills::run(config, skill_args_from_instruction_args(&args, &targets))?;
+    if let Some(skill_args) = skill_args {
+        install_skills::run(config, skill_args)?;
     }
 
     Ok(())

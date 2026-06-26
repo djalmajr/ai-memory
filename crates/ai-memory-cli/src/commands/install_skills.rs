@@ -34,9 +34,7 @@ struct InstallReport {
 /// same-name skill would be overwritten without `--force`, or a skill
 /// file cannot be written.
 pub fn run(_config: &Config, args: InstallSkillsArgs) -> Result<()> {
-    let cwd = std::env::current_dir().context("getting CWD for install-skills target")?;
-    let home = dirs::home_dir();
-    let roots = resolve_target_roots(&args, &cwd, home.as_deref())?;
+    let roots = resolve_target_roots_from_env(&args)?;
 
     if args.print {
         print_install_plan(&roots);
@@ -53,6 +51,18 @@ pub fn run(_config: &Config, args: InstallSkillsArgs) -> Result<()> {
     }
 
     Ok(())
+}
+
+pub(super) fn preflight_overwrite_safety(args: &InstallSkillsArgs) -> Result<()> {
+    let roots = resolve_target_roots_from_env(args)?;
+    let plans = skill_file_plans(&roots);
+    validate_overwrite_safety(&plans, args.force)
+}
+
+fn resolve_target_roots_from_env(args: &InstallSkillsArgs) -> Result<Vec<TargetRoot>> {
+    let cwd = std::env::current_dir().context("getting CWD for install-skills target")?;
+    let home = dirs::home_dir();
+    resolve_target_roots(args, &cwd, home.as_deref())
 }
 
 fn resolve_target_roots(

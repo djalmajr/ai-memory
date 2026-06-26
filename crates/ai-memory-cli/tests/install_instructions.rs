@@ -29,6 +29,62 @@ fn assert_success(output: Output) -> String {
     String::from_utf8(output.stdout).unwrap()
 }
 
+fn assert_failure(output: Output) -> String {
+    assert!(
+        !output.status.success(),
+        "command unexpectedly succeeded\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8(output.stderr).unwrap()
+}
+
+#[test]
+fn skill_conflict_preflight_keeps_instruction_file_unchanged_until_force() {
+    let project = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    let target = project.path().join("CLAUDE.md");
+    let original = b"# Project\n\nKeep this exact.\n".to_vec();
+    fs::write(&target, &original).unwrap();
+
+    let unmanaged = project
+        .path()
+        .join(".claude/skills/ai-memory-retrieval/SKILL.md");
+    let unmanaged_content = b"---\nname: ai-memory-retrieval\n---\nuser skill\n".to_vec();
+    fs::create_dir_all(unmanaged.parent().unwrap()).unwrap();
+    fs::write(&unmanaged, &unmanaged_content).unwrap();
+
+    let output = run_ai_memory(project.path(), home.path(), &["install-instructions"]);
+    let stderr = assert_failure(output);
+    assert!(stderr.contains("refusing to overwrite unmanaged skill"));
+    assert_eq!(fs::read(&target).unwrap(), original);
+    assert_eq!(fs::read(&unmanaged).unwrap(), unmanaged_content);
+    assert!(
+        !project
+            .path()
+            .join(".claude/skills/ai-memory-handoff/SKILL.md")
+            .exists()
+    );
+
+    let output = run_ai_memory(
+        project.path(),
+        home.path(),
+        &["install-instructions", "--skills-force"],
+    );
+    assert_success(output);
+
+    let updated = fs::read_to_string(&target).unwrap();
+    assert!(updated.contains(MARKER_START));
+    assert!(updated.contains("# Project"));
+    assert!(fs::read_to_string(&unmanaged).unwrap().contains(MANAGED_MARKER));
+    assert!(
+        project
+            .path()
+            .join(".claude/skills/ai-memory-handoff/SKILL.md")
+            .exists()
+    );
+}
+
 #[test]
 fn no_skills_writes_only_instruction_snippet() {
     let project = tempfile::tempdir().unwrap();
