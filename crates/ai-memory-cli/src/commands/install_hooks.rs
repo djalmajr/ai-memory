@@ -452,9 +452,9 @@ fn overlay_event_hooks(
     map.insert(event.to_string(), serde_json::Value::Array(entries));
 }
 
-/// Mutate `~/.claude/settings.json` in place: replace the seven hook
-/// entries ai-memory cares about; preserve every other hook the user
-/// has wired up to other tools.
+/// Mutate `~/.claude/settings.json` in place: replace the hook entries
+/// ai-memory cares about (`CLAUDE_CODE_EVENTS`); preserve every other hook the
+/// user has wired up to other tools.
 fn apply_to_claude_code_settings(
     hooks_dir: &Path,
     server_url: &str,
@@ -514,7 +514,7 @@ fn apply_to_claude_code_settings(
 
 /// Mutate `~/.grok/hooks/ai-memory.json` so Grok Build CLI fires the ai-memory
 /// lifecycle hooks. Grok's hook config is structurally identical to Claude
-/// Code's nested hook JSON and uses the same seven CamelCase event names, but
+/// Code's nested hook JSON and uses the same CamelCase event names, but
 /// its script bundle carries `agent=grok` and skips destructive SessionStart
 /// handoff fetches. We merge into a dedicated `ai-memory.json` (Grok discovers
 /// every `~/.grok/hooks/*.json`), so a pre-existing third-party hook file is

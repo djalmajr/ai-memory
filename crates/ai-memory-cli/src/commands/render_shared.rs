@@ -4,9 +4,9 @@
 //! `setup-agent`) all emit configuration snippets that share two
 //! pieces of state:
 //!
-//! 1. The seven Claude Code lifecycle-hook events ai-memory wires
-//!    up — kept in sync between hook-bundle generation (setup-agent)
-//!    and JSON-config rendering (install-hooks).
+//! 1. The Claude Code lifecycle-hook events ai-memory wires up
+//!    (see `CLAUDE_CODE_EVENTS`) — kept in sync between hook-bundle
+//!    generation (setup-agent) and JSON-config rendering (install-hooks).
 //! 2. The optional `Authorization: Bearer <token>` header used by
 //!    both MCP client configs (install-mcp) and hook env blocks
 //!    (install-hooks / setup-agent).
@@ -82,7 +82,7 @@ pub(crate) fn ts_string_literal(s: &str) -> String {
 }
 
 /// Build the Claude Code `settings.json` fragment that wires the
-/// seven hooks. Used by both:
+/// lifecycle hooks (`CLAUDE_CODE_EVENTS`). Used by both:
 /// - `install-hooks --agent claude-code` (script paths are
 ///   wherever the user told us via `--hooks-dir`)
 /// - `setup-agent --agent claude-code` (script paths are where
@@ -846,11 +846,11 @@ mod tests {
     }
 
     #[test]
-    fn claude_code_payload_has_seven_events() {
+    fn claude_code_payload_has_all_events() {
         let root = PathBuf::from("/host/hooks/claude-code");
         let v = build_claude_code_payload(&root, "http://localhost:49374", None);
         let hooks = v.get("hooks").and_then(|h| h.as_object()).unwrap();
-        assert_eq!(hooks.len(), 7);
+        assert_eq!(hooks.len(), CLAUDE_CODE_EVENTS.len());
         for (event, _) in CLAUDE_CODE_EVENTS {
             assert!(hooks.contains_key(event), "missing event {event}");
         }

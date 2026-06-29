@@ -17,15 +17,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the store. The events are accepted (HTTP 202 / counted in the `/hook/batch`
   ack) so clients do not retry or spool them, but they are not stored.
   Top-level sessions are always captured. The `ai-memory hook` command honors
-  the same `AI_MEMORY_DROP_SUBAGENT_CAPTURES` env var to skip subagent captures
-  at the source — they are never spooled or sent — so the client spool does not
-  fill on hosts that opt in. The server-side setting remains the universal
-  backstop for clients that do not set it. The drop now also tracks subagent
-  session ids — seeded by the per-event marker and by the newly registered
-  `SubagentStart`/`SubagentStop` lifecycle hooks (Claude Code and grok) — so the
-  unmarked tail of a subagent session (its `user_prompt_submit`/`stop`/
-  `session_end`, which carry no marker) is dropped too, not just the
-  marker-bearing tool-use events.
+  the same `AI_MEMORY_DROP_SUBAGENT_CAPTURES` env var to skip marker-bearing
+  subagent captures at the source — they are never spooled or sent — so the
+  client spool does not fill on hosts that opt in. The server-side setting
+  remains the universal backstop for clients that do not set it. The drop also
+  tracks subagent session ids — seeded by the per-event marker and by the newly
+  registered `SubagentStart`/`SubagentStop` lifecycle hooks (Claude Code and
+  grok) — so the unmarked tail of a subagent session (its `user_prompt_submit`/
+  `stop`/`session_end`, which carry no marker) is dropped too, not just the
+  marker-bearing tool-use events. The client deliberately forwards the
+  `subagent-start`/`subagent-stop` boundary events even when the opt-out is set,
+  so the server can seed/clear that tracking and close the tail; source-dropping
+  them would blind the server and leak the tail.
 - `AI_MEMORY_SANITIZE_OUTBOUND` env var for the `ai-memory hook` client. When
   set, the captured payload is scrubbed with the built-in privacy patterns
   before it is spooled or sent, so secrets/PII never leave the host or sit

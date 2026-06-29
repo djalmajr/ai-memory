@@ -174,12 +174,16 @@ pub async fn run(data_dir: Option<PathBuf>, args: HookArgs) -> anyhow::Result<()
     let json: serde_json::Value = serde_json::from_str(&payload).unwrap_or(serde_json::Value::Null);
 
     // Client-side opt-out: with AI_MEMORY_DROP_SUBAGENT_CAPTURES set, skip
-    // captures from a SUBAGENT session at the source — never spool or send
-    // them — so a multi-agent harness's subagent swarm cannot fill the local
-    // spool or hammer the server. Shares the env var (and marker detection)
-    // with the server-side `drop_subagent_captures`; a hook must always emit a
-    // JSON object on stdout, so write the empty no-op response and return.
-    if drop_subagent_captures_enabled() && ai_memory_hooks::body_is_subagent(&json) {
+    // marker-bearing captures from a SUBAGENT session at the source — never
+    // spool or send them — so a multi-agent harness's subagent swarm cannot
+    // fill the local spool or hammer the server. Shares the env var (and marker
+    // detection) with the server-side `drop_subagent_captures`. The subagent
+    // BOUNDARY events (`subagent-start`/`subagent-stop`) are deliberately NOT
+    // dropped: forwarding them lets the server seed/clear its tail tracking and
+    // drop the unmarked tail too — source-dropping them would blind that and
+    // leak the tail. A hook must always emit a JSON object on stdout, so write
+    // the empty no-op response and return.
+    if drop_subagent_captures_enabled() && should_source_drop_subagent(&args.event, &json) {
         println!("{{}}");
         return Ok(());
     }
@@ -291,6 +295,29 @@ fn drop_subagent_captures_enabled() -> bool {
         .is_some_and(|value| is_truthy(&value))
 }
 
+/// True for the subagent lifecycle *boundary* events (`subagent-start` /
+/// `subagent-stop`). These must never be source-dropped: they carry no bulk
+/// payload, and the server's stateful subagent-session tracking seeds on
+/// `subagent-start` (and clears on `subagent-stop`) so it can drop the
+/// *unmarked* tail (`user-prompt-submit` / `stop` / `session-end`) of a
+/// subagent session. Dropping them at the source would blind that tracking and
+/// let the tail persist despite the opt-out.
+fn is_subagent_boundary_event(event: &str) -> bool {
+    matches!(
+        event.trim().to_ascii_lowercase().as_str(),
+        "subagent-start" | "subagent_start" | "subagent-stop" | "subagent_stop"
+    )
+}
+
+/// Whether `ai-memory hook` should source-drop this event under
+/// `AI_MEMORY_DROP_SUBAGENT_CAPTURES`: only marker-bearing, *non-boundary*
+/// captures. Boundary events are always forwarded so the server can seed/clear
+/// its tail tracking; unmarked events are forwarded so the server closes the
+/// tail. Mirrors the server-side detection (`body_is_subagent`).
+fn should_source_drop_subagent(event: &str, json: &serde_json::Value) -> bool {
+    !is_subagent_boundary_event(event) && ai_memory_hooks::body_is_subagent(json)
+}
+
 /// Parse a boolean-ish env value: `1` / `true` / `yes` / `on` (case-insensitive).
 fn is_truthy(value: &str) -> bool {
     matches!(
@@ -379,6 +406,23 @@ mod tests {
         for v in ["0", "false", "no", "off", "", "maybe"] {
             assert!(!is_truthy(v), "{v:?} should not be truthy");
         }
+    }
+
+    #[test]
+    fn source_drop_forwards_subagent_boundary_events() {
+        let marked = serde_json::json!({ "subagentType": "general-purpose" });
+        // Boundary events are forwarded even when marker-bearing, so the server
+        // can seed/clear its tail tracking and drop the unmarked tail.
+        assert!(!should_source_drop_subagent("subagent-start", &marked));
+        assert!(!should_source_drop_subagent("subagent-stop", &marked));
+        assert!(!should_source_drop_subagent("subagent_start", &marked));
+        // A marker-bearing NON-boundary capture (the bulk) is still dropped.
+        assert!(should_source_drop_subagent("pre-tool-use", &marked));
+        // An unmarked event is never source-dropped — the server, seeded by the
+        // forwarded boundary event, closes the tail itself.
+        let unmarked = serde_json::json!({ "prompt": "go" });
+        assert!(!should_source_drop_subagent("user-prompt-submit", &unmarked));
+        assert!(!should_source_drop_subagent("session-end", &unmarked));
     }
 
     #[test]
