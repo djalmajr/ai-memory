@@ -26,7 +26,7 @@ pub mod synth;
 // Re-export the sanitizer types from core so callers that grew up
 // pointing at this crate's `sanitize` module keep working.
 pub use ai_memory_core::{SanitizeConfig, Sanitized, Sanitizer};
-pub use payload::{HookEnvelope, HookEvent};
+pub use payload::{HookEnvelope, HookEvent, body_is_subagent};
 pub use router::{
     DEFAULT_HOOK_INGEST_MAX_IN_FLIGHT, DEFAULT_PROJECT_CACHE_MAX_ENTRIES, HookState, ProjectCache,
     ProjectCacheStore, hook_router,

@@ -16,7 +16,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   lifecycle hooks; on a small instance that flood can saturate ingest and bloat
   the store. The events are accepted (HTTP 202 / counted in the `/hook/batch`
   ack) so clients do not retry or spool them, but they are not stored.
-  Top-level sessions are always captured.
+  Top-level sessions are always captured. The `ai-memory hook` command honors
+  the same `AI_MEMORY_DROP_SUBAGENT_CAPTURES` env var to skip subagent captures
+  at the source — they are never spooled or sent — so the client spool does not
+  fill on hosts that opt in. The server-side setting remains the universal
+  backstop for clients that do not set it.
 
 ## [1.4.1] - 2026-06-28
 

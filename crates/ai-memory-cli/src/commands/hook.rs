@@ -173,6 +173,17 @@ pub async fn run(data_dir: Option<PathBuf>, args: HookArgs) -> anyhow::Result<()
     std::io::stdin().read_to_string(&mut payload).ok();
     let json: serde_json::Value = serde_json::from_str(&payload).unwrap_or(serde_json::Value::Null);
 
+    // Client-side opt-out: with AI_MEMORY_DROP_SUBAGENT_CAPTURES set, skip
+    // captures from a SUBAGENT session at the source — never spool or send
+    // them — so a multi-agent harness's subagent swarm cannot fill the local
+    // spool or hammer the server. Shares the env var (and marker detection)
+    // with the server-side `drop_subagent_captures`; a hook must always emit a
+    // JSON object on stdout, so write the empty no-op response and return.
+    if drop_subagent_captures_enabled() && ai_memory_hooks::body_is_subagent(&json) {
+        println!("{{}}");
+        return Ok(());
+    }
+
     let qs = extract_cwd(&json)
         .map(|cwd| marker_query_suffix(&cwd, args.project_strategy.and_then(|s| s.baked())))
         .unwrap_or_default();
@@ -263,6 +274,23 @@ pub async fn run(data_dir: Option<PathBuf>, args: HookArgs) -> anyhow::Result<()
     Ok(())
 }
 
+/// True when `AI_MEMORY_DROP_SUBAGENT_CAPTURES` is set to a truthy value. The
+/// hook fast-path skips full config loading for latency, so it reads the env
+/// directly; the value mirrors the server-side `drop_subagent_captures`.
+fn drop_subagent_captures_enabled() -> bool {
+    std::env::var("AI_MEMORY_DROP_SUBAGENT_CAPTURES")
+        .ok()
+        .is_some_and(|value| is_truthy(&value))
+}
+
+/// Parse a boolean-ish env value: `1` / `true` / `yes` / `on` (case-insensitive).
+fn is_truthy(value: &str) -> bool {
+    matches!(
+        value.trim().to_ascii_lowercase().as_str(),
+        "1" | "true" | "yes" | "on"
+    )
+}
+
 /// Resolve the data dir cheaply, without loading the full config (the hook
 /// fast-path skips config for latency). Mirrors `config.rs`: explicit
 /// `--data-dir`, else `AI_MEMORY_DATA_DIR`, else the platform local-data dir.
@@ -287,6 +315,16 @@ fn resolve_data_dir(data_dir: Option<&Path>) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn is_truthy_accepts_common_boolean_forms() {
+        for v in ["1", "true", "TRUE", " yes ", "On"] {
+            assert!(is_truthy(v), "{v:?} should be truthy");
+        }
+        for v in ["0", "false", "no", "off", "", "maybe"] {
+            assert!(!is_truthy(v), "{v:?} should not be truthy");
+        }
+    }
 
     #[test]
     fn resolve_data_dir_strips_verbatim_prefix_from_baked_arg() {
