@@ -29,12 +29,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `subagent-start`/`subagent-stop` boundary events even when the opt-out is set,
   so the server can seed/clear that tracking and close the tail; source-dropping
   them would blind the server and leak the tail.
-- `AI_MEMORY_SANITIZE_OUTBOUND` env var for the `ai-memory hook` client. When
-  set, the captured payload is scrubbed with the built-in privacy patterns
-  before it is spooled or sent, so secrets/PII never leave the host or sit
-  plaintext in the local spool. JSON string values are scrubbed in place (keys
-  and structure preserved); the server still applies the full sanitize
-  (built-in + operator `[sanitize]` extras) on store as a backstop.
 
 ## [1.4.1] - 2026-06-28
 
