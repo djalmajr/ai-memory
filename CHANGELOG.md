@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- `drop_subagent_captures` setting (off by default; env
+  `AI_MEMORY_DROP_SUBAGENT_CAPTURES`). When enabled, the hook ingest router
+  accepts but does not persist lifecycle captures that carry a subagent marker
+  (`subagentType` for grok, `agent_type`/`agent_id` for Claude Code). A
+  multi-agent harness fans one goal out to many subagent sessions, each firing
+  lifecycle hooks; on a small instance that flood can saturate ingest and bloat
+  the store. The events are accepted (HTTP 202 / counted in the `/hook/batch`
+  ack) so clients do not retry or spool them, but they are not stored.
+  Top-level sessions are always captured.
+
 ## [1.4.1] - 2026-06-28
 
 ## [1.4.0] - 2026-06-26

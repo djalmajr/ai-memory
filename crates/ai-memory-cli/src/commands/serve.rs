@@ -286,6 +286,7 @@ pub async fn run(config: &Config, args: ServeArgs) -> Result<()> {
                     DEFAULT_HOOK_INGEST_MAX_IN_FLIGHT,
                 )),
                 consolidate_on_session_end: config.consolidate_on_session_end,
+                drop_subagent_captures: config.drop_subagent_captures,
                 home_dir: config.home_dir.clone(),
             });
             let admin = admin_router(AdminState {

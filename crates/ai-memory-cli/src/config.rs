@@ -96,6 +96,17 @@ pub struct Config {
     /// and via manual `memory_consolidate`. Set with
     /// `AI_MEMORY_CONSOLIDATE_ON_SESSION_END=true`.
     pub consolidate_on_session_end: bool,
+    /// Opt-in: drop lifecycle-hook captures that originate from a SUBAGENT
+    /// (a nested/spawned agent session) instead of persisting them. A
+    /// multi-agent harness fans one goal out to many subagent sessions, each
+    /// firing lifecycle hooks; on a small instance that flood can saturate
+    /// ingest and bloat the store. When true, the ingest router still ACCEPTS
+    /// such events (so the client treats them as delivered and does not retry)
+    /// but does not store them. Off by default — top-level sessions are always
+    /// captured. Detection keys off the harness-supplied subagent marker
+    /// (`subagentType` / `agent_type`). Set with
+    /// `AI_MEMORY_DROP_SUBAGENT_CAPTURES=true`.
+    pub drop_subagent_captures: bool,
     /// Optional embedding provider (`openai`, `voyage`, `google` / `gemini`).
     pub embedding_provider: Option<String>,
     /// Optional embedding model override.
@@ -353,6 +364,7 @@ impl Default for Config {
             llm_base_url: None,
             llm_compat_strict: false,
             consolidate_on_session_end: false,
+            drop_subagent_captures: false,
             embedding_provider: None,
             embedding_model: None,
             embedding_dim: None,

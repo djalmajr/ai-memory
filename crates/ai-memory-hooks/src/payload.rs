@@ -70,6 +70,27 @@ pub struct HookEnvelope {
     pub raw: serde_json::Value,
 }
 
+/// Keys by which agent harnesses tag a hook event as belonging to a SUBAGENT
+/// (a nested/spawned agent session) rather than the top-level session. Grok
+/// sets `subagentType` (on its tool-use events); Claude Code sets `agent_type`
+/// and `agent_id` (on its `SubagentStart`/`SubagentStop` and subagent tool
+/// events). The set is a union so one check covers every harness that signals
+/// subagent-ness; a harness that does not signal it simply never matches.
+const SUBAGENT_MARKER_KEYS: &[&str] = &["subagentType", "agent_type", "agent_id"];
+
+/// True when the raw hook payload carries a non-empty subagent marker — i.e.
+/// the event originates from a spawned subagent session. The ingest router
+/// consults this to optionally drop subagent captures (the
+/// `drop_subagent_captures` setting). Only top-level string keys are inspected.
+#[must_use]
+pub fn body_is_subagent(raw: &serde_json::Value) -> bool {
+    SUBAGENT_MARKER_KEYS.iter().any(|key| {
+        raw.get(*key)
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|value| !value.trim().is_empty())
+    })
+}
+
 /// How the hook router derives a project name when no explicit
 /// `project` override is present.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
@@ -545,6 +566,32 @@ fn normalize_token(value: &str, max_len: usize) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn body_is_subagent_detects_harness_markers() {
+        // grok tags subagent tool-use events with `subagentType`.
+        assert!(body_is_subagent(
+            &serde_json::json!({ "sessionId": "s", "subagentType": "general-purpose" })
+        ));
+        // Claude Code tags its subagent events with `agent_type` / `agent_id`.
+        assert!(body_is_subagent(
+            &serde_json::json!({ "session_id": "s", "agent_type": "workflow-subagent" })
+        ));
+        assert!(body_is_subagent(&serde_json::json!({ "agent_id": "agent-abc123" })));
+    }
+
+    #[test]
+    fn body_is_subagent_false_for_top_level_and_empty_markers() {
+        // A normal top-level event carries no marker.
+        assert!(!body_is_subagent(
+            &serde_json::json!({ "session_id": "s", "tool_name": "Write" })
+        ));
+        // An empty / blank or non-string marker does not count as a subagent.
+        assert!(!body_is_subagent(&serde_json::json!({ "subagentType": "" })));
+        assert!(!body_is_subagent(&serde_json::json!({ "subagentType": "   " })));
+        assert!(!body_is_subagent(&serde_json::json!({ "agent_type": null })));
+        assert!(!body_is_subagent(&serde_json::json!({})));
+    }
 
     #[test]
     fn parses_known_events() {
