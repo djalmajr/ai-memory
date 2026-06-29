@@ -30,7 +30,7 @@ use crate::commands::path_util::strip_windows_verbatim_prefix;
 /// matching `.sh` and `.ps1` files under
 /// `hooks/{claude-code,codex,cursor,gemini-cli,grok,opencode}/`. The
 /// install-hooks parity test fails if the bundle drifts.
-pub(crate) const CLAUDE_CODE_EVENTS: [(&str, &str); 7] = [
+pub(crate) const CLAUDE_CODE_EVENTS: [(&str, &str); 9] = [
     ("SessionStart", "session-start.sh"),
     ("UserPromptSubmit", "user-prompt-submit.sh"),
     ("PreToolUse", "pre-tool-use.sh"),
@@ -38,6 +38,11 @@ pub(crate) const CLAUDE_CODE_EVENTS: [(&str, &str); 7] = [
     ("PreCompact", "pre-compact.sh"),
     ("Stop", "stop.sh"),
     ("SessionEnd", "session-end.sh"),
+    // Subagent boundaries — let the server seed/forget a subagent session id so
+    // `drop_subagent_captures` can drop the whole nested session (Claude Code +
+    // grok both emit these; other agents keep their own event lists).
+    ("SubagentStart", "subagent-start.sh"),
+    ("SubagentStop", "subagent-stop.sh"),
 ];
 
 /// Format an `Authorization: Bearer <token>` header value, or `None`

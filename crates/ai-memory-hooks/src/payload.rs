@@ -144,6 +144,10 @@ pub enum HookEvent {
     Stop,
     /// Session ended (final).
     SessionEnd,
+    /// A subagent (nested/spawned child session) started.
+    SubagentStart,
+    /// A subagent finished.
+    SubagentStop,
     /// Anything else.
     Other,
 }
@@ -169,6 +173,11 @@ impl HookEvent {
             "notification" | "Notification" => Self::Notification,
             "stop" | "Stop" => Self::Stop,
             "session-end" | "session_end" | "SessionEnd" | "sessionEnd" => Self::SessionEnd,
+            "subagent-start" | "subagent_start" | "SubagentStart" | "subagentStart" => {
+                Self::SubagentStart
+            }
+            "subagent-stop" | "subagent_stop" | "SubagentStop" | "subagentStop" | "subagent-end"
+            | "SubagentEnd" => Self::SubagentStop,
             _ => Self::Other,
         }
     }
@@ -185,6 +194,9 @@ impl HookEvent {
             Self::Notification => ObservationKind::Notification,
             Self::Stop => ObservationKind::Stop,
             Self::SessionEnd => ObservationKind::SessionEnd,
+            // Subagent lifecycle events are normally dropped (drop_subagent_captures);
+            // bucket as Other for the flag-off path rather than growing ObservationKind.
+            Self::SubagentStart | Self::SubagentStop => ObservationKind::Other,
             Self::Other => ObservationKind::Other,
         }
     }

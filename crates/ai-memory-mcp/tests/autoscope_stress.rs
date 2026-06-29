@@ -19,7 +19,7 @@
 
 use ai_memory_core::{ActiveProject, ActiveProjectMode, ActorContext};
 use ai_memory_hooks::{
-    DEFAULT_HOOK_INGEST_MAX_IN_FLIGHT, HookState, ProjectCacheStore, hook_router,
+    DEFAULT_HOOK_INGEST_MAX_IN_FLIGHT, HookState, ProjectCacheStore, SubagentSessionSet, hook_router,
 };
 use ai_memory_mcp::AiMemoryServer;
 use ai_memory_store::Store;
@@ -156,6 +156,8 @@ impl Harness {
                 DEFAULT_HOOK_INGEST_MAX_IN_FLIGHT,
             )),
             consolidate_on_session_end: false,
+            drop_subagent_captures: false,
+            subagent_sessions: Arc::new(tokio::sync::Mutex::new(SubagentSessionSet::default())),
             home_dir: None,
         });
 

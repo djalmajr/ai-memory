@@ -20,7 +20,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the same `AI_MEMORY_DROP_SUBAGENT_CAPTURES` env var to skip subagent captures
   at the source — they are never spooled or sent — so the client spool does not
   fill on hosts that opt in. The server-side setting remains the universal
-  backstop for clients that do not set it.
+  backstop for clients that do not set it. The drop now also tracks subagent
+  session ids — seeded by the per-event marker and by the newly registered
+  `SubagentStart`/`SubagentStop` lifecycle hooks (Claude Code and grok) — so the
+  unmarked tail of a subagent session (its `user_prompt_submit`/`stop`/
+  `session_end`, which carry no marker) is dropped too, not just the
+  marker-bearing tool-use events.
 - `AI_MEMORY_SANITIZE_OUTBOUND` env var for the `ai-memory hook` client. When
   set, the captured payload is scrubbed with the built-in privacy patterns
   before it is spooled or sent, so secrets/PII never leave the host or sit

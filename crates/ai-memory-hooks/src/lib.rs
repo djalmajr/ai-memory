@@ -29,6 +29,6 @@ pub use ai_memory_core::{SanitizeConfig, Sanitized, Sanitizer};
 pub use payload::{HookEnvelope, HookEvent, body_is_subagent};
 pub use router::{
     DEFAULT_HOOK_INGEST_MAX_IN_FLIGHT, DEFAULT_PROJECT_CACHE_MAX_ENTRIES, HookState, ProjectCache,
-    ProjectCacheStore, hook_router,
+    ProjectCacheStore, SubagentSessionSet, SubagentSessions, hook_router,
 };
 pub use synth::synthesize_session_page;

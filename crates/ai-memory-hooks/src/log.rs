@@ -92,6 +92,8 @@ fn format_line(when: Timestamp, event: HookEvent, title: &str) -> String {
         HookEvent::Notification => "notification",
         HookEvent::Stop => "stop",
         HookEvent::SessionEnd => "session-end",
+        HookEvent::SubagentStart => "subagent-start",
+        HookEvent::SubagentStop => "subagent-stop",
         HookEvent::Other => "other",
     };
     let one_line: String = title
