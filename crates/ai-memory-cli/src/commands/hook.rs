@@ -184,6 +184,14 @@ pub async fn run(data_dir: Option<PathBuf>, args: HookArgs) -> anyhow::Result<()
         return Ok(());
     }
 
+    // Outbound privacy scrub: with AI_MEMORY_SANITIZE_OUTBOUND set, redact
+    // secrets/PII from the payload BEFORE it is spooled or sent, so they never
+    // leave the host or sit plaintext in the spool. Scrubs JSON string *values*
+    // (keys/structure preserved) with the built-in patterns only — the
+    // fast-path skips config load, and the server applies the full sanitize
+    // (built-in + operator extras) as a backstop.
+    let payload = maybe_scrub_outbound(payload, &json);
+
     let qs = extract_cwd(&json)
         .map(|cwd| marker_query_suffix(&cwd, args.project_strategy.and_then(|s| s.baked())))
         .unwrap_or_default();
@@ -291,6 +299,53 @@ fn is_truthy(value: &str) -> bool {
     )
 }
 
+/// True when `AI_MEMORY_SANITIZE_OUTBOUND` is set to a truthy value — scrub the
+/// captured payload with the built-in privacy patterns before it leaves the
+/// host. Client-only (the server already sanitizes on store); mirrors the
+/// env-driven, config-skipping style of the rest of the hook fast-path.
+fn sanitize_outbound_enabled() -> bool {
+    std::env::var("AI_MEMORY_SANITIZE_OUTBOUND")
+        .ok()
+        .is_some_and(|value| is_truthy(&value))
+}
+
+/// Redact secrets/PII from the outbound payload when enabled. Scrubs the JSON
+/// string *values* (keys and structure preserved) so redaction can never
+/// corrupt the document; if the payload is not valid JSON there is no structure
+/// to protect, so the raw text is scrubbed directly. Built-in patterns only.
+fn maybe_scrub_outbound(payload: String, json: &serde_json::Value) -> String {
+    if !sanitize_outbound_enabled() {
+        return payload;
+    }
+    let sanitizer = ai_memory_core::Sanitizer::builtin();
+    if json.is_null() {
+        return sanitizer.scrub(&payload);
+    }
+    let mut scrubbed = json.clone();
+    scrub_json_strings(&mut scrubbed, &sanitizer);
+    serde_json::to_string(&scrubbed).unwrap_or(payload)
+}
+
+/// Recursively scrub every JSON string leaf in place. Object keys are left
+/// untouched (they are field names, not values) so downstream field extraction
+/// keeps working.
+fn scrub_json_strings(value: &mut serde_json::Value, sanitizer: &ai_memory_core::Sanitizer) {
+    match value {
+        serde_json::Value::String(s) => *s = sanitizer.scrub(s),
+        serde_json::Value::Array(items) => {
+            for item in items {
+                scrub_json_strings(item, sanitizer);
+            }
+        }
+        serde_json::Value::Object(map) => {
+            for (_key, v) in map.iter_mut() {
+                scrub_json_strings(v, sanitizer);
+            }
+        }
+        _ => {}
+    }
+}
+
 /// Resolve the data dir cheaply, without loading the full config (the hook
 /// fast-path skips config for latency). Mirrors `config.rs`: explicit
 /// `--data-dir`, else `AI_MEMORY_DATA_DIR`, else the platform local-data dir.
@@ -324,6 +379,25 @@ mod tests {
         for v in ["0", "false", "no", "off", "", "maybe"] {
             assert!(!is_truthy(v), "{v:?} should not be truthy");
         }
+    }
+
+    #[test]
+    fn scrub_json_strings_redacts_values_keeps_structure() {
+        let sanitizer = ai_memory_core::Sanitizer::builtin();
+        let mut v = serde_json::json!({
+            "session_id": "abc-123",
+            "toolInput": { "command": "deploy", "token": "sk-ABCDEFGHIJ1234567890abcd" },
+            "args": ["plain", "ghp_ABCDEFGHIJ1234567890XY"]
+        });
+        scrub_json_strings(&mut v, &sanitizer);
+        // Non-secret values and the whole structure survive.
+        assert_eq!(v["session_id"], "abc-123");
+        assert_eq!(v["toolInput"]["command"], "deploy");
+        assert_eq!(v["args"][0], "plain");
+        assert!(v.get("toolInput").is_some(), "keys/structure preserved");
+        // Secret values (object + array) are redacted.
+        assert_eq!(v["toolInput"]["token"], "[REDACTED]");
+        assert_eq!(v["args"][1], "[REDACTED]");
     }
 
     #[test]
