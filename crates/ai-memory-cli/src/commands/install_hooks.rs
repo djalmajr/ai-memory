@@ -1370,6 +1370,12 @@ export const AiMemoryHooks: Plugin = async ({{ directory }}) => {{
         startSession(id, cwdFor(id, directory));
         postHook("stop", {{ sessionID: id, cwd: cwdFor(id, directory) }});
       }}
+      if (event?.type === "session.deleted") {{
+        const info = properties.info ?? {{}};
+        const id = properties.sessionID ?? info.id;
+        const cwd = info.directory ?? cwdFor(id, directory);
+        postHook("session-end", {{ sessionID: id, cwd }});
+      }}
       if (event?.type === "session.compacted") {{
         const id = properties.sessionID;
         postPreCompact(id, directory);
@@ -3243,6 +3249,8 @@ model = "gpt-5"
         assert!(plugin.contains("applyMarkerParams(url, cwd);"));
         assert!(plugin.contains("postPreCompact"));
         assert!(plugin.contains("postHook(\"session-start\""));
+        assert!(plugin.contains(r#""session.deleted")"#));
+        assert!(plugin.contains("postHook(\"session-end\""));
         assert!(plugin.contains("postHook(\"user-prompt\""));
         assert!(plugin.contains("Bearer ${TOKEN}"));
         assert!(plugin.contains("tok"));
