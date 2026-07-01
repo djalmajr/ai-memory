@@ -8,6 +8,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- Documented and regression-tested that `install-instructions` updates only the
+  ai-memory marker block, preserves unrelated CLAUDE.md / AGENTS.md content,
+  writes backups for existing files, and refuses unmanaged same-name skills
+  unless explicitly forced.
 - Claude Code WindowsNative hook installs now use Claude's exec form
   (`command` executable plus `args` argv array) for the native `ai-memory.exe`
   hook, avoiding shell/Git Bash/PowerShell command-string mangling. Set

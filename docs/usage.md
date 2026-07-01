@@ -94,6 +94,8 @@ ai-memory install-instructions --no-skills
 
 `install-instructions` installs or updates managed skills by default. Use
 `--no-skills` only when you intentionally want a snippet-only refresh.
+The CLI replaces only the markered ai-memory block, preserves unrelated content,
+and writes a timestamped backup before changing an existing instruction file.
 `install-instructions --print` previews the instruction snippet only; use
 `install-skills --print` to preview skill payloads. Skill flags mirror
 `install-skills` with an `--skills-` prefix:

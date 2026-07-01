@@ -112,6 +112,48 @@ fn no_skills_writes_only_instruction_snippet() {
 }
 
 #[test]
+fn install_instructions_updates_only_markered_block_and_backs_up_original() {
+    let project = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    let target = project.path().join("CLAUDE.md");
+    let original = format!(
+        "# Project\n\nKeep this intro.\n\n{MARKER_START}\nold ai-memory block\n{MARKER_END}\n\nKeep this tail.\n"
+    );
+    fs::write(&target, &original).unwrap();
+
+    let output = run_ai_memory(
+        project.path(),
+        home.path(),
+        &["install-instructions", "--no-skills"],
+    );
+    assert_success(output);
+
+    let updated = fs::read_to_string(&target).unwrap();
+    assert!(updated.contains("Keep this intro."));
+    assert!(updated.contains("Keep this tail."));
+    assert!(updated.contains(MARKER_START));
+    assert!(updated.contains("Use the installed ai-memory Agent Skills"));
+    assert!(!updated.contains("old ai-memory block"));
+
+    let backups: Vec<_> = fs::read_dir(project.path())
+        .unwrap()
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with("CLAUDE.md.bak-"))
+        })
+        .collect();
+    assert_eq!(
+        backups.len(),
+        1,
+        "install-instructions must back up updates"
+    );
+    assert_eq!(fs::read_to_string(&backups[0]).unwrap(), original);
+}
+
+#[test]
 fn print_shows_only_snippet_without_mutating() {
     let project = tempfile::tempdir().unwrap();
     let home = tempfile::tempdir().unwrap();

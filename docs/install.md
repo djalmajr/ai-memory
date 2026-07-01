@@ -1006,7 +1006,8 @@ default:
 
 Re-running the command is safe. If a project still has the old long ai-memory
 block between those markers, the refresh replaces that block in place with the
-slim snippet and leaves unrelated instructions before and after it alone.
+slim snippet, leaves unrelated instructions before and after it alone, and
+writes a timestamped `.bak-*` backup before changing an existing file.
 Managed skill files contain an ai-memory ownership marker; same-name user skills
 without that marker are preserved unless you explicitly force replacement.
 `install-instructions --print` previews only the instruction snippet; run
