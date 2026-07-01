@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- Generated OpenCode and OMP TypeScript lifecycle hooks now buffer capture
+  posts through a bounded best-effort queue instead of spawning one unbounded
+  fetch per event, reducing client-side request bursts while preserving direct
+  handoff fetches.
+
 ## [1.5.0] - 2026-07-01
 
 ### Added

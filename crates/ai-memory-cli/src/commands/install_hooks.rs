@@ -1141,6 +1141,70 @@ function authHeaders(): Record<string, string> {{
   return TOKEN ? {{ Authorization: `Bearer ${{TOKEN}}` }} : {{}};
 }}
 
+const HOOK_QUEUE_MAX = 100;
+const HOOK_FLUSH_INTERVAL_MS = 2000;
+const HOOK_FLUSH_THRESHOLD = 20;
+const HOOK_INTER_REQUEST_DELAY_MS = 50;
+const HOOK_REQUEST_TIMEOUT_MS = 2000;
+const HOOK_IMMEDIATE_EVENTS = new Set(["session-start", "stop", "session-end", "pre-compact"]);
+
+type HookQueueItem = {{ event: string; url: URL; payload: Record<string, unknown> }};
+const hookQueue: HookQueueItem[] = [];
+let hookFlushTimer: ReturnType<typeof setTimeout> | undefined;
+let hookDraining = false;
+
+function sleep(ms: number): Promise<void> {{
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}}
+
+function scheduleHookFlush(): void {{
+  if (hookFlushTimer) return;
+  hookFlushTimer = setTimeout(() => {{
+    hookFlushTimer = undefined;
+    void drainHookQueue();
+  }}, HOOK_FLUSH_INTERVAL_MS);
+  hookFlushTimer.unref?.();
+}}
+
+function enqueueHook(event: string, url: URL, payload: Record<string, unknown>): void {{
+  if (hookQueue.length >= HOOK_QUEUE_MAX) hookQueue.shift();
+  hookQueue.push({{ event, url, payload }});
+  if (HOOK_IMMEDIATE_EVENTS.has(event) || hookQueue.length >= HOOK_FLUSH_THRESHOLD) {{
+    void drainHookQueue();
+  }} else {{
+    scheduleHookFlush();
+  }}
+}}
+
+async function drainHookQueue(): Promise<void> {{
+  if (hookDraining) return;
+  hookDraining = true;
+  if (hookFlushTimer) {{
+    clearTimeout(hookFlushTimer);
+    hookFlushTimer = undefined;
+  }}
+  try {{
+    while (hookQueue.length > 0) {{
+      const item = hookQueue.shift();
+      if (!item) break;
+      try {{
+        await fetch(item.url, {{
+          method: "POST",
+          headers: {{ "Content-Type": "application/json", ...authHeaders() }},
+          body: JSON.stringify(item.payload),
+          signal: timeoutSignal(HOOK_REQUEST_TIMEOUT_MS),
+        }}).catch(() => undefined);
+      }} catch (_e) {{
+        // Best-effort capture. Hooks must never block the agent.
+      }}
+      if (hookQueue.length > 0) await sleep(HOOK_INTER_REQUEST_DELAY_MS);
+    }}
+  }} finally {{
+    hookDraining = false;
+    if (hookQueue.length > 0) void drainHookQueue();
+  }}
+}}
+
 function findMarker(cwd: string | undefined): string | undefined {{
   if (!cwd) return undefined;
   let dir = resolve(cwd);
@@ -1241,14 +1305,9 @@ function postHook(event: string, payload: Record<string, unknown>): void {{
   url.searchParams.set("agent", AGENT);
   applyMarkerParams(url, typeof payload.cwd === "string" ? payload.cwd : undefined);
   try {{
-    void fetch(url, {{
-      method: "POST",
-      headers: {{ "Content-Type": "application/json", ...authHeaders() }},
-      body: JSON.stringify(payload),
-      signal: timeoutSignal(500),
-    }}).catch(() => undefined);
+    enqueueHook(event, url, payload);
   }} catch (_e) {{
-    // Fire-and-forget. Hooks must never block the agent.
+    // Best-effort capture. Hooks must never block the agent.
   }}
 }}
 
@@ -1446,6 +1505,70 @@ function authHeaders(): Record<string, string> {{
   return TOKEN ? {{ Authorization: `Bearer ${{TOKEN}}` }} : {{}};
 }}
 
+const HOOK_QUEUE_MAX = 100;
+const HOOK_FLUSH_INTERVAL_MS = 2000;
+const HOOK_FLUSH_THRESHOLD = 20;
+const HOOK_INTER_REQUEST_DELAY_MS = 50;
+const HOOK_REQUEST_TIMEOUT_MS = 2000;
+const HOOK_IMMEDIATE_EVENTS = new Set(["session-start", "stop", "session-end", "pre-compact"]);
+
+type HookQueueItem = {{ event: string; url: URL; payload: Record<string, unknown> }};
+const hookQueue: HookQueueItem[] = [];
+let hookFlushTimer: ReturnType<typeof setTimeout> | undefined;
+let hookDraining = false;
+
+function sleep(ms: number): Promise<void> {{
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}}
+
+function scheduleHookFlush(): void {{
+  if (hookFlushTimer) return;
+  hookFlushTimer = setTimeout(() => {{
+    hookFlushTimer = undefined;
+    void drainHookQueue();
+  }}, HOOK_FLUSH_INTERVAL_MS);
+  hookFlushTimer.unref?.();
+}}
+
+function enqueueHook(event: string, url: URL, payload: Record<string, unknown>): void {{
+  if (hookQueue.length >= HOOK_QUEUE_MAX) hookQueue.shift();
+  hookQueue.push({{ event, url, payload }});
+  if (HOOK_IMMEDIATE_EVENTS.has(event) || hookQueue.length >= HOOK_FLUSH_THRESHOLD) {{
+    void drainHookQueue();
+  }} else {{
+    scheduleHookFlush();
+  }}
+}}
+
+async function drainHookQueue(): Promise<void> {{
+  if (hookDraining) return;
+  hookDraining = true;
+  if (hookFlushTimer) {{
+    clearTimeout(hookFlushTimer);
+    hookFlushTimer = undefined;
+  }}
+  try {{
+    while (hookQueue.length > 0) {{
+      const item = hookQueue.shift();
+      if (!item) break;
+      try {{
+        await fetch(item.url, {{
+          method: "POST",
+          headers: {{ "Content-Type": "application/json", ...authHeaders() }},
+          body: JSON.stringify(item.payload),
+          signal: timeoutSignal(HOOK_REQUEST_TIMEOUT_MS),
+        }}).catch(() => undefined);
+      }} catch (_e) {{
+        // Best-effort capture. Hooks must never block the agent.
+      }}
+      if (hookQueue.length > 0) await sleep(HOOK_INTER_REQUEST_DELAY_MS);
+    }}
+  }} finally {{
+    hookDraining = false;
+    if (hookQueue.length > 0) void drainHookQueue();
+  }}
+}}
+
 function findMarker(cwd: string | undefined): string | undefined {{
   if (!cwd) return undefined;
   let dir = resolve(cwd);
@@ -1561,14 +1684,9 @@ function postHook(event: string, payload: Record<string, unknown>): void {{
   url.searchParams.set("agent", AGENT);
   applyMarkerParams(url, typeof payload.cwd === "string" ? payload.cwd : undefined);
   try {{
-    void fetch(url, {{
-      method: "POST",
-      headers: {{ "Content-Type": "application/json", ...authHeaders() }},
-      body: JSON.stringify(payload),
-      signal: timeoutSignal(500),
-    }}).catch(() => undefined);
+    enqueueHook(event, url, payload);
   }} catch (_e) {{
-    // Fire-and-forget. Hooks must never block the agent.
+    // Best-effort capture. Hooks must never block the agent.
   }}
 }}
 
@@ -2869,6 +2987,34 @@ model = "gpt-5"
     // OpenCode tests
     // ----------------------------------------------------------------
 
+    fn assert_generated_ts_uses_bounded_hook_queue(generated: &str) {
+        assert!(generated.contains("const HOOK_QUEUE_MAX = 100;"));
+        assert!(generated.contains("const HOOK_FLUSH_INTERVAL_MS = 2000;"));
+        assert!(generated.contains("const HOOK_FLUSH_THRESHOLD = 20;"));
+        assert!(generated.contains("const HOOK_INTER_REQUEST_DELAY_MS = 50;"));
+        assert!(generated.contains("const HOOK_REQUEST_TIMEOUT_MS = 2000;"));
+        assert!(generated.contains("const HOOK_IMMEDIATE_EVENTS = new Set([\"session-start\", \"stop\", \"session-end\", \"pre-compact\"]);"));
+        assert!(generated.contains("const hookQueue: HookQueueItem[] = [];"));
+        assert!(generated.contains(
+            "function enqueueHook(event: string, url: URL, payload: Record<string, unknown>): void"
+        ));
+        assert!(generated.contains("if (hookQueue.length >= HOOK_QUEUE_MAX) hookQueue.shift();"));
+        assert!(generated.contains(
+            "HOOK_IMMEDIATE_EVENTS.has(event) || hookQueue.length >= HOOK_FLUSH_THRESHOLD"
+        ));
+        assert!(generated.contains("function scheduleHookFlush(): void"));
+        assert!(generated.contains("hookFlushTimer.unref?.();"));
+        assert!(generated.contains("async function drainHookQueue(): Promise<void>"));
+        assert!(generated.contains("signal: timeoutSignal(HOOK_REQUEST_TIMEOUT_MS)"));
+        assert!(generated.contains("await sleep(HOOK_INTER_REQUEST_DELAY_MS)"));
+        assert!(generated.contains("enqueueHook(event, url, payload);"));
+        assert!(generated.contains("async function fetchHandoff"));
+        assert!(generated.contains("const response = await fetch(url, {"));
+        assert!(generated.contains("signal: timeoutSignal(1000)"));
+        assert!(!generated.contains("signal: timeoutSignal(500)"));
+        assert!(!generated.contains("void fetch(url, {"));
+    }
+
     #[test]
     fn opencode_plugin_uses_real_plugin_hooks() {
         let plugin = build_opencode_plugin("http://127.0.0.1:49374", Some("tok"), None);
@@ -2957,6 +3103,13 @@ model = "gpt-5"
         );
     }
 
+    #[test]
+    fn opencode_plugin_uses_bounded_hook_queue() {
+        let plugin = build_opencode_plugin("http://127.0.0.1:49374", Some("tok"), None);
+
+        assert_generated_ts_uses_bounded_hook_queue(&plugin);
+    }
+
     // ----------------------------------------------------------------
     // OMP tests
     // ----------------------------------------------------------------
@@ -3022,6 +3175,13 @@ model = "gpt-5"
             !extension.contains("DEFAULT_PROJECT_STRATEGY"),
             "{extension}"
         );
+    }
+
+    #[test]
+    fn omp_extension_uses_bounded_hook_queue() {
+        let extension = build_omp_extension("http://127.0.0.1:49374", Some("tok"), None);
+
+        assert_generated_ts_uses_bounded_hook_queue(&extension);
     }
 
     #[test]
