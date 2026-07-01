@@ -1353,6 +1353,12 @@ async function fetchHandoff(cwd: string): Promise<string | undefined> {{
 
 export const AiMemoryHooks: Plugin = async ({{ directory }}) => {{
   return {{
+    dispose: async () => {{
+      for (const id of startedSessions) {{
+        postHook("session-end", {{ sessionID: id, cwd: cwdFor(id, directory) }});
+      }}
+      startedSessions.clear();
+    }},
     event: async (input) => {{
       const event = (input as any).event;
       const properties = event?.properties ?? {{}};
@@ -3248,6 +3254,7 @@ model = "gpt-5"
         ));
         assert!(plugin.contains("applyMarkerParams(url, cwd);"));
         assert!(plugin.contains("postPreCompact"));
+        assert!(plugin.contains("dispose: async () =>"));
         assert!(plugin.contains("postHook(\"session-start\""));
         assert!(plugin.contains(r#""session.deleted")"#));
         assert!(plugin.contains("postHook(\"session-end\""));
