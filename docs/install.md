@@ -369,18 +369,23 @@ the agent can execute files owned by your user. Re-run `install-hooks --apply`
 after package upgrades to refresh those staged copies.
 
 Native `ai-memory hook --event ...` commands spool events locally. Session start
-does a short bounded cleanup drain before fetching a handoff; session end starts
-a detached `hook-drain` helper so agent quit paths are not blocked by a large
-backlog. The built-in timings stay short on agent-facing paths, but high-latency
-or large-backlog instances can raise them with whole-minute runtime env vars in
-the agent's environment; no `install-hooks` rerun is needed:
+does a short bounded cleanup drain before fetching a handoff; cancellation-prone
+boundary events (`stop`, `pre-compact`, and `session-end`) start a detached
+`hook-drain` helper so delivery does not depend on one shutdown hook surviving.
+On Unix, the helper uses a trusted `setsid` launcher when available and falls
+back to a separate process group otherwise; Windows uses detached/breakaway
+process flags. The spool is capped, so a permanently undrained backlog is
+eventually pruned rather than unbounded, but old undelivered events can be lost.
+The built-in timings stay short on agent-facing paths, but high-latency or
+large-backlog instances can raise them with whole-minute runtime env vars in the
+agent's environment; no `install-hooks` rerun is needed:
 
 | Env var | Built-in default | Max override | What it caps |
 |---|---:|---:|---|
 | `AI_MEMORY_HOOK_DRAIN_TIMEOUT_MINUTES` | 3 seconds | 60 minutes | each event POST during a drain |
 | `AI_MEMORY_HOOK_HANDOFF_TIMEOUT_MINUTES` | 3 seconds | 60 minutes | the synchronous `session-start` handoff GET |
 | `AI_MEMORY_HOOK_START_BUDGET_MINUTES` | 3 seconds | 60 minutes | total time `session-start` may spend waiting for the drain lock and cleanup draining |
-| `AI_MEMORY_HOOK_BACKGROUND_DRAIN_BUDGET_MINUTES` | 5 minutes | 60 minutes | total time the detached `hook-drain` helper may spend after `session-end` |
+| `AI_MEMORY_HOOK_BACKGROUND_DRAIN_BUDGET_MINUTES` | 5 minutes | 60 minutes | total time the detached `hook-drain` helper may spend after a background-drain boundary |
 | `AI_MEMORY_HOOK_INCREMENTAL_THRESHOLD` | 32 events | positive integer | spool backlog size that triggers a 250 ms `post-tool-use` catch-up drain |
 
 Timing values must be positive whole minutes. Missing, empty, non-numeric, or

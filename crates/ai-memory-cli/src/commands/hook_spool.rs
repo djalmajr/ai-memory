@@ -1,11 +1,13 @@
 //! Local spool for lifecycle-hook events — decouples capture from the network.
 //!
-//! Per-tool-call hooks (`pre-tool-use`, `post-tool-use`, `user-prompt-submit`,
-//! `stop`) append an event here (an instant local write) instead of POSTing
-//! synchronously. The spool is drained to the server at **session boundaries**
-//! (a cleanup pass at `session-start`, the main flush at `session-end`), where a
-//! few seconds of latency is acceptable — unlike the per-tool-call hot path,
-//! which must never block the agent.
+//! Per-tool-call hooks (`pre-tool-use`, `post-tool-use`, `user-prompt-submit`)
+//! append an event here (an instant local write) instead of POSTing
+//! synchronously. The spool is drained to the server at **session boundaries**:
+//! a cleanup pass at `session-start`, detached background flushes at
+//! cancellation-prone boundaries (`stop`, `pre-compact`, `session-end`), and a
+//! small threshold-triggered catch-up on busy `post-tool-use` streams. A few
+//! seconds of latency is acceptable at boundaries, unlike the per-tool-call hot
+//! path, which must never block the agent.
 //!
 //! This makes capture reliable against a remote/slow server (no event is lost:
 //! a file persists until the server answers 2xx) without ever blocking a tool

@@ -105,17 +105,21 @@ fn incremental_drain_threshold_from(mut lookup: impl FnMut(&str) -> Option<Strin
 
 /// Whether to run a mid-session catch-up drain for this event: only
 /// `post-tool-use` (the highest-frequency event) and only once the spool backlog
-/// has crossed `threshold`. Boundaries (`session-start`/`session-end`) remain
-/// the main flush, so a light session never drains mid-session.
+/// has crossed `threshold`. Boundaries run their own cleanup/background drains,
+/// so a light session never drains mid-session.
 fn should_incremental_drain(event: &str, spool_len: usize, threshold: usize) -> bool {
     event == "post-tool-use" && spool_len >= threshold
 }
 
-fn spawn_session_end_drainer(data_dir: &Path) -> std::io::Result<()> {
+fn spawn_background_drainer(data_dir: &Path) -> std::io::Result<()> {
     hook_drain_process::spawn(data_dir)
 }
 
-fn after_session_end_enqueue(
+fn should_spawn_background_drainer(event: &str) -> bool {
+    matches!(event, "session-end" | "stop" | "pre-compact")
+}
+
+fn after_background_drain_event_enqueue(
     data_dir: &Path,
     spawn: impl FnOnce(&Path) -> std::io::Result<()>,
 ) -> std::io::Result<()> {
@@ -182,7 +186,7 @@ pub async fn run(data_dir: Option<PathBuf>, args: HookArgs) -> anyhow::Result<()
         args,
         payload,
         &mut stdout,
-        spawn_session_end_drainer,
+        spawn_background_drainer,
     )
     .await
 }
@@ -192,7 +196,7 @@ async fn run_with_payload<W, S>(
     args: HookArgs,
     payload: String,
     stdout: &mut W,
-    spawn_session_end_drainer: S,
+    spawn_background_drainer: S,
 ) -> anyhow::Result<()>
 where
     W: std::io::Write,
@@ -283,10 +287,12 @@ where
         }
     }
 
-    // session-end: enqueue and hand delivery to a detached native drainer so the
-    // agent quit path is not cancelled while the server processes backlog.
-    if args.event == "session-end"
-        && let Err(err) = after_session_end_enqueue(&dd, spawn_session_end_drainer)
+    // Boundary drain trigger: enqueue first, then ask a detached native drainer
+    // to flush the shared spool. `session-end` remains the primary close path,
+    // but `stop` and `pre-compact` also trigger the helper so delivery does not
+    // rely on the single hook most likely to be cancelled during agent shutdown.
+    if should_spawn_background_drainer(&args.event)
+        && let Err(err) = after_background_drain_event_enqueue(&dd, spawn_background_drainer)
     {
         eprintln!(
             "ai-memory hook warning: failed to start background spool drainer; event remains queued: {err}"
@@ -350,6 +356,18 @@ mod tests {
         assert!(!should_incremental_drain("session-start", 999, 32));
         assert!(!should_incremental_drain("session-end", 999, 32));
         assert!(!should_incremental_drain("stop", 999, 32));
+    }
+
+    #[test]
+    fn boundary_events_trigger_background_drainer() {
+        assert!(should_spawn_background_drainer("session-end"));
+        assert!(should_spawn_background_drainer("stop"));
+        assert!(should_spawn_background_drainer("pre-compact"));
+
+        assert!(!should_spawn_background_drainer("session-start"));
+        assert!(!should_spawn_background_drainer("post-tool-use"));
+        assert!(!should_spawn_background_drainer("pre-tool-use"));
+        assert!(!should_spawn_background_drainer("user-prompt"));
     }
 
     #[test]
@@ -468,6 +486,47 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn stop_and_pre_compact_spawn_background_drainer_after_enqueue() {
+        for event in ["stop", "pre-compact"] {
+            let tmp = tempfile::tempdir().unwrap();
+            let data_dir = tmp.path().to_path_buf();
+            let spool = hook_spool::spool_dir(&data_dir);
+            let called = std::cell::Cell::new(0);
+            let mut stdout = Vec::new();
+            let args = HookArgs {
+                event: event.into(),
+                agent: "claude-code".into(),
+                server_url: "http://127.0.0.1:1".into(),
+                auth_token: None,
+                project_strategy: None,
+            };
+
+            run_with_payload(
+                Some(data_dir.clone()),
+                args,
+                r#"{"session_id":"s","cwd":"/tmp"}"#.into(),
+                &mut stdout,
+                |path| {
+                    assert_eq!(path, data_dir.as_path());
+                    assert_eq!(hook_spool::spool_len(&spool), 1, "spawn runs after enqueue");
+                    called.set(called.get() + 1);
+                    Ok(())
+                },
+            )
+            .await
+            .unwrap();
+
+            assert_eq!(stdout, b"{}\n", "{event} should keep hook stdout clean");
+            assert_eq!(called.get(), 1, "{event} should start background drain");
+            assert_eq!(
+                hook_spool::spool_len(&spool),
+                1,
+                "{event} must not drain inline"
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn session_end_run_spawn_failure_keeps_event_queued_and_stdout_clean() {
         let tmp = tempfile::tempdir().unwrap();
         let data_dir = tmp.path().to_path_buf();
@@ -494,7 +553,7 @@ mod tests {
     #[test]
     fn session_end_spawn_failure_is_returned_for_warning_only() {
         let tmp = tempfile::tempdir().unwrap();
-        let err = after_session_end_enqueue(tmp.path(), |_path| {
+        let err = after_background_drain_event_enqueue(tmp.path(), |_path| {
             Err(std::io::Error::other("spawn failed"))
         })
         .unwrap_err();
@@ -503,11 +562,11 @@ mod tests {
     }
 
     #[test]
-    fn session_end_policy_spawns_without_inline_drain() {
+    fn background_drain_event_policy_spawns_without_inline_drain() {
         let tmp = tempfile::tempdir().unwrap();
         let called = std::cell::Cell::new(false);
 
-        after_session_end_enqueue(tmp.path(), |path| {
+        after_background_drain_event_enqueue(tmp.path(), |path| {
             assert_eq!(path, tmp.path());
             called.set(true);
             Ok(())

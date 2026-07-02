@@ -8,6 +8,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- Native hook spool delivery no longer relies only on the cancellation-prone
+  `session-end` hook to start the detached drainer. `stop` and `pre-compact`
+  also request the background `hook-drain` helper after enqueue, and Unix builds
+  use a trusted `setsid` launcher when available before falling back to a
+  separate process group.
 - OpenCode generated plugins now close sessions from the official
   `session.deleted` event and a deduped best-effort `dispose` fallback, so
   OpenCode sessions can produce automatic session summaries and handoffs without

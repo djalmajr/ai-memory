@@ -33,9 +33,10 @@ pub struct SpawnConfig {
 /// Platform detach configuration.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DetachConfig {
-    /// Unix starts a new process group.
+    /// Unix starts the drainer in a new session through a trusted `setsid`
+    /// launcher when available; otherwise it falls back to a new process group.
     #[cfg(unix)]
-    UnixProcessGroupZero,
+    UnixNewSession { setsid: Option<PathBuf> },
     /// Windows creation flags.
     #[cfg(windows)]
     WindowsCreationFlags(u32),
@@ -84,13 +85,11 @@ fn spawn_spec(spec: &DrainCommandSpec) -> io::Result<()> {
         .append(true)
         .open(&config.stderr_file)?;
 
-    let mut command = Command::new(&spec.exe);
+    let mut command = command_for_spec(spec, &config.detach);
     command
-        .args(&spec.args)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::from(stderr));
-    apply_detach_flags(&mut command, &config.detach);
 
     match command.spawn() {
         Ok(_child) => Ok(()),
@@ -108,13 +107,11 @@ fn spawn_spec(spec: &DrainCommandSpec) -> io::Result<()> {
                 .create(true)
                 .append(true)
                 .open(&config.stderr_file)?;
-            let mut retry = Command::new(&spec.exe);
+            let mut retry = command_for_spec(spec, &config.detach);
             retry
-                .args(&spec.args)
                 .stdin(Stdio::null())
                 .stdout(Stdio::null())
                 .stderr(Stdio::from(stderr));
-            apply_detach_flags(&mut retry, &config.detach);
             retry.spawn().map(|_| ())
         }
         Err(err) => Err(err),
@@ -123,15 +120,38 @@ fn spawn_spec(spec: &DrainCommandSpec) -> io::Result<()> {
 
 #[cfg(unix)]
 fn detach_config(_try_breakaway: bool) -> DetachConfig {
-    DetachConfig::UnixProcessGroupZero
+    DetachConfig::UnixNewSession {
+        setsid: trusted_setsid_launcher(),
+    }
 }
 
 #[cfg(unix)]
-fn apply_detach_flags(command: &mut Command, detach: &DetachConfig) {
+fn command_for_spec(spec: &DrainCommandSpec, detach: &DetachConfig) -> Command {
     use std::os::unix::process::CommandExt as _;
-    if matches!(detach, DetachConfig::UnixProcessGroupZero) {
-        command.process_group(0);
+
+    match detach {
+        DetachConfig::UnixNewSession {
+            setsid: Some(setsid),
+        } => {
+            let mut command = Command::new(setsid);
+            command.arg(&spec.exe).args(&spec.args);
+            command
+        }
+        DetachConfig::UnixNewSession { setsid: None } => {
+            let mut command = Command::new(&spec.exe);
+            command.args(&spec.args);
+            command.process_group(0);
+            command
+        }
     }
+}
+
+#[cfg(unix)]
+fn trusted_setsid_launcher() -> Option<PathBuf> {
+    [Path::new("/usr/bin/setsid"), Path::new("/bin/setsid")]
+        .into_iter()
+        .find(|path| path.is_file())
+        .map(Path::to_path_buf)
 }
 
 #[cfg(windows)]
@@ -156,13 +176,25 @@ fn apply_detach_flags(command: &mut Command, detach: &DetachConfig) {
     }
 }
 
+#[cfg(windows)]
+fn command_for_spec(spec: &DrainCommandSpec, detach: &DetachConfig) -> Command {
+    let mut command = Command::new(&spec.exe);
+    command.args(&spec.args);
+    apply_detach_flags(&mut command, detach);
+    command
+}
+
 #[cfg(not(any(unix, windows)))]
 fn detach_config(_try_breakaway: bool) -> DetachConfig {
     DetachConfig::None
 }
 
 #[cfg(not(any(unix, windows)))]
-fn apply_detach_flags(_command: &mut Command, _detach: &DetachConfig) {}
+fn command_for_spec(spec: &DrainCommandSpec, _detach: &DetachConfig) -> Command {
+    let mut command = Command::new(&spec.exe);
+    command.args(&spec.args);
+    command
+}
 
 #[cfg(not(windows))]
 fn should_retry_without_breakaway(_err: &io::Error) -> bool {
@@ -213,13 +245,16 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn unix_spawn_config_uses_process_group_zero() {
+    fn unix_spawn_config_prefers_true_session_detach_when_available() {
         let tmp = tempfile::tempdir().unwrap();
         let spec = command_spec(tmp.path()).unwrap();
-        assert_eq!(
-            spawn_config(&spec, true).detach,
-            DetachConfig::UnixProcessGroupZero
-        );
+        let DetachConfig::UnixNewSession { setsid } = spawn_config(&spec, true).detach;
+        if let Some(path) = setsid {
+            assert!(
+                path == Path::new("/usr/bin/setsid") || path == Path::new("/bin/setsid"),
+                "only trusted absolute setsid launchers are used: {path:?}"
+            );
+        }
     }
 
     #[cfg(windows)]
