@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- Acknowledged the new `quick-xml` RustSec advisories in CI for the existing
+  `syntect` transitive dependency bucket. `plist` still constrains `quick-xml`
+  below the fixed 0.41.x branch, and ai-memory does not parse untrusted XML in
+  this path; the ignores keep cargo-audit/cargo-deny focused on actionable
+  advisories until the upstream dependency chain can update.
+
 ## [1.7.0] - 2026-07-02
 
 ### Added
