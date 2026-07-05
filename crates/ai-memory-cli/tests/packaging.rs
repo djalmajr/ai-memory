@@ -262,6 +262,10 @@ fn rootless_docker_uses_root_uid_only_for_host_config_commands() {
         "setup-agent",
         "install-instructions",
         "install-skills",
+        // uninstall edits the same host agent-config files; backup writes
+        // its tarball to a host path — same bind mounts, same UID rule.
+        "uninstall",
+        "backup",
     ] {
         let args = run_wrapper_with_fake_docker(&[subcommand], rootless_info);
         assert!(

@@ -297,7 +297,11 @@ case "${WRAPPER_SUBCOMMAND}" in
       RENDERS_HOST_CONFIG=1
       WRITES_HOST_FILES=1
       ;;
-    install-instructions | install-skills)
+    # uninstall edits the same host agent-config files the install-*
+    # commands write; backup writes its tarball to a host path. Both go
+    # through the same $HOME/$PWD bind mounts, so they need the same
+    # rootless-Docker UID treatment.
+    install-instructions | install-skills | uninstall | backup)
       WRITES_HOST_FILES=1
       ;;
 esac

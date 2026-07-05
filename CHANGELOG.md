@@ -9,8 +9,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 - `bin/ai-memory` no longer fails `install-mcp`, `install-hooks`,
-  `setup-agent`, `install-instructions`, and `install-skills` under
-  rootless Docker. Rootless Docker maps container UID 0 back to the real
+  `setup-agent`, `install-instructions`, `install-skills`, `uninstall`,
+  and `backup` under rootless Docker. Rootless Docker maps container UID
+  0 back to the real
   host user but routes any other UID (including the host UID the wrapper
   always passed via `-u`) through an unrelated subordinate-UID range, so
   every write to a bind-mounted host path (`~/.claude/settings.json`,
