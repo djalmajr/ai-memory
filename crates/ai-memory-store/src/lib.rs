@@ -219,6 +219,116 @@ mod tests {
             .unwrap_or(0)
     }
 
+    // Issue #157: the documented safety invariant "pinned pages are never
+    // rewritten by auto-improvement" is enforced at the single apply point
+    // every flow shares (manual approval AND require_approval=false
+    // auto-apply), so no prompt phrasing or approval policy can bypass it.
+    #[tokio::test]
+    async fn approve_refuses_update_proposals_against_pinned_pages() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let ws = store
+            .writer
+            .get_or_create_workspace("default")
+            .await
+            .unwrap();
+        let proj = store
+            .writer
+            .get_or_create_project(ws, "app", None)
+            .await
+            .unwrap();
+
+        // A pinned decision record and an unpinned sibling.
+        let mut pinned = sample_page(ws, proj, "decisions/adr-0001.md", "immutable decision");
+        pinned.pinned = true;
+        store.writer.upsert_page(pinned).await.unwrap();
+        store
+            .writer
+            .upsert_page(sample_page(ws, proj, "notes/mutable.md", "old body"))
+            .await
+            .unwrap();
+
+        let staged = store
+            .writer
+            .stage_auto_improve_run(stage_input(
+                ws,
+                proj,
+                vec![
+                    proposal(
+                        "decisions/adr-0001.md",
+                        AutoImproveProposalOperation::Update,
+                        "rewritten decision",
+                    ),
+                    proposal(
+                        "notes/mutable.md",
+                        AutoImproveProposalOperation::Update,
+                        "new body",
+                    ),
+                ],
+            ))
+            .await
+            .unwrap();
+        let actor = ActorContext::default();
+
+        // Pinned target: refused as a conflict, nothing written.
+        let approve = |proposal_id, path: &str, body: &str| ApproveAutoImproveProposal {
+            workspace_id: ws,
+            project_id: proj,
+            proposal_id,
+            page: sample_page(ws, proj, path, body),
+            actor: actor.clone(),
+            author_id: None,
+            checkpoint: None,
+        };
+        assert_eq!(
+            store
+                .writer
+                .approve_auto_improve_proposal(approve(
+                    staged.proposal_ids[0],
+                    "decisions/adr-0001.md",
+                    "rewritten decision",
+                ))
+                .await
+                .unwrap(),
+            ApproveAutoImproveProposalResult::Conflict,
+            "pinned target must be refused"
+        );
+        let detail = store
+            .reader
+            .auto_improve_proposal_detail(ws, proj, staged.proposal_ids[0])
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            detail
+                .decision_reason
+                .as_deref()
+                .is_some_and(|r| r.contains("pinned")),
+            "decision reason must say WHY: {:?}",
+            detail.decision_reason
+        );
+        let (_, body_hash, _) = latest_snapshot(store.db_path(), ws, proj, "decisions/adr-0001.md");
+        assert_eq!(
+            body_hash,
+            sha256("immutable decision"),
+            "pinned body untouched"
+        );
+
+        // Unpinned sibling still approves normally.
+        assert!(matches!(
+            store
+                .writer
+                .approve_auto_improve_proposal(approve(
+                    staged.proposal_ids[1],
+                    "notes/mutable.md",
+                    "new body",
+                ))
+                .await
+                .unwrap(),
+            ApproveAutoImproveProposalResult::Approved { .. }
+        ));
+    }
+
     #[tokio::test]
     async fn auto_improve_migration_and_stage_persist_reopen_list_detail_scope() {
         let tmp = TempDir::new().unwrap();

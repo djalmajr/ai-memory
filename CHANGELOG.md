@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- The documented auto-improvement safety invariant "never rewrite pinned
+  pages" is now enforced in code, not just in the reviewer prompt: the
+  apply path — shared by manual approval and `require_approval = false`
+  auto-apply — refuses `update` proposals whose target page is pinned,
+  recording the proposal as a conflict with an explicit reason. Unpinning
+  the page is the explicit way to allow a rewrite ([#157]).
+
+### Added
+- Architectural-decision guidance ([#157]): the managed durable-pages
+  Agent Skill now teaches agents to record architectural decisions as
+  pinned wiki pages under `decisions/<slug>.md` with ADR structure
+  (Status / Context / Decision / Consequences, rejected alternatives
+  included) and to supersede with a new page instead of editing history.
+  `docs/usage.md` gains an ADR section clarifying that ai-memory never
+  touches repository files (a `docs/adr/` tree managed by hand or by an
+  external ADR MCP server is outside its write surface) and how the two
+  coexist.
+
 ## [1.11.0] - 2026-07-09
 
 ### Fixed

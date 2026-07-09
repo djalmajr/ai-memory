@@ -601,9 +601,10 @@ pub fn stage_run(
                     proposal.target_path
                 )));
             }
-            (AutoImproveProposalOperation::Update, Some((id, body_hash, updated_at))) => {
-                (Some(id), Some(bytes32(body_hash)?), Some(updated_at))
-            }
+            (
+                AutoImproveProposalOperation::Update,
+                Some((id, body_hash, updated_at, _pinned, _fm)),
+            ) => (Some(id), Some(bytes32(body_hash)?), Some(updated_at)),
             (AutoImproveProposalOperation::Update, None) => {
                 return Err(StoreError::InvalidState(format!(
                     "update proposal target does not exist: {}",
@@ -851,10 +852,38 @@ pub fn approve_proposal(
     }
 
     let current = latest_target_snapshot(&tx, input.workspace_id, input.project_id, &target_path)?;
+    // Hard enforcement of the documented safety invariant: pinned pages are
+    // never rewritten by the auto-improvement path (issue #157). The check
+    // lives HERE — the single point every apply flows through, manual
+    // approval and require_approval=false auto-apply alike — so no index
+    // window, prompt phrasing, or approval policy can bypass it. Unpinning
+    // the page first is the explicit way to allow the rewrite.
+    if current
+        .as_ref()
+        .is_some_and(|(_, _, _, pinned, frontmatter)| {
+            pinned_refusal_applies(&target_path, *pinned, frontmatter)
+        })
+    {
+        const REASON: &str =
+            "target page is pinned; pinned pages are never rewritten by auto-improvement";
+        insert_rejection_for_proposal_in_tx(&tx, input.proposal_id, REASON, now)?;
+        mark_decision_in_tx(&tx, input, "conflict", None, Some(REASON), now)?;
+        insert_event_in_tx(
+            &tx,
+            input.proposal_id,
+            "conflict",
+            &input.actor,
+            input.author_id,
+            &serde_json::json!({ "reason": REASON }),
+            now,
+        )?;
+        tx.commit()?;
+        return Ok(ApproveAutoImproveProposalResult::Conflict);
+    }
     let conflict = match AutoImproveProposalOperation::from_str(&operation)? {
         AutoImproveProposalOperation::Create => current.is_some(),
         AutoImproveProposalOperation::Update => match current {
-            Some((id, body_hash, updated_at)) => {
+            Some((id, body_hash, updated_at, _pinned, _fm)) => {
                 Some(id.as_bytes().to_vec()) != staged_page_id
                     || Some(body_hash) != staged_body_hash
                     || Some(updated_at) != staged_updated_at
@@ -940,10 +969,10 @@ fn latest_target_snapshot(
     workspace_id: WorkspaceId,
     project_id: ProjectId,
     target_path: &str,
-) -> StoreResult<Option<(PageId, Vec<u8>, i64)>> {
+) -> StoreResult<Option<(PageId, Vec<u8>, i64, bool, String)>> {
     let row = tx
         .query_row(
-            "SELECT id, body_sha256, updated_at FROM pages \
+            "SELECT id, body_sha256, updated_at, pinned, frontmatter_json FROM pages \
              WHERE workspace_id = ?1 AND project_id = ?2 AND path = ?3 AND is_latest = 1",
             params![workspace_id.as_bytes(), project_id.as_bytes(), target_path],
             |row| {
@@ -951,11 +980,38 @@ fn latest_target_snapshot(
                     PageId::from_slice(&row.get::<_, Vec<u8>>(0)?).map_err(to_sql_err)?,
                     row.get::<_, Vec<u8>>(1)?,
                     row.get::<_, i64>(2)?,
+                    row.get::<_, bool>(3)?,
+                    row.get::<_, String>(4)?,
                 ))
             },
         )
         .optional()?;
     Ok(row)
+}
+
+/// Whether the pinned-target refusal applies (issue #157). Pinned pages
+/// are never rewritten by auto-improvement — with one sanctioned
+/// exception: NON-invariant memory slots under `_slots/` (e.g.
+/// `current-focus`, a state slot) are always pinned by the slot regime
+/// and are exactly the pages auto-improvement is SUPPOSED to refresh.
+/// Slots whose frontmatter declares `slot_kind: "invariant"` stay
+/// protected, matching the documented safety invariant ("never rewrite
+/// pinned pages or invariant slots").
+fn pinned_refusal_applies(target_path: &str, pinned: bool, frontmatter_json: &str) -> bool {
+    if !pinned {
+        return false;
+    }
+    if !target_path.starts_with("_slots/") {
+        return true;
+    }
+    serde_json::from_str::<serde_json::Value>(frontmatter_json)
+        .ok()
+        .and_then(|fm| {
+            fm.get("slot_kind")
+                .and_then(serde_json::Value::as_str)
+                .map(|kind| kind.eq_ignore_ascii_case("invariant"))
+        })
+        .unwrap_or(false)
 }
 
 fn insert_event_in_tx(
@@ -1199,4 +1255,45 @@ pub(crate) fn opt_bytes32(bytes: Option<Vec<u8>>) -> StoreResult<Option<[u8; 32]
 
 pub(crate) fn to_sql_err<E: std::error::Error + Send + Sync + 'static>(err: E) -> rusqlite::Error {
     rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Blob, Box::new(err))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Issue #157: pinned pages are refused; the sanctioned exception is
+    // NON-invariant `_slots/` pages (the slot regime pins everything, and
+    // state slots like current-focus are exactly what auto-improvement is
+    // supposed to refresh). Invariant slots stay protected.
+    #[test]
+    fn pinned_refusal_spares_state_slots_but_not_invariant_slots() {
+        // Regular pinned page: refused.
+        assert!(pinned_refusal_applies("decisions/adr-0001.md", true, "{}"));
+        // Unpinned: never refused.
+        assert!(!pinned_refusal_applies(
+            "decisions/adr-0001.md",
+            false,
+            "{}"
+        ));
+        // State slot (default kind): allowed.
+        assert!(!pinned_refusal_applies(
+            "_slots/current-focus.md",
+            true,
+            "{}"
+        ));
+        assert!(!pinned_refusal_applies(
+            "_slots/current-focus.md",
+            true,
+            r#"{"slot_kind": "state"}"#
+        ));
+        // Invariant slot: refused.
+        assert!(pinned_refusal_applies(
+            "_slots/never-force-push.md",
+            true,
+            r#"{"slot_kind": "invariant"}"#
+        ));
+        // Malformed frontmatter on a slot: treated as state (allowed) —
+        // the slot regime owns those pages either way.
+        assert!(!pinned_refusal_applies("_slots/x.md", true, "not-json"));
+    }
 }
