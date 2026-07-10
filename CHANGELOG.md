@@ -8,6 +8,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- `memory_query` now runs the raw-observation fallback for explicit `scopes`
+  requests when compiled wiki pages miss, so scoped cross-project searches can
+  still surface bounded raw session matches without falling back to the current
+  project.
 - Upgraded `crossbeam-epoch` to the RUSTSEC-2026-0204 fixed release.
 - Fixed the Docker wrapper on macOS with rootless Docker so host-config
   commands (`install-mcp`, `install-hooks`, `install-instructions`, and
