@@ -17,7 +17,7 @@ use crate::config::Config;
 use ai_memory_core::routing_skills::{
     AGENTS_SKILL_DIR, CLAUDE_SKILL_DIR, MANAGED_MARKER, MANAGED_SKILLS, SKILLS_DIR,
 };
-use ai_memory_core::{MARKER_END, MARKER_START};
+use ai_memory_core::{MARKER_END, MARKER_START, find_marker_line};
 use anyhow::{Context, Result};
 use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
@@ -478,13 +478,17 @@ fn print_docker_hint(data_purged: bool) {
 /// `install_instructions::merge_instructions_block`: an install
 /// followed by an uninstall round-trips to the original file.
 fn strip_instructions_block(content: &str) -> (String, bool) {
-    let Some(start) = content.find(MARKER_START) else {
+    // Line-anchored so an inline mention of the marker strings inside the
+    // managed block can't be matched as the real end delimiter (which would
+    // leave an orphan tail behind, breaking the install->uninstall
+    // round-trip).
+    let Some(start) = find_marker_line(content, MARKER_START, 0) else {
         return (content.to_string(), false);
     };
-    let Some(end_rel) = content[start..].find(MARKER_END) else {
+    let Some(end_pos) = find_marker_line(content, MARKER_END, start) else {
         return (content.to_string(), false);
     };
-    let end = start + end_rel + MARKER_END.len();
+    let end = end_pos + MARKER_END.len();
     // Consume a trailing newline after the end marker if present.
     let after = if content.as_bytes().get(end).copied() == Some(b'\n') {
         end + 1
@@ -881,6 +885,23 @@ mod tests {
         assert_eq!(
             stripped, original,
             "uninstall must restore the original file"
+        );
+    }
+
+    /// Regression: a managed block whose body mentions the end marker
+    /// inline must be stripped up to the REAL delimiter, not the inline
+    /// mention — otherwise an orphan tail survives the uninstall.
+    #[test]
+    fn strip_ignores_inline_marker_mention() {
+        let original = "# Title\n";
+        let block =
+            format!("{MARKER_START}\nsee the `{MARKER_END}` marker inline\nbody\n{MARKER_END}\n");
+        let installed = format!("{original}\n{block}");
+        let (stripped, found) = strip_instructions_block(&installed);
+        assert!(found);
+        assert_eq!(
+            stripped, original,
+            "no orphan tail after the real end marker"
         );
     }
 

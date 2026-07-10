@@ -27,7 +27,7 @@ use crate::config::Config;
 // Markers + the snippet body live in `ai_memory_core::routing_snippet`
 // so the `memory_install_self_routing` MCP tool can return the same
 // block this subcommand writes. Single source of truth.
-use ai_memory_core::{MARKER_END, MARKER_START, full_block};
+use ai_memory_core::{MARKER_END, MARKER_START, find_marker_line, full_block};
 
 /// Run the `install-instructions` subcommand.
 ///
@@ -161,10 +161,14 @@ fn infer_skills_agent_from_instruction_targets(targets: &[PathBuf]) -> InstallSk
 /// `block` to the end of the file with a single blank-line
 /// separator. The user's other content is never touched.
 fn merge_instructions_block(existing: &str, block: &str) -> String {
-    if let Some(start_idx) = existing.find(MARKER_START)
-        && let Some(end_idx_rel) = existing[start_idx..].find(MARKER_END)
+    // Anchor on markers that occupy their own line so an inline mention of
+    // the marker strings (e.g. this block's own prose describing them)
+    // cannot be mistaken for the real end delimiter — which would truncate
+    // the block and leave an orphan tail on every refresh.
+    if let Some(start_idx) = find_marker_line(existing, MARKER_START, 0)
+        && let Some(end_pos) = find_marker_line(existing, MARKER_END, start_idx)
     {
-        let end_idx = start_idx + end_idx_rel + MARKER_END.len();
+        let end_idx = end_pos + MARKER_END.len();
         // Consume a trailing newline after the end marker if present
         // so we don't accumulate blank lines on every re-run.
         let after_end = if existing.as_bytes().get(end_idx).copied() == Some(b'\n') {
@@ -238,6 +242,38 @@ mod tests {
         let first = merge_instructions_block("# Title\n", &block);
         let second = merge_instructions_block(&first, &block);
         assert_eq!(first, second, "second merge must be a no-op");
+    }
+
+    /// Regression: a block whose body *mentions* the end marker inline
+    /// (mid-line, as older snippets did between backticks) must not be
+    /// truncated at that mention. The naive `find` matched the inline
+    /// marker, cut early, and re-injected the tail on every refresh; the
+    /// line-anchored matcher must keep the double-run a true no-op.
+    #[test]
+    fn merge_ignores_inline_marker_mention_in_block() {
+        let block = format!(
+            "{MARKER_START}\nsee the `{MARKER_END}` marker inline\nreal body\n{MARKER_END}\n"
+        );
+        let first = merge_instructions_block("# Title\n", &block);
+        let second = merge_instructions_block(&first, &block);
+        assert_eq!(first, second, "double-run must be a no-op");
+        // One inline mention + one real delimiter — nothing accumulated.
+        assert_eq!(second.matches(MARKER_START).count(), 1);
+        assert_eq!(second.matches(MARKER_END).count(), 2);
+    }
+
+    /// The real shipped block round-trips cleanly through a refresh.
+    #[test]
+    fn merge_idempotent_with_real_block() {
+        let block = full_block();
+        let first = merge_instructions_block("# Title\n", &block);
+        let second = merge_instructions_block(&first, &block);
+        assert_eq!(first, second, "refresh of the real block must be a no-op");
+        assert_eq!(
+            second.matches(MARKER_END).count(),
+            block.matches(MARKER_END).count(),
+            "no orphaned end marker accumulated"
+        );
     }
 
     /// Defensive: existing file ends without trailing newline. We
