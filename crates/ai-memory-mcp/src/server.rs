@@ -968,6 +968,31 @@ impl AiMemoryServer {
             .map_err(Self::scope_error)
     }
 
+    /// Human-readable `workspace/project` label for a resolved scope. Makes
+    /// not-found errors diagnosable — especially under cross-project
+    /// scope-bleed, where a scoped-implicit read resolves to a different
+    /// scope than a concurrent write landed in. Degrades to a placeholder
+    /// when a name lookup fails so it never turns a not-found into a harder
+    /// error.
+    async fn scope_label(
+        &self,
+        ws: ai_memory_core::WorkspaceId,
+        proj: ai_memory_core::ProjectId,
+    ) -> String {
+        let ws_name = self.reader.workspace_name_by_id(ws).await.ok().flatten();
+        let proj_name = self
+            .reader
+            .project_name_by_id(ws, proj)
+            .await
+            .ok()
+            .flatten();
+        format!(
+            "{}/{}",
+            ws_name.as_deref().unwrap_or("<unknown-workspace>"),
+            proj_name.as_deref().unwrap_or("<unknown-project>")
+        )
+    }
+
     async fn embed_query(&self, query: &str) -> Option<Vec<f32>> {
         let Some(embedder) = &self.embedder else {
             return None;
@@ -1837,6 +1862,15 @@ impl AiMemoryServer {
                 &aps_actor,
             )
             .await?;
+        // Diagnose cross-project scope-bleed: a read with no explicit scope
+        // resolves to the active project, which may differ from the scope a
+        // concurrent write landed in — the write persists but the by-path
+        // read looks in the wrong bucket and 404s.
+        let auto_scoped = args
+            .workspace
+            .as_deref()
+            .is_none_or(|s| s.trim().is_empty())
+            && args.project.as_deref().is_none_or(|s| s.trim().is_empty());
 
         let page_path = if let Some(p) = args.path {
             PagePath::new(p)
@@ -1911,7 +1945,28 @@ impl AiMemoryServer {
                             "served_from": "db-fallback",
                         }))
                     }
-                    None => Err(McpError::internal_error(disk_err.to_string(), None)),
+                    None => {
+                        // Not on disk and not in the DB under the resolved
+                        // scope. Name the scope (and flag auto-resolution) so
+                        // scope-bleed is diagnosable from the error itself,
+                        // instead of leaking the raw disk error/path.
+                        let scope = self.scope_label(ws, proj).await;
+                        let hint = if auto_scoped {
+                            " — this scope was auto-resolved from the active \
+                             project; pass explicit workspace+project if this \
+                             is a parallel multi-project session where the \
+                             write may have landed in a different scope"
+                        } else {
+                            ""
+                        };
+                        Err(McpError::internal_error(
+                            format!(
+                                "page {} not found in resolved scope {scope}{hint}",
+                                page_path.as_str()
+                            ),
+                            None,
+                        ))
+                    }
                 }
             }
             Err(disk_err) => Err(McpError::internal_error(disk_err.to_string(), None)),
@@ -4280,6 +4335,55 @@ mod tests {
         assert!(
             text.contains("db-fallback"),
             "expected fallback diagnostic; got {text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn memory_read_page_missing_error_names_the_scope() {
+        let (tmp, store, server, _ws, _proj) = setup_server().await;
+        let wiki = Wiki::new(tmp.path(), store.writer.clone()).unwrap();
+        let server = server.with_wiki(wiki);
+
+        // Explicit scope: the not-found error names workspace/project and the
+        // relative path (no raw disk error / absolute path leak).
+        let err = server
+            .memory_read_page(
+                Parameters(ReadPageArgs {
+                    query: None,
+                    path: Some("does-not-exist.md".into()),
+                    project: Some("scratch".into()),
+                    workspace: Some("default".into()),
+                }),
+                rmcp::handler::server::tool::Extension(test_parts_default()),
+            )
+            .await
+            .expect_err("missing page must error");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("default/scratch"),
+            "must name the scope; got {msg}"
+        );
+        assert!(
+            msg.contains("does-not-exist.md"),
+            "must name the path; got {msg}"
+        );
+
+        // Auto-scoped read: the error adds the parallel-session hint.
+        let err = server
+            .memory_read_page(
+                Parameters(ReadPageArgs {
+                    query: None,
+                    path: Some("does-not-exist.md".into()),
+                    project: None,
+                    workspace: None,
+                }),
+                rmcp::handler::server::tool::Extension(test_parts_default()),
+            )
+            .await
+            .expect_err("missing page must error");
+        assert!(
+            err.to_string().contains("auto-resolved"),
+            "auto-scoped error must hint at scope-bleed; got {err}"
         );
     }
 
