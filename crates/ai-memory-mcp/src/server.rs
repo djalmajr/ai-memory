@@ -1178,9 +1178,14 @@ impl AiMemoryServer {
         };
         let hits = hits.map_err(|e| McpError::internal_error(e.to_string(), None))?;
         self.spawn_access_bump(hits.iter().map(|h| h.id).collect());
-        // Raw-observation fallback only applies to a single resolved
-        // project; for multi-scope queries there is no single (ws, proj).
-        let raw_hits = if hits.is_empty() && args.scopes.is_empty() {
+        // Raw-observation fallback when compiled-page search misses. Works
+        // for a single resolved project (default / workspace+project) AND
+        // for explicit `scopes` — the recommended scope-bleed mitigation —
+        // by searching observations in each resolved (ws, proj) and
+        // rank-merging, so the fallback isn't lost on the scoped path.
+        let raw_hits = if !hits.is_empty() {
+            Vec::new()
+        } else if args.scopes.is_empty() {
             let (ws, proj) = self
                 .effective_ids_for_read_args_with_actor(
                     args.workspace.as_deref(),
@@ -1193,7 +1198,23 @@ impl AiMemoryServer {
                 .await
                 .map_err(|e| McpError::internal_error(e.to_string(), None))?
         } else {
-            Vec::new()
+            let scopes = self.resolve_query_scopes(&args.scopes).await?;
+            let mut obs: Vec<ai_memory_store::ObservationHit> = Vec::new();
+            for (ws, proj) in scopes {
+                let mut scope_obs = self
+                    .reader
+                    .search_observations_for_project(ws, proj, query.clone(), limit)
+                    .await
+                    .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+                obs.append(&mut scope_obs);
+            }
+            obs.sort_by(|a, b| {
+                a.rank
+                    .partial_cmp(&b.rank)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
+            obs.truncate(limit);
+            obs
         };
         // Default-scoped queries (no workspace/project/scopes/global args)
         // also union the reserved `_global` preferences scope, so standing
@@ -3670,6 +3691,78 @@ mod tests {
         assert!(
             text.contains("raw_hits"),
             "expected raw fallback; got {text}"
+        );
+        assert!(text.contains("quokka"), "expected raw snippet; got {text}");
+    }
+
+    #[tokio::test]
+    async fn memory_query_returns_raw_hits_via_explicit_scopes() {
+        // The raw-observation fallback must also fire on the explicit
+        // `scopes` path (the recommended scope-bleed mitigation), not just
+        // default / workspace+project. Regression for a scope with
+        // observations but zero compiled pages.
+        let (_tmp, store, server, ws, _proj) = setup_server().await;
+        let scoped = store
+            .writer
+            .get_or_create_project(ws, "scoped-obs", None)
+            .await
+            .unwrap();
+        let session_id = SessionId::new();
+        store
+            .writer
+            .begin_session(NewSession {
+                id: session_id,
+                workspace_id: ws,
+                project_id: scoped,
+                agent_kind: AgentKind::OpenCode,
+                cwd: None,
+            })
+            .await
+            .unwrap();
+        store
+            .writer
+            .insert_observation(NewObservation {
+                session_id,
+                workspace_id: ws,
+                project_id: scoped,
+                kind: ObservationKind::UserPrompt,
+                extension: None,
+                source_event: None,
+                title: "raw prompt".into(),
+                body: "raw fallback contains quokka only detail".into(),
+                importance: 5,
+            })
+            .await
+            .unwrap();
+
+        let result = server
+            .memory_query(
+                Parameters(QueryArgs {
+                    query: "quokka".into(),
+                    limit: Some(5),
+                    project: None,
+                    scopes: vec![MemoryScopeArg {
+                        project: "scoped-obs".into(),
+                        workspace: "default".into(),
+                    }],
+                    workspace: None,
+                    global: None,
+                }),
+                rmcp::handler::server::tool::Extension(test_parts_default()),
+            )
+            .await
+            .unwrap();
+        let text = match result.content.first().and_then(|c| c.as_text()) {
+            Some(t) => t.text.clone(),
+            None => panic!("expected text content"),
+        };
+        assert!(
+            text.contains("\"hits\": []"),
+            "expected no page hits; got {text}"
+        );
+        assert!(
+            text.contains("raw_hits"),
+            "expected raw fallback via scopes; got {text}"
         );
         assert!(text.contains("quokka"), "expected raw snippet; got {text}");
     }
