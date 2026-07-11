@@ -210,8 +210,6 @@ pub async fn run(config: &Config, args: ServeArgs) -> Result<()> {
         wiki.clone(),
         embedder.clone(),
         admin_llm.clone(),
-        ws,
-        proj,
         config.decay,
     )
     .await;
@@ -485,8 +483,6 @@ async fn start_maintenance_scheduler(
     wiki: Wiki,
     embedder: Option<Arc<dyn Embedder>>,
     llm: Option<Arc<dyn LlmProvider>>,
-    workspace_id: WorkspaceId,
-    project_id: ProjectId,
     decay: ai_memory_store::DecayParams,
 ) -> Vec<tokio::task::JoinHandle<()>> {
     let maintenance_enabled = settings.enabled;
@@ -506,10 +502,15 @@ async fn start_maintenance_scheduler(
             let interval = std::time::Duration::from_secs(forget_sweep_interval_secs);
             loop {
                 tokio::time::sleep(interval).await;
-                match run_sweep(&reader, &writer, workspace_id, project_id, &decay, false).await {
-                    Ok(report) => info!(
-                        evicted = report.evicted.len(),
-                        hard_deleted = report.hard_deleted,
+                let started = std::time::Instant::now();
+                match run_scheduled_sweep_tick(&reader, &writer, &decay).await {
+                    Ok(outcome) => info!(
+                        scopes = outcome.scopes,
+                        candidates_evaluated = outcome.candidates_evaluated,
+                        evicted = outcome.evicted,
+                        hard_deleted = outcome.hard_deleted,
+                        errors = outcome.errors,
+                        elapsed_ms = started.elapsed().as_millis(),
                         "scheduled forget sweep completed"
                     ),
                     Err(e) => tracing::warn!(error = %e, "scheduled forget sweep failed"),
@@ -563,19 +564,13 @@ async fn start_maintenance_scheduler(
             let interval = std::time::Duration::from_secs(lint_interval_secs);
             loop {
                 tokio::time::sleep(interval).await;
-                match run_lint(
-                    &reader,
-                    &wiki,
-                    llm.as_ref(),
-                    workspace_id,
-                    project_id,
-                    false,
-                    false,
-                )
-                .await
-                {
-                    Ok(report) => info!(
-                        findings = report.findings.len(),
+                let started = std::time::Instant::now();
+                match run_scheduled_lint_tick(&reader, &wiki, llm.as_ref()).await {
+                    Ok(outcome) => info!(
+                        scopes = outcome.scopes,
+                        findings = outcome.findings,
+                        errors = outcome.errors,
+                        elapsed_ms = started.elapsed().as_millis(),
                         "scheduled rule-based lint completed"
                     ),
                     Err(e) => tracing::warn!(error = %e, "scheduled lint failed"),
@@ -593,19 +588,18 @@ async fn start_maintenance_scheduler(
                 let interval = std::time::Duration::from_secs(embedding_backfill_interval_secs);
                 loop {
                     tokio::time::sleep(interval).await;
-                    match run_embedding_backfill(
-                        &reader,
-                        &writer,
-                        &wiki,
-                        &embedder,
-                        workspace_id,
-                        project_id,
-                    )
-                    .await
+                    let started = std::time::Instant::now();
+                    match run_scheduled_embedding_backfill_tick(&reader, &writer, &wiki, &embedder)
+                        .await
                     {
-                        Ok((embedded, failed)) => {
-                            info!(embedded, failed, "scheduled embedding backfill completed")
-                        }
+                        Ok(outcome) => info!(
+                            scopes = outcome.scopes,
+                            embedded = outcome.embedded,
+                            failed = outcome.failed,
+                            errors = outcome.errors,
+                            elapsed_ms = started.elapsed().as_millis(),
+                            "scheduled embedding backfill completed"
+                        ),
                         Err(e) => tracing::warn!(error = %e, "scheduled embedding backfill failed"),
                     }
                 }
@@ -694,6 +688,153 @@ async fn initialize_auto_improve_scheduler_scopes(
         }
     }
     Ok((total, errors))
+}
+
+#[derive(Debug, Default)]
+struct ScheduledSweepTickOutcome {
+    scopes: usize,
+    candidates_evaluated: usize,
+    evicted: usize,
+    hard_deleted: usize,
+    errors: usize,
+}
+
+async fn run_scheduled_sweep_tick(
+    reader: &ReaderPool,
+    writer: &WriterHandle,
+    decay: &ai_memory_store::DecayParams,
+) -> Result<ScheduledSweepTickOutcome> {
+    let scopes = reader.list_all_scopes().await?;
+    let mut outcome = ScheduledSweepTickOutcome {
+        scopes: scopes.len(),
+        ..ScheduledSweepTickOutcome::default()
+    };
+
+    for scope in scopes {
+        match run_sweep(
+            reader,
+            writer,
+            scope.workspace_id,
+            scope.project_id,
+            decay,
+            false,
+        )
+        .await
+        {
+            Ok(report) => {
+                outcome.candidates_evaluated += report.candidates_evaluated;
+                outcome.evicted += report.evicted.len();
+                outcome.hard_deleted += report.hard_deleted;
+            }
+            Err(e) => {
+                outcome.errors += 1;
+                tracing::warn!(
+                    workspace = %scope.workspace_name,
+                    project = %scope.project_name,
+                    error = %e,
+                    "scheduled forget sweep failed for scope"
+                );
+            }
+        }
+    }
+
+    Ok(outcome)
+}
+
+#[derive(Debug, Default)]
+struct ScheduledLintTickOutcome {
+    scopes: usize,
+    findings: usize,
+    errors: usize,
+}
+
+async fn run_scheduled_lint_tick(
+    reader: &ReaderPool,
+    wiki: &Wiki,
+    llm: Option<&Arc<dyn LlmProvider>>,
+) -> Result<ScheduledLintTickOutcome> {
+    let scopes = reader.list_all_scopes().await?;
+    let mut outcome = ScheduledLintTickOutcome {
+        scopes: scopes.len(),
+        ..ScheduledLintTickOutcome::default()
+    };
+
+    for scope in scopes {
+        match run_lint(
+            reader,
+            wiki,
+            llm,
+            scope.workspace_id,
+            scope.project_id,
+            false,
+            false,
+        )
+        .await
+        {
+            Ok(report) => outcome.findings += report.findings.len(),
+            Err(e) => {
+                outcome.errors += 1;
+                tracing::warn!(
+                    workspace = %scope.workspace_name,
+                    project = %scope.project_name,
+                    error = %e,
+                    "scheduled lint failed for scope"
+                );
+            }
+        }
+    }
+
+    Ok(outcome)
+}
+
+#[derive(Debug, Default)]
+struct ScheduledEmbeddingBackfillTickOutcome {
+    scopes: usize,
+    embedded: usize,
+    failed: usize,
+    errors: usize,
+}
+
+async fn run_scheduled_embedding_backfill_tick(
+    reader: &ReaderPool,
+    writer: &WriterHandle,
+    wiki: &Wiki,
+    embedder: &Arc<dyn Embedder>,
+) -> Result<ScheduledEmbeddingBackfillTickOutcome> {
+    let scopes = reader.list_all_scopes().await?;
+    let mut outcome = ScheduledEmbeddingBackfillTickOutcome {
+        scopes: scopes.len(),
+        ..ScheduledEmbeddingBackfillTickOutcome::default()
+    };
+
+    for scope in scopes {
+        match run_embedding_backfill(
+            reader,
+            writer,
+            wiki,
+            embedder,
+            scope.workspace_id,
+            scope.project_id,
+        )
+        .await
+        {
+            Ok((embedded, failed)) => {
+                outcome.embedded += embedded;
+                outcome.failed += failed;
+            }
+            Err(e) => {
+                outcome.errors += 1;
+                tracing::warn!(
+                    workspace = %scope.workspace_name,
+                    project = %scope.project_name,
+                    error = %e,
+                    "scheduled embedding backfill failed for scope"
+                );
+            }
+        }
+    }
+
+    Ok(outcome)
 }
 
 async fn run_embedding_backfill(
@@ -1907,6 +2048,183 @@ mod tests {
             Self: 'async_trait,
         {
             Box::pin(async move { panic!("preflight-skipped scheduler test must not call LLM") })
+        }
+    }
+
+    async fn two_project_wiki() -> (TempDir, Store, Wiki, WorkspaceId, ProjectId, ProjectId) {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let wiki = Wiki::new(tmp.path(), store.writer.clone()).unwrap();
+        let ws = store
+            .writer
+            .get_or_create_workspace("default")
+            .await
+            .unwrap();
+        let first = store
+            .writer
+            .get_or_create_project(ws, "first", None)
+            .await
+            .unwrap();
+        let second = store
+            .writer
+            .get_or_create_project(ws, "second", None)
+            .await
+            .unwrap();
+        (tmp, store, wiki, ws, first, second)
+    }
+
+    async fn write_test_page(
+        wiki: &Wiki,
+        ws: WorkspaceId,
+        project: ProjectId,
+        path: &str,
+        title: &str,
+        tier: Tier,
+    ) {
+        wiki.write_page(WritePageRequest {
+            workspace_id: ws,
+            project_id: project,
+            path: PagePath::new(path).unwrap(),
+            frontmatter: serde_json::json!({"title": title}),
+            body: format!("# {title}\n\nbody for {path}"),
+            tier,
+            pinned: false,
+            title: Some(title.into()),
+            admission_ctx: None,
+            author_id: None,
+            actor: ai_memory_core::ActorContext::anonymous(),
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn scheduled_maintenance_sweep_tick_covers_all_projects() {
+        let (_tmp, store, wiki, ws, first, second) = two_project_wiki().await;
+        for (project, name) in [(first, "first"), (second, "second")] {
+            write_test_page(
+                &wiki,
+                ws,
+                project,
+                &format!("notes/{name}.md"),
+                name,
+                Tier::Episodic,
+            )
+            .await;
+        }
+
+        let decay = ai_memory_store::DecayParams {
+            cold_threshold: 2.0,
+            ..ai_memory_store::DecayParams::default()
+        };
+        let outcome = run_scheduled_sweep_tick(&store.reader, &store.writer, &decay)
+            .await
+            .unwrap();
+
+        assert_eq!(outcome.scopes, 2);
+        assert_eq!(outcome.errors, 0);
+        assert_eq!(outcome.candidates_evaluated, 2);
+        assert_eq!(outcome.evicted, 2);
+        for project in [first, second] {
+            assert!(
+                store
+                    .reader
+                    .decay_candidates(ws, project)
+                    .await
+                    .unwrap()
+                    .is_empty(),
+                "sweep should evict the eligible page in every project"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn scheduled_maintenance_lint_tick_covers_all_projects() {
+        let (_tmp, store, wiki, ws, first, second) = two_project_wiki().await;
+        for project in [first, second] {
+            write_test_page(
+                &wiki,
+                ws,
+                project,
+                "notes/a.md",
+                "Duplicate",
+                Tier::Semantic,
+            )
+            .await;
+            write_test_page(
+                &wiki,
+                ws,
+                project,
+                "notes/b.md",
+                "Duplicate",
+                Tier::Semantic,
+            )
+            .await;
+        }
+
+        let outcome = run_scheduled_lint_tick(&store.reader, &wiki, None)
+            .await
+            .unwrap();
+
+        assert_eq!(outcome.scopes, 2);
+        assert_eq!(outcome.errors, 0);
+        assert_eq!(outcome.findings, 2);
+        for project in [first, second] {
+            assert!(
+                wiki.read_page(ws, project, &PagePath::new("_lint".to_string()).unwrap())
+                    .is_err(),
+                "lint reports are dated pages, not the directory itself"
+            );
+            let lint_pages = store
+                .reader
+                .decay_candidates(ws, project)
+                .await
+                .unwrap()
+                .into_iter()
+                .filter(|c| c.path.as_str().starts_with("_lint/"))
+                .count();
+            assert_eq!(lint_pages, 1, "lint should write one report per project");
+        }
+    }
+
+    #[tokio::test]
+    async fn scheduled_maintenance_embedding_backfill_tick_covers_all_projects() {
+        let (_tmp, store, wiki, ws, first, second) = two_project_wiki().await;
+        for (project, name) in [(first, "first"), (second, "second")] {
+            write_test_page(
+                &wiki,
+                ws,
+                project,
+                &format!("notes/{name}.md"),
+                name,
+                Tier::Semantic,
+            )
+            .await;
+        }
+        let embedder: Arc<dyn Embedder> = Arc::new(SyntheticEmbedder::new(16));
+
+        let outcome =
+            run_scheduled_embedding_backfill_tick(&store.reader, &store.writer, &wiki, &embedder)
+                .await
+                .unwrap();
+
+        assert_eq!(outcome.scopes, 2);
+        assert_eq!(outcome.errors, 0);
+        assert_eq!(outcome.failed, 0);
+        assert_eq!(outcome.embedded, 2);
+        for project in [first, second] {
+            let embedded = store
+                .reader
+                .embedded_page_ids(
+                    ws,
+                    project,
+                    embedder.provider().to_string(),
+                    embedder.model().to_string(),
+                    embedder.dim(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(embedded.len(), 1, "each project should get embeddings");
         }
     }
 

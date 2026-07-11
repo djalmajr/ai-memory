@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- Scheduled forget sweep, rule-based lint, and opt-in embedding backfill now
+  iterate every existing workspace/project scope instead of only the project
+  selected at server boot. Embedding backfill remains disabled by default, but
+  enabled schedules are now store-wide and can increase provider usage ([#173]).
+
 ## [1.11.3] - 2026-07-11
 
 ### Changed

@@ -89,6 +89,9 @@ from hook paths.
    schedule: pages with `retention < cold_threshold` are soft-deleted;
    soft-deletions older than `hard_delete_after_days` with no subsequent
    access get purged. Semantic / pinned / freshly-touched pages survive.
+   Scheduled sweep, rule-based lint, and opt-in embedding backfill ticks
+   enumerate every existing workspace/project scope before doing per-project
+   work, matching the auto-improvement scheduler's store-wide scope model.
 8. Backups: `ai-memory backup --to <tarball>` uses SQLite's online
    backup API so the source stays writable; `ai-memory restore`
    reverses. Or: `git push` the wiki dir + `rsync` the data dir.

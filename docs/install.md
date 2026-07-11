@@ -1100,9 +1100,11 @@ volume). Outside docker, override with `AI_MEMORY_DATA_DIR=/path`.
 
 Scheduled maintenance is configured in `[maintenance]` in `config.toml`.
 By default, rule-based lint and forget sweep run daily outside hook
-latency. Embedding backfill is supported but defaults to off because it
-can call a paid provider; enable it with
-`embedding_backfill_interval_secs` after configuring an embedder.
+latency across every existing workspace/project. Embedding backfill is
+supported but defaults to off because it can call a paid provider; if you
+enable `embedding_backfill_interval_secs` after configuring an embedder,
+each scheduled tick backfills every existing workspace/project and may
+increase provider usage accordingly.
 
 ---
 
