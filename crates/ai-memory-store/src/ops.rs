@@ -129,6 +129,16 @@ fn project_name_in_other_workspaces(
     Ok(rows)
 }
 
+fn warn_project_name_in_other_workspaces(name: &str, also_in: &[String]) {
+    if !also_in.is_empty() {
+        tracing::warn!(
+            project = name,
+            also_in = ?also_in,
+            "creating a project whose name already exists in other workspace(s) — legal (id-namespaced) but often an accidental misroute"
+        );
+    }
+}
+
 /// Resolve a project by `(workspace_id, name)`, creating it if missing.
 /// Atomic.
 pub fn get_or_create_project(
@@ -139,6 +149,8 @@ pub fn get_or_create_project(
 ) -> StoreResult<ai_memory_core::ProjectId> {
     let repo_path = repo_path.map(normalize_repo_path_key);
     let tx = conn.transaction()?;
+    let mut also_in = Vec::new();
+    let mut created = false;
     let existing: Option<Vec<u8>> = tx
         .query_row(
             "SELECT id FROM projects WHERE workspace_id = ?1 AND name = ?2",
@@ -149,16 +161,7 @@ pub fn get_or_create_project(
     let id = if let Some(bytes) = existing {
         ai_memory_core::ProjectId::from_slice(&bytes)?
     } else {
-        let also_in = project_name_in_other_workspaces(&tx, workspace_id, name)?;
-        if !also_in.is_empty() {
-            tracing::warn!(
-                project = name,
-                also_in = ?also_in,
-                "creating a project whose name already exists in other \
-                 workspace(s) — legal (id-namespaced) but often an \
-                 accidental misroute"
-            );
-        }
+        also_in = project_name_in_other_workspaces(&tx, workspace_id, name)?;
         let id = ai_memory_core::ProjectId::new();
         tx.execute(
             "INSERT INTO projects (id, workspace_id, name, repo_path, created_at) \
@@ -171,11 +174,15 @@ pub fn get_or_create_project(
                 Timestamp::now().as_microsecond()
             ],
         )?;
+        created = true;
         id
     };
     tx.commit()?;
     if scheduler_state_table_exists(conn)? {
         crate::auto_improve::ensure_scheduler_state(conn, *workspace_id, id)?;
+    }
+    if created {
+        warn_project_name_in_other_workspaces(name, &also_in);
     }
     Ok(id)
 }
@@ -362,7 +369,8 @@ pub fn ensure_project_with_id(
     repo_path: Option<&str>,
 ) -> StoreResult<()> {
     let repo_path = repo_path.map(normalize_repo_path_key);
-    conn.execute(
+    let tx = conn.transaction()?;
+    let inserted = tx.execute(
         "INSERT INTO projects (id, workspace_id, name, repo_path, created_at) \
          VALUES (?1, ?2, ?3, ?4, ?5) ON CONFLICT(id) DO NOTHING",
         params![
@@ -373,8 +381,13 @@ pub fn ensure_project_with_id(
             Timestamp::now().as_microsecond()
         ],
     )?;
+    let also_in = if inserted > 0 {
+        project_name_in_other_workspaces(&tx, &workspace_id, name)?
+    } else {
+        Vec::new()
+    };
     type ProjectRow = (Vec<u8>, String, Option<String>);
-    let existing: Option<ProjectRow> = conn
+    let existing: Option<ProjectRow> = tx
         .query_row(
             "SELECT workspace_id, name, repo_path FROM projects WHERE id = ?1",
             params![id.as_bytes()],
@@ -399,6 +412,10 @@ pub fn ensure_project_with_id(
             "project id {id} was not inserted"
         ))),
     }?;
+    tx.commit()?;
+    if inserted > 0 {
+        warn_project_name_in_other_workspaces(name, &also_in);
+    }
     Ok(())
 }
 
@@ -1519,7 +1536,44 @@ mod tests {
         LinkTarget, NewHandoff, NewPage, NewSession, PagePath, ProjectId, Tier, WorkspaceId,
     };
     use rusqlite::Connection;
+    use std::io::Write;
+    use std::sync::{Arc, Mutex};
     use tempfile::TempDir;
+
+    #[derive(Clone, Default)]
+    struct CapturedLogs(Arc<Mutex<Vec<u8>>>);
+
+    struct CapturedLogWriter(Arc<Mutex<Vec<u8>>>);
+
+    impl Write for CapturedLogWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CapturedLogs {
+        type Writer = CapturedLogWriter;
+
+        fn make_writer(&'a self) -> Self::Writer {
+            CapturedLogWriter(Arc::clone(&self.0))
+        }
+    }
+
+    fn capture_warnings(run: impl FnOnce()) -> String {
+        let logs = CapturedLogs::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::WARN)
+            .with_writer(logs.clone())
+            .without_time()
+            .finish();
+        tracing::subscriber::with_default(subscriber, run);
+        String::from_utf8(logs.0.lock().unwrap().clone()).unwrap()
+    }
 
     /// Open a fresh DB with migrations applied + a default workspace
     /// and "scratch" project pre-created. Tuple-return keeps the
@@ -1585,6 +1639,82 @@ mod tests {
         assert_ne!(
             a_shared, b_shared,
             "homonymous projects must get distinct ids"
+        );
+    }
+
+    #[test]
+    fn get_or_create_project_warns_when_creating_homonym_across_workspaces() {
+        let (_tmp, mut conn, _ws, _proj) = fresh_db();
+        let ws_a = get_or_create_workspace(&mut conn, "alpha").unwrap();
+        let ws_b = get_or_create_workspace(&mut conn, "beta").unwrap();
+        get_or_create_project(&mut conn, &ws_a, "shared", None).unwrap();
+
+        let logs = capture_warnings(|| {
+            get_or_create_project(&mut conn, &ws_b, "shared", None).unwrap();
+        });
+        assert!(
+            logs.contains("already exists in other workspace")
+                && logs.contains("shared")
+                && logs.contains("alpha"),
+            "homonym creation warning should name the project and other workspace: {logs}"
+        );
+
+        let logs = capture_warnings(|| {
+            get_or_create_project(&mut conn, &ws_b, "shared", None).unwrap();
+        });
+        assert!(
+            !logs.contains("already exists in other workspace"),
+            "idempotent lookup must not warn: {logs}"
+        );
+    }
+
+    #[test]
+    fn ensure_project_with_id_warns_when_creating_homonym_across_workspaces() {
+        let (_tmp, mut conn, _ws, _proj) = fresh_db();
+        let ws_a = get_or_create_workspace(&mut conn, "alpha").unwrap();
+        let ws_b = get_or_create_workspace(&mut conn, "beta").unwrap();
+        get_or_create_project(&mut conn, &ws_a, "shared", None).unwrap();
+        let id = ProjectId::new();
+
+        let logs = capture_warnings(|| {
+            ensure_project_with_id(&mut conn, id, ws_b, "shared", None).unwrap();
+        });
+        assert!(
+            logs.contains("already exists in other workspace")
+                && logs.contains("shared")
+                && logs.contains("alpha"),
+            "manifest project creation warning should name the project and other workspace: {logs}"
+        );
+
+        let logs = capture_warnings(|| {
+            ensure_project_with_id(&mut conn, id, ws_b, "shared", None).unwrap();
+        });
+        assert!(
+            !logs.contains("already exists in other workspace"),
+            "idempotent manifest import must not warn: {logs}"
+        );
+    }
+
+    #[test]
+    fn ensure_project_with_id_does_not_warn_when_validation_fails() {
+        let (_tmp, mut conn, _ws, _proj) = fresh_db();
+        let ws_a = get_or_create_workspace(&mut conn, "alpha").unwrap();
+        let ws_b = get_or_create_workspace(&mut conn, "beta").unwrap();
+        get_or_create_project(&mut conn, &ws_a, "shared", None).unwrap();
+        let id = ProjectId::new();
+        ensure_project_with_id(&mut conn, id, ws_b, "other", None).unwrap();
+
+        let logs = capture_warnings(|| {
+            let err = ensure_project_with_id(&mut conn, id, ws_b, "shared", None)
+                .expect_err("same id with different name must fail validation");
+            assert!(
+                matches!(err, StoreError::Duplicate(_)),
+                "unexpected error: {err}"
+            );
+        });
+        assert!(
+            !logs.contains("already exists in other workspace"),
+            "failed validation must not emit a creation warning: {logs}"
         );
     }
 

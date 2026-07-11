@@ -8,6 +8,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- Project creation now emits a warning when the same project name already
+  exists in another workspace, helping catch accidental cross-workspace
+  misroutes while preserving legal id-namespaced homonyms.
 - `memory_query` now runs the raw-observation fallback for explicit `scopes`
   requests when compiled wiki pages miss, so scoped cross-project searches can
   still surface bounded raw session matches without falling back to the current
