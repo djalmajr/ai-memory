@@ -10,6 +10,8 @@ on a homelab box where mistakes are harder to undo.
 |---|---|---|---|---|
 | `purge-project --confirm` | ✅ yes | the one project's data | no | Atomic `rm -rf <project_root>` on the namespaced disk path; sibling projects untouched. |
 | `rename-project --from --to` | ✅ yes | no | yes (rename back) | Column-only update on `projects.name`. The on-disk dir is keyed by `project_id` (UUID), so the rename never moves a file. |
+| `/admin/rename-workspace` | ✅ yes | no | yes (rename back) | Column-only update on `workspaces.name`; refreshes `_meta.md` scope manifests and checkpoints the wiki tree. |
+| `/admin/delete-workspace` | ✅ yes | the workspace and every child project | no | Runs `purge_workspace` admission first, deletes SQLite rows in one cascade, removes the UUID-keyed workspace directory, reports filesystem partial failures, and dispatches mirror notification after durable work. |
 | `move-project --confirm` | ✅ yes | source only in the merge case (a `Reject`-policy `purge_project` webhook can still abort the source teardown leaving everything intact) | no | Fresh destination → lossless **true move** (re-stamp `workspace_id`, keep `project_id`, rename the dir): sessions/observations/handoffs + history all survive. Destination with a same-named project → **copy+purge merge**: only latest pages migrate. |
 | `backup --output-path` | ✅ yes | no | n/a | Streams a gzipped tarball from the server's online `sqlite3 .backup` plus the wiki tree. Safe alongside the live writer. |
 | `checkpoints` | ✅ yes | no | n/a | Lists recent wiki git checkpoints. Read-only. |
@@ -129,6 +131,46 @@ Failure modes:
 - **`to` name already exists in this workspace** → 422.
 - **`to` invalid (empty, slash, whitespace)** → 422.
 - **Source `from` not found** → 404.
+
+### `/admin/rename-workspace`
+
+Renames a workspace by updating `workspaces.name`; on-disk paths remain keyed by
+`workspace_id`, so no page files move. After the SQLite rename, the handler
+refreshes `_meta.md` scope manifests with `Wiki::backfill_scope_manifests()` and
+returns `manifests_refreshed` plus a post-rename checkpoint when the wiki tree
+changed.
+
+Failure modes:
+
+- **Source `from` not found** → 404.
+- **`to` name already exists or is invalid** → 422.
+
+### `/admin/delete-workspace`
+
+Deletes a workspace row and all child projects/pages/sessions through the
+`workspace_id` cascade. The route is guarded by `force: true` for non-empty
+workspaces and follows the destructive-operation ordering used by project
+purges:
+
+1. Look up the workspace without creating missing scopes.
+2. Run blocking `op=purge_workspace` admission. A reject-policy webhook aborts
+   before DB rows or files are removed.
+3. Take a pre-delete checkpoint if the wiki tree is dirty.
+4. Delete the workspace in one writer-actor transaction.
+5. Remove `<wiki_root>/<workspace_id>` from disk.
+6. Dispatch non-blocking `purge_workspace` mirror notifications after durable
+   work. If the DB delete committed but disk removal failed, the response
+   includes `files_failed` and webhook `ctx.partial_failure: true`.
+7. Take a post-delete checkpoint if the wiki tree changed.
+
+Failure modes:
+
+- **Workspace not found** → 404, no mutation.
+- **Non-empty workspace without `force: true`** → 409, no mutation.
+- **Reject-policy `purge_workspace` webhook fails** → 500, no DB/disk mutation.
+- **Filesystem removal fails after SQL commit** → 200 with `files_failed`
+  populated and `partial_failure: true` on async mirror notifications; manual
+  cleanup of the reported path is required.
 
 ### `move-project`
 

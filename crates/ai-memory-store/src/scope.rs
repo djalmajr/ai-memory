@@ -183,12 +183,7 @@ pub async fn lookup_existing_scope(
     workspace: &str,
     project: &str,
 ) -> Result<ResolvedScope, ScopeResolutionError> {
-    let workspace_id = reader
-        .find_workspace(workspace.to_owned())
-        .await?
-        .ok_or_else(|| ScopeResolutionError::WorkspaceNotFound {
-            workspace: workspace.to_owned(),
-        })?;
+    let workspace_id = lookup_existing_workspace(reader, workspace).await?;
     let project_id = reader
         .find_project(workspace_id, project.to_owned())
         .await?
@@ -200,6 +195,22 @@ pub async fn lookup_existing_scope(
         workspace_id,
         project_id,
     })
+}
+
+/// Look up an explicit workspace by name without creating anything.
+///
+/// This is for admin/destructive surfaces that operate at workspace granularity
+/// and must fail closed on typos instead of auto-creating a scope.
+pub async fn lookup_existing_workspace(
+    reader: &ReaderPool,
+    workspace: &str,
+) -> Result<WorkspaceId, ScopeResolutionError> {
+    reader
+        .find_workspace(workspace.to_owned())
+        .await?
+        .ok_or_else(|| ScopeResolutionError::WorkspaceNotFound {
+            workspace: workspace.to_owned(),
+        })
 }
 
 /// Create or fetch an explicit workspace/project pair.

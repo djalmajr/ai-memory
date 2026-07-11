@@ -56,6 +56,9 @@ pub enum AdmissionOp {
     /// `remove_dir_all`). Carries the project (ctx), no page path. Lets a
     /// mirror remove the project's directory.
     PurgeProject,
+    /// A whole workspace is being purged. Carries the workspace (ctx), no page
+    /// path, and an empty project. Lets a mirror remove the workspace tree.
+    PurgeWorkspace,
     /// A whole project is being moved between workspaces without changing its
     /// project id. Carries source names in `workspace`/`project` and
     /// destination names in `destination_workspace`/`destination_project`.
@@ -71,6 +74,7 @@ impl AdmissionOp {
             AdmissionOp::Consolidate => "consolidate",
             AdmissionOp::Delete => "delete",
             AdmissionOp::PurgeProject => "purge_project",
+            AdmissionOp::PurgeWorkspace => "purge_workspace",
             AdmissionOp::MoveProject => "move_project",
         }
     }
@@ -568,6 +572,25 @@ mod tests {
         assert!(matches!(pol, FailurePolicy::Ignore));
         let op = AdmissionOp::default();
         assert!(matches!(op, AdmissionOp::WritePage));
+    }
+
+    #[test]
+    fn purge_workspace_header_value_is_stable() {
+        assert_eq!(
+            AdmissionOp::PurgeWorkspace.as_header_value(),
+            "purge_workspace"
+        );
+    }
+
+    #[test]
+    fn purge_workspace_event_deserializes_from_config_value() {
+        let cfg: WebhookConfig = serde_json::from_value(serde_json::json!({
+            "name": "mirror",
+            "url": "http://127.0.0.1:1/hook",
+            "events": ["purge_workspace"]
+        }))
+        .unwrap();
+        assert_eq!(cfg.events, vec![AdmissionOp::PurgeWorkspace]);
     }
 
     #[test]

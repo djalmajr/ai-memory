@@ -34,7 +34,38 @@ use tower::ServiceExt;
 
 async fn make_state(tmp: &TempDir) -> (AdminState, Store) {
     let store = Store::open(tmp.path()).unwrap();
-    let wiki = Wiki::new(tmp.path(), store.writer.clone()).unwrap();
+    let wiki = Wiki::new(tmp.path(), store.writer.clone())
+        .unwrap()
+        .with_store_reader(store.reader.clone());
+    let db_path = store.db_path().to_path_buf();
+    let state = AdminState {
+        writer: store.writer.clone(),
+        reader: store.reader.clone(),
+        wiki,
+        llm: None,
+        auto_improve_require_approval: false,
+        auto_improve_review_config: Default::default(),
+        embedder: None,
+        provider_health: ai_memory_llm::ProviderHealth::default(),
+        decay_params: DecayParams::default(),
+        data_dir: tmp.path().to_path_buf(),
+        db_path,
+        bind: "127.0.0.1:0".to_string(),
+        home_dir: None,
+        bootstrap_lock: std::sync::Arc::new(tokio::sync::Mutex::new(())),
+        token_pepper: None,
+        active_project: ai_memory_core::ActiveProject::new(),
+        on_project_moved: None,
+    };
+    (state, store)
+}
+
+async fn make_state_with_chain(tmp: &TempDir, chain: AdmissionChain) -> (AdminState, Store) {
+    let store = Store::open(tmp.path()).unwrap();
+    let wiki = Wiki::new(tmp.path(), store.writer.clone())
+        .unwrap()
+        .with_admission_chain(chain)
+        .with_store_reader(store.reader.clone());
     let db_path = store.db_path().to_path_buf();
     let state = AdminState {
         writer: store.writer.clone(),
@@ -1802,4 +1833,179 @@ async fn rename_workspace_ok_collision_and_unknown() {
         .await;
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
     }
+}
+
+#[tokio::test]
+async fn rename_workspace_refreshes_scope_manifests() {
+    let tmp = TempDir::new().unwrap();
+    let (state, store) = make_state(&tmp).await;
+    seed_page(&store, &state.wiki, "old", "proj", "notes/a.md", "b").await;
+    state.wiki.backfill_scope_manifests().await.unwrap();
+    let ws_id = store
+        .reader
+        .find_workspace("old".into())
+        .await
+        .unwrap()
+        .expect("workspace exists");
+
+    let resp = post(
+        state,
+        "/admin/rename-workspace",
+        json!({"from":"old","to":"new"}),
+    )
+    .await;
+
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = body_json(resp).await;
+    assert!(
+        body["manifests_refreshed"].as_u64().unwrap_or(0) >= 1,
+        "rename should rewrite the workspace manifest: {body}"
+    );
+    let manifest = std::fs::read_to_string(
+        tmp.path()
+            .join("wiki")
+            .join(ws_id.to_string())
+            .join("_meta.md"),
+    )
+    .unwrap();
+    assert!(manifest.contains("workspace: new"), "{manifest}");
+    assert!(!manifest.contains("workspace: old"), "{manifest}");
+}
+
+#[tokio::test]
+async fn delete_workspace_reject_policy_aborts_before_db_or_disk_destruction() {
+    let app = Router::new().route(
+        "/hook",
+        axum_post(
+            |headers: HeaderMap, Json(_payload): Json<serde_json::Value>| async move {
+                let op = headers
+                    .get("X-Memory-Op")
+                    .and_then(|v| v.to_str().ok())
+                    .unwrap_or("");
+                assert_eq!(op, "purge_workspace");
+                (StatusCode::INTERNAL_SERVER_ERROR, "no workspace purge")
+            },
+        ),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}/hook", listener.local_addr().unwrap());
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+    let tmp = TempDir::new().unwrap();
+    let chain = AdmissionChain::new(vec![WebhookConfig {
+        name: "rejecting-mirror".into(),
+        url,
+        timeout_ms: 2_000,
+        failure_policy: FailurePolicy::Reject,
+        events: vec![AdmissionOp::PurgeWorkspace],
+        blocking: true,
+    }])
+    .unwrap();
+    let (state, store) = make_state_with_chain(&tmp, chain).await;
+    seed_page(&store, &state.wiki, "victim", "proj", "notes/a.md", "body").await;
+    let ws_id = store
+        .reader
+        .find_workspace("victim".into())
+        .await
+        .unwrap()
+        .expect("workspace exists");
+    let ws_root = tmp.path().join("wiki").join(ws_id.to_string());
+
+    let resp = post(
+        state,
+        "/admin/delete-workspace",
+        json!({ "workspace": "victim", "force": true }),
+    )
+    .await;
+
+    assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    assert!(
+        store
+            .reader
+            .find_workspace("victim".into())
+            .await
+            .unwrap()
+            .is_some(),
+        "rejecting admission must leave DB rows intact"
+    );
+    assert!(
+        ws_root.exists(),
+        "rejecting admission must leave disk intact"
+    );
+}
+
+#[tokio::test]
+async fn delete_workspace_reports_partial_disk_failure_and_dispatches_notification() {
+    let (tx, rx) = tokio::sync::oneshot::channel::<serde_json::Value>();
+    let tx = Arc::new(Mutex::new(Some(tx)));
+    let tx_for_route = tx.clone();
+    let app = Router::new().route(
+        "/hook",
+        axum_post(move |Json(payload): Json<serde_json::Value>| {
+            let tx_for_route = tx_for_route.clone();
+            async move {
+                if let Some(tx) = tx_for_route.lock().unwrap().take() {
+                    let _ = tx.send(payload);
+                }
+                StatusCode::NO_CONTENT
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}/hook", listener.local_addr().unwrap());
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+    let tmp = TempDir::new().unwrap();
+    let chain = AdmissionChain::new(vec![WebhookConfig {
+        name: "async-mirror".into(),
+        url,
+        timeout_ms: 2_000,
+        failure_policy: FailurePolicy::Ignore,
+        events: vec![AdmissionOp::PurgeWorkspace],
+        blocking: false,
+    }])
+    .unwrap();
+    let (state, store) = make_state_with_chain(&tmp, chain).await;
+    seed_page(&store, &state.wiki, "victim", "proj", "notes/a.md", "body").await;
+    let ws_id = store
+        .reader
+        .find_workspace("victim".into())
+        .await
+        .unwrap()
+        .expect("workspace exists");
+    let ws_root = tmp.path().join("wiki").join(ws_id.to_string());
+    std::fs::remove_dir_all(&ws_root).unwrap();
+    std::fs::write(&ws_root, "not a directory").unwrap();
+
+    let resp = post(
+        state,
+        "/admin/delete-workspace",
+        json!({ "workspace": "victim", "force": true }),
+    )
+    .await;
+
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = body_json(resp).await;
+    assert!(
+        body["files_deleted"].as_array().unwrap().is_empty(),
+        "{body}"
+    );
+    assert_eq!(body["files_failed"].as_array().unwrap().len(), 1, "{body}");
+    assert!(
+        store
+            .reader
+            .find_workspace("victim".into())
+            .await
+            .unwrap()
+            .is_none(),
+        "DB delete should still commit and be reported as partial filesystem failure"
+    );
+
+    let payload = tokio::time::timeout(std::time::Duration::from_secs(2), rx)
+        .await
+        .expect("async purge_workspace dispatch should fire")
+        .unwrap();
+    assert_eq!(payload["ctx"]["op"], "purge_workspace");
+    assert_eq!(payload["ctx"]["workspace"], "victim");
+    assert_eq!(payload["ctx"]["partial_failure"], true);
 }

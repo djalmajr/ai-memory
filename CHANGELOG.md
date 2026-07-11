@@ -8,6 +8,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Changed
+- `/admin/delete-workspace` now runs `purge_workspace` admission before
+  destructive work, reports filesystem partial failures in `files_failed`, and
+  notifies non-blocking mirrors after durable deletion; `/admin/rename-workspace`
+  refreshes scope manifests after the SQLite rename.
 - OIDC CLI help and token-store test fixtures now use a neutral `ai-memory`
   realm placeholder instead of the old project-specific `serpro` example, and
   the unused LLM retry-exhaustion error variant was removed ([#171]).
