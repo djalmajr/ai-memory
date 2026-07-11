@@ -90,9 +90,8 @@ latest binary's recommended copy:
   `CLAUDE.md`; pass `--target AGENTS.md` for non-Claude agents or projects
   that use `AGENTS.md` as the canonical instruction file).
 
-Both are idempotent: re-runs replace the block bracketed by
-`<!-- ai-memory:start -->` / `<!-- ai-memory:end -->` markers without
-disturbing the rest of the file.
+Both are idempotent: re-runs replace the block delimited by the ai-memory
+start/end HTML-comment markers, without disturbing the rest of the file.
 "#;
 
 /// Build the full markered block that should land in CLAUDE.md /
@@ -104,4 +103,79 @@ disturbing the rest of the file.
 #[must_use]
 pub fn full_block() -> String {
     format!("{MARKER_START}\n{}\n{MARKER_END}\n", SNIPPET_BODY.trim())
+}
+
+/// Byte offset, at or after `from`, of an occurrence of `marker` that sits
+/// alone on its own line (only whitespace before it on the line and after
+/// it up to the newline). [`full_block`] always writes the real delimiters
+/// on their own lines, so this matches the true markers while skipping any
+/// inline mention of the marker strings — a marker quoted inside prose or
+/// code — which a naive [`str::find`] would hit first, truncating the
+/// managed block and leaving an orphan tail on every refresh. Returns
+/// `None` when no line-anchored occurrence exists.
+#[must_use]
+pub fn find_marker_line(haystack: &str, marker: &str, from: usize) -> Option<usize> {
+    if marker.is_empty() || from > haystack.len() || !haystack.is_char_boundary(from) {
+        return None;
+    }
+
+    let mut idx = from;
+    while let Some(rel) = haystack[idx..].find(marker) {
+        let pos = idx + rel;
+        let line_start = haystack[..pos].rfind('\n').map_or(0, |n| n + 1);
+        let before = &haystack[line_start..pos];
+        let after = haystack[pos + marker.len()..]
+            .split('\n')
+            .next()
+            .unwrap_or("");
+        if before.trim().is_empty() && after.trim().is_empty() {
+            return Some(pos);
+        }
+        idx = pos + marker.len();
+    }
+    None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn find_marker_line_skips_inline_mention() {
+        let text = format!("a\nsee `{MARKER_END}` inline\n{MARKER_END}\nb\n");
+        let pos = find_marker_line(&text, MARKER_END, 0).unwrap();
+        let line_start = text[..pos].rfind('\n').map_or(0, |n| n + 1);
+        assert_eq!(
+            &text[line_start..pos],
+            "",
+            "matched marker must start its own line"
+        );
+        assert!(
+            text[pos + MARKER_END.len()..].starts_with('\n'),
+            "nothing may follow the marker on its line"
+        );
+    }
+
+    #[test]
+    fn find_marker_line_absent_returns_none() {
+        assert!(find_marker_line("no markers here\n", MARKER_END, 0).is_none());
+    }
+
+    #[test]
+    fn find_marker_line_rejects_invalid_search_inputs() {
+        assert!(find_marker_line(MARKER_END, "", 0).is_none());
+        assert!(find_marker_line(MARKER_END, MARKER_END, MARKER_END.len() + 1).is_none());
+        assert!(find_marker_line("é\n", MARKER_END, 1).is_none());
+    }
+
+    /// Option-2 guard: the canonical block must not embed the markers
+    /// anywhere but as the real delimiters, so the agent-driven install
+    /// path (which never runs the CLI matcher) stays safe too.
+    #[test]
+    fn full_block_has_exactly_one_of_each_marker() {
+        let block = full_block();
+        assert_eq!(block.matches(MARKER_START).count(), 1);
+        assert_eq!(block.matches(MARKER_END).count(), 1);
+        assert!(block.trim_end().ends_with(MARKER_END));
+    }
 }

@@ -8,6 +8,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- `ai-memory install-instructions` and `ai-memory uninstall --only instructions`
+  now match only line-anchored routing markers, handle CRLF marker lines, and
+  repair the exact orphan-tail shape left by older refreshes when the snippet
+  body mentioned an end marker inline.
 - Project creation now emits a warning when the same project name already
   exists in another workspace, helping catch accidental cross-workspace
   misroutes while preserving legal id-namespaced homonyms.

@@ -1914,7 +1914,11 @@ mod tests {
         let mut perms = std::fs::metadata(&path).unwrap().permissions();
         perms.set_mode(0o755);
         std::fs::set_permissions(&path, perms).unwrap();
-        path.display().to_string()
+        // Execute through the shell instead of exec'ing the freshly-written
+        // temp file directly. Some Linux filesystems can briefly report
+        // ETXTBSY for direct exec under parallel tests even after write(2)
+        // returns and the file handle has been dropped.
+        format!("sh {}", path.display())
     }
 
     #[cfg(windows)]

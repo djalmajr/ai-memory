@@ -2852,8 +2852,9 @@ mod tests {
             "snippet must tell agents to refresh managed skill files"
         );
         assert!(
-            snippet.contains(ai_memory_core::MARKER_START)
-                && snippet.contains(ai_memory_core::MARKER_END),
+            snippet.contains("start/end HTML-comment markers")
+                && ai_memory_core::full_block().contains(ai_memory_core::MARKER_START)
+                && ai_memory_core::full_block().contains(ai_memory_core::MARKER_END),
             "snippet must preserve marker replacement guidance"
         );
     }
