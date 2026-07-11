@@ -1138,20 +1138,14 @@ impl AiMemoryServer {
 
         let query = args.query.clone();
         let query_vec = self.embed_query(&args.query).await;
-        let hits = if args.scopes.is_empty() {
-            let (ws, proj) = self
-                .effective_ids_for_read_args_with_actor(
-                    args.workspace.as_deref(),
-                    args.project.as_deref(),
-                    &aps_actor,
-                )
-                .await?;
-            self.search_project(ws, proj, &args.query, query_vec.as_deref(), limit)
-                .await
+        let resolved_scopes = if args.scopes.is_empty() {
+            None
         } else {
-            let scopes = self.resolve_query_scopes(&args.scopes).await?;
+            Some(self.resolve_query_scopes(&args.scopes).await?)
+        };
+        let hits = if let Some(scopes) = &resolved_scopes {
             let mut hits_by_id: HashMap<PageId, PageHit> = HashMap::new();
-            for (ws, proj) in scopes {
+            for &(ws, proj) in scopes {
                 let hits = self
                     .search_project(ws, proj, &args.query, query_vec.as_deref(), limit)
                     .await
@@ -1175,12 +1169,44 @@ impl AiMemoryServer {
             });
             hits.truncate(limit);
             Ok(hits)
+        } else {
+            let (ws, proj) = self
+                .effective_ids_for_read_args_with_actor(
+                    args.workspace.as_deref(),
+                    args.project.as_deref(),
+                    &aps_actor,
+                )
+                .await?;
+            self.search_project(ws, proj, &args.query, query_vec.as_deref(), limit)
+                .await
         };
         let hits = hits.map_err(|e| McpError::internal_error(e.to_string(), None))?;
         self.spawn_access_bump(hits.iter().map(|h| h.id).collect());
-        // Raw-observation fallback only applies to a single resolved
-        // project; for multi-scope queries there is no single (ws, proj).
-        let raw_hits = if hits.is_empty() && args.scopes.is_empty() {
+        // Raw-observation fallback when compiled-page search misses. Works
+        // for a single resolved project (default / workspace+project) AND
+        // for explicit `scopes` — the recommended scope-bleed mitigation —
+        // by searching observations in each resolved (ws, proj) and
+        // rank-merging, so the fallback isn't lost on the scoped path.
+        let raw_hits = if !hits.is_empty() {
+            Vec::new()
+        } else if let Some(scopes) = &resolved_scopes {
+            let mut obs: Vec<ai_memory_store::ObservationHit> = Vec::new();
+            for &(ws, proj) in scopes {
+                let mut scope_obs = self
+                    .reader
+                    .search_observations_for_project(ws, proj, query.clone(), limit)
+                    .await
+                    .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+                obs.append(&mut scope_obs);
+            }
+            obs.sort_by(|a, b| {
+                a.rank
+                    .partial_cmp(&b.rank)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
+            obs.truncate(limit);
+            obs
+        } else {
             let (ws, proj) = self
                 .effective_ids_for_read_args_with_actor(
                     args.workspace.as_deref(),
@@ -1192,8 +1218,6 @@ impl AiMemoryServer {
                 .search_observations_for_project(ws, proj, query, limit)
                 .await
                 .map_err(|e| McpError::internal_error(e.to_string(), None))?
-        } else {
-            Vec::new()
         };
         // Default-scoped queries (no workspace/project/scopes/global args)
         // also union the reserved `_global` preferences scope, so standing
@@ -2622,6 +2646,42 @@ mod tests {
         serde_json::from_str(text).unwrap_or_else(|e| panic!("invalid JSON response: {e}\n{text}"))
     }
 
+    async fn insert_test_observation(
+        store: &Store,
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+        title: &str,
+        body: &str,
+    ) {
+        let session_id = SessionId::new();
+        store
+            .writer
+            .begin_session(NewSession {
+                id: session_id,
+                workspace_id,
+                project_id,
+                agent_kind: AgentKind::OpenCode,
+                cwd: None,
+            })
+            .await
+            .unwrap();
+        store
+            .writer
+            .insert_observation(NewObservation {
+                session_id,
+                workspace_id,
+                project_id,
+                kind: ObservationKind::UserPrompt,
+                extension: None,
+                source_event: None,
+                title: title.into(),
+                body: body.into(),
+                importance: 5,
+            })
+            .await
+            .unwrap();
+    }
+
     const MCP_TOOL_NAMES: &[&str] = &[
         "memory_query",
         "memory_recent",
@@ -3672,6 +3732,342 @@ mod tests {
             "expected raw fallback; got {text}"
         );
         assert!(text.contains("quokka"), "expected raw snippet; got {text}");
+    }
+
+    #[tokio::test]
+    async fn memory_query_returns_raw_hits_via_explicit_scopes() {
+        // The raw-observation fallback must also fire on the explicit
+        // `scopes` path (the recommended scope-bleed mitigation), not just
+        // default / workspace+project. Regression for a scope with
+        // observations but zero compiled pages.
+        let (_tmp, store, server, ws, _proj) = setup_server().await;
+        let scoped = store
+            .writer
+            .get_or_create_project(ws, "scoped-obs", None)
+            .await
+            .unwrap();
+        let session_id = SessionId::new();
+        store
+            .writer
+            .begin_session(NewSession {
+                id: session_id,
+                workspace_id: ws,
+                project_id: scoped,
+                agent_kind: AgentKind::OpenCode,
+                cwd: None,
+            })
+            .await
+            .unwrap();
+        store
+            .writer
+            .insert_observation(NewObservation {
+                session_id,
+                workspace_id: ws,
+                project_id: scoped,
+                kind: ObservationKind::UserPrompt,
+                extension: None,
+                source_event: None,
+                title: "raw prompt".into(),
+                body: "raw fallback contains quokka only detail".into(),
+                importance: 5,
+            })
+            .await
+            .unwrap();
+
+        let result = server
+            .memory_query(
+                Parameters(QueryArgs {
+                    query: "quokka".into(),
+                    limit: Some(5),
+                    project: None,
+                    scopes: vec![MemoryScopeArg {
+                        project: "scoped-obs".into(),
+                        workspace: "default".into(),
+                    }],
+                    workspace: None,
+                    global: None,
+                }),
+                rmcp::handler::server::tool::Extension(test_parts_default()),
+            )
+            .await
+            .unwrap();
+        let text = match result.content.first().and_then(|c| c.as_text()) {
+            Some(t) => t.text.clone(),
+            None => panic!("expected text content"),
+        };
+        assert!(
+            text.contains("\"hits\": []"),
+            "expected no page hits; got {text}"
+        );
+        assert!(
+            text.contains("raw_hits"),
+            "expected raw fallback via scopes; got {text}"
+        );
+        assert!(text.contains("quokka"), "expected raw snippet; got {text}");
+    }
+
+    #[tokio::test]
+    async fn memory_query_scoped_raw_hits_respect_limit_and_rank_order() {
+        let (_tmp, store, server, ws, _proj) = setup_server().await;
+        let first = store
+            .writer
+            .get_or_create_project(ws, "rank-first", None)
+            .await
+            .unwrap();
+        let second = store
+            .writer
+            .get_or_create_project(ws, "rank-second", None)
+            .await
+            .unwrap();
+        for (project_id, title) in [
+            (first, "first-a"),
+            (first, "first-b"),
+            (second, "second-a"),
+            (second, "second-b"),
+        ] {
+            insert_test_observation(
+                &store,
+                ws,
+                project_id,
+                title,
+                &format!("rank_token appears in {title}"),
+            )
+            .await;
+        }
+
+        let mut expected = store
+            .reader
+            .search_observations_for_project(ws, first, "rank_token".into(), 3)
+            .await
+            .unwrap();
+        expected.extend(
+            store
+                .reader
+                .search_observations_for_project(ws, second, "rank_token".into(), 3)
+                .await
+                .unwrap(),
+        );
+        expected.sort_by(|a, b| {
+            a.rank
+                .partial_cmp(&b.rank)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        expected.truncate(3);
+        assert!(
+            expected.iter().any(|hit| hit.title.starts_with("first-"))
+                && expected.iter().any(|hit| hit.title.starts_with("second-")),
+            "test setup must require merged hits from both scopes: {expected:?}"
+        );
+
+        let json = call_tool_json(
+            server
+                .memory_query(
+                    Parameters(QueryArgs {
+                        query: "rank_token".into(),
+                        limit: Some(3),
+                        project: None,
+                        scopes: vec![
+                            MemoryScopeArg {
+                                project: "rank-first".into(),
+                                workspace: "default".into(),
+                            },
+                            MemoryScopeArg {
+                                project: "rank-second".into(),
+                                workspace: "default".into(),
+                            },
+                        ],
+                        workspace: None,
+                        global: None,
+                    }),
+                    rmcp::handler::server::tool::Extension(test_parts_default()),
+                )
+                .await
+                .unwrap(),
+        );
+        let raw_hits = json["raw_hits"].as_array().unwrap();
+        assert_eq!(raw_hits.len(), 3, "raw hits must be truncated: {json}");
+        let titles: Vec<&str> = raw_hits
+            .iter()
+            .map(|hit| hit["title"].as_str().unwrap())
+            .collect();
+        let expected_titles: Vec<&str> = expected.iter().map(|hit| hit.title.as_str()).collect();
+        assert_eq!(
+            titles, expected_titles,
+            "raw hits should match the merged-and-truncated store ranking: {json}"
+        );
+        let ranks: Vec<f64> = raw_hits
+            .iter()
+            .map(|hit| hit["rank"].as_f64().unwrap())
+            .collect();
+        assert!(
+            ranks.windows(2).all(|pair| pair[0] <= pair[1]),
+            "raw hits must be rank-sorted: {json}"
+        );
+    }
+
+    #[tokio::test]
+    async fn memory_query_scoped_raw_hits_deduplicate_duplicate_scopes() {
+        let (_tmp, store, server, ws, _proj) = setup_server().await;
+        let scoped = store
+            .writer
+            .get_or_create_project(ws, "dedupe-obs", None)
+            .await
+            .unwrap();
+        insert_test_observation(
+            &store,
+            ws,
+            scoped,
+            "dedupe raw prompt",
+            "dedupe_token appears once",
+        )
+        .await;
+
+        let json = call_tool_json(
+            server
+                .memory_query(
+                    Parameters(QueryArgs {
+                        query: "dedupe_token".into(),
+                        limit: Some(10),
+                        project: None,
+                        scopes: vec![
+                            MemoryScopeArg {
+                                project: "dedupe-obs".into(),
+                                workspace: "default".into(),
+                            },
+                            MemoryScopeArg {
+                                project: "dedupe-obs".into(),
+                                workspace: "default".into(),
+                            },
+                        ],
+                        workspace: None,
+                        global: None,
+                    }),
+                    rmcp::handler::server::tool::Extension(test_parts_default()),
+                )
+                .await
+                .unwrap(),
+        );
+        let raw_hits = json["raw_hits"].as_array().unwrap();
+        assert_eq!(
+            raw_hits.len(),
+            1,
+            "duplicate scopes must not duplicate raw hits: {json}"
+        );
+        assert_eq!(raw_hits[0]["title"], "dedupe raw prompt");
+    }
+
+    #[tokio::test]
+    async fn memory_query_missing_scope_fails_closed_without_default_raw_fallback() {
+        let (_tmp, store, server, ws, proj) = setup_server().await;
+        insert_test_observation(
+            &store,
+            ws,
+            proj,
+            "default raw prompt",
+            "missing_scope_token exists only in the default project",
+        )
+        .await;
+
+        let err = server
+            .memory_query(
+                Parameters(QueryArgs {
+                    query: "missing_scope_token".into(),
+                    limit: Some(10),
+                    project: None,
+                    scopes: vec![MemoryScopeArg {
+                        project: "absent".into(),
+                        workspace: "default".into(),
+                    }],
+                    workspace: None,
+                    global: None,
+                }),
+                rmcp::handler::server::tool::Extension(test_parts_default()),
+            )
+            .await
+            .expect_err("missing explicit scope must fail closed");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("absent") || msg.contains("not found"),
+            "missing scope error should identify the bad scope: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn memory_query_page_hits_suppress_scoped_raw_fallback() {
+        let (_tmp, store, server, ws, _proj) = setup_server().await;
+        let pages = store
+            .writer
+            .get_or_create_project(ws, "page-scope", None)
+            .await
+            .unwrap();
+        let raw = store
+            .writer
+            .get_or_create_project(ws, "raw-scope", None)
+            .await
+            .unwrap();
+        store
+            .writer
+            .upsert_page(NewPage {
+                workspace_id: ws,
+                project_id: pages,
+                path: PagePath::new("page-hit.md").unwrap(),
+                title: "Page Hit".into(),
+                body: "mixed_scope_token appears in a compiled page".into(),
+                tier: Tier::Semantic,
+                frontmatter_json: serde_json::json!({}),
+                pinned: false,
+                links: Vec::new(),
+                author_id: None,
+            })
+            .await
+            .unwrap();
+        insert_test_observation(
+            &store,
+            ws,
+            raw,
+            "raw mixed prompt",
+            "mixed_scope_token also appears only in raw observations",
+        )
+        .await;
+
+        let json = call_tool_json(
+            server
+                .memory_query(
+                    Parameters(QueryArgs {
+                        query: "mixed_scope_token".into(),
+                        limit: Some(10),
+                        project: None,
+                        scopes: vec![
+                            MemoryScopeArg {
+                                project: "page-scope".into(),
+                                workspace: "default".into(),
+                            },
+                            MemoryScopeArg {
+                                project: "raw-scope".into(),
+                                workspace: "default".into(),
+                            },
+                        ],
+                        workspace: None,
+                        global: None,
+                    }),
+                    rmcp::handler::server::tool::Extension(test_parts_default()),
+                )
+                .await
+                .unwrap(),
+        );
+        assert!(
+            json["hits"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|hit| hit["path"] == "page-hit.md"),
+            "expected compiled page hit: {json}"
+        );
+        assert!(
+            json.get("raw_hits")
+                .is_none_or(|raw_hits| raw_hits.as_array().is_some_and(Vec::is_empty)),
+            "compiled page hits must suppress raw fallback: {json}"
+        );
     }
 
     #[tokio::test]
