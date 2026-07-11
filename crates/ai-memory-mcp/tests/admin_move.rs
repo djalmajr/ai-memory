@@ -1565,3 +1565,71 @@ async fn copy_purge_rerun_is_idempotent() {
     paths.sort();
     assert_eq!(paths, vec!["notes/a.md", "notes/keep.md"]);
 }
+
+#[tokio::test]
+async fn delete_workspace_refuses_non_empty_without_force() {
+    let tmp = TempDir::new().unwrap();
+    let (state, store) = make_state(&tmp).await;
+    seed_page(&store, &state.wiki, "victim", "proj", "notes/a.md", "body").await;
+
+    let resp = post(
+        state,
+        "/admin/delete-workspace",
+        json!({ "workspace": "victim" }),
+    )
+    .await;
+    assert_eq!(
+        resp.status(),
+        StatusCode::CONFLICT,
+        "non-empty delete must be refused without force"
+    );
+    assert!(
+        store
+            .reader
+            .find_workspace("victim".into())
+            .await
+            .unwrap()
+            .is_some(),
+        "a refused delete must not remove the workspace"
+    );
+}
+
+#[tokio::test]
+async fn delete_workspace_force_removes_everything() {
+    let tmp = TempDir::new().unwrap();
+    let (state, store) = make_state(&tmp).await;
+    seed_page(&store, &state.wiki, "victim", "proj", "notes/a.md", "body").await;
+
+    let resp = post(
+        state,
+        "/admin/delete-workspace",
+        json!({ "workspace": "victim", "force": true }),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = body_json(resp).await;
+    assert_eq!(body["projects_deleted"].as_u64().unwrap_or(0), 1, "{body}");
+    assert!(body["pages_deleted"].as_u64().unwrap_or(0) >= 1, "{body}");
+    assert!(
+        store
+            .reader
+            .find_workspace("victim".into())
+            .await
+            .unwrap()
+            .is_none(),
+        "workspace must be gone after a force delete"
+    );
+}
+
+#[tokio::test]
+async fn delete_workspace_unknown_is_404() {
+    let tmp = TempDir::new().unwrap();
+    let (state, _store) = make_state(&tmp).await;
+    let resp = post(
+        state,
+        "/admin/delete-workspace",
+        json!({ "workspace": "ghost" }),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+}

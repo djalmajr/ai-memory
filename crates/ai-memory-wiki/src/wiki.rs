@@ -561,6 +561,22 @@ impl Wiki {
         }
     }
 
+    /// Remove a workspace's on-disk directory (`<wiki_root>/<ws>`), including
+    /// every project under it, without running admission. Best-effort: a
+    /// missing dir is not an error.
+    ///
+    /// # Errors
+    /// Returns [`WikiError::Io`] on filesystem errors other than NotFound.
+    pub async fn remove_workspace_dir(&self, workspace_id: WorkspaceId) -> WikiResult<()> {
+        let _guard = self.mutation_lock.write().await;
+        let root = self.root.join(workspace_id.to_string());
+        match std::fs::remove_dir_all(&root) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(crate::WikiError::Io(e)),
+        }
+    }
+
     /// Dispatch non-blocking purge webhooks after the caller's purge has
     /// completed its durable DB/filesystem work.
     pub fn dispatch_purge_project(&self, admission_ctx: Option<&AdmissionContext>) {

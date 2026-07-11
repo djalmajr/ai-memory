@@ -22,7 +22,9 @@ use crate::auto_improve::{
     RejectAutoImproveProposal, StageAutoImproveRun, StagedAutoImproveRun,
 };
 use crate::error::{StoreError, StoreResult};
-use crate::ops::{self, EmbeddingWrite, MoveSummary, PurgeSummary, ReorgSummary};
+use crate::ops::{
+    self, DeleteWorkspaceSummary, EmbeddingWrite, MoveSummary, PurgeSummary, ReorgSummary,
+};
 use crate::users::{self, TOKEN_HASH_LEN};
 
 /// Commands accepted by the writer thread.
@@ -153,6 +155,13 @@ pub(crate) enum WriteCmd {
         /// Human-readable `workspace/project` label forwarded into the summary.
         label: String,
         reply: oneshot::Sender<StoreResult<PurgeSummary>>,
+    },
+    /// Delete a workspace row (its `workspace_id` FKs cascade projects/pages/
+    /// sessions/…). Refused when non-empty unless `force`.
+    DeleteWorkspace {
+        workspace_id: WorkspaceId,
+        force: bool,
+        reply: oneshot::Sender<StoreResult<DeleteWorkspaceSummary>>,
     },
     /// Re-stamp a project's `workspace_id` across every domain table in one
     /// transaction, keeping the same `project_id` (a lossless cross-workspace
@@ -618,6 +627,28 @@ impl WriterHandle {
             workspace_id,
             project_id,
             label: label.into(),
+            reply: tx,
+        })
+        .await?;
+        rx.await.map_err(|_| StoreError::WriterClosed)?
+    }
+
+    /// Delete a workspace and, via the `workspace_id` cascade, every project /
+    /// page / session under it. Refuses a non-empty workspace unless `force`.
+    ///
+    /// # Errors
+    /// [`StoreError::WorkspaceNotEmpty`] when it still holds projects and
+    /// `force` is false; [`StoreError::NotFound`] when the workspace is absent;
+    /// [`StoreError::WriterClosed`] if the actor has shut down.
+    pub async fn delete_workspace(
+        &self,
+        workspace_id: WorkspaceId,
+        force: bool,
+    ) -> StoreResult<DeleteWorkspaceSummary> {
+        let (tx, rx) = oneshot::channel();
+        self.send(WriteCmd::DeleteWorkspace {
+            workspace_id,
+            force,
             reply: tx,
         })
         .await?;
@@ -1161,6 +1192,14 @@ fn worker_loop(mut conn: Connection, mut rx: mpsc::Receiver<WriteCmd>) {
             } => {
                 let result = ops::purge_project(&mut conn, &workspace_id, &project_id, &label);
                 send_or_warn(reply, result, "purge_project");
+            }
+            WriteCmd::DeleteWorkspace {
+                workspace_id,
+                force,
+                reply,
+            } => {
+                let result = ops::delete_workspace(&mut conn, &workspace_id, force);
+                send_or_warn(reply, result, "delete_workspace");
             }
             WriteCmd::MoveProjectWorkspace {
                 project_id,

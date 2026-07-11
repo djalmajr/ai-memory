@@ -1345,6 +1345,59 @@ pub fn purge_project(
     })
 }
 
+/// Summary returned by [`delete_workspace`].
+#[derive(Debug, Default, Clone)]
+pub struct DeleteWorkspaceSummary {
+    /// Projects removed (0 when the workspace was already empty).
+    pub projects_deleted: u64,
+    /// `pages` rows removed via cascade (all versions).
+    pub pages_deleted: u64,
+}
+
+/// Delete a workspace row. Refuses a workspace that still holds projects
+/// unless `force` is set (the guard exists so a stray typo can't wipe a live
+/// workspace). The `workspace_id` FKs are `ON DELETE CASCADE`, so a single
+/// `DELETE FROM workspaces` also removes its projects / pages / sessions /
+/// observations / handoffs. The caller removes the on-disk workspace dir
+/// afterwards.
+///
+/// # Errors
+/// [`StoreError::WorkspaceNotEmpty`] when it still holds projects and `force`
+/// is false; [`StoreError::NotFound`] when the workspace does not exist.
+pub fn delete_workspace(
+    conn: &mut Connection,
+    workspace_id: &WorkspaceId,
+    force: bool,
+) -> StoreResult<DeleteWorkspaceSummary> {
+    let tx = conn.transaction()?;
+    let wid = workspace_id.as_bytes();
+    let count = |sql: &str| -> StoreResult<u64> {
+        let n: Option<i64> = tx
+            .query_row(sql, rusqlite::params![&wid[..]], |row| row.get(0))
+            .optional()?;
+        Ok(u64::try_from(n.unwrap_or(0)).unwrap_or(0))
+    };
+
+    let projects_deleted = count("SELECT COUNT(*) FROM projects WHERE workspace_id = ?1")?;
+    if projects_deleted > 0 && !force {
+        return Err(StoreError::WorkspaceNotEmpty(projects_deleted));
+    }
+    let pages_deleted = count("SELECT COUNT(*) FROM pages WHERE workspace_id = ?1")?;
+
+    let removed = tx.execute(
+        "DELETE FROM workspaces WHERE id = ?1",
+        rusqlite::params![&wid[..]],
+    )?;
+    if removed == 0 {
+        return Err(StoreError::NotFound("workspace".into()));
+    }
+    tx.commit()?;
+    Ok(DeleteWorkspaceSummary {
+        projects_deleted,
+        pages_deleted,
+    })
+}
+
 /// Summary returned by [`move_project_workspace`] and exposed via
 /// [`crate::writer::WriterHandle::move_project_workspace`].
 #[derive(Debug, Default, Clone)]
@@ -1716,6 +1769,57 @@ mod tests {
             !logs.contains("already exists in other workspace"),
             "failed validation must not emit a creation warning: {logs}"
         );
+    }
+
+    #[test]
+    fn delete_workspace_refuses_non_empty_then_cascades_with_force() {
+        let (_tmp, mut conn, ws, proj) = fresh_db();
+        upsert_page(&mut conn, &page(ws, proj, "notes/a.md", "body")).unwrap();
+
+        // Non-empty (holds the "scratch" project + a page) → refused w/o force.
+        let err = delete_workspace(&mut conn, &ws, false).unwrap_err();
+        assert!(
+            matches!(err, StoreError::WorkspaceNotEmpty(n) if n >= 1),
+            "expected WorkspaceNotEmpty, got {err:?}"
+        );
+        let ws_still: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM workspaces WHERE id = ?1",
+                rusqlite::params![ws.as_bytes()],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(ws_still, 1, "refused delete must not touch the row");
+
+        // Force cascades: project + page gone, workspace row gone.
+        let summary = delete_workspace(&mut conn, &ws, true).unwrap();
+        assert!(
+            summary.projects_deleted >= 1 && summary.pages_deleted >= 1,
+            "{summary:?}"
+        );
+        let proj_left: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM projects WHERE workspace_id = ?1",
+                rusqlite::params![ws.as_bytes()],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(proj_left, 0, "projects must cascade on workspace delete");
+
+        // Deleting again → NotFound.
+        assert!(matches!(
+            delete_workspace(&mut conn, &ws, true).unwrap_err(),
+            StoreError::NotFound(_)
+        ));
+    }
+
+    #[test]
+    fn delete_workspace_empty_succeeds_without_force() {
+        let (_tmp, mut conn, _ws, _proj) = fresh_db();
+        let empty = get_or_create_workspace(&mut conn, "orphan-ws").unwrap();
+        let summary = delete_workspace(&mut conn, &empty, false).unwrap();
+        assert_eq!(summary.projects_deleted, 0);
+        assert_eq!(summary.pages_deleted, 0);
     }
 
     fn fresh_db() -> (

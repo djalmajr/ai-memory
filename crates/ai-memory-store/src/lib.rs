@@ -34,7 +34,7 @@ pub use auto_improve::{
 };
 pub use decay::{DecayParams, retention_score};
 pub use error::{StoreError, StoreResult};
-pub use ops::{EmbeddingWrite, MoveSummary, PurgeSummary, ReorgSummary};
+pub use ops::{DeleteWorkspaceSummary, EmbeddingWrite, MoveSummary, PurgeSummary, ReorgSummary};
 pub use reader::{
     ActivityWindow, AutoImproveCandidateSession, BriefingPage, BriefingSnapshot,
     ContaminationFinding, ContaminationReport, ContaminationSummary, DecayCandidate,

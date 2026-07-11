@@ -515,6 +515,7 @@ pub fn admin_router(state: AdminState) -> Router {
         .route("/admin/purge-project", post(handle_purge_project))
         .route("/admin/rename-project", post(handle_rename_project))
         .route("/admin/move-project", post(handle_move_project))
+        .route("/admin/delete-workspace", post(handle_delete_workspace))
         .route("/admin/write-page", post(handle_write_page))
         .route("/admin/delete-page", post(handle_delete_page));
     let users = Router::new()
@@ -2952,6 +2953,86 @@ async fn handle_purge_project(
 // ---------------------------------------------------------------------
 // rename-project
 // ---------------------------------------------------------------------
+
+/// JSON request body for `POST /admin/delete-workspace`.
+#[derive(Deserialize)]
+struct DeleteWorkspaceRequest {
+    /// Workspace name to delete (must exist).
+    workspace: String,
+    /// Delete even when the workspace still holds projects. Without it, a
+    /// non-empty workspace is refused so a typo can't wipe live data.
+    #[serde(default)]
+    force: bool,
+}
+
+/// Wire-format summary returned by `POST /admin/delete-workspace`.
+#[derive(Debug, Serialize)]
+pub struct DeleteWorkspaceResult {
+    /// Workspace name that was deleted.
+    pub workspace: String,
+    /// Projects removed via the `workspace_id` cascade.
+    pub projects_deleted: u64,
+    /// `pages` rows removed via cascade (all versions).
+    pub pages_deleted: u64,
+    /// Post-delete mirror checkpoint, if one was taken.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub checkpoint: Option<String>,
+}
+
+/// `POST /admin/delete-workspace` — remove a workspace and, via cascade, every
+/// project/page under it. Guarded: refuses a non-empty workspace unless
+/// `force` (a typo shouldn't wipe live data). Orphan-workspace cleanup.
+async fn handle_delete_workspace(
+    State(state): State<Arc<AdminState>>,
+    Json(req): Json<DeleteWorkspaceRequest>,
+) -> impl IntoResponse {
+    let ws_id = match state.reader.find_workspace(req.workspace.clone()).await {
+        Ok(Some(id)) => id,
+        Ok(None) => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({
+                    "error": format!("workspace '{}' not found", req.workspace)
+                })),
+            );
+        }
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "error": e.to_string() })),
+            );
+        }
+    };
+
+    let summary = match state.writer.delete_workspace(ws_id, req.force).await {
+        Ok(s) => s,
+        Err(e) => {
+            let status = match &e {
+                StoreError::WorkspaceNotEmpty(_) => StatusCode::CONFLICT,
+                StoreError::NotFound(_) => StatusCode::NOT_FOUND,
+                _ => StatusCode::INTERNAL_SERVER_ERROR,
+            };
+            return (status, Json(serde_json::json!({ "error": e.to_string() })));
+        }
+    };
+
+    // DB rows are gone (cascade); drop the on-disk dir best-effort so a
+    // filesystem hiccup doesn't fail an already-durable delete.
+    if let Err(e) = state.wiki.remove_workspace_dir(ws_id).await {
+        warn!(error = %e, workspace = %req.workspace, "delete-workspace: on-disk dir removal failed");
+    }
+
+    let result = DeleteWorkspaceResult {
+        workspace: req.workspace.clone(),
+        projects_deleted: summary.projects_deleted,
+        pages_deleted: summary.pages_deleted,
+        checkpoint: checkpoint_or_warn(&state.wiki, format!("delete-workspace {}", req.workspace)),
+    };
+    (
+        StatusCode::OK,
+        Json(serde_json::to_value(&result).unwrap_or(serde_json::Value::Null)),
+    )
+}
 
 /// JSON request body for `POST /admin/rename-project`.
 #[derive(Deserialize)]
