@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- OIDC CLI help and token-store test fixtures now use a neutral `ai-memory`
+  realm placeholder instead of the old project-specific `serpro` example, and
+  the unused LLM retry-exhaustion error variant was removed ([#171]).
+
 ### Fixed
 - Copy-purge `/admin/move-project` now skips only the webhook named exactly
   `contributors` while copying pages, avoiding redundant per-page contributor

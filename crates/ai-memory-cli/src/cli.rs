@@ -298,7 +298,7 @@ pub struct AuthLoginArgs {
     #[arg(long)]
     pub client_id: Option<String>,
     /// OIDC issuer URL for `oidc-device` login, e.g. a Keycloak realm
-    /// (`https://keycloak.example.com/realms/serpro`). Endpoints are
+    /// (`https://keycloak.example.com/realms/ai-memory`). Endpoints are
     /// discovered from `<issuer>/.well-known/openid-configuration`.
     #[arg(long)]
     pub issuer: Option<String>,

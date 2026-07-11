@@ -42,10 +42,6 @@ pub enum LlmError {
     /// JSON schema for structured output could not be derived.
     #[error("schema: {0}")]
     Schema(String),
-
-    /// Operation exhausted its retry budget.
-    #[error("retries exhausted: {0}")]
-    RetriesExhausted(String),
 }
 
 impl From<serde_json::Error> for LlmError {

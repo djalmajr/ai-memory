@@ -356,9 +356,9 @@ mod tests {
             access: SecretString::from("access-x".to_string()),
             refresh: SecretString::from("refresh-y".to_string()),
             expires_at_ms: now_ms() + 3_600_000,
-            issuer: "https://kc.example.com/realms/serpro".to_string(),
+            issuer: "https://kc.example.com/realms/ai-memory".to_string(),
             client_id: "ai-memory-dev".to_string(),
-            token_endpoint: "https://kc.example.com/realms/serpro/protocol/openid-connect/token"
+            token_endpoint: "https://kc.example.com/realms/ai-memory/protocol/openid-connect/token"
                 .to_string(),
         }
     }
@@ -375,7 +375,7 @@ mod tests {
         assert_eq!(loaded.client_id, "ai-memory-dev");
         assert_eq!(
             loaded.token_endpoint,
-            "https://kc.example.com/realms/serpro/protocol/openid-connect/token"
+            "https://kc.example.com/realms/ai-memory/protocol/openid-connect/token"
         );
     }
 
