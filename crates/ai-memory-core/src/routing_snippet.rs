@@ -178,4 +178,31 @@ mod tests {
         assert_eq!(block.matches(MARKER_END).count(), 1);
         assert!(block.trim_end().ends_with(MARKER_END));
     }
+
+    /// The committed root `AGENTS.md` carries this managed block between the
+    /// ai-memory markers. It is generated out-of-band
+    /// (`ai-memory install-instructions --target AGENTS.md`) and committed
+    /// separately, so nothing forces it to track [`SNIPPET_BODY`]. This guard
+    /// fails when the two drift — regenerate to fix it. Only `AGENTS.md` is
+    /// checked (root `CLAUDE.md` is a pointer; `README.md` is prose).
+    #[test]
+    fn committed_agents_md_matches_snippet_body() {
+        // From `crates/ai-memory-core` up to the repo root.
+        let agents_md = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../AGENTS.md"));
+        let normalize = |s: &str| s.replace("\r\n", "\n");
+        let agents_md = normalize(agents_md);
+
+        let start = find_marker_line(&agents_md, MARKER_START, 0)
+            .expect("committed AGENTS.md must contain the ai-memory start marker");
+        let end = find_marker_line(&agents_md, MARKER_END, start)
+            .expect("committed AGENTS.md must contain the ai-memory end marker");
+        let region = &agents_md[start..end + MARKER_END.len()];
+
+        assert_eq!(
+            region,
+            full_block().trim_end(),
+            "committed AGENTS.md managed block is stale vs SNIPPET_BODY — \
+             regenerate with `ai-memory install-instructions --target AGENTS.md --no-skills`"
+        );
+    }
 }
