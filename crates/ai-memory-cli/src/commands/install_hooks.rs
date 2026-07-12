@@ -1088,7 +1088,9 @@ fn render_opencode_plugin(
 /// and repo-root is resolved host-side via `repoRootProject`.
 fn ts_apply_marker_params(default_strategy: Option<&str>) -> String {
     let Some(default) = default_strategy else {
-        return r#"function applyMarkerParams(url: URL, cwd: string | undefined): void {
+        return format!(
+            "{TS_TOML_FLAG}\n{}",
+            r#"function applyMarkerParams(url: URL, cwd: string | undefined): void {
   const marker = findMarker(cwd);
   if (!marker || !cwd) return;
   url.searchParams.set("cwd", cwd);
@@ -1098,10 +1100,16 @@ fn ts_apply_marker_params(default_strategy: Option<&str>) -> String {
     const project = tomlKey(body, "project");
     const projectStrategy = tomlKey(body, "project_strategy");
     const dropSubagent = tomlKey(body, "drop_subagent_captures");
+    const defaultGlobal = tomlFlag(body, "default_global");
+    const briefing = tomlFlag(body, "inject_on_session_start");
+    const briefingBudget = tomlFlag(body, "max_chars");
     if (workspace) url.searchParams.set("workspace", workspace);
     if (project) url.searchParams.set("project", project);
     if (projectStrategy) url.searchParams.set("project_strategy", projectStrategy);
     if (dropSubagent) url.searchParams.set("drop_subagent", dropSubagent);
+    if (defaultGlobal) url.searchParams.set("default_global", defaultGlobal);
+    if (briefing) url.searchParams.set("briefing", briefing);
+    if (briefingBudget) url.searchParams.set("briefing_budget", briefingBudget);
     if (!project && (projectStrategy === "repo-root" || projectStrategy === "repo_root")) {
       const repoProject = repoRootProject(cwd);
       if (repoProject) url.searchParams.set("project", repoProject);
@@ -1109,7 +1117,7 @@ fn ts_apply_marker_params(default_strategy: Option<&str>) -> String {
   } catch (_e) {
   }
 }"#
-        .to_string();
+        );
     };
     let body = r#"function applyMarkerParams(url: URL, cwd: string | undefined): void {
   if (!cwd) return;
@@ -1118,6 +1126,9 @@ fn ts_apply_marker_params(default_strategy: Option<&str>) -> String {
   let project: string | undefined;
   let projectStrategy: string | undefined;
   let dropSubagent: string | undefined;
+  let defaultGlobal: string | undefined;
+  let briefing: string | undefined;
+  let briefingBudget: string | undefined;
   const marker = findMarker(cwd);
   if (marker) {
     try {
@@ -1126,6 +1137,9 @@ fn ts_apply_marker_params(default_strategy: Option<&str>) -> String {
       project = tomlKey(body, "project");
       projectStrategy = tomlKey(body, "project_strategy");
       dropSubagent = tomlKey(body, "drop_subagent_captures");
+      defaultGlobal = tomlFlag(body, "default_global");
+      briefing = tomlFlag(body, "inject_on_session_start");
+      briefingBudget = tomlFlag(body, "max_chars");
     } catch (_e) {
     }
   }
@@ -1138,12 +1152,29 @@ fn ts_apply_marker_params(default_strategy: Option<&str>) -> String {
   if (project) url.searchParams.set("project", project);
   if (projectStrategy) url.searchParams.set("project_strategy", projectStrategy);
   if (dropSubagent) url.searchParams.set("drop_subagent", dropSubagent);
+  if (defaultGlobal) url.searchParams.set("default_global", defaultGlobal);
+  if (briefing) url.searchParams.set("briefing", briefing);
+  if (briefingBudget) url.searchParams.set("briefing_budget", briefingBudget);
 }"#;
     format!(
-        "const DEFAULT_PROJECT_STRATEGY = {};\n{body}",
+        "const DEFAULT_PROJECT_STRATEGY = {};\n{TS_TOML_FLAG}\n{body}",
         ts_string_literal(default)
     )
 }
+
+/// `tomlFlag` mirrors the native hook's `parse_toml_flag`: unlike `tomlKey`
+/// (quoted strings only) it also accepts a bare token (`default_global =
+/// true`, `max_chars = 4000`), so section-style marker keys work whether or
+/// not the operator quotes the value. Emitted next to `applyMarkerParams`
+/// in every generated TypeScript integration.
+pub(crate) const TS_TOML_FLAG: &str = r#"function tomlFlag(text: string, key: string): string | undefined {
+  const re = new RegExp(`^\\s*${key}\\s*=\\s*(?:"([^"]*)"|([^#\\s]+))`);
+  for (const line of text.split(/\r?\n/)) {
+    const match = re.exec(line);
+    if (match) return match[1] ?? match[2];
+  }
+  return undefined;
+}"#;
 
 fn build_opencode_plugin(
     server_url: &str,
@@ -3498,6 +3529,10 @@ model = "gpt-5"
         assert!(plugin.contains("tomlKey(body, \"drop_subagent_captures\")"));
         assert!(plugin.contains("url.searchParams.set(\"project_strategy\", projectStrategy)"));
         assert!(plugin.contains("url.searchParams.set(\"drop_subagent\", dropSubagent)"));
+        assert!(plugin.contains("function tomlFlag"));
+        assert!(plugin.contains("tomlFlag(body, \"default_global\")"));
+        assert!(plugin.contains("tomlFlag(body, \"inject_on_session_start\")"));
+        assert!(plugin.contains("url.searchParams.set(\"briefing_budget\", briefingBudget)"));
         assert!(plugin.contains(
             "applyMarkerParams(url, typeof payload.cwd === \"string\" ? payload.cwd : undefined);"
         ));
@@ -3617,6 +3652,10 @@ model = "gpt-5"
         assert!(extension.contains("tomlKey(body, \"drop_subagent_captures\")"));
         assert!(extension.contains("url.searchParams.set(\"project_strategy\", projectStrategy)"));
         assert!(extension.contains("url.searchParams.set(\"drop_subagent\", dropSubagent)"));
+        assert!(extension.contains("function tomlFlag"));
+        assert!(extension.contains("tomlFlag(body, \"default_global\")"));
+        assert!(extension.contains("tomlFlag(body, \"inject_on_session_start\")"));
+        assert!(extension.contains("url.searchParams.set(\"briefing_budget\", briefingBudget)"));
         assert!(extension.contains(
             "applyMarkerParams(url, typeof payload.cwd === \"string\" ? payload.cwd : undefined);"
         ));

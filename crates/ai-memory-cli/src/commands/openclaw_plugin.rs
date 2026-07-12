@@ -202,8 +202,11 @@ pub(crate) fn manifest_json() -> String {
 /// `project` / `project_strategy` still win (§3.3). Mirrors the opencode/omp
 /// `ts_apply_marker_params` in `install_hooks.rs`.
 fn apply_marker_params_ts(default_strategy: Option<&str>) -> String {
+    let toml_flag = super::install_hooks::TS_TOML_FLAG;
     let Some(default) = default_strategy else {
-        return r#"function applyMarkerParams(url: URL, cwd: string | undefined): void {
+        return format!(
+            "{toml_flag}\n{}",
+            r#"function applyMarkerParams(url: URL, cwd: string | undefined): void {
   if (!cwd) return;
   url.searchParams.set("cwd", cwd);
   const marker = findMarker(cwd);
@@ -214,10 +217,16 @@ fn apply_marker_params_ts(default_strategy: Option<&str>) -> String {
     const project = tomlKey(body, "project");
     const projectStrategy = tomlKey(body, "project_strategy");
     const dropSubagent = tomlKey(body, "drop_subagent_captures");
+    const defaultGlobal = tomlFlag(body, "default_global");
+    const briefing = tomlFlag(body, "inject_on_session_start");
+    const briefingBudget = tomlFlag(body, "max_chars");
     if (workspace) url.searchParams.set("workspace", workspace);
     if (project) url.searchParams.set("project", project);
     if (projectStrategy) url.searchParams.set("project_strategy", projectStrategy);
     if (dropSubagent) url.searchParams.set("drop_subagent", dropSubagent);
+    if (defaultGlobal) url.searchParams.set("default_global", defaultGlobal);
+    if (briefing) url.searchParams.set("briefing", briefing);
+    if (briefingBudget) url.searchParams.set("briefing_budget", briefingBudget);
     if (!project && (projectStrategy === "repo-root" || projectStrategy === "repo_root")) {
       const repoProject = repoRootProject(cwd);
       if (repoProject) url.searchParams.set("project", repoProject);
@@ -225,7 +234,7 @@ fn apply_marker_params_ts(default_strategy: Option<&str>) -> String {
   } catch (_e) {
   }
 }"#
-        .to_string();
+        );
     };
     let body = r#"function applyMarkerParams(url: URL, cwd: string | undefined): void {
   if (!cwd) return;
@@ -234,6 +243,9 @@ fn apply_marker_params_ts(default_strategy: Option<&str>) -> String {
   let project: string | undefined;
   let projectStrategy: string | undefined;
   let dropSubagent: string | undefined;
+  let defaultGlobal: string | undefined;
+  let briefing: string | undefined;
+  let briefingBudget: string | undefined;
   const marker = findMarker(cwd);
   if (marker) {
     try {
@@ -242,6 +254,9 @@ fn apply_marker_params_ts(default_strategy: Option<&str>) -> String {
       project = tomlKey(body, "project");
       projectStrategy = tomlKey(body, "project_strategy");
       dropSubagent = tomlKey(body, "drop_subagent_captures");
+      defaultGlobal = tomlFlag(body, "default_global");
+      briefing = tomlFlag(body, "inject_on_session_start");
+      briefingBudget = tomlFlag(body, "max_chars");
     } catch (_e) {
     }
   }
@@ -254,9 +269,12 @@ fn apply_marker_params_ts(default_strategy: Option<&str>) -> String {
   if (project) url.searchParams.set("project", project);
   if (projectStrategy) url.searchParams.set("project_strategy", projectStrategy);
   if (dropSubagent) url.searchParams.set("drop_subagent", dropSubagent);
+  if (defaultGlobal) url.searchParams.set("default_global", defaultGlobal);
+  if (briefing) url.searchParams.set("briefing", briefing);
+  if (briefingBudget) url.searchParams.set("briefing_budget", briefingBudget);
 }"#;
     format!(
-        "const DEFAULT_PROJECT_STRATEGY = {};\n{body}",
+        "const DEFAULT_PROJECT_STRATEGY = {};\n{toml_flag}\n{body}",
         ts_string_literal(default)
     )
 }
@@ -528,6 +546,10 @@ mod tests {
         assert!(plugin.contains("tomlKey(body, \"project_strategy\")"));
         assert!(plugin.contains("tomlKey(body, \"drop_subagent_captures\")"));
         assert!(plugin.contains("url.searchParams.set(\"drop_subagent\", dropSubagent)"));
+        assert!(plugin.contains("function tomlFlag"));
+        assert!(plugin.contains("tomlFlag(body, \"default_global\")"));
+        assert!(plugin.contains("tomlFlag(body, \"inject_on_session_start\")"));
+        assert!(plugin.contains("url.searchParams.set(\"briefing_budget\", briefingBudget)"));
         assert!(plugin.contains("import { execFileSync } from \"node:child_process\";"));
         assert!(plugin.contains("import { basename, dirname, join, resolve } from \"node:path\";"));
         assert!(plugin.contains("function repoRootProject"));

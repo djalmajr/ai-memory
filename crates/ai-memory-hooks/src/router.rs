@@ -718,6 +718,19 @@ pub struct HandoffQuery {
     pub project: Option<String>,
     /// Project strategy (mirror of `HookQuery.project_strategy`).
     pub project_strategy: Option<String>,
+    /// Per-repo opt-in for the session-start project brief, forwarded by
+    /// the host-side hook from `.ai-memory.toml`'s
+    /// `[briefing] inject_on_session_start`. A truthy value makes this
+    /// endpoint append a compiled, char-budgeted brief of the project's
+    /// pinned / `_rules/` / `_slots/` pages after any pending handoff, so
+    /// the agent starts with the architecture context instead of
+    /// re-exploring the codebase (#176). Off when absent.
+    pub briefing: Option<String>,
+    /// Char budget for the brief, forwarded from the marker's
+    /// `[briefing] max_chars`. Clamped server-side to
+    /// [`BRIEF_BUDGET_MIN`], [`BRIEF_BUDGET_MAX`]; defaults to
+    /// [`BRIEF_BUDGET_DEFAULT`] when absent or unparsable.
+    pub briefing_budget: Option<String>,
 }
 
 /// Synchronous endpoint used by `session-start.sh` to discover any
@@ -772,15 +785,144 @@ async fn fetch_and_accept_handoff(
         false,
     )
     .await?;
-    let handoff = state
-        .reader
-        .latest_open_handoff(ws, proj, query.cwd)
-        .await?;
-    let Some(h) = handoff else {
-        return Ok(None);
+    let handoff_md = {
+        let handoff = state
+            .reader
+            .latest_open_handoff(ws, proj, query.cwd)
+            .await?;
+        match handoff {
+            Some(h) => {
+                state.writer.accept_handoff(h.id, agent, None).await?;
+                Some(render_handoff_markdown(&h))
+            }
+            None => None,
+        }
     };
-    state.writer.accept_handoff(h.id, agent, None).await?;
-    Ok(Some(render_handoff_markdown(&h)))
+    // The brief is additive and non-destructive: unlike the handoff (a
+    // single-use slot consumed above), it is recomposed on every opted-in
+    // session start — exactly what a Claude Code `/clear` needs (#176).
+    let brief_md = if crate::payload::query_flag_truthy(query.briefing.as_deref()) {
+        let budget = query
+            .briefing_budget
+            .as_deref()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .unwrap_or(BRIEF_BUDGET_DEFAULT)
+            .clamp(BRIEF_BUDGET_MIN, BRIEF_BUDGET_MAX);
+        let (core, recent) = state
+            .reader
+            .session_brief_pages(ws, proj, BRIEF_CORE_PAGES_LIMIT, BRIEF_RECENT_PAGES_LIMIT)
+            .await?;
+        render_session_brief(&core, &recent, budget)
+    } else {
+        None
+    };
+    Ok(match (handoff_md, brief_md) {
+        (Some(h), Some(b)) => Some(format!("{h}\n{b}")),
+        (Some(h), None) => Some(h),
+        (None, Some(b)) => Some(b),
+        (None, None) => None,
+    })
+}
+
+/// Default char budget for the session-start brief (~1k tokens at the
+/// usual ~4 chars/token) — enough for a few rules pages without taxing
+/// every session start.
+const BRIEF_BUDGET_DEFAULT: usize = 4_000;
+/// Floor for the marker-supplied budget: below this the brief can't fit
+/// even one meaningful page plus the headers.
+const BRIEF_BUDGET_MIN: usize = 500;
+/// Ceiling for the marker-supplied budget: the brief is injected into
+/// EVERY opted-in session start, so an unbounded budget would let one
+/// marker line quietly burn five figures of tokens per `/clear`.
+const BRIEF_BUDGET_MAX: usize = 20_000;
+/// How many core (pinned / `_rules/` / `_slots/`) pages the store fetches;
+/// the char budget usually cuts earlier.
+const BRIEF_CORE_PAGES_LIMIT: usize = 24;
+/// How many recently-updated page titles the brief lists as follow-up
+/// pointers.
+const BRIEF_RECENT_PAGES_LIMIT: usize = 10;
+
+/// Truncate to at most `max` bytes without splitting a UTF-8 char.
+fn truncate_at_char_boundary(s: &str, max: usize) -> &str {
+    if s.len() <= max {
+        return s;
+    }
+    let mut end = max;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    &s[..end]
+}
+
+/// Render the marker-opted session-start project brief: core pages with
+/// bodies (pinned first) under a char budget, then recently-updated titles
+/// as follow-up pointers. Returns `None` for an empty project so the hook
+/// injects nothing rather than an empty scaffold.
+fn render_session_brief(
+    core: &[ai_memory_store::BriefPageBody],
+    recent: &[ai_memory_store::BriefingPage],
+    budget_chars: usize,
+) -> Option<String> {
+    if core.is_empty() && recent.is_empty() {
+        return None;
+    }
+    let mut buf = String::with_capacity(budget_chars.min(8_192));
+    buf.push_str(
+        "> 🧭 **ai-memory: project brief** (auto-injected — `.ai-memory.toml [briefing]`)\n",
+    );
+
+    let mut omitted: Vec<&str> = Vec::new();
+    for page in core {
+        let pin = if page.pinned { " 📌" } else { "" };
+        let header = format!(
+            "\n## {title}{pin} (`{path}`)\n",
+            title = page.title,
+            path = page.path,
+        );
+        // Reserve room for the footer sections so a single huge page
+        // can't crowd out the recent-pages pointers entirely.
+        let used = buf.len();
+        if used + header.len() >= budget_chars {
+            omitted.push(&page.path);
+            continue;
+        }
+        let remaining = budget_chars - used - header.len();
+        let body = page.body.trim();
+        buf.push_str(&header);
+        if body.len() > remaining {
+            buf.push_str(truncate_at_char_boundary(body, remaining));
+            buf.push_str("\n_[truncated by `[briefing] max_chars`]_\n");
+        } else {
+            buf.push_str(body);
+            buf.push('\n');
+        }
+    }
+    if !omitted.is_empty() {
+        buf.push_str("\n**Core pages omitted by budget** (read via `memory_query` if needed)\n");
+        for path in omitted {
+            buf.push_str(&format!("- `{path}`\n"));
+        }
+    }
+    if !recent.is_empty() {
+        buf.push_str("\n**Recently updated pages** (titles only)\n");
+        for page in recent {
+            buf.push_str(&format!(
+                "- {title} (`{path}`, {kind}, {ts})\n",
+                title = page.title,
+                path = page.path,
+                kind = page.kind,
+                ts = page.updated_at,
+            ));
+        }
+    }
+    buf.push_str(
+        "\n_**To the receiving agent:** this brief is compiled from this \
+         project's pinned / `_rules/` / `_slots/` wiki pages. Treat it as \
+         current architecture and standing-rule context — do NOT re-explore \
+         the codebase to rediscover what is already stated here. Call \
+         `memory_query` for detail beyond this brief._\n",
+    );
+    Some(buf)
 }
 
 fn render_handoff_markdown(h: &Handoff) -> String {
@@ -4435,6 +4577,8 @@ mod tests {
                 workspace: Some("acme".into()),
                 project: None,
                 project_strategy: None,
+                briefing: None,
+                briefing_budget: None,
             },
             None,
         )
@@ -4444,6 +4588,184 @@ mod tests {
         assert!(
             rendered.as_deref().is_some_and(|s| s.contains("continue")),
             "workspace-only marker handoff lookup must resolve workspace + basename(cwd)"
+        );
+    }
+
+    fn brief_page(
+        ws: ai_memory_core::WorkspaceId,
+        proj: ai_memory_core::ProjectId,
+        path: &str,
+        body: &str,
+        pinned: bool,
+    ) -> ai_memory_core::NewPage {
+        ai_memory_core::NewPage {
+            workspace_id: ws,
+            project_id: proj,
+            path: ai_memory_core::PagePath::new(path).unwrap(),
+            title: path.trim_end_matches(".md").to_string(),
+            body: body.into(),
+            tier: ai_memory_core::Tier::Semantic,
+            frontmatter_json: serde_json::json!({}),
+            pinned,
+            links: Vec::new(),
+            author_id: None,
+        }
+    }
+
+    /// `briefing=true` on the `/handoff` query returns the compiled project
+    /// brief even with NO pending handoff — the `/clear` case of #176 — and
+    /// a truthy value combined with a pending handoff returns both, handoff
+    /// first. A non-truthy value leaves the endpoint's contract unchanged.
+    #[tokio::test]
+    async fn handoff_query_briefing_flag_appends_project_brief() {
+        let tmp = TempDir::new().unwrap();
+        let state = make_state(&tmp).await;
+        let cwd = "/home/u/briefed-repo";
+
+        let (ws, proj) = resolve_project_ids(
+            &state,
+            Some(cwd),
+            None,
+            None,
+            ProjectStrategy::Basename,
+            &ai_memory_core::ActorKey::default(),
+        )
+        .await
+        .unwrap();
+        state
+            .writer
+            .upsert_page(brief_page(
+                ws,
+                proj,
+                "_rules/style.md",
+                "always use the single writer actor",
+                false,
+            ))
+            .await
+            .unwrap();
+
+        let query = |briefing: Option<&str>| HandoffQuery {
+            agent: Some("claude-code".into()),
+            cwd: Some(cwd.into()),
+            workspace: None,
+            project: None,
+            project_strategy: None,
+            briefing: briefing.map(str::to_owned),
+            briefing_budget: None,
+        };
+
+        // Non-truthy opt-in: no handoff pending, nothing to inject.
+        let rendered = fetch_and_accept_handoff(&state, query(Some("false")), None)
+            .await
+            .unwrap();
+        assert!(
+            rendered.is_none(),
+            "non-truthy briefing flag must not inject anything"
+        );
+
+        // Truthy opt-in, no pending handoff: brief alone (the /clear case).
+        let rendered = fetch_and_accept_handoff(&state, query(Some("true")), None)
+            .await
+            .unwrap()
+            .expect("brief must be injected without a pending handoff");
+        assert!(
+            rendered.contains("project brief") && rendered.contains("single writer actor"),
+            "brief must carry the rules page body: {rendered}"
+        );
+        assert!(
+            rendered.contains("do NOT re-explore"),
+            "brief must end with the agent-facing reading instructions"
+        );
+
+        // Truthy opt-in with a pending handoff: handoff first, brief after.
+        state
+            .writer
+            .insert_handoff(NewHandoff {
+                workspace_id: ws,
+                project_id: proj,
+                from_session_id: None,
+                from_agent: AgentKind::ClaudeCode,
+                to_agent: None,
+                cwd: Some(std::path::PathBuf::from(cwd)),
+                summary: "resume the auth refactor".to_string(),
+                open_questions: Vec::new(),
+                next_steps: Vec::new(),
+                files_touched: Vec::new(),
+            })
+            .await
+            .unwrap();
+        let rendered = fetch_and_accept_handoff(&state, query(Some("true")), None)
+            .await
+            .unwrap()
+            .expect("handoff + brief must both be injected");
+        let handoff_pos = rendered.find("resume the auth refactor").unwrap();
+        let brief_pos = rendered.find("project brief").unwrap();
+        assert!(
+            handoff_pos < brief_pos,
+            "pending handoff must precede the brief"
+        );
+    }
+
+    /// The brief renderer respects the char budget: an over-budget body is
+    /// truncated with a visible note, fully crowded-out core pages are
+    /// listed as omitted, and an empty project renders nothing at all.
+    #[test]
+    fn render_session_brief_enforces_budget() {
+        let core = vec![
+            ai_memory_store::BriefPageBody {
+                path: "_rules/a.md".into(),
+                title: "a".into(),
+                body: "x".repeat(2_000),
+                pinned: true,
+                updated_at: "2026-07-12T00:00:00Z".into(),
+            },
+            ai_memory_store::BriefPageBody {
+                path: "_rules/b.md".into(),
+                title: "b".into(),
+                body: "never truncated into view".into(),
+                pinned: false,
+                updated_at: "2026-07-12T00:00:00Z".into(),
+            },
+        ];
+        let recent = vec![ai_memory_store::BriefingPage {
+            path: "concepts/q.md".into(),
+            title: "queue".into(),
+            kind: "fact".into(),
+            updated_at: "2026-07-12T00:00:00Z".into(),
+        }];
+
+        let out = render_session_brief(&core, &recent, BRIEF_BUDGET_MIN).unwrap();
+        assert!(
+            out.contains("[truncated by `[briefing] max_chars`]"),
+            "over-budget body must be visibly truncated: {out}"
+        );
+        assert!(
+            out.contains("Core pages omitted by budget") && out.contains("`_rules/b.md`"),
+            "crowded-out core pages must be listed by path: {out}"
+        );
+        assert!(
+            !out.contains("never truncated into view"),
+            "omitted page bodies must not leak: {out}"
+        );
+        assert!(
+            out.contains("Recently updated pages") && out.contains("concepts/q.md"),
+            "recent pointers survive the budget cut: {out}"
+        );
+
+        // Multi-byte safety: a body of 4-byte chars must cut on a boundary.
+        let emoji_core = vec![ai_memory_store::BriefPageBody {
+            path: "_rules/e.md".into(),
+            title: "e".into(),
+            body: "🦀".repeat(1_000),
+            pinned: false,
+            updated_at: "2026-07-12T00:00:00Z".into(),
+        }];
+        let out = render_session_brief(&emoji_core, &[], BRIEF_BUDGET_MIN).unwrap();
+        assert!(out.is_char_boundary(out.len()), "must remain valid UTF-8");
+
+        assert!(
+            render_session_brief(&[], &[], BRIEF_BUDGET_DEFAULT).is_none(),
+            "empty project must inject nothing"
         );
     }
 
@@ -4488,6 +4810,8 @@ mod tests {
                 workspace: None,
                 project: None,
                 project_strategy: None,
+                briefing: None,
+                briefing_budget: None,
             },
             None,
         )

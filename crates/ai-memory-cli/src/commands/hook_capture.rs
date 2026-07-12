@@ -54,6 +54,7 @@ pub fn marker_query_suffix(cwd: &str, default_strategy: Option<&str>) -> String 
     let mut qs = format!("&cwd={}", url_encode(cwd));
     let (mut workspace, mut project, mut strategy, mut drop_subagent, mut default_global) =
         (None, None, None, None, None);
+    let (mut briefing, mut briefing_budget) = (None, None);
     if let Some(marker) = find_marker(cwd) {
         workspace = parse_toml_key(&marker, "workspace");
         project = parse_toml_key(&marker, "project");
@@ -62,6 +63,11 @@ pub fn marker_query_suffix(cwd: &str, default_strategy: Option<&str>) -> String 
         // `[recall] default_global = true` (or top-level; quoted or bare) —
         // a meta-repo opts every default-scoped read into a global search.
         default_global = parse_toml_flag(&marker, "default_global");
+        // `[briefing] inject_on_session_start = true` + optional
+        // `max_chars = N` — opt this repo into the compiled project brief
+        // appended to the session-start handoff fetch (#176).
+        briefing = parse_toml_flag(&marker, "inject_on_session_start");
+        briefing_budget = parse_toml_flag(&marker, "max_chars");
     }
     if strategy.is_none() {
         strategy = default_strategy.map(str::to_owned);
@@ -89,6 +95,16 @@ pub fn marker_query_suffix(cwd: &str, default_strategy: Option<&str>) -> String 
     // tools search globally. Truthiness is decided server-side.
     if let Some(val) = default_global.filter(|v| !v.is_empty()) {
         qs.push_str(&format!("&default_global={}", url_encode(&val)));
+    }
+    // Per-repo session-start brief opt-in: forwarded on every request for
+    // simplicity (the capture path ignores it); only the `/handoff` GET at
+    // session start acts on it. Truthiness and the char-budget clamp are
+    // decided server-side.
+    if let Some(val) = briefing.filter(|v| !v.is_empty()) {
+        qs.push_str(&format!("&briefing={}", url_encode(&val)));
+    }
+    if let Some(val) = briefing_budget.filter(|v| !v.is_empty()) {
+        qs.push_str(&format!("&briefing_budget={}", url_encode(&val)));
     }
     qs
 }
@@ -582,6 +598,34 @@ drop_subagent_captures = "true"
         .unwrap();
         let qs = marker_query_suffix(tmp.path().to_str().unwrap(), None);
         assert!(!qs.contains("default_global"), "{qs}");
+    }
+
+    /// A `[briefing]` section (bare or quoted values) forwards the opt-in
+    /// and the char budget so the session-start `/handoff` GET can compose
+    /// the project brief (#176).
+    #[test]
+    fn marker_query_suffix_appends_briefing_opt_in() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        std::fs::write(
+            tmp.path().join(".ai-memory.toml"),
+            "workspace = \"acme\"\n[briefing]\ninject_on_session_start = true\nmax_chars = 6000\n",
+        )
+        .unwrap();
+        let qs = marker_query_suffix(tmp.path().to_str().unwrap(), None);
+        assert!(qs.contains("&briefing=true"), "{qs}");
+        assert!(qs.contains("&briefing_budget=6000"), "{qs}");
+    }
+
+    #[test]
+    fn marker_query_suffix_omits_briefing_when_unset() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        std::fs::write(
+            tmp.path().join(".ai-memory.toml"),
+            "workspace = \"acme\"\nproject = \"infra\"\n",
+        )
+        .unwrap();
+        let qs = marker_query_suffix(tmp.path().to_str().unwrap(), None);
+        assert!(!qs.contains("briefing"), "{qs}");
     }
 
     #[test]

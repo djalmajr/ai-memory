@@ -36,7 +36,7 @@ pub use decay::{DecayParams, retention_score};
 pub use error::{StoreError, StoreResult};
 pub use ops::{DeleteWorkspaceSummary, EmbeddingWrite, MoveSummary, PurgeSummary, ReorgSummary};
 pub use reader::{
-    ActivityWindow, AutoImproveCandidateSession, BriefingPage, BriefingSnapshot,
+    ActivityWindow, AutoImproveCandidateSession, BriefPageBody, BriefingPage, BriefingSnapshot,
     ContaminationFinding, ContaminationReport, ContaminationSummary, DecayCandidate,
     DerivedIndexStatus, EmbeddingTripleCount, HealthDetail, HealthPage, ObservationHit,
     OpenSession, PageAuthor, PageHit, PageHitWithMeta, PageLinks, PageMeta, PageSummary,
@@ -1606,6 +1606,92 @@ mod tests {
                 .unwrap()
                 .is_empty(),
             "moved scheduler claims should keep claimed sessions suppressed"
+        );
+    }
+
+    /// `session_brief_pages` returns pinned / `_rules/` / `_slots/` pages
+    /// WITH bodies (pinned first, then path order), recent titles for the
+    /// whole project, and never leaks a sibling project's pages.
+    #[tokio::test]
+    async fn session_brief_pages_selects_core_pages_and_isolates_projects() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let ws = store
+            .writer
+            .get_or_create_workspace("default")
+            .await
+            .unwrap();
+        let proj = store
+            .writer
+            .get_or_create_project(ws, "app", None)
+            .await
+            .unwrap();
+        let other = store
+            .writer
+            .get_or_create_project(ws, "other", None)
+            .await
+            .unwrap();
+
+        let mut adr = sample_page(ws, proj, "decisions/adr-001.md", "single writer actor");
+        adr.pinned = true;
+        store.writer.upsert_page(adr).await.unwrap();
+        store
+            .writer
+            .upsert_page(sample_page(
+                ws,
+                proj,
+                "_rules/style.md",
+                "no unwrap in runtime",
+            ))
+            .await
+            .unwrap();
+        store
+            .writer
+            .upsert_page(sample_page(ws, proj, "_slots/focus.md", "shipping v2 auth"))
+            .await
+            .unwrap();
+        store
+            .writer
+            .upsert_page(sample_page(ws, proj, "concepts/queue.md", "ordinary page"))
+            .await
+            .unwrap();
+        store
+            .writer
+            .upsert_page(sample_page(ws, other, "_rules/other.md", "sibling rule"))
+            .await
+            .unwrap();
+
+        let (core, recent) = store
+            .reader
+            .session_brief_pages(ws, proj, 24, 10)
+            .await
+            .unwrap();
+
+        let core_paths: Vec<&str> = core.iter().map(|p| p.path.as_str()).collect();
+        assert_eq!(
+            core_paths,
+            vec!["decisions/adr-001.md", "_rules/style.md", "_slots/focus.md"],
+            "core = pinned first, then _rules/ + _slots/ by path; no ordinary pages"
+        );
+        assert!(core[0].pinned, "pinned flag must survive the round-trip");
+        assert_eq!(
+            core[1].body, "no unwrap in runtime",
+            "core pages carry bodies"
+        );
+
+        let recent_paths: Vec<&str> = recent.iter().map(|p| p.path.as_str()).collect();
+        assert_eq!(
+            recent.len(),
+            4,
+            "recent lists every latest page in the project"
+        );
+        assert!(
+            recent_paths.contains(&"concepts/queue.md"),
+            "ordinary pages appear as recent pointers"
+        );
+        assert!(
+            !recent_paths.contains(&"_rules/other.md") && core.len() == 3,
+            "sibling project pages must not leak into the brief"
         );
     }
 

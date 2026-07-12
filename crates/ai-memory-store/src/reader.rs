@@ -373,6 +373,25 @@ pub struct BriefingPage {
     pub updated_at: String,
 }
 
+/// One core page of the session-start project brief — body included,
+/// because the brief is injected as agent context and the whole point is
+/// sparing the agent a re-exploration round-trip. Returned by
+/// [`ReaderPool::session_brief_pages`].
+#[derive(Debug, Clone, Serialize)]
+pub struct BriefPageBody {
+    /// Relative wiki path.
+    pub path: String,
+    /// Page title (first H1 / frontmatter title).
+    pub title: String,
+    /// Full markdown body of the latest version. The hooks-side renderer
+    /// applies the char budget; the store returns it whole.
+    pub body: String,
+    /// Whether the page is pinned (decay-immune, operator-curated).
+    pub pinned: bool,
+    /// ISO-8601 timestamp of the last update.
+    pub updated_at: String,
+}
+
 /// One row per (workspace, project) with aggregate stats.
 /// Returned by [`ReaderPool::list_projects_with_stats`].
 #[derive(Debug, Clone, Serialize)]
@@ -2094,6 +2113,101 @@ impl ReaderPool {
                 cross_project_dependents,
                 cross_project_dependencies,
             })
+        })
+        .await
+    }
+
+    /// Fetch the pages that make up a session-start project brief: the
+    /// "core" pages WITH bodies (pinned, plus everything under `_rules/`
+    /// and `_slots/` — the operator-curated, highest-signal memory), and
+    /// the most-recently-updated page titles WITHOUT bodies (pointers the
+    /// agent can follow up on via `memory_query`).
+    ///
+    /// Core pages are ordered pinned-first then by path, so a char-budget
+    /// cut in the renderer drops the least-curated content last. Both
+    /// limits are clamped defensively; the renderer applies the actual
+    /// byte budget.
+    ///
+    /// # Errors
+    /// Propagates any SQL or pool error.
+    pub async fn session_brief_pages(
+        &self,
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+        core_pages_limit: usize,
+        recent_pages_limit: usize,
+    ) -> StoreResult<(Vec<BriefPageBody>, Vec<BriefingPage>)> {
+        let core_limit = core_pages_limit.clamp(1, 100) as i64;
+        let recent_limit = recent_pages_limit.clamp(1, 100) as i64;
+        self.with_conn(move |conn| {
+            let mut core_stmt = conn.prepare_cached(
+                "SELECT path, title, body, pinned, updated_at \
+                 FROM pages \
+                 WHERE workspace_id = ?1 AND project_id = ?2 AND is_latest = 1 \
+                   AND (pinned = 1 OR path GLOB '_rules/*' OR path GLOB '_slots/*') \
+                 ORDER BY pinned DESC, path ASC \
+                 LIMIT ?3",
+            )?;
+            let core: Vec<BriefPageBody> = core_stmt
+                .query_map(
+                    params![workspace_id.as_bytes(), project_id.as_bytes(), core_limit],
+                    |row| {
+                        let updated_us: i64 = row.get(4)?;
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, String>(2)?,
+                            row.get::<_, i64>(3)? != 0,
+                            updated_us,
+                        ))
+                    },
+                )?
+                .collect::<Result<Vec<_>, _>>()?
+                .into_iter()
+                .map(|(path, title, body, pinned, updated_us)| {
+                    jiff::Timestamp::from_microsecond(updated_us)
+                        .map(|ts| BriefPageBody {
+                            path,
+                            title,
+                            body,
+                            pinned,
+                            updated_at: ts.to_string(),
+                        })
+                        .map_err(|e| {
+                            StoreError::Memory(ai_memory_core::MemoryError::MalformedRecord(
+                                format!("bad updated_at: {e}"),
+                            ))
+                        })
+                })
+                .collect::<StoreResult<Vec<_>>>()?;
+
+            let mut recent_stmt = conn.prepare_cached(
+                "SELECT path, title, \
+                        COALESCE( \
+                            json_extract(frontmatter_json, '$.kind'), \
+                            CASE \
+                                WHEN path LIKE '\\_rules/%' ESCAPE '\\' THEN 'rule' \
+                                WHEN path LIKE 'decisions/%' THEN 'decision' \
+                                WHEN path LIKE 'gotchas/%' THEN 'gotcha' \
+                                ELSE 'fact' \
+                            END \
+                        ) AS kind, \
+                        updated_at \
+                 FROM pages \
+                 WHERE workspace_id = ?1 AND project_id = ?2 AND is_latest = 1 \
+                 ORDER BY updated_at DESC \
+                 LIMIT ?3",
+            )?;
+            let recent: Vec<BriefingPage> = recent_stmt
+                .query_map(
+                    params![workspace_id.as_bytes(), project_id.as_bytes(), recent_limit],
+                    briefing_page_from_row,
+                )?
+                .collect::<Result<Vec<_>, _>>()?
+                .into_iter()
+                .collect::<Result<Vec<_>, _>>()?;
+
+            Ok((core, recent))
         })
         .await
     }

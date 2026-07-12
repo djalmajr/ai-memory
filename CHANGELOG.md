@@ -8,6 +8,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- New `.ai-memory.toml` marker section `[briefing] inject_on_session_start
+  = "true"` ([#176]): the session-start handoff fetch also returns a
+  compiled project brief — pinned / `_rules/` / `_slots/` pages with
+  bodies plus recently-updated page titles — injected as agent context so
+  a fresh session (or a Claude Code `/clear`, which re-fires SessionStart)
+  starts with the architecture instead of re-exploring the codebase.
+  `max_chars` caps the brief (default 4000 chars, clamped to 500–20000);
+  over-budget pages are truncated or listed by path. The brief is
+  recomposed on every opted-in session start (non-consumable, unlike the
+  handoff) and appended after any pending handoff. Off by default — it
+  costs tokens on every session start.
+- Generated OpenCode / OMP / OpenClaw TypeScript integrations now forward
+  the `[recall] default_global` marker flag (previously only the native
+  hook binary did) and the new `[briefing]` keys, accepting bare
+  (unquoted) TOML values for both.
 - New `.ai-memory.toml` marker option `[recall] default_global = "true"`
   ([#177]): sessions in the marked tree make an *unscoped* `memory_query`
   behave as `global=true`, so meta-repos that constantly need
