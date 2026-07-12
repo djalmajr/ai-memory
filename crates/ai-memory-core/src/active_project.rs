@@ -121,9 +121,19 @@ impl ActorKey {
     }
 }
 
+/// One per-actor slot: the resolved project plus the actor's opted-in
+/// `default_global` recall preference and the insertion time (for TTL).
+#[derive(Debug, Clone, Copy)]
+struct Entry {
+    ws: WorkspaceId,
+    proj: ProjectId,
+    default_global: bool,
+    inserted: Instant,
+}
+
 #[derive(Debug)]
 struct PerActorMap {
-    entries: HashMap<ActorKey, (WorkspaceId, ProjectId, Instant)>,
+    entries: HashMap<ActorKey, Entry>,
     ttl: Duration,
     max_entries: usize,
 }
@@ -145,7 +155,7 @@ impl PerActorMap {
     /// surfaces to a tool handler and the cap below sees an accurate size.
     fn purge_expired(&mut self, now: Instant) {
         self.entries
-            .retain(|_, (_, _, inserted)| now.saturating_duration_since(*inserted) < self.ttl);
+            .retain(|_, e| now.saturating_duration_since(e.inserted) < self.ttl);
     }
 
     /// Cap the map at `max_entries`, dropping the oldest insertions first.
@@ -156,54 +166,77 @@ impl PerActorMap {
             return;
         }
         let excess = self.entries.len() - self.max_entries;
-        let mut by_age: Vec<(ActorKey, Instant)> =
-            self.entries.iter().map(|(k, v)| (k.clone(), v.2)).collect();
+        let mut by_age: Vec<(ActorKey, Instant)> = self
+            .entries
+            .iter()
+            .map(|(k, e)| (k.clone(), e.inserted))
+            .collect();
         by_age.sort_by_key(|(_, inserted)| *inserted);
         for (k, _) in by_age.into_iter().take(excess) {
             self.entries.remove(&k);
         }
     }
 
-    fn insert(&mut self, key: ActorKey, ws: WorkspaceId, proj: ProjectId, now: Instant) {
+    fn insert(
+        &mut self,
+        key: ActorKey,
+        ws: WorkspaceId,
+        proj: ProjectId,
+        default_global: bool,
+        now: Instant,
+    ) {
         self.purge_expired(now);
-        self.entries.insert(key, (ws, proj, now));
+        self.entries.insert(
+            key,
+            Entry {
+                ws,
+                proj,
+                default_global,
+                inserted: now,
+            },
+        );
         self.enforce_cap();
     }
 
     fn get(&mut self, key: &ActorKey, now: Instant) -> Option<(WorkspaceId, ProjectId)> {
         self.purge_expired(now);
-        self.entries.get(key).map(|(ws, proj, _)| (*ws, *proj))
+        self.entries.get(key).map(|e| (e.ws, e.proj))
+    }
+
+    /// The actor's opted-in `default_global` preference, or `false` when no
+    /// live entry exists for the key.
+    fn get_default_global(&mut self, key: &ActorKey, now: Instant) -> bool {
+        self.purge_expired(now);
+        self.entries.get(key).is_some_and(|e| e.default_global)
     }
 
     fn retarget_project(&mut self, project_id: ProjectId, workspace_id: WorkspaceId, now: Instant) {
         self.purge_expired(now);
-        for (ws, proj, _) in self.entries.values_mut() {
-            if *proj == project_id {
-                *ws = workspace_id;
+        for e in self.entries.values_mut() {
+            if e.proj == project_id {
+                e.ws = workspace_id;
             }
         }
     }
 
     fn clear_project(&mut self, project_id: ProjectId, now: Instant) {
         self.purge_expired(now);
-        self.entries.retain(|_, (_, proj, _)| *proj != project_id);
+        self.entries.retain(|_, e| e.proj != project_id);
     }
 
     fn clear_workspace(&mut self, workspace_id: WorkspaceId, now: Instant) {
         self.purge_expired(now);
-        self.entries.retain(|_, (ws, _, _)| *ws != workspace_id);
+        self.entries.retain(|_, e| e.ws != workspace_id);
     }
 
     fn contains_project(&mut self, project_id: ProjectId, now: Instant) -> bool {
         self.purge_expired(now);
-        self.entries
-            .values()
-            .any(|(_, proj, _)| *proj == project_id)
+        self.entries.values().any(|e| e.proj == project_id)
     }
 
     fn contains_workspace(&mut self, workspace_id: WorkspaceId, now: Instant) -> bool {
         self.purge_expired(now);
-        self.entries.values().any(|(ws, _, _)| *ws == workspace_id)
+        self.entries.values().any(|e| e.ws == workspace_id)
     }
 
     /// Test-only: live row count in the backing HashMap. Counts all
@@ -225,6 +258,11 @@ impl PerActorMap {
 pub struct ActiveProject {
     mode: ActiveProjectMode,
     single: Arc<RwLock<Option<(WorkspaceId, ProjectId)>>>,
+    /// `default_global` for the single/fallback slot (Single mode or an actor
+    /// with no usable coordinate). Kept beside `single` rather than inside the
+    /// tuple so the legacy `set`/`get` API and every existing caller stay
+    /// byte-for-byte unchanged.
+    single_default_global: Arc<RwLock<bool>>,
     per_actor: Arc<RwLock<PerActorMap>>,
 }
 
@@ -259,6 +297,7 @@ impl ActiveProject {
         Self {
             mode,
             single: Arc::new(RwLock::new(None)),
+            single_default_global: Arc::new(RwLock::new(false)),
             per_actor: Arc::new(RwLock::new(PerActorMap::new(ttl, max_entries))),
         }
     }
@@ -282,8 +321,15 @@ impl ActiveProject {
     /// - In `PerActor`, a user-only entry is also set when `user` is present.
     ///   Requests that carry that user but no session id can still resolve to
     ///   the user's latest project without falling through to the global slot.
-    pub fn set_for(&self, actor: &ActorKey, workspace_id: WorkspaceId, project_id: ProjectId) {
+    pub fn set_for(
+        &self,
+        actor: &ActorKey,
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+        default_global: bool,
+    ) {
         self.write_single(workspace_id, project_id);
+        self.write_single_default_global(default_global);
         if self.mode == ActiveProjectMode::Single || actor.is_empty() {
             return;
         }
@@ -303,10 +349,17 @@ impl ActiveProject {
                 },
                 workspace_id,
                 project_id,
+                default_global,
                 Instant::now(),
             );
         }
-        guard.insert(scoped, workspace_id, project_id, Instant::now());
+        guard.insert(
+            scoped,
+            workspace_id,
+            project_id,
+            default_global,
+            Instant::now(),
+        );
     }
 
     /// Read the currently active project for the given actor, if any has
@@ -333,6 +386,24 @@ impl ActiveProject {
         guard.get(&scoped, Instant::now())
     }
 
+    /// Whether the actor opted this session into `default_global` recall (via
+    /// the repo's `[recall] default_global` marker, published by the hook).
+    /// Uses the SAME slot-selection as [`Self::get_for`], so the flag tracks
+    /// the project pointer it was published alongside. Defaults to `false`
+    /// (unchanged behaviour) for any actor/slot that never opted in.
+    #[must_use]
+    pub fn default_global_for(&self, actor: &ActorKey) -> bool {
+        if self.mode == ActiveProjectMode::Single || actor.is_empty() {
+            return self.read_single_default_global();
+        }
+        let scoped = self.scoped_key(actor);
+        if scoped.is_empty() {
+            return self.read_single_default_global();
+        }
+        let mut guard = self.per_actor.write().unwrap_or_else(|e| e.into_inner());
+        guard.get_default_global(&scoped, Instant::now())
+    }
+
     /// Project the actor's identity onto only the coordinates the current
     /// mode uses: `PerSession` keeps `session_id`, `PerActor` keeps both.
     fn scoped_key(&self, actor: &ActorKey) -> ActorKey {
@@ -356,6 +427,22 @@ impl ActiveProject {
 
     fn read_single(&self) -> Option<(WorkspaceId, ProjectId)> {
         let guard = self.single.read().unwrap_or_else(|e| e.into_inner());
+        *guard
+    }
+
+    fn write_single_default_global(&self, value: bool) {
+        let mut guard = self
+            .single_default_global
+            .write()
+            .unwrap_or_else(|e| e.into_inner());
+        *guard = value;
+    }
+
+    fn read_single_default_global(&self) -> bool {
+        let guard = self
+            .single_default_global
+            .read()
+            .unwrap_or_else(|e| e.into_inner());
         *guard
     }
 
@@ -540,7 +627,7 @@ mod tests {
         let alice = key_actor("alice", "sA");
         let ws = WorkspaceId::new();
         let proj = ProjectId::new();
-        ap.set_for(&alice, ws, proj);
+        ap.set_for(&alice, ws, proj, false);
         assert_eq!(ap.get_for(&alice), Some((ws, proj)));
 
         ap.clear();
@@ -558,8 +645,8 @@ mod tests {
         let moved = ProjectId::new();
         let other = ProjectId::new();
 
-        ap.set_for(&alice, old_ws, moved);
-        ap.set_for(&bob, old_ws, other);
+        ap.set_for(&alice, old_ws, moved, false);
+        ap.set_for(&bob, old_ws, other, false);
         ap.set(old_ws, moved);
 
         ap.retarget_project_workspace(moved, new_ws);
@@ -580,8 +667,8 @@ mod tests {
         let doomed = ProjectId::new();
         let kept = ProjectId::new();
 
-        ap.set_for(&alice, ws, doomed);
-        ap.set_for(&bob, ws, kept);
+        ap.set_for(&alice, ws, doomed, false);
+        ap.set_for(&bob, ws, kept, false);
         ap.set(ws, doomed);
 
         ap.clear_project(doomed);
@@ -603,8 +690,8 @@ mod tests {
         let p1 = ProjectId::new();
         let p2 = ProjectId::new();
 
-        ap.set_for(&alice, doomed_ws, p1);
-        ap.set_for(&bob, kept_ws, p2);
+        ap.set_for(&alice, doomed_ws, p1, false);
+        ap.set_for(&bob, kept_ws, p2, false);
         ap.set(doomed_ws, p1);
 
         ap.clear_workspace(doomed_ws);
@@ -624,8 +711,8 @@ mod tests {
         let ws = WorkspaceId::new();
         let p_alice = ProjectId::new();
         let p_bob = ProjectId::new();
-        ap.set_for(&alice, ws, p_alice);
-        ap.set_for(&bob, ws, p_bob);
+        ap.set_for(&alice, ws, p_alice, false);
+        ap.set_for(&bob, ws, p_bob, false);
         // Both reads see the last write; that's the legacy contract.
         assert_eq!(ap.get_for(&alice), Some((ws, p_bob)));
         assert_eq!(ap.get_for(&bob), Some((ws, p_bob)));
@@ -640,8 +727,8 @@ mod tests {
         let ws = WorkspaceId::new();
         let p_a = ProjectId::new();
         let p_b = ProjectId::new();
-        ap.set_for(&sess_a, ws, p_a);
-        ap.set_for(&sess_b, ws, p_b);
+        ap.set_for(&sess_a, ws, p_a, false);
+        ap.set_for(&sess_b, ws, p_b, false);
         assert_eq!(ap.get_for(&sess_a), Some((ws, p_a)));
         assert_eq!(ap.get_for(&sess_b), Some((ws, p_b)));
     }
@@ -653,9 +740,9 @@ mod tests {
         let p = ProjectId::new();
         let alice = key_actor("alice", "shared-session");
         let bob = key_actor("bob", "shared-session");
-        ap.set_for(&alice, ws, p);
+        ap.set_for(&alice, ws, p, false);
         let p_bob = ProjectId::new();
-        ap.set_for(&bob, ws, p_bob);
+        ap.set_for(&bob, ws, p_bob, false);
         // Same session_id, different users → still collapses to one entry
         // (intentional: per_session is the right mode for single-operator,
         // multi-cwd installs; per_actor is the mode for multi-operator).
@@ -672,9 +759,9 @@ mod tests {
         let p1 = ProjectId::new();
         let p2 = ProjectId::new();
         let p3 = ProjectId::new();
-        ap.set_for(&alice_a, ws, p1);
-        ap.set_for(&alice_b, ws, p2);
-        ap.set_for(&bob_a, ws, p3);
+        ap.set_for(&alice_a, ws, p1, false);
+        ap.set_for(&alice_b, ws, p2, false);
+        ap.set_for(&bob_a, ws, p3, false);
         assert_eq!(ap.get_for(&alice_a), Some((ws, p1)));
         assert_eq!(ap.get_for(&alice_b), Some((ws, p2)));
         assert_eq!(ap.get_for(&bob_a), Some((ws, p3)));
@@ -688,8 +775,8 @@ mod tests {
         let ws = WorkspaceId::new();
         let p_alice = ProjectId::new();
         let p_bob = ProjectId::new();
-        ap.set_for(&alice_a, ws, p_alice);
-        ap.set_for(&bob_a, ws, p_bob);
+        ap.set_for(&alice_a, ws, p_alice, false);
+        ap.set_for(&bob_a, ws, p_bob, false);
 
         assert_eq!(
             ap.get_for(&ActorKey {
@@ -709,8 +796,8 @@ mod tests {
         let ws = WorkspaceId::new();
         let p_alice = ProjectId::new();
         let p_bob = ProjectId::new();
-        ap.set_for(&alice_a, ws, p_alice);
-        ap.set_for(&bob_a, ws, p_bob);
+        ap.set_for(&alice_a, ws, p_alice, false);
+        ap.set_for(&bob_a, ws, p_bob, false);
 
         assert_eq!(
             ap.get_for(&ActorKey {
@@ -744,8 +831,41 @@ mod tests {
         let alice = key_actor("alice", "sA");
         let ws = WorkspaceId::new();
         let proj = ProjectId::new();
-        ap.set_for(&alice, ws, proj);
+        ap.set_for(&alice, ws, proj, false);
         assert_eq!(ap.get(), Some((ws, proj)));
+    }
+
+    #[test]
+    fn default_global_round_trips_per_actor_and_defaults_false() {
+        let ap = ActiveProject::with_mode(ActiveProjectMode::PerActor);
+        let alice = key_actor("alice", "sA");
+        let bob = key_actor("bob", "sB");
+        let ws = WorkspaceId::new();
+        let (pa, pb) = (ProjectId::new(), ProjectId::new());
+
+        ap.set_for(&alice, ws, pa, true); // alice opted in
+        ap.set_for(&bob, ws, pb, false); // bob did not
+
+        assert!(ap.default_global_for(&alice), "alice opted in");
+        assert!(!ap.default_global_for(&bob), "bob did not");
+        // The project-pointer resolution is unaffected by the recall flag.
+        assert_eq!(ap.get_for(&alice), Some((ws, pa)));
+        assert_eq!(ap.get_for(&bob), Some((ws, pb)));
+        // An actor that never published defaults to false (unchanged behaviour).
+        assert!(!ap.default_global_for(&key_actor("carol", "sC")));
+    }
+
+    #[test]
+    fn default_global_single_slot_tracks_last_publish() {
+        let ap = ActiveProject::with_mode(ActiveProjectMode::Single);
+        let ws = WorkspaceId::new();
+        let proj = ProjectId::new();
+        ap.set_for(&empty_actor(), ws, proj, true);
+        assert!(ap.default_global_for(&empty_actor()));
+        // A later publish without the flag clears it — the pointer and its
+        // preference move together.
+        ap.set_for(&empty_actor(), ws, proj, false);
+        assert!(!ap.default_global_for(&empty_actor()));
     }
 
     #[test]
@@ -758,11 +878,11 @@ mod tests {
         let k1 = key_session("s1");
         let k2 = key_session("s2");
         let k3 = key_session("s3");
-        ap.set_for(&k1, ws, p1);
+        ap.set_for(&k1, ws, p1, false);
         std::thread::sleep(Duration::from_millis(2));
-        ap.set_for(&k2, ws, p2);
+        ap.set_for(&k2, ws, p2, false);
         std::thread::sleep(Duration::from_millis(2));
-        ap.set_for(&k3, ws, p3);
+        ap.set_for(&k3, ws, p3, false);
         // Use the test-only keyed-only getter so the cap assertion targets
         // the backing map directly.
         assert!(ap.keyed_only_get(&k1).is_none(), "k1 must be evicted");
@@ -780,7 +900,7 @@ mod tests {
         let k = key_session("s");
         let ws = WorkspaceId::new();
         let proj = ProjectId::new();
-        ap.set_for(&k, ws, proj);
+        ap.set_for(&k, ws, proj, false);
         assert_eq!(ap.get_for(&k), Some((ws, proj)));
         std::thread::sleep(Duration::from_millis(40));
         // The per-actor entry must be gone; identified callers with expired
@@ -874,7 +994,7 @@ mod tests {
             match op {
                 Op::Set(i) => {
                     let proj = ProjectId::new();
-                    ap.set_for(&actors[i], ws, proj);
+                    ap.set_for(&actors[i], ws, proj, false);
                 }
                 Op::Get(i) => {
                     let _ = ap.get_for(&actors[i]);
@@ -949,7 +1069,7 @@ mod tests {
             for step in 0..1_000 {
                 let i = (rng.next() as usize) % pool_size;
                 let proj = ProjectId::new();
-                ap.set_for(&actors[i], ws, proj);
+                ap.set_for(&actors[i], ws, proj, false);
                 let got = ap.keyed_only_get(&actors[i]);
                 assert_eq!(
                     got,
@@ -1013,7 +1133,7 @@ mod tests {
             // Pre-populate every actor; record the write time relative
             // to the run start.
             for actor in &actors {
-                ap.set_for(actor, ws, ProjectId::new());
+                ap.set_for(actor, ws, ProjectId::new(), false);
             }
 
             // Wait for TTL plus a margin so every pre-populated entry
@@ -1033,7 +1153,7 @@ mod tests {
             // the map shouldn't go into an unrecoverable state.
             let i = (rng.next() as usize) % actors.len();
             let proj = ProjectId::new();
-            ap.set_for(&actors[i], ws, proj);
+            ap.set_for(&actors[i], ws, proj, false);
             assert_eq!(
                 ap.keyed_only_get(&actors[i]),
                 Some((ws, proj)),

@@ -41,6 +41,13 @@ pub struct HookQuery {
     /// project that asked for it avoids a server-global switch that would shed
     /// subagent captures for every project on a shared instance.
     pub drop_subagent: Option<String>,
+    /// Per-repo opt-in for `[recall] default_global`, forwarded by the
+    /// host-side hook from a project's `.ai-memory.toml`. A truthy value makes
+    /// the server publish `default_global` on this actor's `ActiveProject`, so
+    /// a default-scoped `memory_query` / `memory_recent` searches every project
+    /// instead of just the current one — the meta-repo case (e.g. `ai-memory`
+    /// needing to see `ai-memory-ops` / `infra` without passing `global=true`).
+    pub default_global: Option<String>,
 }
 
 /// Coalesced view of an incoming hook event after light parsing of the
@@ -70,6 +77,11 @@ pub struct HookEnvelope {
     /// ingest router consults this per-event so the drop is scoped to the
     /// project that asked for it.
     pub drop_subagent_requested: bool,
+    /// Whether this repo opted into `[recall] default_global` via its
+    /// `.ai-memory.toml` (forwarded as the `default_global` query flag). The
+    /// router publishes it on the actor's `ActiveProject` so default-scoped
+    /// read tools broaden to a global search.
+    pub recall_default_global_requested: bool,
     /// Optional third-party extension namespace.
     pub extension: Option<String>,
     /// Optional source event name from the extension vocabulary.
@@ -105,7 +117,7 @@ pub(crate) fn body_is_subagent(raw: &serde_json::Value) -> bool {
 /// Truthy interpretation of a query-string flag (`1`/`true`/`yes`/`on`,
 /// case-insensitive). Used for the per-project `drop_subagent` opt-in the
 /// host-side hook forwards from a project's `.ai-memory.toml`.
-fn query_flag_truthy(value: Option<&str>) -> bool {
+pub(crate) fn query_flag_truthy(value: Option<&str>) -> bool {
     matches!(
         value.map(|v| v.trim().to_ascii_lowercase()).as_deref(),
         Some("1" | "true" | "yes" | "on")
@@ -293,6 +305,7 @@ impl HookEnvelope {
         let project_override = query.project.filter(|s| !s.is_empty());
         let project_strategy = ProjectStrategy::parse(query.project_strategy.as_deref());
         let drop_subagent_requested = query_flag_truthy(query.drop_subagent.as_deref());
+        let recall_default_global_requested = query_flag_truthy(query.default_global.as_deref());
         let extension = normalize_extension_name(query.extension.as_deref());
         let source_event = extension.as_ref().and_then(|_| {
             let raw_source = query
@@ -325,6 +338,7 @@ impl HookEnvelope {
             project_override,
             project_strategy,
             drop_subagent_requested,
+            recall_default_global_requested,
             extension,
             source_event,
             title_hint,
@@ -711,6 +725,24 @@ mod tests {
             HookEvent::SessionEnd.to_observation_kind(),
             ObservationKind::SessionEnd
         );
+    }
+
+    #[test]
+    fn envelope_maps_default_global_flag() {
+        let on = HookEnvelope::from_query_and_body(
+            HookQuery {
+                default_global: Some("true".into()),
+                ..Default::default()
+            },
+            serde_json::json!({ "session_id": "s1" }),
+        );
+        assert!(on.recall_default_global_requested);
+
+        let off = HookEnvelope::from_query_and_body(
+            HookQuery::default(),
+            serde_json::json!({ "session_id": "s1" }),
+        );
+        assert!(!off.recall_default_global_requested);
     }
 
     #[test]

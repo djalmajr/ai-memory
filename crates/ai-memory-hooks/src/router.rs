@@ -654,13 +654,14 @@ async fn should_drop_subagent(state: &HookState, env: &HookEnvelope, actor: &Act
     let Ok(session_id) = resolve_session_id(env) else {
         return false;
     };
-    let Ok((workspace_id, project_id)) = resolve_project_ids(
+    let Ok((workspace_id, project_id)) = resolve_project_ids_inner(
         state,
         env.cwd.as_deref(),
         env.workspace_override.as_deref(),
         env.project_override.as_deref(),
         env.project_strategy,
         actor,
+        env.recall_default_global_requested,
     )
     .await
     else {
@@ -759,13 +760,16 @@ async fn fetch_and_accept_handoff(
         user: actor_user,
         session_id: None,
     };
-    let (ws, proj) = resolve_project_ids(
+    let (ws, proj) = resolve_project_ids_inner(
         state,
         query.cwd.as_deref(),
         query.workspace.as_deref(),
         query.project.as_deref(),
         ProjectStrategy::parse(query.project_strategy.as_deref()),
         &actor_key,
+        // The /handoff query carries no recall preference; the main capture
+        // path is what publishes default_global for read tools.
+        false,
     )
     .await?;
     let handoff = state
@@ -881,13 +885,15 @@ fn normalize_project_path_key(path: &str) -> String {
 /// project_strategy)` so the same `cwd` resolved with and without an
 /// override (e.g. during a hook-script upgrade window) doesn't poison each
 /// other's slot.
-async fn resolve_project_ids(
+#[allow(clippy::too_many_arguments)]
+async fn resolve_project_ids_inner(
     state: &HookState,
     cwd: Option<&str>,
     workspace_override: Option<&str>,
     project_override: Option<&str>,
     project_strategy: ProjectStrategy,
     actor: &ai_memory_core::ActorKey,
+    default_global: bool,
 ) -> anyhow::Result<(WorkspaceId, ProjectId)> {
     let cwd_norm = cwd
         .filter(|s| !s.is_empty())
@@ -914,7 +920,9 @@ async fn resolve_project_ids(
             // MCP read tools need as their default. Keyed by the actor so
             // opt-in isolation modes (`per_session`/`per_actor`) keep
             // concurrent callers separated.
-            state.active_project.set_for(actor, ids.0, ids.1);
+            state
+                .active_project
+                .set_for(actor, ids.0, ids.1, default_global);
             return Ok(ids);
         }
     }
@@ -932,9 +940,12 @@ async fn resolve_project_ids(
         (None, Some(c)) => match derive_project_from_cwd(c, project_strategy) {
             Some(resolved) => resolved,
             None => {
-                state
-                    .active_project
-                    .set_for(actor, state.workspace_id, state.project_id);
+                state.active_project.set_for(
+                    actor,
+                    state.workspace_id,
+                    state.project_id,
+                    default_global,
+                );
                 return Ok((state.workspace_id, state.project_id));
             }
         },
@@ -945,9 +956,12 @@ async fn resolve_project_ids(
             // gets refactored. Same effect as `unreachable!`, but
             // visible at compile time instead of inside the panic
             // message.
-            state
-                .active_project
-                .set_for(actor, state.workspace_id, state.project_id);
+            state.active_project.set_for(
+                actor,
+                state.workspace_id,
+                state.project_id,
+                default_global,
+            );
             return Ok((state.workspace_id, state.project_id));
         }
     };
@@ -966,7 +980,7 @@ async fn resolve_project_ids(
         );
         state
             .active_project
-            .set_for(actor, state.workspace_id, state.project_id);
+            .set_for(actor, state.workspace_id, state.project_id, default_global);
         return Ok((state.workspace_id, state.project_id));
     }
 
@@ -1120,8 +1134,35 @@ async fn resolve_project_ids(
     };
     let ids = (ws, proj);
     state.project_cache.lock().await.insert(cache_key, ids);
-    state.active_project.set_for(actor, ws, proj);
+    state
+        .active_project
+        .set_for(actor, ws, proj, default_global);
     Ok(ids)
+}
+
+/// Back-compat wrapper used by tests: resolve without the `default_global`
+/// recall preference (equivalent to a repo that never opted into
+/// `[recall] default_global`). Production paths call
+/// [`resolve_project_ids_inner`] directly with the marker's value.
+#[cfg(test)]
+async fn resolve_project_ids(
+    state: &HookState,
+    cwd: Option<&str>,
+    workspace_override: Option<&str>,
+    project_override: Option<&str>,
+    project_strategy: ProjectStrategy,
+    actor: &ai_memory_core::ActorKey,
+) -> anyhow::Result<(WorkspaceId, ProjectId)> {
+    resolve_project_ids_inner(
+        state,
+        cwd,
+        workspace_override,
+        project_override,
+        project_strategy,
+        actor,
+        false,
+    )
+    .await
 }
 
 /// Whether session-sticky attribution may apply: the event's cwd must sit
@@ -1222,19 +1263,23 @@ async fn process(
             // Publish the pointer like resolve_project_ids does on a cache
             // hit: this session being active is exactly what the MCP read
             // tools should default to.
-            state
-                .active_project
-                .set_for(&actor_key, session_ws, session_proj);
+            state.active_project.set_for(
+                &actor_key,
+                session_ws,
+                session_proj,
+                env.recall_default_global_requested,
+            );
             (session_ws, session_proj)
         }
         None => {
-            resolve_project_ids(
+            resolve_project_ids_inner(
                 state,
                 env.cwd.as_deref(),
                 env.workspace_override.as_deref(),
                 env.project_override.as_deref(),
                 env.project_strategy,
                 &actor_key,
+                env.recall_default_global_requested,
             )
             .await?
         }
@@ -1300,13 +1345,14 @@ async fn process(
             env.project_strategy,
         );
         state.project_cache.lock().await.remove(&key);
-        let refreshed = resolve_project_ids(
+        let refreshed = resolve_project_ids_inner(
             state,
             env.cwd.as_deref(),
             env.workspace_override.as_deref(),
             env.project_override.as_deref(),
             env.project_strategy,
             &actor_key,
+            env.recall_default_global_requested,
         )
         .await?;
         ws = refreshed.0;

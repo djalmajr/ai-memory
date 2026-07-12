@@ -62,6 +62,18 @@ project_strategy = "repo-root"
 # opt-in here keeps the drop from affecting other projects on the same
 # server. Off by default (absent / "false").
 drop_subagent_captures = "true"
+
+# Optional. Broaden this repo's DEFAULT memory recall to every project:
+# an unscoped `memory_query` from sessions in this tree behaves as
+# `global=true` (each hit annotated with its workspace + project).
+# Meant for meta-repos that constantly need sibling-project context.
+# Explicit args always win — passing `workspace`/`project`/`scopes`/
+# `global` overrides this for that call. Off by default. Note: while
+# active, unscoped queries return cross-project `global_hits` instead
+# of project `hits` + `global_scope_hits` (the `_global` preference
+# pages still appear, annotated, among the global results).
+[recall]
+default_global = "true"
 ```
 
 **Naming rules** for `workspace` and `project`, validated server-side:

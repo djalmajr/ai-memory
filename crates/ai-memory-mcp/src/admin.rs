@@ -6370,7 +6370,7 @@ mod tests {
             user: Some("alice".into()),
             session_id: Some("session-1".into()),
         };
-        active.set_for(&actor, src_ws, src_proj);
+        active.set_for(&actor, src_ws, src_proj, false);
         active.set(WorkspaceId::new(), ProjectId::new());
 
         let move_body = serde_json::json!({
@@ -6452,7 +6452,7 @@ mod tests {
             user: Some("alice".into()),
             session_id: Some("session-1".into()),
         };
-        active.set_for(&actor, ws, proj);
+        active.set_for(&actor, ws, proj, false);
         active.set(ws, proj);
 
         let resp = router
@@ -6577,7 +6577,7 @@ mod tests {
             user: Some("alice".into()),
             session_id: Some("session-1".into()),
         };
-        active.set_for(&actor, src_ws, src_proj);
+        active.set_for(&actor, src_ws, src_proj, false);
         active.set(src_ws, src_proj);
 
         let resp = router

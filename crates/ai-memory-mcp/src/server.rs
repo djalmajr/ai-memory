@@ -1120,7 +1120,24 @@ impl AiMemoryServer {
     ) -> Result<CallToolResult, McpError> {
         let aps_actor = Self::actor_key_from_parts(Some(&parts));
         let limit = args.limit.unwrap_or(self.default_limit).clamp(1, 100);
-        if args.global.unwrap_or(false) {
+        // A repo that opted into `[recall] default_global` (published on the
+        // ActiveProject by the hook) makes a query with NO explicit scoping
+        // behave as `global=true`. Precedence is strict: an explicit
+        // `global` / `scopes` / `workspace` / `project` arg always wins, so
+        // this only fires when the caller passed none of them.
+        let explicit_scoping = !args.scopes.is_empty()
+            || args
+                .workspace
+                .as_deref()
+                .is_some_and(|s| !s.trim().is_empty())
+            || args
+                .project
+                .as_deref()
+                .is_some_and(|s| !s.trim().is_empty());
+        let recall_global = !explicit_scoping
+            && !args.global.unwrap_or(false)
+            && self.active_project.default_global_for(&aps_actor);
+        if args.global.unwrap_or(false) || recall_global {
             if !args.scopes.is_empty()
                 || args
                     .workspace
@@ -4685,6 +4702,113 @@ mod tests {
             "hit must carry project name: {text}"
         );
         assert!(text.contains("global_hits"), "global hits field: {text}");
+    }
+
+    #[tokio::test]
+    async fn memory_query_default_global_marker_broadens_unscoped_query() {
+        let (_tmp, store, server, ws, _pj) = setup_server().await;
+        let infra = store
+            .writer
+            .get_or_create_project(ws, "infra", None)
+            .await
+            .unwrap();
+        let ops_ws = store.writer.get_or_create_workspace("ops").await.unwrap();
+        let runbooks = store
+            .writer
+            .get_or_create_project(ops_ws, "runbooks", None)
+            .await
+            .unwrap();
+        for (w, p, path, body) in [
+            (ws, infra, "cluster.md", "recall_token lives in infra"),
+            (
+                ops_ws,
+                runbooks,
+                "deploy.md",
+                "recall_token lives in runbooks",
+            ),
+        ] {
+            store
+                .writer
+                .upsert_page(NewPage {
+                    workspace_id: w,
+                    project_id: p,
+                    path: PagePath::new(path).unwrap(),
+                    title: path.into(),
+                    body: body.into(),
+                    tier: Tier::Semantic,
+                    frontmatter_json: serde_json::json!({}),
+                    pinned: false,
+                    links: Vec::new(),
+                    author_id: None,
+                })
+                .await
+                .unwrap();
+        }
+
+        // The repo opted into `[recall] default_global` — the hook publishes it
+        // on the ActiveProject (single slot here, matching the empty test actor).
+        server
+            .active_project
+            .set_for(&ai_memory_core::ActorKey::default(), ws, infra, true);
+
+        // A query with NO scoping args now behaves as `global=true`.
+        let result = server
+            .memory_query(
+                Parameters(QueryArgs {
+                    query: "recall_token".into(),
+                    limit: Some(10),
+                    project: None,
+                    scopes: Vec::new(),
+                    workspace: None,
+                    global: None,
+                }),
+                OptionalParts(test_parts_default()),
+            )
+            .await
+            .unwrap();
+        let text = result
+            .content
+            .first()
+            .and_then(|c| c.as_text())
+            .map(|t| t.text.clone())
+            .unwrap();
+        assert!(
+            text.contains("global_hits"),
+            "default_global must route the unscoped query to global: {text}"
+        );
+        assert!(text.contains("cluster.md"), "infra hit expected: {text}");
+        assert!(text.contains("deploy.md"), "runbooks hit expected: {text}");
+
+        // Precedence: an EXPLICIT workspace+project still wins over
+        // default_global — the query scopes to runbooks only (no infra hit).
+        let scoped = server
+            .memory_query(
+                Parameters(QueryArgs {
+                    query: "recall_token".into(),
+                    limit: Some(10),
+                    project: Some("runbooks".into()),
+                    scopes: Vec::new(),
+                    workspace: Some("ops".into()),
+                    global: None,
+                }),
+                OptionalParts(test_parts_default()),
+            )
+            .await
+            .unwrap();
+        let scoped_text = scoped
+            .content
+            .first()
+            .and_then(|c| c.as_text())
+            .map(|t| t.text.clone())
+            .unwrap();
+        assert!(
+            scoped_text.contains("deploy.md"),
+            "explicit ops/runbooks hit expected: {scoped_text}"
+        );
+        assert!(
+            !scoped_text.contains("cluster.md"),
+            "explicit scope must NOT broaden to infra: {scoped_text}"
+        );
     }
 
     #[tokio::test]

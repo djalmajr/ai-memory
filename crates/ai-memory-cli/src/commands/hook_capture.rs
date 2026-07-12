@@ -52,12 +52,16 @@ pub fn url_encode(s: &str) -> String {
 /// server cannot see this checkout.
 pub fn marker_query_suffix(cwd: &str, default_strategy: Option<&str>) -> String {
     let mut qs = format!("&cwd={}", url_encode(cwd));
-    let (mut workspace, mut project, mut strategy, mut drop_subagent) = (None, None, None, None);
+    let (mut workspace, mut project, mut strategy, mut drop_subagent, mut default_global) =
+        (None, None, None, None, None);
     if let Some(marker) = find_marker(cwd) {
         workspace = parse_toml_key(&marker, "workspace");
         project = parse_toml_key(&marker, "project");
         strategy = parse_toml_key(&marker, "project_strategy");
         drop_subagent = parse_toml_key(&marker, "drop_subagent_captures");
+        // `[recall] default_global = true` (or top-level; quoted or bare) —
+        // a meta-repo opts every default-scoped read into a global search.
+        default_global = parse_toml_flag(&marker, "default_global");
     }
     if strategy.is_none() {
         strategy = default_strategy.map(str::to_owned);
@@ -80,7 +84,41 @@ pub fn marker_query_suffix(cwd: &str, default_strategy: Option<&str>) -> String 
     if let Some(val) = drop_subagent.filter(|v| !v.is_empty()) {
         qs.push_str(&format!("&drop_subagent={}", url_encode(&val)));
     }
+    // Per-repo `default_global` opt-in: forward the marker's value so the
+    // server can publish it on the ActiveProject and make default-scoped read
+    // tools search globally. Truthiness is decided server-side.
+    if let Some(val) = default_global.filter(|v| !v.is_empty()) {
+        qs.push_str(&format!("&default_global={}", url_encode(&val)));
+    }
     qs
+}
+
+/// Parse a root-level `key = <value>` line, accepting a quoted string
+/// (`key = "true"`) OR a bare token (`key = true` / `key = 1`), so a
+/// `[recall] default_global = true` marker works whether or not the operator
+/// quotes the value. Line-based like [`parse_toml_key`], so section headers
+/// are ignored; strips an optional trailing `# comment`.
+fn parse_toml_flag(file: &Path, key: &str) -> Option<String> {
+    let text = std::fs::read_to_string(file).ok()?;
+    for line in text.lines() {
+        let trimmed = line.trim_start();
+        let Some(after_key) = trimmed.strip_prefix(key) else {
+            continue;
+        };
+        let Some(rest) = after_key.trim_start().strip_prefix('=') else {
+            continue;
+        };
+        let val = rest
+            .split('#')
+            .next()
+            .unwrap_or("")
+            .trim()
+            .trim_matches('"');
+        if !val.is_empty() {
+            return Some(val.to_string());
+        }
+    }
+    None
 }
 
 fn repo_root_project(cwd: &str) -> Option<String> {
@@ -518,6 +556,32 @@ drop_subagent_captures = "true"
         .unwrap();
         let qs = marker_query_suffix(tmp.path().to_str().unwrap(), None);
         assert!(!qs.contains("drop_subagent"), "{qs}");
+    }
+
+    /// A `[recall] default_global` marker (bare `true`, under a section)
+    /// forwards the flag so the server can broaden default-scoped reads.
+    #[test]
+    fn marker_query_suffix_appends_default_global() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        std::fs::write(
+            tmp.path().join(".ai-memory.toml"),
+            "workspace = \"acme\"\n[recall]\ndefault_global = true\n",
+        )
+        .unwrap();
+        let qs = marker_query_suffix(tmp.path().to_str().unwrap(), None);
+        assert!(qs.contains("&default_global=true"), "{qs}");
+    }
+
+    #[test]
+    fn marker_query_suffix_omits_default_global_when_unset() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        std::fs::write(
+            tmp.path().join(".ai-memory.toml"),
+            "workspace = \"acme\"\nproject = \"infra\"\n",
+        )
+        .unwrap();
+        let qs = marker_query_suffix(tmp.path().to_str().unwrap(), None);
+        assert!(!qs.contains("default_global"), "{qs}");
     }
 
     #[test]

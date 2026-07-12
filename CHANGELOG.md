@@ -8,6 +8,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- New `.ai-memory.toml` marker option `[recall] default_global = "true"`
+  ([#177]): sessions in the marked tree make an *unscoped* `memory_query`
+  behave as `global=true`, so meta-repos that constantly need
+  sibling-project context stop passing `global=true` by hand. Strictly
+  opt-in and per-repo; explicit `workspace`/`project`/`scopes`/`global`
+  arguments always win. While active, unscoped queries return
+  cross-project `global_hits` (workspace+project annotated) instead of
+  project `hits` + `global_scope_hits`; `memory_recent` stays
+  project-scoped (documented follow-up).
 - `purge-project` and `rename-project` now write attributed rows to the
   append-only `audit_log`, inside the same transaction as the operation
   itself — so "which user wiped project X?" finally has an answer, and a

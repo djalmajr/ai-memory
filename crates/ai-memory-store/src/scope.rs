@@ -532,7 +532,7 @@ mod tests {
             user: Some("alice".into()),
             session_id: Some("s1".into()),
         };
-        active_project.set_for(&actor, active_ws, active_scratch);
+        active_project.set_for(&actor, active_ws, active_scratch, false);
 
         let resolver = ScopeResolver::new(&store.reader, default_ws, default_scratch)
             .with_active_project(&active_project);
@@ -579,7 +579,7 @@ mod tests {
             user: None,
             session_id: Some("s1".into()),
         };
-        active_project.set_for(&actor, active_ws, active_project_id);
+        active_project.set_for(&actor, active_ws, active_project_id, false);
         let resolver = ScopeResolver::new(&store.reader, default_ws, default_project)
             .with_writer(&store.writer)
             .with_active_project(&active_project);
