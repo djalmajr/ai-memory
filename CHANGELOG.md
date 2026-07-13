@@ -16,6 +16,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   audited, scoped to the handoff's workspace/project with a NULL author by
   design — handoffs are agent/session-keyed, not owned by a DB user
   ([#179]).
+- Devin CLI is now a supported MCP + lifecycle-hook integration. `install-mcp
+  --client devin` writes Devin's `mcpServers` config, `install-hooks --agent
+  devin` writes Devin lifecycle hooks, `setup-agent --agent devin` emits
+  host-copyable hook snippets, and `uninstall` removes only ai-memory-owned
+  Devin entries. Devin hook capture covers `SessionStart`,
+  `UserPromptSubmit`, `PreToolUse`, `PostToolUse`, `PostCompaction`, `Stop`,
+  and `SessionEnd`; `PostCompaction` is stored as a dedicated observation kind
+  and captures Devin's `summary` field. Devin does not expose subagent hook
+  events, so subagent capture is not installed for Devin.
+- Managed Agent Skills can now target Devin: project installs use
+  `.devin/skills`; global installs use `%APPDATA%\devin\skills` on Windows and
+  `~/.devin/skills` elsewhere.
+- The store migration set now admits `devin` as a persisted
+  `sessions.agent_kind`, preserving the same workspace/project invariants as
+  the other supported agents.
+
+### Fixed
+- `install-mcp` and `install-hooks` now honor an explicit `--server-url` even
+  when it matches the compiled default. Previously that value was
+  indistinguishable from "flag omitted" and could be overridden by
+  `AI_MEMORY_SERVER_URL`, which could write config for the wrong local server.
+- Devin hook capture now derives `cwd` when the native payload omits it:
+  payload `cwd` still wins, followed by `DEVIN_PROJECT_DIR`, then the hook
+  process working directory. This keeps real Devin `SessionStart` /
+  `PostToolUse` fixtures routable without inventing a payload field.
 
 ## [1.12.0] - 2026-07-12
 
@@ -257,7 +282,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   '{{.SecurityOptions}}'` and runs as `-u 0:0` for just the commands that
   write host-side files; thin-client commands (`status`, `bootstrap`, …)
   are unaffected since they only touch the `/data` named volume.
-
 ## [1.8.0] - 2026-07-04
 
 ### Added

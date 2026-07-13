@@ -27,9 +27,9 @@ use crate::commands::path_util::home_dir;
 use crate::commands::render_shared::{
     ANTIGRAVITY_LIFECYCLE_EVENTS, ANTIGRAVITY_TOOL_EVENTS, CODEX_PROFILE, CURSOR_PROFILE,
     GEMINI_PROFILE, build_antigravity_payload_with_data_dir,
-    build_claude_code_payload_with_data_dir, build_grok_payload_with_data_dir,
-    build_profile_payload_for_agent, hook_script_for_claude_code, hook_script_for_current_platform,
-    ts_string_literal,
+    build_claude_code_payload_with_data_dir, build_devin_payload_with_data_dir,
+    build_grok_payload_with_data_dir, build_profile_payload_for_agent, hook_script_for_claude_code,
+    hook_script_for_current_platform, ts_string_literal,
 };
 use crate::config::{Config, DEFAULT_SERVER_URL};
 
@@ -95,6 +95,22 @@ pub(crate) fn zero_hooks_path() -> anyhow::Result<std::path::PathBuf> {
         .join("hooks.json"))
 }
 
+/// `~/.devin/hooks.v1.json` — Devin CLI lifecycle hooks (default target).
+pub(crate) fn devin_hooks_path() -> anyhow::Result<std::path::PathBuf> {
+    Ok(home_dir()
+        .context("could not locate $HOME for ~/.devin/hooks.v1.json")?
+        .join(".devin")
+        .join("hooks.v1.json"))
+}
+
+/// `~/.devin/config.json` — Devin CLI lifecycle hooks (alternative target under `hooks` key).
+pub(crate) fn devin_config_path() -> anyhow::Result<std::path::PathBuf> {
+    Ok(home_dir()
+        .context("could not locate $HOME for ~/.devin/config.json")?
+        .join(".devin")
+        .join("config.json"))
+}
+
 /// `~/.config/opencode/plugins/ai-memory.ts` — OpenCode's plugin file.
 pub(crate) fn opencode_plugin_path() -> anyhow::Result<std::path::PathBuf> {
     Ok(home_dir()
@@ -130,7 +146,7 @@ pub(crate) fn pi_extension_path() -> anyhow::Result<std::path::PathBuf> {
 /// # Errors
 /// Returns an error if the hook script directory cannot be located.
 pub fn run(config: &Config, args: InstallHooksArgs) -> Result<()> {
-    let inferred = if args.server_url == DEFAULT_SERVER_URL {
+    let inferred = if args.server_url.is_none() {
         infer_installed_mcp_config(args.agent)
     } else {
         None
@@ -196,6 +212,10 @@ pub fn run(config: &Config, args: InstallHooksArgs) -> Result<()> {
                 apply_to_grok_settings(&hooks_dir, &server_url, auth, &config.data_dir, &args)
             }
             AgentChoice::Zero => apply_to_zero_hooks(&server_url, auth, &config.data_dir, &args),
+            AgentChoice::Devin => {
+                let hooks_dir = resolve_hooks_dir(args.hooks_dir.as_deref(), args.agent)?;
+                apply_to_devin_settings(&hooks_dir, &server_url, auth, &config.data_dir, &args)
+            }
             AgentChoice::Openclaw => openclaw_plugin::apply(&server_url, auth, &args),
         };
     }
@@ -257,6 +277,10 @@ pub fn run(config: &Config, args: InstallHooksArgs) -> Result<()> {
             render_grok(&hooks_dir, &server_url, auth, &config.data_dir, strategy)
         }
         AgentChoice::Zero => render_zero(&server_url, auth, &config.data_dir, strategy),
+        AgentChoice::Devin => {
+            let hooks_dir = resolve_hooks_dir(args.hooks_dir.as_deref(), args.agent)?;
+            render_devin(&hooks_dir, &server_url, auth, &config.data_dir, strategy)
+        }
         AgentChoice::Openclaw => {
             openclaw_plugin::render(&server_url, auth, strategy);
             Ok(())
@@ -299,14 +323,14 @@ fn effective_hook_server_url(
     args: &InstallHooksArgs,
     inferred: Option<&InferredMcpConfig>,
 ) -> String {
-    let raw = if args.server_url != DEFAULT_SERVER_URL {
-        args.server_url.clone()
+    let raw = if let Some(url) = &args.server_url {
+        url.clone()
     } else if config.server_url_configured() {
         config.server_url.clone()
     } else if let Some(url) = inferred.and_then(|mcp| mcp.hook_server_url.clone()) {
         url
     } else {
-        return args.server_url.clone();
+        return DEFAULT_SERVER_URL.to_string();
     };
     apply_base_path_to_hook_url(&normalise_hook_server_url(&raw), &config.base_path)
 }
@@ -359,6 +383,7 @@ fn infer_installed_mcp_config(agent: AgentChoice) -> Option<InferredMcpConfig> {
         McpClient::AntigravityCli => {
             infer_json_mcp_config(&content, &["mcpServers", "ai-memory"], "serverUrl")
         }
+        McpClient::Devin => infer_json_mcp_config(&content, &["mcpServers", "ai-memory"], "url"),
         McpClient::ClaudeDesktop => None,
         // MCP-only client: no AgentChoice counterpart routes here.
         // Reachable only if a future install_hooks flow targets VS
@@ -380,9 +405,9 @@ fn mcp_client_for_agent(agent: AgentChoice) -> Option<McpClient> {
         AgentChoice::Openclaw => Some(McpClient::Openclaw),
         AgentChoice::AntigravityCli => Some(McpClient::AntigravityCli),
         AgentChoice::Zero => Some(McpClient::Zero),
-        // Grok manages its own MCP config under ~/.grok/; we don't
-        // auto-infer a hook server URL from it.
-        AgentChoice::Pi | AgentChoice::Grok => None,
+        // Grok and Devin manage their own MCP config under ~/.grok/ and ~/.devin/;
+        // we don't auto-infer a hook server URL from it.
+        AgentChoice::Pi | AgentChoice::Grok | AgentChoice::Devin => None,
     }
 }
 
@@ -626,6 +651,73 @@ fn apply_to_grok_settings(
             }
             Ok(())
         })
+    })?;
+    println!(
+        "✓ {} {} ({})",
+        outcome.verb(),
+        path.display(),
+        match outcome {
+            ApplyOutcome::Created => "new file",
+            ApplyOutcome::Updated => "backup written next to it",
+            ApplyOutcome::NoOp => "already up to date",
+        }
+    );
+    Ok(())
+}
+
+/// Mutate Devin's hook config (either `~/.devin/hooks.v1.json` or `~/.devin/config.json` hooks key).
+/// Devin uses the same nested hook JSON shape as Claude Code/Grok, but with DEVIN_EVENTS
+/// (PostCompaction instead of PreCompact, no subagent events). SessionStart injects
+/// the handoff via hookSpecificOutput.additionalContext.
+fn apply_to_devin_settings(
+    hooks_dir: &Path,
+    server_url: &str,
+    auth_token: Option<&str>,
+    data_dir: &Path,
+    args: &InstallHooksArgs,
+) -> Result<()> {
+    let path = match &args.config_file {
+        Some(p) => p.clone(),
+        None => devin_hooks_path()?,
+    };
+    let staged = stage_hook_scripts(hooks_dir, "devin")?;
+    let command_dir = staged_command_dir(&staged, "devin");
+    let strategy = args.project_strategy.baked();
+    let payload = build_devin_payload_with_data_dir(
+        &command_dir,
+        server_url,
+        auth_token,
+        Some(data_dir),
+        strategy,
+    );
+    let our_hooks = payload
+        .get("hooks")
+        .and_then(|v| v.as_object())
+        .context("internal: build_devin_payload didn't return a hooks object")?
+        .clone();
+    let outcome = apply_atomic(&path, |existing| {
+        // For hooks.v1.json, the entire file IS the hooks object
+        // For config.json hooks key, we merge into the hooks object
+        if path.file_name() == Some("hooks.v1.json".as_ref()) {
+            mutate_json(existing, |root| {
+                for (event, value) in &our_hooks {
+                    overlay_event_hooks(root, event, value);
+                }
+                Ok(())
+            })
+        } else {
+            mutate_json(existing, |root| {
+                let hooks = root
+                    .entry("hooks")
+                    .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()))
+                    .as_object_mut()
+                    .context("`hooks` is present in config.json but not an object")?;
+                for (event, value) in &our_hooks {
+                    overlay_event_hooks(hooks, event, value);
+                }
+                Ok(())
+            })
+        }
     })?;
     println!(
         "✓ {} {} ({})",
@@ -2604,6 +2696,56 @@ fn render_zero(
     Ok(())
 }
 
+fn render_devin(
+    hooks_dir: &Path,
+    server_url: &str,
+    auth_token: Option<&str>,
+    data_dir: &Path,
+    project_strategy: Option<&str>,
+) -> Result<()> {
+    // Soft check (same rationale as render_claude_code): warn, don't bail,
+    // so the docker host-path flow still works.
+    for (_, script) in super::render_shared::DEVIN_EVENTS {
+        let script = hook_script_for_claude_code(script);
+        let abs = hooks_dir.join(script.as_ref());
+        if !abs.exists() {
+            eprintln!(
+                "# warning: {} not present on this filesystem. \
+                 If this command is running inside docker against a \
+                 host path, you can ignore this; otherwise extract \
+                 the scripts first with `ai-memory setup-agent`.",
+                abs.display()
+            );
+        }
+    }
+    let payload = build_devin_payload_with_data_dir(
+        hooks_dir,
+        server_url,
+        auth_token,
+        Some(data_dir),
+        project_strategy,
+    );
+    let serialized =
+        serde_json::to_string_pretty(&payload).context("serializing devin hook config")?;
+    println!(
+        "# Devin CLI hook config — write to ~/.devin/hooks.v1.json or ~/.devin/config.json hooks key"
+    );
+    println!("# Hook scripts: {}", hooks_dir.display());
+    println!("# AI-memory server URL: {server_url}");
+    if auth_token.is_some() {
+        println!("# Auth: AI_MEMORY_AUTH_TOKEN embedded in each hook command below.");
+        println!(
+            "#       Treat ~/.devin/hooks.v1.json or ~/.devin/config.json as sensitive (chmod 600)."
+        );
+    }
+    println!(
+        "# NOTE: Devin consumes the handoff via hookSpecificOutput.additionalContext on SessionStart."
+    );
+    println!();
+    println!("{serialized}");
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2753,7 +2895,7 @@ mod tests {
         InstallHooksArgs {
             agent: AgentChoice::OpenCode,
             hooks_dir: None,
-            server_url: DEFAULT_SERVER_URL.into(),
+            server_url: None,
             auth_token: None,
             as_user: None,
             apply: true,
@@ -2906,11 +3048,38 @@ mod tests {
             ..Config::default()
         };
         let mut args = default_hook_args();
-        args.server_url = "http://explicit:49374/".into();
+        args.server_url = Some("http://explicit:49374/".into());
 
         assert_eq!(
             effective_hook_server_url(&config, &args, None),
             "http://explicit:49374"
+        );
+    }
+
+    /// Regression (found 2026-07-12 during Devin real-acceptance A/B
+    /// testing): an explicit `--server-url` that happens to equal the
+    /// compiled-in `DEFAULT_SERVER_URL` must still win over a configured
+    /// (env/config.toml) server_url pointing somewhere else. Before the
+    /// `Option<String>` fix, `args.server_url` was a plain `String` with
+    /// `default_value_t = DEFAULT_SERVER_URL`, so clap couldn't
+    /// distinguish "operator explicitly typed the default value" from
+    /// "operator passed nothing at all" — both produced the same string,
+    /// so this exact case silently fell through to `AI_MEMORY_SERVER_URL`
+    /// / config.toml instead of honouring the explicit flag.
+    #[test]
+    fn hook_server_url_explicit_flag_matching_compiled_default_still_wins() {
+        let config = Config {
+            server_url: "http://127.0.0.1:49375".into(),
+            ..Config::default()
+        };
+        let mut args = default_hook_args();
+        args.server_url = Some(DEFAULT_SERVER_URL.to_string());
+
+        assert_eq!(
+            effective_hook_server_url(&config, &args, None),
+            DEFAULT_SERVER_URL,
+            "an explicit --server-url matching the compiled default must not be \
+             silently overridden by a differently-configured server_url"
         );
     }
 
@@ -3085,6 +3254,16 @@ mod tests {
     }
 
     #[test]
+    fn resolve_hooks_dir_uses_devin_bundle_for_devin() {
+        let tmp = TempDir::new().unwrap();
+        fs::create_dir_all(tmp.path().join("devin")).unwrap();
+        fs::create_dir_all(tmp.path().join("claude-code")).unwrap();
+
+        let resolved = resolve_hooks_dir(Some(tmp.path()), AgentChoice::Devin).unwrap();
+        assert_eq!(resolved, tmp.path().join("devin"));
+    }
+
+    #[test]
     fn opencode_mcp_inference_supplies_hook_origin_and_token() {
         let inferred = infer_json_mcp_config(
             r#"{
@@ -3200,6 +3379,7 @@ model = "gpt-5"
             "cursor",
             "gemini-cli",
             "grok",
+            "devin",
             "opencode",
             "antigravity-cli",
         ] {
@@ -3265,6 +3445,57 @@ model = "gpt-5"
             .unwrap_or_else(|| panic!("{} missing agent value", path.display()))
             .to_string();
         (event, agent)
+    }
+
+    #[test]
+    fn devin_bundle_has_no_subagent_scripts() {
+        let hooks_root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("..")
+            .join("hooks");
+        let devin_dir = hooks_root.join("devin");
+
+        for entry in fs::read_dir(&devin_dir).unwrap() {
+            let path = entry.unwrap().path();
+            if !path.is_file() {
+                continue;
+            }
+            let stem = path
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or("unknown");
+            assert!(
+                !stem.contains("subagent"),
+                "Devin bundle should not contain subagent scripts, found: {}",
+                path.display()
+            );
+        }
+    }
+
+    #[test]
+    fn devin_bundle_has_post_compaction_not_pre_compact() {
+        let hooks_root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("..")
+            .join("hooks");
+        let devin_dir = hooks_root.join("devin");
+
+        assert!(
+            devin_dir.join("post-compaction.sh").is_file(),
+            "Devin bundle must have post-compaction.sh"
+        );
+        assert!(
+            devin_dir.join("post-compaction.ps1").is_file(),
+            "Devin bundle must have post-compaction.ps1"
+        );
+        assert!(
+            !devin_dir.join("pre-compact.sh").exists(),
+            "Devin bundle should not have pre-compact.sh"
+        );
+        assert!(
+            !devin_dir.join("pre-compact.ps1").exists(),
+            "Devin bundle should not have pre-compact.ps1"
+        );
     }
 
     fn extract_ps1_hook_metadata(path: &Path) -> (String, String) {
@@ -3711,7 +3942,7 @@ model = "gpt-5"
         let args = InstallHooksArgs {
             agent: AgentChoice::Omp,
             hooks_dir: None,
-            server_url: "http://127.0.0.1:49374".into(),
+            server_url: Some("http://127.0.0.1:49374".into()),
             auth_token: None,
             as_user: None,
             apply: true,
@@ -3739,7 +3970,7 @@ model = "gpt-5"
         let args = InstallHooksArgs {
             agent: AgentChoice::Pi,
             hooks_dir: None,
-            server_url: "http://127.0.0.1:49374".into(),
+            server_url: Some("http://127.0.0.1:49374".into()),
             auth_token: None,
             as_user: None,
             apply: true,
@@ -4229,5 +4460,334 @@ model = "gpt-5"
         )
         .unwrap();
         assert_eq!(second, ApplyOutcome::NoOp, "second apply must be a no-op");
+    }
+
+    // ----------------------------------------------------------------
+    // Devin tests
+    // ----------------------------------------------------------------
+
+    #[test]
+    fn devin_apply_writes_hooks_v1_json_by_default() {
+        let hooks_tmp = TempDir::new().unwrap();
+        stub_scripts(
+            hooks_tmp.path(),
+            &[
+                "session-start.sh",
+                "session-end.sh",
+                "user-prompt-submit.sh",
+                "pre-tool-use.sh",
+                "post-tool-use.sh",
+                "post-compaction.sh",
+                "stop.sh",
+            ],
+        );
+
+        let config_tmp = TempDir::new().unwrap();
+        let config_path = config_tmp.path().join("hooks.v1.json");
+
+        apply_to_devin_settings(
+            hooks_tmp.path(),
+            "http://127.0.0.1:49374",
+            None,
+            config_tmp.path(),
+            &InstallHooksArgs {
+                agent: AgentChoice::Devin,
+                hooks_dir: Some(hooks_tmp.path().to_path_buf()),
+                server_url: Some("http://127.0.0.1:49374".to_string()),
+                auth_token: None,
+                config_file: Some(config_path.clone()),
+                project_strategy: crate::cli::ProjectStrategyArg::Basename,
+                as_user: None,
+                apply: false,
+            },
+        )
+        .unwrap();
+
+        let parsed: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&config_path).unwrap()).unwrap();
+        // hooks.v1.json: the entire file IS the hooks object (no wrapper)
+        assert!(
+            parsed["SessionStart"].is_array(),
+            "SessionStart hook should be present"
+        );
+        assert!(
+            parsed["PostCompaction"].is_array(),
+            "PostCompaction hook should be present"
+        );
+        assert!(
+            parsed.get("hooks").is_none(),
+            "hooks.v1.json should not have a 'hooks' wrapper"
+        );
+    }
+
+    #[test]
+    fn devin_apply_config_json_hooks_key_via_flag() {
+        let hooks_tmp = TempDir::new().unwrap();
+        stub_scripts(
+            hooks_tmp.path(),
+            &[
+                "session-start.sh",
+                "session-end.sh",
+                "user-prompt-submit.sh",
+                "pre-tool-use.sh",
+                "post-tool-use.sh",
+                "post-compaction.sh",
+                "stop.sh",
+            ],
+        );
+
+        let config_tmp = TempDir::new().unwrap();
+        let config_path = config_tmp.path().join("config.json");
+
+        // Pre-existing config.json with mcpServers
+        fs::write(
+            &config_path,
+            r#"{"mcpServers":{"other-server":{"url":"http://example.com"}}}"#,
+        )
+        .unwrap();
+
+        apply_to_devin_settings(
+            hooks_tmp.path(),
+            "http://127.0.0.1:49374",
+            None,
+            config_tmp.path(),
+            &InstallHooksArgs {
+                agent: AgentChoice::Devin,
+                hooks_dir: Some(hooks_tmp.path().to_path_buf()),
+                server_url: Some("http://127.0.0.1:49374".to_string()),
+                auth_token: None,
+                config_file: Some(config_path.clone()),
+                project_strategy: crate::cli::ProjectStrategyArg::Basename,
+                as_user: None,
+                apply: false,
+            },
+        )
+        .unwrap();
+
+        let parsed: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&config_path).unwrap()).unwrap();
+        // config.json: hooks are nested under the "hooks" key
+        assert!(
+            parsed["hooks"]["SessionStart"].is_array(),
+            "SessionStart hook should be present"
+        );
+        assert!(
+            parsed["hooks"]["PostCompaction"].is_array(),
+            "PostCompaction hook should be present"
+        );
+        // mcpServers should be preserved
+        assert!(
+            parsed["mcpServers"]["other-server"].is_object(),
+            "mcpServers should be preserved"
+        );
+    }
+
+    #[test]
+    fn devin_apply_both_targets_are_idempotent() {
+        let hooks_tmp = TempDir::new().unwrap();
+        stub_scripts(
+            hooks_tmp.path(),
+            &[
+                "session-start.sh",
+                "session-end.sh",
+                "user-prompt-submit.sh",
+                "pre-tool-use.sh",
+                "post-tool-use.sh",
+                "post-compaction.sh",
+                "stop.sh",
+            ],
+        );
+
+        // Test hooks.v1.json idempotency
+        let config_tmp = TempDir::new().unwrap();
+        let hooks_v1_path = config_tmp.path().join("hooks.v1.json");
+
+        let args_v1 = InstallHooksArgs {
+            agent: AgentChoice::Devin,
+            hooks_dir: Some(hooks_tmp.path().to_path_buf()),
+            server_url: Some("http://127.0.0.1:49374".to_string()),
+            auth_token: None,
+            config_file: Some(hooks_v1_path.clone()),
+            project_strategy: crate::cli::ProjectStrategyArg::Basename,
+            as_user: None,
+            apply: false,
+        };
+
+        apply_to_devin_settings(
+            hooks_tmp.path(),
+            "http://127.0.0.1:49374",
+            None,
+            config_tmp.path(),
+            &args_v1,
+        )
+        .unwrap();
+
+        apply_to_devin_settings(
+            hooks_tmp.path(),
+            "http://127.0.0.1:49374",
+            None,
+            config_tmp.path(),
+            &args_v1,
+        )
+        .unwrap();
+
+        // Idempotency check: second apply should be a no-op
+        let v1_first_content = fs::read_to_string(&hooks_v1_path).unwrap();
+        let v1_second_content = fs::read_to_string(&hooks_v1_path).unwrap();
+        assert_eq!(
+            v1_first_content, v1_second_content,
+            "hooks.v1.json should be unchanged after second apply"
+        );
+
+        // Test config.json hooks key idempotency
+        let config_tmp2 = TempDir::new().unwrap();
+        let config_path = config_tmp2.path().join("config.json");
+        fs::write(&config_path, "{}").unwrap();
+
+        let args_config = InstallHooksArgs {
+            agent: AgentChoice::Devin,
+            hooks_dir: Some(hooks_tmp.path().to_path_buf()),
+            server_url: Some("http://127.0.0.1:49374".to_string()),
+            auth_token: None,
+            config_file: Some(config_path.clone()),
+            project_strategy: crate::cli::ProjectStrategyArg::Basename,
+            as_user: None,
+            apply: false,
+        };
+
+        apply_to_devin_settings(
+            hooks_tmp.path(),
+            "http://127.0.0.1:49374",
+            None,
+            config_tmp2.path(),
+            &args_config,
+        )
+        .unwrap();
+
+        apply_to_devin_settings(
+            hooks_tmp.path(),
+            "http://127.0.0.1:49374",
+            None,
+            config_tmp2.path(),
+            &args_config,
+        )
+        .unwrap();
+
+        // Idempotency check: second apply should be a no-op
+        let config_first_content = fs::read_to_string(&config_path).unwrap();
+        let config_second_content = fs::read_to_string(&config_path).unwrap();
+        assert_eq!(
+            config_first_content, config_second_content,
+            "config.json should be unchanged after second apply"
+        );
+    }
+
+    #[test]
+    fn devin_preserves_existing_hooks_and_adds_ours() {
+        let hooks_tmp = TempDir::new().unwrap();
+        stub_scripts(
+            hooks_tmp.path(),
+            &[
+                "session-start.sh",
+                "pre-tool-use.sh",
+                "post-tool-use.sh",
+                "post-compaction.sh",
+                "stop.sh",
+            ],
+        );
+
+        let config_tmp = TempDir::new().unwrap();
+        let config_path = config_tmp.path().join("hooks.v1.json");
+        // Pre-existing settings with another named hook group.
+        fs::write(
+            &config_path,
+            r#"{"my-linter":{"PostToolUse":[{"matcher":"run_command","hooks":[{"type":"command","command":"lint.sh"}]}]}}"#,
+        )
+        .unwrap();
+
+        apply_to_devin_settings(
+            hooks_tmp.path(),
+            "http://127.0.0.1:49374",
+            None,
+            config_tmp.path(),
+            &InstallHooksArgs {
+                agent: AgentChoice::Devin,
+                hooks_dir: Some(hooks_tmp.path().to_path_buf()),
+                server_url: Some("http://127.0.0.1:49374".to_string()),
+                auth_token: None,
+                config_file: Some(config_path.clone()),
+                project_strategy: crate::cli::ProjectStrategyArg::Basename,
+                as_user: None,
+                apply: false,
+            },
+        )
+        .unwrap();
+
+        let parsed: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&config_path).unwrap()).unwrap();
+        // The pre-existing my-linter group survives.
+        assert!(
+            parsed["my-linter"]["PostToolUse"].is_array(),
+            "my-linter.PostToolUse must survive"
+        );
+        // Our hooks are present at the top level (hooks.v1.json format).
+        assert!(
+            parsed["SessionStart"].is_array(),
+            "SessionStart hook should be present"
+        );
+        assert!(
+            parsed["PostCompaction"].is_array(),
+            "PostCompaction hook should be present"
+        );
+        assert!(
+            parsed["PostToolUse"].is_array(),
+            "PostToolUse hook should be present"
+        );
+    }
+
+    #[test]
+    fn devin_session_start_injects_handoff_additional_context() {
+        let hooks_root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("..")
+            .join("hooks");
+        let devin_session_start = hooks_root.join("devin").join("session-start.sh");
+
+        // Normalized because this is the only assertion below that spans a
+        // line break: on a Windows checkout with core.autocrlf=true the
+        // working-tree copy has CRLF even though the committed blob is
+        // LF-only, which breaks an exact multi-line substring match.
+        let script_content = fs::read_to_string(&devin_session_start)
+            .unwrap()
+            .replace("\r\n", "\n");
+        // Verify the script injects handoff via hookSpecificOutput.additionalContext
+        assert!(
+            script_content.contains("hookSpecificOutput"),
+            "Devin session-start.sh must inject handoff via hookSpecificOutput"
+        );
+        assert!(
+            script_content.contains("additionalContext"),
+            "Devin session-start.sh must use additionalContext field"
+        );
+        assert!(
+            script_content.contains("ai_memory_get_handoff"),
+            "Devin session-start.sh must fetch handoff"
+        );
+        assert!(
+            script_content.contains("$SERVER/handoff?agent=devin${QS}"),
+            "Devin session-start.sh must use the registered /handoff endpoint with agent=devin"
+        );
+        assert!(
+            !script_content.contains("/handoff/latest"),
+            "Devin session-start.sh must not call the removed /handoff/latest route"
+        );
+        assert!(
+            script_content.contains("ai_memory_json_string"),
+            "Devin session-start.sh must JSON-escape handoff text before embedding it"
+        );
+        assert!(
+            script_content.contains("else\n    printf '{}\\n'\nfi"),
+            "Devin session-start.sh must print {{}} only when no handoff is available"
+        );
     }
 }

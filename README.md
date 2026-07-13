@@ -24,6 +24,7 @@
 | Native Windows | Experimental | Tagged releases publish `ai-memory-windows-x86_64.zip` with `ai-memory.exe`; Docker Desktop wrapper and source builds are also available. Claude Code uses Claude exec form with a real native `ai-memory.exe` by default; other script-hook agents use the current PowerShell defaults pending harness feedback. See [`docs/windows.md`](docs/windows.md). |
 | Claude Code | Supported | MCP config + lifecycle hooks. |
 | Codex | Supported | MCP config + lifecycle hooks; no automatic true session-end hook, so run `ai-memory finalize-session` when you need a final summary/handoff. |
+| Devin CLI | Supported | MCP config + lifecycle hooks. Hooks use Devin's `PostCompaction` event, inject handoffs via `hookSpecificOutput.additionalContext`, and omit subagent events because Devin does not expose them. |
 | OpenCode | Supported | Remote MCP config + generated TypeScript plugin. |
 | Cursor | Supported | MCP config + lifecycle hooks. |
 | Gemini CLI | Supported | MCP config + lifecycle hooks. |
@@ -90,7 +91,7 @@ priors are at the [bottom](#influences-and-prior-art).
   project list, folder tree, FTS5 search, markdown rendering, dark
   mode. Mounted on the same axum server as MCP.
 - **Multi-agent + multi-machine ready.** Supported clients: Claude
-  Code, Codex, OpenCode, Cursor, Claude Desktop (via `mcp-remote`),
+  Code, Codex, Devin CLI, OpenCode, Cursor, Claude Desktop (via `mcp-remote`),
   Gemini CLI, Antigravity CLI, Grok Build CLI, OpenClaw, Oh My Pi / OMP
   (`omp` / `oh-my-pi`), Pi via generated bridge extension, and VS Code GitHub
   Copilot agent mode
@@ -225,8 +226,8 @@ packaged unit. Full user-service, system-service, auth, and provider setup is in
 
 ### Docker
 
-You need: Docker + an agent CLI (Claude Code, Codex, OpenCode, OMP, Cursor,
-Antigravity CLI, Grok Build CLI, or anything else that speaks MCP).
+You need: Docker + an agent CLI (Claude Code, Codex, Devin CLI, OpenCode, OMP,
+Cursor, Antigravity CLI, Grok Build CLI, or anything else that speaks MCP).
 
 The published Docker image includes `linux/amd64` and `linux/arm64` variants,
 so Apple Silicon Macs and ARM64 Linux hosts can pull `akitaonrails/ai-memory`
@@ -268,7 +269,7 @@ docker run -d --name ai-memory \
 
 # 3. Wire your agent CLI in two commands. The wrapper takes care of
 #    mounts + auto-detecting ~/.claude/settings.json. Re-run with
-#    `--agent codex`, `--agent opencode`, `--agent gemini-cli`,
+#    `--agent codex`, `--agent devin`, `--agent opencode`, `--agent gemini-cli`,
 #    `--agent omp`, `--agent oh-my-pi`, `--client cursor`,
 #    `--client gemini-cli`, etc.
 #    for additional agents; full list in docs/install.md.
@@ -340,8 +341,9 @@ one matching entry.
   projects) when you want new tool guidance. The refresh writes the slim
   markered snippet and managed Agent Skills from the same binary-owned assets.
 
-For Codex, OpenCode, OMP, Cursor, Claude Desktop, Gemini CLI, Antigravity CLI,
-Grok Build CLI, OpenClaw, VS Code Copilot, curl-based hook installs, source builds,
+For Codex, Devin CLI, OpenCode, OMP, Cursor, Claude Desktop, Gemini CLI,
+Antigravity CLI, Grok Build CLI, OpenClaw, VS Code Copilot,
+curl-based hook installs, source builds,
 CLI env vars, and the full subcommand reference, see [`docs/install.md`](docs/install.md).
 
 ## Security

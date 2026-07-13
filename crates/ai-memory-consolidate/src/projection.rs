@@ -351,8 +351,9 @@ fn observation_score(obs: &Observation, idx: usize, total: usize) -> i32 {
     score += match obs.kind {
         ObservationKind::UserPrompt => 100,
         ObservationKind::SessionEnd => 95,
-        ObservationKind::Stop => 55,
         ObservationKind::PreCompact => 90,
+        ObservationKind::PostCompaction => 85,
+        ObservationKind::Stop => 55,
         ObservationKind::PostToolUse => 30,
         ObservationKind::Notification => 25,
         ObservationKind::SessionStart => 20,

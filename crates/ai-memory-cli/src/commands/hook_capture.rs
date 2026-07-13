@@ -21,6 +21,32 @@ pub fn extract_cwd(payload: &serde_json::Value) -> Option<String> {
         .map(str::to_owned)
 }
 
+fn non_empty(value: Option<String>) -> Option<String> {
+    value.filter(|s| !s.trim().is_empty())
+}
+
+/// Resolve the cwd for hook bridges whose native payload may omit it.
+///
+/// Ordered fallback:
+///
+/// 1. `cwd` in the payload, if present.
+/// 2. `DEVIN_PROJECT_DIR`, when the launcher provides it.
+/// 3. The native hook process current directory.
+pub fn resolve_cwd_with_fallbacks(
+    payload: &serde_json::Value,
+    mut env_lookup: impl FnMut(&str) -> Option<String>,
+    current_dir: impl FnOnce() -> Option<PathBuf>,
+) -> Option<String> {
+    non_empty(extract_cwd(payload))
+        .or_else(|| non_empty(env_lookup("DEVIN_PROJECT_DIR")))
+        .or_else(|| {
+            current_dir().and_then(|path| {
+                let cwd = path.to_string_lossy().into_owned();
+                non_empty(Some(cwd))
+            })
+        })
+}
+
 /// URL-encode the reserved characters `ai_memory_url_encode` handles.
 pub fn url_encode(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
@@ -417,6 +443,42 @@ mod tests {
     fn missing_cwd_is_none() {
         let p: serde_json::Value = serde_json::from_str(r#"{"x":1}"#).unwrap();
         assert_eq!(extract_cwd(&p), None);
+    }
+
+    #[test]
+    fn resolve_cwd_prefers_payload_over_env_and_process_cwd() {
+        let p: serde_json::Value = serde_json::from_str(r#"{"cwd":"/payload"}"#).unwrap();
+
+        let cwd = resolve_cwd_with_fallbacks(
+            &p,
+            |_| Some("/env".into()),
+            || Some(PathBuf::from("/process")),
+        );
+
+        assert_eq!(cwd.as_deref(), Some("/payload"));
+    }
+
+    #[test]
+    fn resolve_cwd_uses_devin_project_dir_when_payload_omits_cwd() {
+        let p: serde_json::Value = serde_json::from_str(r#"{"source":"startup"}"#).unwrap();
+
+        let cwd = resolve_cwd_with_fallbacks(
+            &p,
+            |name| (name == "DEVIN_PROJECT_DIR").then(|| "/env-project".into()),
+            || Some(PathBuf::from("/process")),
+        );
+
+        assert_eq!(cwd.as_deref(), Some("/env-project"));
+    }
+
+    #[test]
+    fn resolve_cwd_uses_process_cwd_when_payload_and_env_omit_cwd() {
+        let p: serde_json::Value = serde_json::from_str(r#"{"source":"startup"}"#).unwrap();
+
+        let cwd =
+            resolve_cwd_with_fallbacks(&p, |_| None, || Some(PathBuf::from("process-project")));
+
+        assert_eq!(cwd.as_deref(), Some("process-project"));
     }
 
     #[test]

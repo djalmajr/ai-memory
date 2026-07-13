@@ -340,3 +340,57 @@ fn legacy_long_marker_block_rerun_upgrades_in_place_to_slim_snippet() {
         1
     );
 }
+
+#[test]
+fn devin_install_instructions_targets_agents_md() {
+    let project = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().unwrap();
+
+    // Create AGENTS.md first so it gets picked up instead of defaulting to CLAUDE.md
+    fs::write(project.path().join("AGENTS.md"), "# Project\n").unwrap();
+
+    let output = run_ai_memory(
+        project.path(),
+        home.path(),
+        &[
+            "install-instructions",
+            "--skills-agent",
+            "devin",
+            "--no-skills",
+        ],
+    );
+    assert_success(output);
+
+    let agents_md = fs::read_to_string(project.path().join("AGENTS.md")).unwrap();
+    assert!(agents_md.contains(MARKER_START));
+    assert!(agents_md.contains("Use the installed ai-memory Agent Skills"));
+    assert!(!project.path().join("CLAUDE.md").exists());
+}
+
+#[test]
+fn devin_install_instructions_writes_project_devin_skills() {
+    let project = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().unwrap();
+
+    fs::write(project.path().join("AGENTS.md"), "# Project\n").unwrap();
+
+    let output = run_ai_memory(
+        project.path(),
+        home.path(),
+        &["install-instructions", "--skills-agent", "devin"],
+    );
+    assert_success(output);
+
+    let agents_md = fs::read_to_string(project.path().join("AGENTS.md")).unwrap();
+    assert!(agents_md.contains(MARKER_START));
+    assert!(agents_md.contains("Use the installed ai-memory Agent Skills"));
+
+    let devin_skill = project
+        .path()
+        .join(".devin/skills/ai-memory-handoff/SKILL.md");
+    let skill_content = fs::read_to_string(&devin_skill)
+        .unwrap_or_else(|err| panic!("expected Devin skill {}: {err}", devin_skill.display()));
+    assert!(skill_content.contains(MANAGED_MARKER));
+    assert!(!project.path().join(".claude/skills").exists());
+    assert!(!project.path().join(".agents/skills").exists());
+}

@@ -4,7 +4,8 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use ai_memory_core::routing_skills::{
-    AGENTS_SKILL_DIR, CLAUDE_SKILL_DIR, MANAGED_MARKER, MANAGED_SKILLS, ManagedSkill, SKILLS_DIR,
+    AGENTS_SKILL_DIR, CLAUDE_SKILL_DIR, DEVIN_SKILL_DIR, MANAGED_MARKER, MANAGED_SKILLS,
+    ManagedSkill, SKILLS_DIR,
 };
 use anyhow::{Context, Result, bail};
 
@@ -81,13 +82,31 @@ fn print_reports(reports: Vec<InstallReport>) {
 fn resolve_target_roots_from_env(args: &InstallSkillsArgs) -> Result<Vec<TargetRoot>> {
     let cwd = std::env::current_dir().context("getting CWD for install-skills target")?;
     let home = home_dir();
-    resolve_target_roots(args, &cwd, home.as_deref())
+    let appdata = std::env::var_os("APPDATA").map(PathBuf::from);
+    resolve_target_roots_for_platform(
+        args,
+        &cwd,
+        home.as_deref(),
+        appdata.as_deref(),
+        SkillHostPlatform::current(),
+    )
 }
 
+#[cfg(test)]
 fn resolve_target_roots(
     args: &InstallSkillsArgs,
     cwd: &Path,
     home: Option<&Path>,
+) -> Result<Vec<TargetRoot>> {
+    resolve_target_roots_for_platform(args, cwd, home, None, SkillHostPlatform::Other)
+}
+
+fn resolve_target_roots_for_platform(
+    args: &InstallSkillsArgs,
+    cwd: &Path,
+    home: Option<&Path>,
+    appdata: Option<&Path>,
+    platform: SkillHostPlatform,
 ) -> Result<Vec<TargetRoot>> {
     if let Some(target_dir) = &args.target_dir {
         return Ok(vec![TargetRoot::new(target_dir.clone())]);
@@ -95,24 +114,79 @@ fn resolve_target_roots(
 
     let roots = match args.agent {
         InstallSkillsAgent::ClaudeCode => {
-            vec![agent_root(args.scope, SkillRootKind::Claude, cwd, home)?]
+            vec![agent_root(
+                args.scope,
+                SkillRootKind::Claude,
+                cwd,
+                home,
+                appdata,
+                platform,
+            )?]
         }
         InstallSkillsAgent::Agents => {
-            vec![agent_root(args.scope, SkillRootKind::Agents, cwd, home)?]
+            vec![agent_root(
+                args.scope,
+                SkillRootKind::Agents,
+                cwd,
+                home,
+                appdata,
+                platform,
+            )?]
+        }
+        InstallSkillsAgent::Devin => {
+            vec![agent_root(
+                args.scope,
+                SkillRootKind::Devin,
+                cwd,
+                home,
+                appdata,
+                platform,
+            )?]
         }
         InstallSkillsAgent::Both => vec![
-            agent_root(args.scope, SkillRootKind::Claude, cwd, home)?,
-            agent_root(args.scope, SkillRootKind::Agents, cwd, home)?,
+            agent_root(
+                args.scope,
+                SkillRootKind::Claude,
+                cwd,
+                home,
+                appdata,
+                platform,
+            )?,
+            agent_root(
+                args.scope,
+                SkillRootKind::Agents,
+                cwd,
+                home,
+                appdata,
+                platform,
+            )?,
         ],
     };
 
     Ok(roots.into_iter().map(TargetRoot::new).collect())
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+enum SkillHostPlatform {
+    Windows,
+    Other,
+}
+
+impl SkillHostPlatform {
+    fn current() -> Self {
+        if cfg!(windows) {
+            Self::Windows
+        } else {
+            Self::Other
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
 enum SkillRootKind {
     Claude,
     Agents,
+    Devin,
 }
 
 fn agent_root(
@@ -120,7 +194,18 @@ fn agent_root(
     kind: SkillRootKind,
     cwd: &Path,
     home: Option<&Path>,
+    appdata: Option<&Path>,
+    platform: SkillHostPlatform,
 ) -> Result<PathBuf> {
+    if scope == InstallSkillsScope::Global
+        && kind == SkillRootKind::Devin
+        && platform == SkillHostPlatform::Windows
+    {
+        let appdata = appdata
+            .context("could not locate %APPDATA% for global Devin skill install on Windows")?;
+        return Ok(appdata.join("devin").join(SKILLS_DIR));
+    }
+
     let base = match scope {
         InstallSkillsScope::Project => cwd,
         InstallSkillsScope::Global => {
@@ -130,6 +215,7 @@ fn agent_root(
     let agent_dir = match kind {
         SkillRootKind::Claude => CLAUDE_SKILL_DIR,
         SkillRootKind::Agents => AGENTS_SKILL_DIR,
+        SkillRootKind::Devin => DEVIN_SKILL_DIR,
     };
     Ok(base.join(agent_dir).join(SKILLS_DIR))
 }
@@ -259,6 +345,14 @@ mod tests {
         .unwrap();
         assert_eq!(root_names(&project_agents), ["/repo/.agents/skills"]);
 
+        let project_devin = resolve_target_roots(
+            &args(InstallSkillsScope::Project, InstallSkillsAgent::Devin),
+            cwd,
+            Some(home),
+        )
+        .unwrap();
+        assert_eq!(root_names(&project_devin), ["/repo/.devin/skills"]);
+
         let project_both = resolve_target_roots(
             &args(InstallSkillsScope::Project, InstallSkillsAgent::Both),
             cwd,
@@ -280,6 +374,52 @@ mod tests {
             root_names(&global_both),
             ["/home/alice/.claude/skills", "/home/alice/.agents/skills"]
         );
+
+        let global_devin = resolve_target_roots(
+            &args(InstallSkillsScope::Global, InstallSkillsAgent::Devin),
+            cwd,
+            Some(home),
+        )
+        .unwrap();
+        assert_eq!(root_names(&global_devin), ["/home/alice/.devin/skills"]);
+    }
+
+    #[test]
+    fn devin_global_skill_root_matches_confirmed_windows_path() {
+        let cwd = Path::new("/repo");
+        let home = Path::new("/home/alice");
+        let appdata = Path::new("C:/Users/Alice/AppData/Roaming");
+
+        let global_devin = resolve_target_roots_for_platform(
+            &args(InstallSkillsScope::Global, InstallSkillsAgent::Devin),
+            cwd,
+            Some(home),
+            Some(appdata),
+            SkillHostPlatform::Windows,
+        )
+        .unwrap();
+
+        assert_eq!(
+            root_names(&global_devin),
+            ["C:/Users/Alice/AppData/Roaming/devin/skills"]
+        );
+    }
+
+    #[test]
+    fn devin_global_skill_root_requires_appdata_on_windows() {
+        let cwd = Path::new("/repo");
+        let home = Path::new("/home/alice");
+
+        let err = resolve_target_roots_for_platform(
+            &args(InstallSkillsScope::Global, InstallSkillsAgent::Devin),
+            cwd,
+            Some(home),
+            None,
+            SkillHostPlatform::Windows,
+        )
+        .unwrap_err();
+
+        assert!(err.to_string().contains("%APPDATA%"));
     }
 
     #[test]
@@ -313,6 +453,22 @@ mod tests {
                 .iter()
                 .all(|report| report.outcome == ApplyOutcome::NoOp)
         );
+    }
+
+    #[test]
+    fn install_writes_managed_skills_to_devin_root() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join(".devin/skills");
+        let reports = install_managed_skills(&[TargetRoot::new(root.clone())], false).unwrap();
+
+        assert_eq!(reports.len(), MANAGED_SKILLS.len());
+        for skill in MANAGED_SKILLS {
+            let path = root.join(skill.relative_path);
+            let content = fs::read_to_string(&path)
+                .unwrap_or_else(|err| panic!("expected Devin skill {}: {err}", path.display()));
+            assert!(content.contains(MANAGED_MARKER));
+            assert!(content.contains(skill.description));
+        }
     }
 
     #[test]

@@ -9,7 +9,7 @@ path (docker + Claude Code). This page covers everything else:
 - [Arch Linux native packages (AUR)](#arch-linux-native-packages-aur)
   (systemd system service or user service)
 - [Configuring other agent CLIs](#configuring-other-agent-clis)
-  (Codex, OpenCode, OMP, Pi, Cursor, Claude Desktop, Gemini CLI, Antigravity CLI, Grok Build CLI, Zero, OpenClaw, VS Code Copilot)
+  (Codex, Devin CLI, OpenCode, OMP, Pi, Cursor, Claude Desktop, Gemini CLI, Antigravity CLI, Grok Build CLI, Zero, OpenClaw, VS Code Copilot)
 - [Installing hooks without docker](#installing-hooks-without-docker)
   (curl-based installer)
 - [Running ai-memory without docker](#running-ai-memory-without-docker)
@@ -488,12 +488,12 @@ Each agent CLI needs two things:
    Without this, the agent can still query memory but capture
    becomes manual.
 
-Claude Desktop is MCP-only today. Claude Code, Codex, OpenCode, OMP,
-Cursor, Gemini CLI, Antigravity CLI, Grok Build CLI, and OpenClaw have lifecycle capture paths through
+Claude Desktop is MCP-only today. Claude Code, Codex, Devin CLI, OpenCode,
+OMP, Cursor, Gemini CLI, Antigravity CLI, Grok Build CLI, and OpenClaw have lifecycle capture paths through
 `install-hooks`.
 
 > **Two-step hook install pattern.** Claude Code, Codex, Cursor,
-> Gemini CLI, Antigravity CLI, and Grok Build CLI use shell/PowerShell hook scripts: (1) `docker cp` the
+> Gemini CLI, Antigravity CLI, Grok Build CLI, and Devin CLI use shell/PowerShell hook scripts: (1) `docker cp` the
 > bundled scripts to your home dir, (2) `docker run --rm install-hooks`
 > to render the config snippet.
 > On native Windows, Claude Code is the exception to the PowerShell default:
@@ -533,6 +533,39 @@ auto-improvement eligibility for the current project, run:
 ai-memory finalize-session
 # add --all to close every matching open Codex session in this workspace/project
 ```
+
+### Devin CLI
+
+Devin uses `~/.devin/config.json` for MCP servers and `~/.devin/hooks.v1.json`
+for lifecycle hooks by default. If you prefer one combined Devin config file,
+pass `--config-file ~/.devin/config.json` to `install-hooks`; ai-memory then
+merges the hook entries under that file's `hooks` key.
+
+```bash
+ai-memory install-mcp --client devin --apply \
+    --server-url "http://homelab:49374/mcp" \
+    --auth-token "$TOKEN"
+
+ai-memory install-hooks --agent devin --apply \
+    --server-url "http://homelab:49374" \
+    --auth-token "$TOKEN"
+
+ai-memory install-skills --agent devin
+```
+
+Devin's hook vocabulary is close to Claude Code's, with two important
+differences:
+
+- Devin emits `PostCompaction` after compaction and includes a `summary` field;
+  ai-memory records it as `post-compaction`.
+- Devin does not expose subagent start/stop hooks, so ai-memory cannot capture
+  nested subagent boundaries for Devin.
+
+The `SessionStart` hook injects pending handoffs through Devin's
+`hookSpecificOutput.additionalContext`. Real Devin `SessionStart` and
+`PostToolUse` payloads may omit `session_id` and `cwd`; ai-memory derives stable
+session/cwd context from its hook state and process environment so those events
+are still captured.
 
 ### OpenCode
 
@@ -1057,7 +1090,7 @@ without that marker are preserved unless you explicitly force replacement.
 |---|---|
 | `--no-skills` | Refresh only the markered instruction block. |
 | `--skills-scope <scope>` | Choose project-local or user-global skill roots. Values: `project`, `global`. Defaults to `project`. |
-| `--skills-agent <agent>` | Choose `.claude/skills`, `.agents/skills`, or both. Values: `claude-code`, `agents`, `both`. By default, `CLAUDE.md` targets imply `claude-code`, `AGENTS.md` targets imply `agents`, and both instruction files imply `both`. |
+| `--skills-agent <agent>` | Choose `.claude/skills`, `.agents/skills`, `.devin/skills`, or both Claude/Agents roots. Values: `claude-code`, `agents`, `devin`, `both`. By default, `CLAUDE.md` targets imply `claude-code`, `AGENTS.md` targets imply `agents`, and both instruction files imply `both`. |
 | `--skills-target-dir <dir>` | Write managed skill directories below an explicit root instead of inferring from scope and agent. |
 | `--skills-force` | Replace unmanaged same-name skills during `install-instructions`; without it, they are left untouched and the command exits with an actionable error. |
 
@@ -1067,6 +1100,7 @@ Agent Skill files need a refresh:
 ```bash
 ai-memory install-skills
 ai-memory install-skills --scope global --agent agents
+ai-memory install-skills --scope global --agent devin
 ai-memory install-skills --agent both --print
 ai-memory install-skills --target-dir .custom/skills --force
 ```
@@ -1076,17 +1110,17 @@ ai-memory install-skills --target-dir .custom/skills --force
 | Flag | Meaning |
 |---|---|
 | `--scope <scope>` | Install into this project or the current user's global skill roots. Values: `project`, `global`. Defaults to `project`. |
-| `--agent <agent>` | Install into Claude Code's skill root, the cross-agent skill root, or both. Values: `claude-code`, `agents`, `both`. Defaults to `claude-code`. |
+| `--agent <agent>` | Install into Claude Code's skill root, the cross-agent skill root, Devin's skill root, or both Claude/Agents roots. Values: `claude-code`, `agents`, `devin`, `both`. Defaults to `claude-code`. |
 | `--target-dir <dir>` | Write managed skill directories below an explicit root; `--scope` and `--agent` are ignored. |
 | `--print` | Print target paths and `SKILL.md` contents without writing files. |
 | `--force` | Replace unmanaged same-name skills; without it, user-authored same-name skills are preserved. |
 
 Default skill target roots:
 
-| Scope | `--agent claude-code` | `--agent agents` |
-|---|---|---|
-| `project` | `.claude/skills` | `.agents/skills` |
-| `global` | `~/.claude/skills` | `~/.agents/skills` |
+| Scope | `--agent claude-code` | `--agent agents` | `--agent devin` |
+|---|---|---|---|
+| `project` | `.claude/skills` | `.agents/skills` | `.devin/skills` |
+| `global` | `~/.claude/skills` | `~/.agents/skills` | Windows: `%APPDATA%\devin\skills`; non-Windows: `~/.devin/skills` |
 
 Each managed skill is written as `<root>/<skill-name>/SKILL.md`.
 

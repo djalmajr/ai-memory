@@ -2571,6 +2571,7 @@ mod tests {
             AgentKind::Omp,
             AgentKind::Pi,
             AgentKind::Grok,
+            AgentKind::Devin,
             AgentKind::Other,
         ] {
             let sid = SessionId::new();
@@ -3545,6 +3546,113 @@ mod tests {
             "V25 must recreate the V22 scheduler/session pairing trigger"
         );
 
+        let fk_violations: i64 = conn
+            .query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(fk_violations, 0, "V25 must leave foreign keys clean");
+    }
+
+    #[test]
+    fn v28_adds_devin_and_preserves_sessions_invariants_on_upgraded_db() {
+        use ai_memory_core::{AgentKind, NewSession, SessionId};
+
+        let tmp = TempDir::new().unwrap();
+        let db_path = tmp.path().join("test.sqlite");
+        let ws;
+        let proj;
+        let existing_sid = SessionId::new();
+
+        {
+            let mut conn = Connection::open(&db_path).unwrap();
+            conn.pragma_update(None, "foreign_keys", "OFF").unwrap();
+            crate::migrations::run_to(&mut conn, 25).unwrap();
+            conn.pragma_update(None, "foreign_keys", "ON").unwrap();
+            ws = get_or_create_workspace(&mut conn, "default").unwrap();
+            proj = get_or_create_project(&mut conn, &ws, "scratch", None).unwrap();
+            begin_session(
+                &mut conn,
+                &NewSession {
+                    id: existing_sid,
+                    workspace_id: ws,
+                    project_id: proj,
+                    agent_kind: AgentKind::ClaudeCode,
+                    cwd: None,
+                },
+            )
+            .unwrap();
+        }
+
+        // Run through V26 (Zero) and V27 (unrelated data repair) too, not
+        // just straight to V28: this proves the whole upgrade chain composes
+        // on a pre-V26 database, not just V28 applied in isolation.
+        let mut conn = Connection::open(&db_path).unwrap();
+        conn.pragma_update(None, "foreign_keys", "OFF").unwrap();
+        crate::migrations::run_to(&mut conn, 28).unwrap();
+        conn.pragma_update(None, "foreign_keys", "ON").unwrap();
+
+        begin_session(
+            &mut conn,
+            &NewSession {
+                id: SessionId::new(),
+                workspace_id: ws,
+                project_id: proj,
+                agent_kind: AgentKind::Devin,
+                cwd: None,
+            },
+        )
+        .unwrap();
+
+        let session_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM sessions", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(session_count, 2, "V28 must preserve existing sessions");
+
+        let index_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master \
+                 WHERE type = 'index' \
+                   AND name IN ('idx_sessions_recent', 'idx_sessions_project', 'idx_sessions_started_at', 'idx_sessions_scope_ended')",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(index_count, 4, "V28 must recreate sessions indexes");
+
+        let trigger_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master \
+                 WHERE type = 'trigger' AND name = 'sessions_ws_proj_pairing_ai'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            trigger_count, 1,
+            "V28 must recreate the V18 pairing trigger"
+        );
+
+        let scheduler_trigger_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master \
+                 WHERE type = 'trigger' AND name = 'auto_improve_scheduler_claims_session_pairing_ai'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            scheduler_trigger_count, 1,
+            "V28 must recreate the V22 scheduler/session pairing trigger"
+        );
+
+        let fk_violations: i64 = conn
+            .query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(fk_violations, 0, "V28 must leave foreign keys clean");
+
         let other_ws = get_or_create_workspace(&mut conn, "other").unwrap();
         let other_proj =
             get_or_create_project(&mut conn, &other_ws, "other-project", None).unwrap();
@@ -3554,7 +3662,7 @@ mod tests {
                 id: SessionId::new(),
                 workspace_id: ws,
                 project_id: other_proj,
-                agent_kind: AgentKind::Pi,
+                agent_kind: AgentKind::Devin,
                 cwd: None,
             },
         )
@@ -3562,7 +3670,7 @@ mod tests {
         assert!(
             err.to_string()
                 .contains("sessions.workspace_id does not match"),
-            "pairing trigger must reject split-brain sessions after V25: {err}"
+            "pairing trigger must reject split-brain sessions after V28: {err}"
         );
 
         let fk_violations: i64 = conn
@@ -3570,7 +3678,10 @@ mod tests {
                 r.get(0)
             })
             .unwrap();
-        assert_eq!(fk_violations, 0, "V25 must leave foreign keys clean");
+        assert_eq!(
+            fk_violations, 0,
+            "V28 must leave foreign keys clean after pairing test"
+        );
     }
 
     /// V19 is idempotent: re-running on a repaired DB is a no-op.

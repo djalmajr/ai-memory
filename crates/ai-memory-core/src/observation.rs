@@ -27,6 +27,8 @@ pub enum ObservationKind {
     PostToolUse,
     /// Compaction event (context window pressure).
     PreCompact,
+    /// Post-compaction event (Devin-specific, after context compaction).
+    PostCompaction,
     /// Agent emitted a notification.
     Notification,
     /// Agent finished its turn.
@@ -47,6 +49,7 @@ impl ObservationKind {
             Self::PreToolUse => "pre-tool-use",
             Self::PostToolUse => "post-tool-use",
             Self::PreCompact => "pre-compact",
+            Self::PostCompaction => "post-compaction",
             Self::Notification => "notification",
             Self::Stop => "stop",
             Self::SessionEnd => "session-end",
@@ -65,6 +68,7 @@ impl std::str::FromStr for ObservationKind {
             "pre-tool-use" | "pre_tool_use" | "PreToolUse" => Ok(Self::PreToolUse),
             "post-tool-use" | "post_tool_use" | "PostToolUse" => Ok(Self::PostToolUse),
             "pre-compact" | "pre_compact" | "PreCompact" => Ok(Self::PreCompact),
+            "post-compaction" | "post_compaction" | "PostCompaction" => Ok(Self::PostCompaction),
             "notification" | "Notification" => Ok(Self::Notification),
             "stop" | "Stop" => Ok(Self::Stop),
             "session-end" | "session_end" | "SessionEnd" => Ok(Self::SessionEnd),
@@ -158,6 +162,7 @@ mod tests {
             ObservationKind::PreToolUse,
             ObservationKind::PostToolUse,
             ObservationKind::PreCompact,
+            ObservationKind::PostCompaction,
             ObservationKind::Notification,
             ObservationKind::Stop,
             ObservationKind::SessionEnd,
@@ -176,6 +181,10 @@ mod tests {
         assert_eq!(
             "session_start".parse::<ObservationKind>().unwrap(),
             ObservationKind::SessionStart,
+        );
+        assert_eq!(
+            "PostCompaction".parse::<ObservationKind>().unwrap(),
+            ObservationKind::PostCompaction,
         );
     }
 }

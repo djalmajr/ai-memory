@@ -37,7 +37,7 @@ use anyhow::{Context, Result, bail};
 use crate::cli::{AgentChoice, SetupAgentArgs};
 use crate::commands::render_shared::{
     ANTIGRAVITY_LIFECYCLE_EVENTS, ANTIGRAVITY_TOOL_EVENTS, CODEX_PROFILE, CURSOR_PROFILE,
-    GEMINI_PROFILE, build_claude_code_payload, build_grok_payload,
+    GEMINI_PROFILE, build_claude_code_payload, build_devin_payload, build_grok_payload,
     hook_script_for_current_platform,
 };
 use crate::config::{Config, DEFAULT_SERVER_URL};
@@ -129,6 +129,7 @@ pub fn run(config: &Config, args: SetupAgentArgs) -> Result<()> {
     match args.agent {
         AgentChoice::ClaudeCode => emit_claude_code(&emit_root, &args)?,
         AgentChoice::Grok => emit_grok(&emit_root, &args)?,
+        AgentChoice::Devin => emit_devin(&emit_root, &args)?,
         AgentChoice::Codex => emit_other(&emit_root, agent_sub, &args, &[CODEX_PROFILE.events]),
         AgentChoice::Cursor => emit_other(&emit_root, agent_sub, &args, &[CURSOR_PROFILE.events]),
         AgentChoice::GeminiCli => {
@@ -276,6 +277,37 @@ fn emit_grok(emit_root: &Path, args: &SetupAgentArgs) -> Result<()> {
     Ok(())
 }
 
+fn emit_devin(emit_root: &Path, args: &SetupAgentArgs) -> Result<()> {
+    print!("{}", render_devin_setup_output(emit_root, args)?);
+    Ok(())
+}
+
+fn render_devin_setup_output(emit_root: &Path, args: &SetupAgentArgs) -> Result<String> {
+    let payload = build_devin_payload(emit_root, &args.server_url, args.auth_token.as_deref());
+    let serialized =
+        serde_json::to_string_pretty(&payload).context("serializing Devin hook config")?;
+    let mut out = String::new();
+    out.push_str(
+        "# Devin CLI — write to ~/.devin/hooks.v1.json or ~/.devin/config.json hooks key\n",
+    );
+    out.push_str("# Hook scripts (must be reachable from the host that runs Devin):\n");
+    out.push_str(&format!("#   {}\n", emit_root.display()));
+    out.push_str(&format!("# AI-memory server: {}\n", args.server_url));
+    if args.auth_token.is_some() {
+        out.push_str("# Auth: AI_MEMORY_AUTH_TOKEN embedded in each hook command below.\n");
+        out.push_str(
+            "#       Treat ~/.devin/hooks.v1.json or ~/.devin/config.json as sensitive (chmod 600).\n",
+        );
+    }
+    out.push_str(
+        "# NOTE: Devin consumes the handoff via hookSpecificOutput.additionalContext on SessionStart.\n",
+    );
+    out.push('\n');
+    out.push_str(&serialized);
+    out.push('\n');
+    Ok(out)
+}
+
 fn emit_other(
     emit_root: &Path,
     label: &str,
@@ -323,13 +355,21 @@ fn copy_support_hook_scripts(source_dir: &Path, dest_dir: &Path) -> Result<()> {
     let Some(source_hooks_root) = source_dir.parent() else {
         return Ok(());
     };
+    let Some(dest_hooks_root) = dest_dir.parent() else {
+        return Ok(());
+    };
+    let shared_lib = source_hooks_root.join("_lib.sh");
+    if shared_lib.is_file() {
+        let to = dest_hooks_root.join("_lib.sh");
+        fs::copy(&shared_lib, &to)
+            .with_context(|| format!("copying {} → {}", shared_lib.display(), to.display()))?;
+    }
+
     let source_lib = source_hooks_root.join("lib");
     if !source_lib.is_dir() {
         return Ok(());
     }
-    let Some(dest_hooks_root) = dest_dir.parent() else {
-        return Ok(());
-    };
+
     let dest_lib = dest_hooks_root.join("lib");
     fs::create_dir_all(&dest_lib)
         .with_context(|| format!("creating hook support dir {}", dest_lib.display()))?;
@@ -460,6 +500,85 @@ mod tests {
         run(&Config::default(), args).unwrap();
 
         assert!(!tmp.path().join("hooks").exists());
+    }
+
+    #[test]
+    fn devin_setup_emits_script_hook_config() {
+        let args = SetupAgentArgs {
+            agent: AgentChoice::Devin,
+            to: PathBuf::from("/container/hooks"),
+            host_prefix: Some(PathBuf::from("/host/hooks")),
+            server_url: "http://127.0.0.1:49374".into(),
+            auth_token: Some("token-for-test".into()),
+            source: None,
+        };
+        let emit_root = Path::new("/host/hooks/devin");
+
+        let rendered = render_devin_setup_output(emit_root, &args).unwrap();
+
+        assert!(rendered.contains("# Devin CLI"));
+        assert!(rendered.contains("~/.devin/hooks.v1.json"));
+        assert!(rendered.contains("hookSpecificOutput.additionalContext"));
+        assert!(rendered.contains("AI_MEMORY_AUTH_TOKEN"));
+
+        let json_start = rendered.find('{').expect("rendered Devin config JSON");
+        let parsed: serde_json::Value = serde_json::from_str(&rendered[json_start..]).unwrap();
+        let hooks = parsed["hooks"].as_object().expect("hooks object");
+        assert!(hooks["SessionStart"].is_array());
+        assert!(hooks["PostCompaction"].is_array());
+        assert!(hooks.get("PreCompact").is_none());
+        assert!(hooks.get("SubagentStart").is_none());
+        assert!(hooks.get("SubagentStop").is_none());
+
+        let session_start = hooks["SessionStart"][0]["hooks"][0]["command"]
+            .as_str()
+            .unwrap();
+        assert!(session_start.contains("/host/hooks/devin/session-start.sh"));
+        // Script-mode handlers inline env vars into the command string
+        // itself (see `claude_code_payload_embeds_auth_token_when_provided`
+        // in render_shared.rs) rather than using a separate `env` field.
+        assert!(
+            session_start.contains("AI_MEMORY_AUTH_TOKEN=token-for-test"),
+            "command should inline the auth token; got: {session_start}"
+        );
+
+        let post_compaction = hooks["PostCompaction"][0]["hooks"][0]["command"]
+            .as_str()
+            .unwrap();
+        assert!(post_compaction.contains("/host/hooks/devin/post-compaction.sh"));
+    }
+
+    #[test]
+    fn devin_setup_copies_event_scripts_and_shared_lib() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let source_root = tmp.path().join("source");
+        let source_devin = source_root.join("devin");
+        fs::create_dir_all(&source_devin).unwrap();
+        fs::write(
+            source_devin.join("session-start.sh"),
+            "#!/bin/sh\n. \"$(dirname \"$0\")/../_lib.sh\"\n",
+        )
+        .unwrap();
+        fs::write(
+            source_root.join("_lib.sh"),
+            "ai_memory_json_string() { cat; }\n",
+        )
+        .unwrap();
+
+        let dest = tmp.path().join("dest");
+        let args = SetupAgentArgs {
+            agent: AgentChoice::Devin,
+            to: dest.clone(),
+            host_prefix: None,
+            server_url: "http://127.0.0.1:49374".into(),
+            auth_token: None,
+            source: Some(source_root),
+        };
+
+        run(&Config::default(), args).unwrap();
+
+        assert!(dest.join("devin/session-start.sh").exists());
+        assert!(dest.join("_lib.sh").exists());
     }
 
     #[test]
