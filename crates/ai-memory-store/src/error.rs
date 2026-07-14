@@ -19,6 +19,28 @@ pub enum StoreError {
     #[error("migration: {0}")]
     Migration(#[from] refinery::Error),
 
+    /// The store's schema is newer than this binary: an applied migration is
+    /// absent from the compiled-in set (refinery reports this as
+    /// `MissingVersion`). The data was written by a newer ai-memory build than
+    /// the one now running, so the store is left untouched rather than opened
+    /// against a schema this binary does not understand. This replaces
+    /// refinery's misleading raw wording ("migration V… is missing from the
+    /// filesystem"), which reads as if a file were deleted.
+    #[error(
+        "memory database schema is newer than this ai-memory build: the store \
+         has migration {applied} applied, but this build only ships migrations \
+         through V{supported}. Run an ai-memory release at least as new as the \
+         one that wrote this data; a newer store cannot be opened by an older \
+         binary."
+    )]
+    DataSchemaAhead {
+        /// The applied migration this binary does not know about, formatted as
+        /// `V{version} ({name})` (e.g. `V28 (sessions_devin_agent_kind)`).
+        applied: String,
+        /// The highest schema version this binary ships.
+        supported: u32,
+    },
+
     /// I/O failed (e.g. opening the DB file).
     #[error(transparent)]
     Io(#[from] std::io::Error),

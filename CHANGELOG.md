@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- Opening a store whose schema is *newer* than the running binary now fails
+  with an actionable error instead of refinery's raw "migration V… is missing
+  from the filesystem" wording. When an applied migration is absent from the
+  binary's compiled-in set (the data was migrated by a newer ai-memory build),
+  the store layer now returns `DataSchemaAhead`, which names the offending
+  migration, reports the highest schema version this build ships, and tells the
+  operator to run a build at least as new as the one that wrote the data. Every
+  other migration failure is unchanged.
+
 ## [1.13.0] - 2026-07-14
 
 ### Fixed
