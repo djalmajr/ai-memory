@@ -19,9 +19,9 @@
 This page documents how to register ai-memory as an MCP server with
 agent CLIs beyond the README quick start.
 
-Claude Code, OpenAI Codex, Cursor, Gemini CLI, Antigravity CLI, Grok Build CLI, Zero, OpenClaw, OpenCode, and
+Claude Code, OpenAI Codex, Devin CLI, Cursor, Gemini CLI, Antigravity CLI, Grok Build CLI, Zero, OpenClaw, OpenCode, and
 OMP have automatic capture integrations (shell/PowerShell hooks for
-Claude Code / Codex / Cursor / Gemini CLI / Antigravity CLI / Grok Build CLI, TypeScript plugin/extension
+Claude Code / Codex / Devin CLI / Cursor / Gemini CLI / Antigravity CLI / Grok Build CLI, TypeScript plugin/extension
 files for OpenClaw / OpenCode / OMP) and are covered in the
 [main README](../README.md#quick-start). On native Windows, Claude Code uses
 Git Bash `.sh` hooks rather than the PowerShell default used by other
@@ -447,6 +447,68 @@ capture and session-end handoff *creation* work, but handoff *injection*
 does not — ask Zero to call `memory_handoff_accept` at the start of a
 resumed session.
 
+## Devin CLI
+
+Devin manages MCP servers in `~/.devin/config.json` under `mcpServers`:
+
+```bash
+ai-memory install-mcp --client devin --apply \
+    --server-url "http://homelab:49374/mcp" --auth-token "$TOKEN"
+```
+
+which merges:
+
+```json
+{
+  "mcpServers": {
+    "ai-memory": {
+      "url": "http://homelab:49374/mcp",
+      "transport": "http",
+      "headers": { "Authorization": "Bearer <token>" }
+    }
+  }
+}
+```
+
+Lifecycle capture is separate:
+
+```bash
+ai-memory install-hooks --agent devin --apply \
+    --server-url "http://homelab:49374" --auth-token "$TOKEN"
+```
+
+By default this writes `~/.devin/hooks.v1.json`, whose root object is the
+event map. If you want the hook entries inside `~/.devin/config.json` instead,
+pass that path with `--config-file`; ai-memory then merges them under the
+`hooks` key.
+
+Devin's supported lifecycle events are `SessionStart`, `UserPromptSubmit`,
+`PreToolUse`, `PostToolUse`, `PostCompaction`, `Stop`, and `SessionEnd`.
+`PostCompaction` is a Devin post-compaction event with a `summary` field; it is
+not Claude Code's `PreCompact`. Devin does not currently expose subagent
+start/stop hooks, so there is no Devin subagent capture surface to install.
+
+Session-start handoff injection is built in: the generated Devin SessionStart
+hook returns `hookSpecificOutput.additionalContext` when a pending handoff is
+available.
+
+Real Devin hook payloads may omit `session_id` and `cwd`; the installed hooks
+fill both in:
+
+- **cwd** — the payload's `cwd` wins when present, then the
+  `DEVIN_PROJECT_DIR` environment variable (when Devin's launcher provides
+  it), then the hook process working directory.
+- **session id** — when the payload has none, the hook mints one at
+  `SessionStart`, stores it in a single per-host slot
+  (`<data-dir>/hook-state/devin-session-id`), reuses it for every later
+  event, and clears it at `SessionEnd`. Set `AI_MEMORY_SESSION_ID` in the
+  hook environment to pin an externally managed run id instead. Because the
+  slot is per host+agent, two Devin sessions running *concurrently* on the
+  same machine share it — the newest `SessionStart` wins and earlier
+  sessions' remaining events are attributed to it (same graceful-degradation
+  stance as the single-slot `/handoff` fallback). A payload that does carry
+  its own `session_id` always wins over both.
+
 ## OpenClaw
 
 **Status:** ✅ MCP supported. ✅ Lifecycle hooks supported via a native
@@ -607,8 +669,8 @@ that *starts* the next one - to play nicely with ai-memory:
 
 | Side | What's needed | Covered by |
 |---|---|---|
-| **Ending side** | The agent must create a handoff, either through a true session-end hook, the supported Codex manual finalizer, or by calling `memory_handoff_begin`. | Built-in automatically for Claude Code, Cursor, Gemini CLI, Grok Build CLI, Zero, OpenClaw, OpenCode, and OMP. Codex has no reliable true session-end event, so run `ai-memory finalize-session` when you need the final summary/handoff/auto-improve eligibility. Antigravity CLI has no true session-end event in the current integration, so ask it to call `memory_handoff_begin` before quitting when you need a handoff. |
-| **Starting side** | Either (a) the session-start/plugin path injects the handoff via `/handoff`, OR (b) the model proactively calls `memory_handoff_accept` on first turn. | (a) is built-in for Claude Code / Codex / Cursor / Gemini CLI / Antigravity CLI / OpenClaw / OpenCode / OMP. Grok is explicitly excluded because it ignores SessionStart stdout; use (b). (b) works for any MCP-capable client if you nudge the model - see [the managed routing package](usage.md#install-the-routing-snippet-and-agent-skills). |
+| **Ending side** | The agent must create a handoff, either through a true session-end hook, the supported Codex manual finalizer, or by calling `memory_handoff_begin`. | Built-in automatically for Claude Code, Devin CLI, Cursor, Gemini CLI, Grok Build CLI, Zero, OpenClaw, OpenCode, and OMP. Codex has no reliable true session-end event, so run `ai-memory finalize-session` when you need the final summary/handoff/auto-improve eligibility. Antigravity CLI has no true session-end event in the current integration, so ask it to call `memory_handoff_begin` before quitting when you need a handoff. |
+| **Starting side** | Either (a) the session-start/plugin path injects the handoff via `/handoff`, OR (b) the model proactively calls `memory_handoff_accept` on first turn. | (a) is built-in for Claude Code / Codex / Devin CLI / Cursor / Gemini CLI / Antigravity CLI / OpenClaw / OpenCode / OMP. Grok is explicitly excluded because it ignores SessionStart stdout; use (b). (b) works for any MCP-capable client if you nudge the model - see [the managed routing package](usage.md#install-the-routing-snippet-and-agent-skills). |
 
 OpenCode uses its official `session.deleted` plugin event for true session-end
 delivery. Its generated plugin also sends a deduped best-effort close for any

@@ -468,14 +468,18 @@ fn default_uninstall_removes_managed_skills_across_roots_and_preserves_user_cont
 
     let project_claude = project.path().join(".claude/skills");
     let project_agents = project.path().join(".agents/skills");
+    let project_devin = project.path().join(".devin/skills");
     let global_claude = home.path().join(".claude/skills");
     let global_agents = home.path().join(".agents/skills");
+    let global_devin = home.path().join(".devin/skills");
 
     let managed_paths = [
         project_claude.join(MANAGED_SKILLS[0].relative_path),
         project_agents.join(MANAGED_SKILLS[2].relative_path),
+        project_devin.join(MANAGED_SKILLS[1].relative_path),
         global_claude.join(MANAGED_SKILLS[3].relative_path),
         global_agents.join(MANAGED_SKILLS[4].relative_path),
+        global_devin.join(MANAGED_SKILLS[0].relative_path),
     ];
     for path in &managed_paths {
         write_file(path, &managed_content);
@@ -526,7 +530,11 @@ fn default_uninstall_removes_managed_skills_across_roots_and_preserves_user_cont
         "empty managed skill directory should be removed"
     );
     assert!(
-        !global_claude.exists() && !global_agents.exists(),
+        !project_devin.exists(),
+        "empty Devin skills root should be removed"
+    );
+    assert!(
+        !global_claude.exists() && !global_agents.exists() && !global_devin.exists(),
         "empty global skill roots should be removed"
     );
 }
@@ -779,5 +787,128 @@ fn purge_data_refuses_when_sibling_alive() {
         std::fs::read_to_string(&settings).unwrap(),
         original,
         "no wiring should be removed when the purge is refused up front"
+    );
+}
+
+#[test]
+fn uninstall_devin_hooks_preserves_user_entries() {
+    let _guard = cli_test_lock();
+    let home = tempfile::tempdir().unwrap();
+    let devin = home.path().join(".devin");
+    std::fs::create_dir_all(&devin).unwrap();
+    let hooks = devin.join("hooks.v1.json");
+    std::fs::write(
+        &hooks,
+        r#"{
+          "SessionStart": [
+            {"type":"command","command":"AI_MEMORY_HOOK_URL=http://h /x/session-start.sh"},
+            {"type":"command","command":"/usr/bin/user-session-start"}
+          ],
+          "SessionEnd": [
+            {"type":"command","command":"AI_MEMORY_HOOK_URL=http://h /x/session-end.sh"}
+          ]
+        }"#,
+    )
+    .unwrap();
+
+    let status = command_with_home(home.path())
+        .args(["uninstall", "--apply", "--only", "hooks", "--yes"])
+        .status()
+        .unwrap();
+    assert!(status.success(), "uninstall failed");
+
+    let after: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&hooks).unwrap()).unwrap();
+    assert_eq!(
+        after["SessionStart"].as_array().unwrap().len(),
+        1,
+        "third-party entry in same event must survive"
+    );
+    assert!(after.get("SessionEnd").is_none());
+    assert!(
+        after.get("hooks").is_none(),
+        "hooks.v1.json must remain flat"
+    );
+}
+
+#[test]
+fn uninstall_devin_removes_from_both_targets() {
+    let _guard = cli_test_lock();
+    let home = tempfile::tempdir().unwrap();
+    let devin = home.path().join(".devin");
+    std::fs::create_dir_all(&devin).unwrap();
+
+    // Both hooks.v1.json and config.json with ai-memory entries
+    let hooks_v1 = devin.join("hooks.v1.json");
+    std::fs::write(
+        &hooks_v1,
+        r#"{"SessionStart":[{"type":"command","command":"AI_MEMORY_HOOK_URL=http://h /x/session-start.sh"}]}"#,
+    )
+    .unwrap();
+
+    let config = devin.join("config.json");
+    std::fs::write(
+        &config,
+        r#"{"hooks":{"SessionStart":[{"type":"command","command":"AI_MEMORY_HOOK_URL=http://h /x/session-start.sh"}]}}"#,
+    )
+    .unwrap();
+
+    let status = command_with_home(home.path())
+        .args(["uninstall", "--apply", "--only", "hooks", "--yes"])
+        .status()
+        .unwrap();
+    assert!(status.success(), "uninstall failed");
+
+    let after_hooks: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&hooks_v1).unwrap()).unwrap();
+    assert!(after_hooks.get("SessionStart").is_none());
+    assert!(
+        after_hooks.get("hooks").is_none(),
+        "hooks.v1.json must remain flat"
+    );
+
+    let after_config: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&config).unwrap()).unwrap();
+    assert!(after_config["hooks"].get("SessionStart").is_none());
+}
+
+#[test]
+fn uninstall_mcp_removes_devin_only() {
+    let _guard = cli_test_lock();
+    let home = tempfile::tempdir().unwrap();
+    let devin = home.path().join(".devin");
+    std::fs::create_dir_all(&devin).unwrap();
+    let config = devin.join("config.json");
+    std::fs::write(
+        &config,
+        r#"{
+          "mcpServers": {
+            "ai-memory": {"url":"http://127.0.0.1:49374/mcp"},
+            "other-mcp": {"url":"http://other/mcp"}
+          }
+        }"#,
+    )
+    .unwrap();
+
+    let status = command_with_home(home.path())
+        .args([
+            "uninstall",
+            "--apply",
+            "--only",
+            "mcp",
+            "--mcp-url",
+            "http://127.0.0.1:49374/mcp",
+            "--yes",
+        ])
+        .status()
+        .unwrap();
+    assert!(status.success(), "uninstall failed");
+
+    let after: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&config).unwrap()).unwrap();
+    assert!(after["mcpServers"].get("ai-memory").is_none());
+    assert!(
+        after["mcpServers"].get("other-mcp").is_some(),
+        "third-party MCP server must survive"
     );
 }

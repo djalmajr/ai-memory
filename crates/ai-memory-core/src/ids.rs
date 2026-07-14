@@ -200,6 +200,8 @@ pub enum AgentKind {
     Grok,
     /// Zero coding agent (Gitlawb/zero).
     Zero,
+    /// Devin CLI (Cognition).
+    Devin,
     /// Anything else (manual capture, future agents).
     Other,
 }
@@ -210,7 +212,7 @@ impl AgentKind {
     /// CHECK constraint accepts every kind (the Zero integration shipped
     /// with the enum variant but without the V26 migration and only a
     /// live test caught it). Extend together with the enum.
-    pub const ALL: [Self; 13] = [
+    pub const ALL: [Self; 14] = [
         Self::ClaudeCode,
         Self::Codex,
         Self::OpenCode,
@@ -223,6 +225,7 @@ impl AgentKind {
         Self::Pi,
         Self::Grok,
         Self::Zero,
+        Self::Devin,
         Self::Other,
     ];
 
@@ -242,6 +245,7 @@ impl AgentKind {
             Self::Pi => "pi",
             Self::Grok => "grok",
             Self::Zero => "zero",
+            Self::Devin => "devin",
             Self::Other => "other",
         }
     }
@@ -264,6 +268,7 @@ impl AgentKind {
             "omp" | "oh-my-pi" => Self::Omp,
             "grok" => Self::Grok,
             "zero" => Self::Zero,
+            "devin" => Self::Devin,
             _ => Self::Other,
         }
     }
@@ -336,6 +341,25 @@ mod tests {
     }
 
     #[test]
+    fn agent_kind_devin_round_trips() {
+        assert_eq!(AgentKind::Devin.as_str(), "devin");
+        assert_eq!(AgentKind::from_wire("devin"), AgentKind::Devin);
+        // serde uses rename_all = "kebab-case" → "devin".
+        assert_eq!(
+            serde_json::to_string(&AgentKind::Devin).unwrap(),
+            "\"devin\""
+        );
+        assert_eq!(
+            serde_json::from_str::<AgentKind>("\"devin\"").unwrap(),
+            AgentKind::Devin
+        );
+        // Unknown tags still degrade to Other.
+        assert_eq!(AgentKind::from_wire("devin-2"), AgentKind::Other);
+        // Devin can inject the session-start handoff (consumes additionalContext).
+        assert!(AgentKind::Devin.session_start_injects_handoff());
+    }
+
+    #[test]
     fn page_path_rejects_backslashes_and_windows_prefixes() {
         assert!(PagePath::new(r"notes\secret.md").is_err());
         assert!(PagePath::new(r"C:\Users\me\secret.md").is_err());
@@ -400,5 +424,14 @@ mod tests {
 
         let antigravity = serde_json::to_string(&AgentKind::AntigravityCli).unwrap();
         assert_eq!(antigravity, "\"antigravity-cli\"");
+
+        let devin = serde_json::to_string(&AgentKind::Devin).unwrap();
+        assert_eq!(devin, "\"devin\"");
+        assert_eq!(AgentKind::Devin.as_str(), "devin");
+        assert_eq!(AgentKind::from_wire("devin"), AgentKind::Devin);
+        assert_eq!(
+            serde_json::from_str::<AgentKind>(&devin).unwrap(),
+            AgentKind::Devin
+        );
     }
 }

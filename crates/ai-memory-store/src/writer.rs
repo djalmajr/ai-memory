@@ -68,6 +68,9 @@ pub(crate) enum WriteCmd {
         workspace_id: WorkspaceId,
         project_id: ProjectId,
         path: PagePath,
+        /// Authenticated operator recorded in the `audit_log` row (NULL when
+        /// single-user / unauthenticated).
+        author_id: Option<ai_memory_core::UserId>,
         reply: oneshot::Sender<StoreResult<()>>,
     },
     BeginSession {
@@ -825,12 +828,14 @@ impl WriterHandle {
         workspace_id: WorkspaceId,
         project_id: ProjectId,
         path: PagePath,
+        author_id: Option<ai_memory_core::UserId>,
     ) -> StoreResult<()> {
         let (tx, rx) = oneshot::channel();
         self.send(WriteCmd::DeletePage {
             workspace_id,
             project_id,
             path,
+            author_id,
             reply: tx,
         })
         .await?;
@@ -1099,9 +1104,11 @@ fn worker_loop(mut conn: Connection, mut rx: mpsc::Receiver<WriteCmd>) {
                 workspace_id,
                 project_id,
                 path,
+                author_id,
                 reply,
             } => {
-                let result = ops::delete_page(&conn, workspace_id, project_id, &path);
+                let result =
+                    ops::delete_page(&mut conn, workspace_id, project_id, &path, author_id);
                 send_or_warn(reply, result, "delete_page");
             }
             WriteCmd::UpsertPageBatch { pages, reply } => {

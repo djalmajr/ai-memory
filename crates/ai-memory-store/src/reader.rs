@@ -159,11 +159,11 @@ pub struct StatusCounts {
 /// with no cwd/session anomaly) is not detectable structurally.
 #[derive(Debug, Clone, Serialize)]
 pub struct ContaminationFinding {
-    /// Heuristic that fired: `session_wrong_bucket` | `observation_session_drift`.
+    /// Heuristic that fired: `session_wrong_bucket` (CHECK A).
     pub check: &'static str,
-    /// Confidence — `high` for both structural checks.
+    /// Confidence — `high` for the structural check.
     pub confidence: &'static str,
-    /// Entity kind: `session` | `observation`.
+    /// Entity kind: `session`.
     pub entity_kind: &'static str,
     /// Entity id (lowercase hex of the 16-byte UUID).
     pub entity_id: String,
@@ -171,16 +171,13 @@ pub struct ContaminationFinding {
     pub landed_workspace: String,
     /// Project name the entity actually landed in.
     pub landed_project: String,
-    /// Project the evidence says it belongs to (resolved cwd project for CHECK A,
-    /// the owning session's project for CHECK B).
+    /// Project the evidence says it belongs to (the session's cwd
+    /// prefix-resolution result for CHECK A).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub expected_project: Option<String>,
     /// Originating session cwd — the prefix-resolution evidence (CHECK A).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cwd: Option<String>,
-    /// Owning session id (lowercase hex) — the drift evidence (CHECK B).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub session_id: Option<String>,
 }
 
 /// Per-check counts for an [`ReaderPool::audit_contamination`] run.
@@ -188,8 +185,6 @@ pub struct ContaminationFinding {
 pub struct ContaminationSummary {
     /// Sessions whose cwd prefix-resolves to a different project (CHECK A).
     pub sessions_misbucketed: usize,
-    /// Observations whose project disagrees with their session (CHECK B).
-    pub observations_drifted: usize,
 }
 
 /// Result of [`ReaderPool::audit_contamination`] — advisory, never mutates.
@@ -3873,15 +3868,21 @@ impl ReaderPool {
 
     /// Structural cross-project contamination audit (cheap, SQL-only, no LLM).
     ///
-    /// Two HIGH-precision heuristics:
+    /// One HIGH-precision heuristic:
     /// - **CHECK A** (`session_wrong_bucket`): a session whose `cwd`
     ///   longest-prefix-resolves to a *different* project than the one it landed
     ///   in — the direct signature of the auto-scope bleed bug. Resolved with the
     ///   same prefix and cwd-safety rules as [`Self::find_project_by_cwd_prefix`],
     ///   so the audit never claims a session a live resolve would not.
-    /// - **CHECK B** (`observation_session_drift`): an observation whose
-    ///   `project_id` disagrees with its owning session's. On a healthy DB this
-    ///   is always empty, so a non-empty result is a regression alarm.
+    ///
+    /// Note: an earlier "observation drifted from its session's project" check
+    /// was removed. With per-event cwd resolution, an observation's `project_id`
+    /// is set from the cwd *of that event* — so an agent that legitimately
+    /// `cd`s across repos in one session produces observations whose project
+    /// differs from the session's home project. That is correct attribution,
+    /// not contamination, so the check flagged normal cross-repo work as a false
+    /// positive (and observations carry no cwd of their own to disambiguate).
+    /// CHECK A — anchored on the session's own cwd — remains the precise signal.
     ///
     /// Detects only contamination with a STRUCTURAL trace; purely semantic
     /// mislandings (topic-level, no cwd/session anomaly) are not detectable.
@@ -3904,60 +3905,22 @@ impl ReaderPool {
             None => Vec::new(),
         };
 
-        // One connection: CHECK B findings + the candidate session list + the
-        // valid repo_path prefixes used to resolve CHECK A. Loading prefixes
-        // once avoids a reader query per historical session while preserving the
-        // same path boundary and safety rules as the runtime resolver.
+        // One connection: the candidate session list + the valid repo_path
+        // prefixes used to resolve CHECK A. Loading prefixes once avoids a
+        // reader query per historical session while preserving the same path
+        // boundary and safety rules as the runtime resolver.
         type Candidate = (String, WorkspaceId, ProjectId, String, String, String);
         type Prefix = (WorkspaceId, ProjectId, String, String);
-        let sp_b = scope_params.clone();
         let (mut findings, candidates, prefixes): (
             Vec<ContaminationFinding>,
             Vec<Candidate>,
             Vec<Prefix>,
         ) = self
             .with_conn(move |conn| {
-                let mut findings: Vec<ContaminationFinding> = Vec::new();
-
-                // CHECK B — observation drifted from its owning session.
-                let mut b_sql = String::from(
-                    "SELECT lower(hex(o.id)), lower(hex(o.session_id)), wl.name, pl.name, pe.name \
-                     FROM observations o \
-                     JOIN sessions s ON s.id = o.session_id \
-                     JOIN workspaces wl ON wl.id = o.workspace_id \
-                     JOIN projects pl ON pl.id = o.project_id \
-                     JOIN projects pe ON pe.id = s.project_id \
-                     WHERE o.project_id != s.project_id",
-                );
-                if scoped {
-                    b_sql.push_str(" AND o.workspace_id = ? AND o.project_id = ?");
-                }
-                {
-                    let mut stmt = conn.prepare(&b_sql)?;
-                    let rows = stmt.query_map(params_from_iter(sp_b.iter()), |row| {
-                        Ok((
-                            row.get::<_, String>(0)?,
-                            row.get::<_, String>(1)?,
-                            row.get::<_, String>(2)?,
-                            row.get::<_, String>(3)?,
-                            row.get::<_, String>(4)?,
-                        ))
-                    })?;
-                    for r in rows {
-                        let (id, sess, lws, lproj, eproj) = r?;
-                        findings.push(ContaminationFinding {
-                            check: "observation_session_drift",
-                            confidence: "high",
-                            entity_kind: "observation",
-                            entity_id: id,
-                            landed_workspace: lws,
-                            landed_project: lproj,
-                            expected_project: Some(eproj),
-                            cwd: None,
-                            session_id: Some(sess),
-                        });
-                    }
-                }
+                // CHECK A findings are built after this closure (they need the
+                // repo_path prefixes resolved outside the DB connection); this
+                // closure only gathers the raw inputs.
+                let findings: Vec<ContaminationFinding> = Vec::new();
 
                 // Candidate sessions (cwd present) — resolved outside the conn.
                 let mut s_sql = String::from(
@@ -4095,7 +4058,6 @@ impl ReaderPool {
                     landed_project: landed_proj_name,
                     expected_project: Some(resolved_name.clone()),
                     cwd: Some(cwd),
-                    session_id: None,
                 });
             }
         }
@@ -4104,10 +4066,6 @@ impl ReaderPool {
             sessions_misbucketed: findings
                 .iter()
                 .filter(|f| f.check == "session_wrong_bucket")
-                .count(),
-            observations_drifted: findings
-                .iter()
-                .filter(|f| f.check == "observation_session_drift")
                 .count(),
         };
         Ok(ContaminationReport { summary, findings })

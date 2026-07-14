@@ -22,6 +22,9 @@ pub struct HookQuery {
     /// Project name override (same source as `workspace`). When
     /// `None` the server falls back to `basename(cwd)`.
     pub project: Option<String>,
+    /// Session identifier supplied by a host-side bridge when the agent's
+    /// native hook payload does not include one. Body values still win.
+    pub session_id: Option<String>,
     /// Optional project derivation strategy from `.ai-memory.toml`.
     /// `repo-root` makes the server derive project identity from the
     /// main git repository root instead of `basename(cwd)`.
@@ -59,8 +62,9 @@ pub struct HookEnvelope {
     pub event: HookEvent,
     /// Agent CLI identifier.
     pub agent: AgentKind,
-    /// Session identifier, if found in the body. Required for everything
-    /// except the initial `SessionStart`.
+    /// Session identifier from the body, or from the query string when a
+    /// host-side bridge had to supply it. Required for everything except the
+    /// initial `SessionStart`.
     pub session_id: Option<String>,
     /// Current working directory at the time of the event.
     pub cwd: Option<String>,
@@ -171,6 +175,8 @@ pub enum HookEvent {
     PostToolUse,
     /// Compaction event (context window pressure).
     PreCompact,
+    /// Post-compaction event (Devin-specific, after context compaction).
+    PostCompaction,
     /// Agent emitted a notification.
     Notification,
     /// Agent finished its turn (interactive `/stop` or natural end).
@@ -203,6 +209,7 @@ impl HookEvent {
             "pre-compact" | "pre_compact" | "PreCompact" | "preCompact" | "PreCompress" => {
                 Self::PreCompact
             }
+            "post-compaction" | "post_compaction" | "PostCompaction" => Self::PostCompaction,
             "notification" | "Notification" => Self::Notification,
             "stop" | "Stop" => Self::Stop,
             "session-end" | "session_end" | "SessionEnd" | "sessionEnd" => Self::SessionEnd,
@@ -224,6 +231,7 @@ impl HookEvent {
             Self::PreToolUse => ObservationKind::PreToolUse,
             Self::PostToolUse => ObservationKind::PostToolUse,
             Self::PreCompact => ObservationKind::PreCompact,
+            Self::PostCompaction => ObservationKind::PostCompaction,
             Self::Notification => ObservationKind::Notification,
             Self::Stop => ObservationKind::Stop,
             Self::SessionEnd => ObservationKind::SessionEnd,
@@ -256,7 +264,7 @@ impl HookEnvelope {
         // Codex `sessionId`, and Antigravity CLI uses `conversationId`.
         // JSON keys are case-sensitive, so all spellings must be listed
         // or tool events fail the router's "missing session_id" check.
-        let session_id = extract_string(
+        let body_session_id = extract_string(
             &raw,
             &[
                 "session_id",
@@ -281,6 +289,7 @@ impl HookEnvelope {
                 ],
             )
         });
+        let session_id = body_session_id.or_else(|| query.session_id.filter(|s| !s.is_empty()));
         let body_cwd = extract_string(&raw, &["cwd", "current_dir", "working_dir", "directory"])
             .or_else(|| extract_first_string_array_item(&raw, &["workspacePaths"]))
             .or_else(|| {
@@ -462,6 +471,7 @@ fn best_title_hint(event: HookEvent, raw: &serde_json::Value) -> Option<String> 
                 })
         }
         HookEvent::Notification => extract_string(raw, &["message", "text"]),
+        HookEvent::PostCompaction => extract_string(raw, &["summary"]),
         _ => None,
     }
 }
@@ -553,6 +563,7 @@ fn best_body_excerpt(event: HookEvent, raw: &serde_json::Value) -> Option<String
             Some(format!("tool: {tool}\n---\n{}", truncate_excerpt(&result)))
         }
         HookEvent::Notification => extract_content(raw, &["message", "text"]),
+        HookEvent::PostCompaction => extract_content(raw, &["summary"]),
         _ => None,
     }
 }
@@ -725,6 +736,28 @@ mod tests {
             HookEvent::SessionEnd.to_observation_kind(),
             ObservationKind::SessionEnd
         );
+        assert_eq!(
+            HookEvent::PostCompaction.to_observation_kind(),
+            ObservationKind::PostCompaction
+        );
+    }
+
+    #[test]
+    fn hook_event_parses_post_compaction() {
+        assert_eq!(
+            HookEvent::parse("post-compaction"),
+            HookEvent::PostCompaction
+        );
+        assert_eq!(
+            HookEvent::parse("post_compaction"),
+            HookEvent::PostCompaction
+        );
+        assert_eq!(
+            HookEvent::parse("PostCompaction"),
+            HookEvent::PostCompaction
+        );
+        // Unknown event still maps to Other.
+        assert_eq!(HookEvent::parse("unknown-event"), HookEvent::Other);
     }
 
     #[test]
@@ -762,6 +795,107 @@ mod tests {
         assert_eq!(env.session_id.as_deref(), Some("abc-123"));
         assert_eq!(env.cwd.as_deref(), Some("/tmp/x"));
         assert_eq!(env.title_hint.as_deref(), Some("claude-sonnet-4-6"));
+    }
+
+    #[test]
+    fn envelope_uses_query_session_id_when_body_omits_it() {
+        let q = HookQuery {
+            event: "post-tool-use".into(),
+            agent: Some("devin".into()),
+            session_id: Some("bridge-session-123".into()),
+            ..Default::default()
+        };
+        let raw = serde_json::json!({
+            "hook_event_name": "PostToolUse",
+            "tool_name": "exec",
+            "tool_input": {"command": "ls"},
+            "tool_use_id": "call_c101a272288d400b831e1498",
+            "tool_response": {"success": true, "output": "ok", "error": null}
+        });
+
+        let env = HookEnvelope::from_query_and_body(q, raw);
+
+        assert_eq!(env.event, HookEvent::PostToolUse);
+        assert_eq!(env.agent, AgentKind::Devin);
+        assert_eq!(env.session_id.as_deref(), Some("bridge-session-123"));
+    }
+
+    #[test]
+    fn envelope_body_session_id_wins_over_query_session_id() {
+        let q = HookQuery {
+            event: "post-tool-use".into(),
+            agent: Some("devin".into()),
+            session_id: Some("bridge-session-123".into()),
+            ..Default::default()
+        };
+        let raw = serde_json::json!({
+            "session_id": "body-session-456",
+            "hook_event_name": "PostToolUse",
+            "tool_name": "exec"
+        });
+
+        let env = HookEnvelope::from_query_and_body(q, raw);
+
+        assert_eq!(env.session_id.as_deref(), Some("body-session-456"));
+    }
+
+    #[test]
+    fn envelope_uses_query_cwd_when_body_omits_it() {
+        let q = HookQuery {
+            event: "post-tool-use".into(),
+            agent: Some("devin".into()),
+            cwd: Some("/resolved/from/hook".into()),
+            session_id: Some("bridge-session-123".into()),
+            ..Default::default()
+        };
+        let raw = serde_json::json!({
+            "hook_event_name": "PostToolUse",
+            "tool_name": "exec",
+            "tool_input": {"command": "ls"},
+            "tool_use_id": "call_c101a272288d400b831e1498",
+            "tool_response": {"success": true, "output": "ok", "error": null}
+        });
+
+        let env = HookEnvelope::from_query_and_body(q, raw);
+
+        assert_eq!(env.agent, AgentKind::Devin);
+        assert_eq!(env.session_id.as_deref(), Some("bridge-session-123"));
+        assert_eq!(env.cwd.as_deref(), Some("/resolved/from/hook"));
+    }
+
+    #[test]
+    fn envelope_body_cwd_wins_over_query_cwd() {
+        let q = HookQuery {
+            event: "post-tool-use".into(),
+            agent: Some("devin".into()),
+            cwd: Some("/resolved/from/hook".into()),
+            ..Default::default()
+        };
+        let raw = serde_json::json!({
+            "hook_event_name": "PostToolUse",
+            "cwd": "/native/from/body"
+        });
+
+        let env = HookEnvelope::from_query_and_body(q, raw);
+
+        assert_eq!(env.cwd.as_deref(), Some("/native/from/body"));
+    }
+
+    #[test]
+    fn devin_real_session_start_fixture_has_no_native_session_or_cwd() {
+        let q = HookQuery {
+            event: "session-start".into(),
+            agent: Some("devin".into()),
+            ..Default::default()
+        };
+        let raw = serde_json::json!({
+            "source": "startup"
+        });
+        let env = HookEnvelope::from_query_and_body(q, raw);
+        assert_eq!(env.event, HookEvent::SessionStart);
+        assert_eq!(env.agent, AgentKind::Devin);
+        assert!(env.session_id.is_none());
+        assert!(env.cwd.is_none());
     }
 
     #[test]

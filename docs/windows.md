@@ -6,7 +6,7 @@ agent CLI actually runs.
 ## Rule Of Thumb
 
 Run `install-mcp` and `install-hooks` from the same environment that
-launches Claude Code, Codex, Cursor, Gemini CLI, or another agent.
+launches Claude Code, Codex, Devin CLI, Cursor, Gemini CLI, or another agent.
 
 - If the agent runs inside WSL2, install ai-memory inside WSL2.
 - If the agent runs as a native Windows process, install ai-memory from
@@ -22,8 +22,8 @@ Claude Code invokes its hooks with Claude's direct exec form
 Command](#native-hook-command-claude-code-on-windows). Set
 `AI_MEMORY_HOOK_PLATFORM=windows-bash` to fall back to the older
 `bash -c` + `.sh` Git Bash commands. Other native Windows script-hook
-agents keep the PowerShell `.ps1` default until their harness behavior
-is verified.
+agents, including Devin CLI, keep the current script-command defaults for
+their harness.
 
 ## Scenario A: Everything Inside WSL2
 
@@ -108,11 +108,17 @@ the CLI to render hook commands for the native Windows agent:
   exec form (`command` executable + `args` argv array), no shell — set
   `AI_MEMORY_HOOK_PLATFORM=windows-bash` for the old `bash -c` + `.sh`
   Git Bash path.
-- Other native Windows script-hook agents currently call `powershell.exe` and
-  point at `.ps1` scripts.
+- Other native Windows script-hook agents, including Devin CLI, use their
+  generated script-command hook entries for the selected platform.
 
 Use the matching `--client` / `--agent` values for other clients, for
-example `codex`, `cursor`, or `gemini-cli`.
+example `codex`, `devin`, `cursor`, or `gemini-cli`.
+
+For Devin, `install-mcp --client devin --apply` writes MCP config to
+`%USERPROFILE%\.devin\config.json`. `install-hooks --agent devin --apply`
+writes lifecycle hooks to `%USERPROFILE%\.devin\hooks.v1.json` by default;
+pass `--config-file "%USERPROFILE%\.devin\config.json"` if you want hooks under
+the `hooks` key in Devin's main config file.
 
 ## Scenario C: Prebuilt Release Binary (No Toolchain)
 
@@ -292,7 +298,7 @@ Windows agent builds.
   Claude Code invokes hooks as a direct binary call (no shell) by default;
   `AI_MEMORY_HOOK_PLATFORM=windows-bash` restores the Git Bash `bash -c`
   path. WSL2 Claude Code uses normal WSL `.sh` paths.
-- Codex, OpenCode, Cursor, Gemini CLI, Grok Build CLI, and OpenClaw may each choose different
+- Codex, Devin CLI, OpenCode, Cursor, Gemini CLI, Grok Build CLI, and OpenClaw may each choose different
   Windows config locations or shell execution behavior. ai-memory uses
   the current best-known defaults, but they need validation on real
   installations.
@@ -322,7 +328,8 @@ For native Windows:
 2. Confirm generated hook commands match the agent: Claude Code should use
    the native `"…ai-memory.exe" hook --event …` command (or `bash -c` + `.sh`
    when `AI_MEMORY_HOOK_PLATFORM=windows-bash`); other script-hook agents
-   should use `.ps1` files under your Windows home directory.
+   should use their generated script-command hook entries under your Windows
+   home directory.
 3. Launch the native Windows agent.
 4. Call `memory_status` from the agent.
 5. Send a prompt, then run `ai-memory status` or `ai-memory recent`.

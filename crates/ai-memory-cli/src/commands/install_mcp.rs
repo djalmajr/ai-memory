@@ -48,7 +48,7 @@ enum JsonMcpLocation {
 pub fn run(config: &Config, args: InstallMcpArgs) -> Result<()> {
     let server_url = effective_mcp_server_url(config, &args);
     let args = InstallMcpArgs {
-        server_url,
+        server_url: Some(server_url),
         auth_token: args.auth_token.or_else(|| config.auth.bearer_token.clone()),
         ..args
     };
@@ -67,6 +67,7 @@ pub fn run(config: &Config, args: InstallMcpArgs) -> Result<()> {
         McpClient::Omp => render_omp(&args)?,
         McpClient::AntigravityCli => render_antigravity_cli(&args)?,
         McpClient::Zero => render_zero(&args)?,
+        McpClient::Devin => render_devin(&args)?,
         McpClient::VsCodeCopilot => render_vscode_copilot(&args)?,
     };
     println!("{snippet}");
@@ -74,13 +75,13 @@ pub fn run(config: &Config, args: InstallMcpArgs) -> Result<()> {
 }
 
 fn effective_mcp_server_url(config: &Config, args: &InstallMcpArgs) -> String {
-    if args.server_url != DEFAULT_MCP_URL {
-        return args.server_url.clone();
+    if let Some(url) = &args.server_url {
+        return url.clone();
     }
     if config.server_url_configured() {
         return mcp_server_url_from_base(&config.server_url);
     }
-    args.server_url.clone()
+    DEFAULT_MCP_URL.to_string()
 }
 
 fn mcp_server_url_from_base(server_url: &str) -> String {
@@ -157,6 +158,7 @@ pub(crate) fn mcp_config_path(client: crate::cli::McpClient) -> Result<PathBuf> 
         // to ~/.config; we target the default and --config-file covers
         // non-default XDG setups (same policy as OpenCode above).
         McpClient::Zero => home()?.join(".config").join("zero").join("config.json"),
+        McpClient::Devin => home()?.join(".devin").join("config.json"),
         // VS Code MCP is workspace-scoped by default: `.vscode/mcp.json`
         // at the current workspace root. The user-profile alternative
         // lives under VS Code's profile-specific data dir; use VS
@@ -214,7 +216,8 @@ fn json_mcp_location(client: McpClient) -> Option<JsonMcpLocation> {
         | McpClient::Cursor
         | McpClient::GeminiCli
         | McpClient::Omp
-        | McpClient::AntigravityCli => Some(JsonMcpLocation::RootMcpServers),
+        | McpClient::AntigravityCli
+        | McpClient::Devin => Some(JsonMcpLocation::RootMcpServers),
         McpClient::OpenCode => Some(JsonMcpLocation::RootMcp),
         // Zero's config.json nests servers under `mcp.servers`, the same
         // shape OpenClaw uses.
@@ -306,11 +309,14 @@ fn render_json_mcp_fragment(args: &InstallMcpArgs) -> Result<String> {
 /// `httpUrl` plus optional `headers`. Returns the per-client variant.
 fn build_mcp_entry(args: &InstallMcpArgs) -> Result<serde_json::Value> {
     let bearer = bearer_header_value(args.auth_token.as_deref());
+    // `run()` resolves the URL before dispatch; the fallback only fires for
+    // direct callers (tests, uninstall re-render) that skip that step.
+    let server_url = args.server_url.as_deref().unwrap_or(DEFAULT_MCP_URL);
     let mut entry = serde_json::Map::new();
     match args.client {
         McpClient::ClaudeCode => {
             entry.insert("type".into(), json!("http"));
-            entry.insert("url".into(), json!(args.server_url));
+            entry.insert("url".into(), json!(server_url));
             if let Some(b) = &bearer {
                 entry.insert("headers".into(), json!({"Authorization": b}));
             }
@@ -318,7 +324,7 @@ fn build_mcp_entry(args: &InstallMcpArgs) -> Result<serde_json::Value> {
         McpClient::ClaudeDesktop => {
             // Stdio shim via mcp-remote — Claude Desktop's JSON
             // doesn't accept HTTP transport directly.
-            let mut cmd_args = vec![json!("-y"), json!("mcp-remote"), json!(args.server_url)];
+            let mut cmd_args = vec![json!("-y"), json!("mcp-remote"), json!(server_url)];
             if let Some(b) = &bearer {
                 cmd_args.push(json!("--header"));
                 cmd_args.push(json!("Authorization:${AI_MEMORY_AUTH_HEADER}"));
@@ -328,13 +334,13 @@ fn build_mcp_entry(args: &InstallMcpArgs) -> Result<serde_json::Value> {
             entry.insert("args".into(), serde_json::Value::Array(cmd_args));
         }
         McpClient::Cursor => {
-            entry.insert("url".into(), json!(args.server_url));
+            entry.insert("url".into(), json!(server_url));
             if let Some(b) = &bearer {
                 entry.insert("headers".into(), json!({"Authorization": b}));
             }
         }
         McpClient::GeminiCli => {
-            entry.insert("httpUrl".into(), json!(args.server_url));
+            entry.insert("httpUrl".into(), json!(server_url));
             entry.insert("timeout".into(), json!(GEMINI_MCP_TIMEOUT_MS));
             if let Some(b) = &bearer {
                 entry.insert("headers".into(), json!({"Authorization": b}));
@@ -342,15 +348,22 @@ fn build_mcp_entry(args: &InstallMcpArgs) -> Result<serde_json::Value> {
         }
         McpClient::Omp => {
             entry.insert("type".into(), json!("http"));
-            entry.insert("url".into(), json!(args.server_url));
+            entry.insert("url".into(), json!(server_url));
             entry.insert("enabled".into(), json!(true));
             if let Some(b) = &bearer {
                 entry.insert("headers".into(), json!({"Authorization": b}));
             }
         }
         McpClient::AntigravityCli => {
-            entry.insert("serverUrl".into(), json!(args.server_url));
+            entry.insert("serverUrl".into(), json!(server_url));
             entry.insert("timeout".into(), json!(GEMINI_MCP_TIMEOUT_MS));
+            if let Some(b) = &bearer {
+                entry.insert("headers".into(), json!({"Authorization": b}));
+            }
+        }
+        McpClient::Devin => {
+            entry.insert("url".into(), json!(server_url));
+            entry.insert("transport".into(), json!("http"));
             if let Some(b) = &bearer {
                 entry.insert("headers".into(), json!({"Authorization": b}));
             }
@@ -362,7 +375,7 @@ fn build_mcp_entry(args: &InstallMcpArgs) -> Result<serde_json::Value> {
             // The `mcpServers` key (used by Claude Code/Cursor/Gemini)
             // is silently ignored here — VS Code reads `servers`.
             entry.insert("type".into(), json!("http"));
-            entry.insert("url".into(), json!(args.server_url));
+            entry.insert("url".into(), json!(server_url));
             if let Some(b) = &bearer {
                 entry.insert("headers".into(), json!({"Authorization": b}));
             }
@@ -374,9 +387,10 @@ fn build_mcp_entry(args: &InstallMcpArgs) -> Result<serde_json::Value> {
 
 fn build_mcp_entry_opencode(args: &InstallMcpArgs) -> Result<serde_json::Value> {
     let bearer = bearer_header_value(args.auth_token.as_deref());
+    let server_url = args.server_url.as_deref().unwrap_or(DEFAULT_MCP_URL);
     let mut entry = serde_json::Map::new();
     entry.insert("type".into(), json!("remote"));
-    entry.insert("url".into(), json!(args.server_url));
+    entry.insert("url".into(), json!(server_url));
     entry.insert("enabled".into(), json!(true));
     if let Some(b) = bearer {
         entry.insert("headers".into(), json!({"Authorization": b}));
@@ -386,8 +400,9 @@ fn build_mcp_entry_opencode(args: &InstallMcpArgs) -> Result<serde_json::Value> 
 
 fn build_mcp_entry_openclaw(args: &InstallMcpArgs) -> Result<serde_json::Value> {
     let bearer = bearer_header_value(args.auth_token.as_deref());
+    let server_url = args.server_url.as_deref().unwrap_or(DEFAULT_MCP_URL);
     let mut entry = serde_json::Map::new();
-    entry.insert("url".into(), json!(args.server_url));
+    entry.insert("url".into(), json!(server_url));
     entry.insert("transport".into(), json!("streamable-http"));
     if let Some(b) = bearer {
         entry.insert("headers".into(), json!({"Authorization": b}));
@@ -400,9 +415,10 @@ fn build_mcp_entry_openclaw(args: &InstallMcpArgs) -> Result<serde_json::Value> 
 /// `type: "http"` + `url` + a `headers` map (issue #156).
 fn build_mcp_entry_zero(args: &InstallMcpArgs) -> Result<serde_json::Value> {
     let bearer = bearer_header_value(args.auth_token.as_deref());
+    let server_url = args.server_url.as_deref().unwrap_or(DEFAULT_MCP_URL);
     let mut entry = serde_json::Map::new();
     entry.insert("type".into(), json!("http"));
-    entry.insert("url".into(), json!(args.server_url));
+    entry.insert("url".into(), json!(server_url));
     if let Some(b) = bearer {
         entry.insert("headers".into(), json!({"Authorization": b}));
     }
@@ -470,7 +486,7 @@ fn codex_upsert_mcp_server(
     //     `Authorization = "Bearer ..."`. Codex schema-validates
     //     and uses it as a static auth header.
     let mut server = Table::new();
-    server["url"] = value(args.server_url.clone());
+    server["url"] = value(args.server_url.as_deref().unwrap_or(DEFAULT_MCP_URL));
     // Auto-approve ai-memory's tool calls. Without this, Codex
     // prompts on EVERY tool invocation ("approve memory_query?"
     // "approve memory_briefing?" …) which makes the MCP unusable
@@ -510,14 +526,14 @@ fn render_claude_code(args: &InstallMcpArgs) -> Result<String> {
         format!(
             "claude mcp add --transport http {name} {url} \\\n    --header \"Authorization: {b}\"",
             name = args.name,
-            url = args.server_url,
+            url = args.server_url.as_deref().unwrap_or(DEFAULT_MCP_URL),
             b = b,
         )
     } else {
         format!(
             "claude mcp add --transport http {name} {url}",
             name = args.name,
-            url = args.server_url,
+            url = args.server_url.as_deref().unwrap_or(DEFAULT_MCP_URL),
         )
     };
     let snippet = render_json_mcp_fragment(args)?;
@@ -553,7 +569,7 @@ fn render_codex(args: &InstallMcpArgs) -> String {
          # approval friction makes it unusable otherwise.\n\
          default_tools_approval_mode = \"approve\"\n",
         name = args.name,
-        url = args.server_url,
+        url = args.server_url.as_deref().unwrap_or(DEFAULT_MCP_URL),
     );
     if let Some(b) = bearer_header_value(args.auth_token.as_deref()) {
         out.push_str(&format!(
@@ -657,7 +673,7 @@ fn pi_mcp_render_guidance(args: &InstallMcpArgs) -> String {
          # lifecycle capture and an HTTP MCP bridge that registers tools in Pi.\n\
          ai-memory install-hooks --agent pi --apply --server-url {}{}\n\
          # Restart Pi after installing ~/.pi/agent/extensions/ai-memory.ts.\n",
-        hook_server_url_from_mcp_url(&args.server_url),
+        hook_server_url_from_mcp_url(args.server_url.as_deref().unwrap_or(DEFAULT_MCP_URL)),
         if args.auth_token.is_some() {
             " --auth-token <token>"
         } else {
@@ -669,7 +685,7 @@ fn pi_mcp_render_guidance(args: &InstallMcpArgs) -> String {
 fn pi_mcp_apply_guidance(args: &InstallMcpArgs) -> String {
     format!(
         "Pi has no native mcp.json; refusing to write MCP config. Install the generated bridge instead: ai-memory install-hooks --agent pi --apply --server-url {}{}",
-        hook_server_url_from_mcp_url(&args.server_url),
+        hook_server_url_from_mcp_url(args.server_url.as_deref().unwrap_or(DEFAULT_MCP_URL)),
         if args.auth_token.is_some() {
             " --auth-token <token>"
         } else {
@@ -705,6 +721,16 @@ fn render_antigravity_cli(args: &InstallMcpArgs) -> Result<String> {
     ))
 }
 
+fn render_devin(args: &InstallMcpArgs) -> Result<String> {
+    Ok(format!(
+        "# Devin CLI — merge into ~/.devin/config.json:\n\
+         #\n\
+         # Devin uses `mcpServers` with HTTP transport and optional Bearer auth.\n\
+         {snippet}\n",
+        snippet = render_json_mcp_fragment(args)?,
+    ))
+}
+
 fn render_vscode_copilot(args: &InstallMcpArgs) -> Result<String> {
     Ok(format!(
         "# VS Code GitHub Copilot (agent mode) — write to one of:\n\
@@ -732,11 +758,14 @@ fn render_vscode_copilot(args: &InstallMcpArgs) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use clap::Parser;
+    use std::fs;
+    use tempfile;
 
     fn args_for(client: McpClient) -> InstallMcpArgs {
         InstallMcpArgs {
             client,
-            server_url: "http://127.0.0.1:49374/mcp".into(),
+            server_url: None,
             name: "ai-memory".into(),
             auth_token: None,
             apply: false,
@@ -747,7 +776,7 @@ mod tests {
     fn args_with_token(client: McpClient) -> InstallMcpArgs {
         InstallMcpArgs {
             client,
-            server_url: "http://127.0.0.1:49374/mcp".into(),
+            server_url: None,
             name: "ai-memory".into(),
             auth_token: Some("test-token-deadbeef".into()),
             apply: false,
@@ -769,6 +798,7 @@ mod tests {
             McpClient::Omp => render_omp(&args).unwrap(),
             McpClient::AntigravityCli => render_antigravity_cli(&args).unwrap(),
             McpClient::Zero => render_zero(&args).unwrap(),
+            McpClient::Devin => render_devin(&args).unwrap(),
             McpClient::VsCodeCopilot => render_vscode_copilot(&args).unwrap(),
         }
     }
@@ -788,6 +818,7 @@ mod tests {
             McpClient::Omp,
             McpClient::AntigravityCli,
             McpClient::Zero,
+            McpClient::Devin,
             McpClient::VsCodeCopilot,
         ] {
             let out = render_with_token(client);
@@ -821,6 +852,7 @@ mod tests {
             McpClient::Omp,
             McpClient::AntigravityCli,
             McpClient::Zero,
+            McpClient::Devin,
             McpClient::VsCodeCopilot,
         ] {
             let out = render_for_test(client);
@@ -845,6 +877,7 @@ mod tests {
             McpClient::Omp => render_omp(&args).unwrap(),
             McpClient::AntigravityCli => render_antigravity_cli(&args).unwrap(),
             McpClient::Zero => render_zero(&args).unwrap(),
+            McpClient::Devin => render_devin(&args).unwrap(),
             McpClient::VsCodeCopilot => render_vscode_copilot(&args).unwrap(),
         }
     }
@@ -884,11 +917,34 @@ mod tests {
             ..Config::default()
         };
         let mut args = args_for(McpClient::OpenCode);
-        args.server_url = "http://explicit:49374/mcp".into();
+        args.server_url = Some("http://explicit:49374/mcp".into());
 
         assert_eq!(
             effective_mcp_server_url(&config, &args),
             "http://explicit:49374/mcp"
+        );
+    }
+
+    /// Regression (found 2026-07-12 during Devin real-acceptance A/B
+    /// testing): an explicit `--server-url` that happens to equal the
+    /// compiled-in `DEFAULT_MCP_URL` must still win over a configured
+    /// (env/config.toml) server_url pointing somewhere else. Mirrors
+    /// `hook_server_url_explicit_flag_matching_compiled_default_still_wins`
+    /// in install_hooks.rs -- same bug class, same fix, both commands.
+    #[test]
+    fn mcp_server_url_explicit_flag_matching_compiled_default_still_wins() {
+        let config = Config {
+            server_url: "http://127.0.0.1:49375".into(),
+            ..Config::default()
+        };
+        let mut args = args_for(McpClient::OpenCode);
+        args.server_url = Some(DEFAULT_MCP_URL.to_string());
+
+        assert_eq!(
+            effective_mcp_server_url(&config, &args),
+            DEFAULT_MCP_URL,
+            "an explicit --server-url matching the compiled default must not be \
+             silently overridden by a differently-configured server_url"
         );
     }
 
@@ -910,6 +966,14 @@ mod tests {
         assert!(pi.contains("~/.pi/agent/extensions/ai-memory.ts"));
         assert!(!pi.contains("~/.omp"));
         assert!(render_for_test(McpClient::AntigravityCli).contains("\"serverUrl\""));
+        let devin = render_for_test(McpClient::Devin);
+        assert!(devin.contains("\"mcpServers\""));
+        assert!(devin.contains("\"url\""));
+        assert!(devin.contains("\"transport\": \"http\""));
+        assert!(!devin.contains("\"httpUrl\""));
+        let devin_with_token = render_with_token(McpClient::Devin);
+        assert!(devin_with_token.contains("\"headers\""));
+        assert!(devin_with_token.contains("\"Authorization\": \"Bearer test-token-deadbeef\""));
         // VS Code Copilot must use the `servers` top-level key — the
         // `mcpServers` form is silently ignored by VS Code's MCP
         // framework. Regression guard against a future copy-paste
@@ -944,7 +1008,7 @@ mod tests {
     #[test]
     fn pi_guidance_derives_hook_url_from_mcp_url() {
         let mut args = args_for(McpClient::Pi);
-        args.server_url = "http://host:49374/base/mcp".into();
+        args.server_url = Some("http://host:49374/base/mcp".into());
         args.auth_token = Some("tok".into());
 
         let guidance = render_pi(&args).unwrap();
@@ -1048,5 +1112,103 @@ mod tests {
         assert!(out.contains("[mcp_servers.other-server]"));
         assert!(out.contains("http://other"));
         assert!(out.contains("[mcp_servers.ai-memory]"));
+    }
+
+    #[test]
+    fn devin_mcp_client_parses() {
+        let cli = crate::cli::Cli::parse_from([
+            "ai-memory",
+            "install-mcp",
+            "--client",
+            "devin",
+            "--server-url",
+            "http://example.test:49374",
+        ]);
+        let crate::cli::Command::InstallMcp(mcp_args) = cli.command else {
+            panic!("expected install-mcp command for devin");
+        };
+        assert!(matches!(mcp_args.client, crate::cli::McpClient::Devin));
+    }
+
+    #[test]
+    fn devin_apply_writes_mcp_servers() {
+        let args = args_with_token(McpClient::Devin);
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config_path = tmp.path().join("config.json");
+
+        let entry = build_json_mcp_entry(&args).unwrap();
+        let root = serde_json::json!({
+            "mcpServers": {
+                "ai-memory": entry
+            }
+        });
+
+        fs::write(&config_path, serde_json::to_string_pretty(&root).unwrap()).unwrap();
+
+        let parsed: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&config_path).unwrap()).unwrap();
+        assert!(
+            parsed["mcpServers"]["ai-memory"].is_object(),
+            "Devin config must have mcpServers.ai-memory"
+        );
+        assert_eq!(
+            parsed["mcpServers"]["ai-memory"]["url"],
+            "http://127.0.0.1:49374/mcp"
+        );
+        assert_eq!(parsed["mcpServers"]["ai-memory"]["transport"], "http");
+    }
+
+    #[test]
+    fn devin_apply_preserves_sibling_mcp_servers() {
+        let args = args_with_token(McpClient::Devin);
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config_path = tmp.path().join("config.json");
+
+        // Pre-existing config with sibling MCP server
+        fs::write(
+            &config_path,
+            r#"{"mcpServers":{"other-server":{"url":"http://example.com","transport":"http"}}}"#,
+        )
+        .unwrap();
+
+        let mut args_with_path = args.clone();
+        args_with_path.config_file = Some(config_path.clone());
+
+        apply_to_config_file(&args_with_path).unwrap();
+
+        let parsed: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&config_path).unwrap()).unwrap();
+        // Sibling must be preserved
+        assert!(
+            parsed["mcpServers"]["other-server"].is_object(),
+            "other-server must be preserved"
+        );
+        // ai-memory must be added
+        assert!(
+            parsed["mcpServers"]["ai-memory"].is_object(),
+            "ai-memory must be added"
+        );
+    }
+
+    #[test]
+    fn devin_apply_mcp_is_idempotent() {
+        let args = args_with_token(McpClient::Devin);
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config_path = tmp.path().join("config.json");
+
+        let mut args_with_path = args.clone();
+        args_with_path.config_file = Some(config_path.clone());
+
+        apply_to_config_file(&args_with_path).unwrap();
+
+        let first_content = fs::read_to_string(&config_path).unwrap();
+
+        apply_to_config_file(&args_with_path).unwrap();
+
+        let second_content = fs::read_to_string(&config_path).unwrap();
+        assert_eq!(
+            first_content, second_content,
+            "second apply must produce identical bytes"
+        );
     }
 }

@@ -70,7 +70,7 @@ fn seed(db_path: &std::path::Path) {
 }
 
 #[tokio::test]
-async fn audit_flags_wrong_bucket_session_and_drifted_observation() {
+async fn audit_flags_wrong_bucket_session_but_not_cross_project_observation() {
     let tmp = tempfile::tempdir().unwrap();
     let store = Store::open(tmp.path()).unwrap();
     seed(store.db_path());
@@ -80,10 +80,6 @@ async fn audit_flags_wrong_bucket_session_and_drifted_observation() {
     assert_eq!(
         report.summary.sessions_misbucketed, 1,
         "exactly the wrong-bucket session is flagged (clean one is not)"
-    );
-    assert_eq!(
-        report.summary.observations_drifted, 1,
-        "exactly the drifted observation is flagged (clean one is not)"
     );
 
     let a = report
@@ -97,14 +93,17 @@ async fn audit_flags_wrong_bucket_session_and_drifted_observation() {
     assert_eq!(a.expected_project.as_deref(), Some("proj-b"));
     assert_eq!(a.cwd.as_deref(), Some("/w/b/sub"));
 
-    let b = report
-        .findings
-        .iter()
-        .find(|f| f.check == "observation_session_drift")
-        .expect("CHECK B finding present");
-    assert_eq!(b.entity_kind, "observation");
-    assert_eq!(b.landed_project, "proj-b");
-    assert_eq!(b.expected_project.as_deref(), Some("proj-a"));
+    // The observation whose project differs from its session's project (seeded
+    // above) is NOT flagged: with per-cwd attribution that is legitimate
+    // cross-repo work, not contamination. Only the session-cwd signal fires.
+    assert!(
+        report
+            .findings
+            .iter()
+            .all(|f| f.entity_kind != "observation"),
+        "cross-project observations must not be flagged (per-cwd is legitimate)"
+    );
+    assert_eq!(report.findings.len(), 1, "only CHECK A fires");
 }
 
 #[tokio::test]
@@ -136,7 +135,6 @@ async fn audit_clean_db_returns_no_findings() {
 
     let report = store.reader.audit_contamination(None, None).await.unwrap();
     assert_eq!(report.summary.sessions_misbucketed, 0);
-    assert_eq!(report.summary.observations_drifted, 0);
     assert!(report.findings.is_empty());
 }
 
@@ -272,16 +270,15 @@ async fn audit_scope_restricts_to_landed_bucket() {
     seed(store.db_path());
     let (ws, a) = (id(1), id(2));
 
-    // Scoped to proj-a: the wrong-bucket session (landed in A) is in scope; the
-    // drifted observation (landed in B) is out of scope.
+    // Scoped to proj-a: only the wrong-bucket session (landed in A) is in scope.
     let scope = Some((
         WorkspaceId::from_slice(&ws).unwrap(),
         ProjectId::from_slice(&a).unwrap(),
     ));
     let report = store.reader.audit_contamination(scope, None).await.unwrap();
     assert_eq!(report.summary.sessions_misbucketed, 1);
-    assert_eq!(
-        report.summary.observations_drifted, 0,
-        "the drifted obs landed in proj-b, outside the proj-a scope"
+    assert!(
+        report.findings.iter().all(|f| f.landed_project == "proj-a"),
+        "a scoped audit returns only findings landed in the scoped project"
     );
 }

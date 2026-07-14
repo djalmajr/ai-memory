@@ -11,16 +11,20 @@
 //!
 //! See `docs/windows.md#native-hook-command-claude-code-on-windows`.
 
+use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use ai_memory_core::AgentKind;
+use ai_memory_core::{AgentKind, SessionId};
 use ai_memory_llm::OidcToken;
 
 use crate::cli::HookArgs;
 
-use super::hook_capture::{build_client, extract_cwd, get_handoff, marker_query_suffix};
+use super::hook_capture::{
+    build_client, extract_cwd, get_handoff, marker_query_suffix, resolve_cwd_with_fallbacks,
+    url_encode,
+};
 use super::hook_drain_process;
 use super::hook_spool;
 use super::path_util::strip_windows_verbatim_prefix;
@@ -119,6 +123,100 @@ fn should_spawn_background_drainer(event: &str) -> bool {
     matches!(event, "session-end" | "stop" | "pre-compact")
 }
 
+fn session_id_state_path(data_dir: &Path, agent: AgentKind) -> PathBuf {
+    data_dir
+        .join("hook-state")
+        .join(format!("{}-session-id", agent.as_str()))
+}
+
+fn stored_session_id(data_dir: &Path, agent: AgentKind) -> Option<String> {
+    let path = session_id_state_path(data_dir, agent);
+    let raw = fs::read_to_string(path).ok()?;
+    let trimmed = raw.trim();
+    (!trimmed.is_empty()).then(|| trimmed.to_owned())
+}
+
+fn store_session_id(data_dir: &Path, agent: AgentKind, session_id: &str) {
+    let path = session_id_state_path(data_dir, agent);
+    if let Some(parent) = path.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    let _ = fs::write(path, session_id);
+}
+
+fn clear_session_id(data_dir: &Path, agent: AgentKind) {
+    let _ = fs::remove_file(session_id_state_path(data_dir, agent));
+}
+
+fn fresh_session_id(data_dir: &Path, agent: AgentKind) -> String {
+    let session_id = SessionId::new().to_string();
+    store_session_id(data_dir, agent, &session_id);
+    session_id
+}
+
+fn payload_has_session_id(raw: &serde_json::Value) -> bool {
+    [
+        "session_id",
+        "sessionId",
+        "sessionID",
+        "session",
+        "conversationId",
+    ]
+    .iter()
+    .any(|key| {
+        raw.get(*key)
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|value| !value.trim().is_empty())
+    })
+}
+
+fn session_id_query_suffix(
+    data_dir: &Path,
+    agent: &str,
+    event: &str,
+    raw: &serde_json::Value,
+) -> String {
+    let agent_kind = AgentKind::from_wire(agent);
+    if agent_kind != AgentKind::Devin || payload_has_session_id(raw) {
+        return String::new();
+    }
+
+    let session_id = if event == "session-start" {
+        fresh_session_id(data_dir, agent_kind)
+    } else {
+        stored_session_id(data_dir, agent_kind)
+            .unwrap_or_else(|| fresh_session_id(data_dir, agent_kind))
+    };
+    format!("&session_id={}", url_encode(&session_id))
+}
+
+fn cwd_query_suffix_with(
+    agent: &str,
+    raw: &serde_json::Value,
+    default_strategy: Option<&str>,
+    env_lookup: impl FnMut(&str) -> Option<String>,
+    current_dir: impl FnOnce() -> Option<PathBuf>,
+) -> String {
+    let agent_kind = AgentKind::from_wire(agent);
+    let cwd = if agent_kind == AgentKind::Devin {
+        resolve_cwd_with_fallbacks(raw, env_lookup, current_dir)
+    } else {
+        extract_cwd(raw).filter(|s| !s.trim().is_empty())
+    };
+    cwd.map(|cwd| marker_query_suffix(&cwd, default_strategy))
+        .unwrap_or_default()
+}
+
+fn cwd_query_suffix(
+    agent: &str,
+    raw: &serde_json::Value,
+    default_strategy: Option<&str>,
+) -> String {
+    cwd_query_suffix_with(agent, raw, default_strategy, env_lookup, || {
+        std::env::current_dir().ok()
+    })
+}
+
 fn after_background_drain_event_enqueue(
     data_dir: &Path,
     spawn: impl FnOnce(&Path) -> std::io::Result<()>,
@@ -204,12 +302,16 @@ where
 {
     let json: serde_json::Value = serde_json::from_str(&payload).unwrap_or(serde_json::Value::Null);
 
-    let qs = extract_cwd(&json)
-        .map(|cwd| marker_query_suffix(&cwd, args.project_strategy.and_then(|s| s.baked())))
-        .unwrap_or_default();
+    let qs = cwd_query_suffix(
+        &args.agent,
+        &json,
+        args.project_strategy.and_then(|s| s.baked()),
+    );
     let base = args.server_url.trim_end_matches('/');
     let dd = resolve_data_dir(data_dir.as_deref());
     let spool = hook_spool::spool_dir(&dd);
+    let session_qs = session_id_query_suffix(&dd, &args.agent, &args.event, &json);
+    let hook_qs = format!("{qs}{session_qs}");
 
     // Spool THIS event — an instant local write, never the network. The auth
     // mode is decided without a round-trip: an explicit `--auth-token` is
@@ -220,7 +322,10 @@ where
             .ok()
             .flatten()
             .is_some();
-    let event_url = format!("{base}/hook?event={}&agent={}{qs}", args.event, args.agent);
+    let event_url = format!(
+        "{base}/hook?event={}&agent={}{}",
+        args.event, args.agent, hook_qs
+    );
     let entry = hook_spool::entry_for(
         event_url,
         payload.clone(),
@@ -231,6 +336,9 @@ where
         eprintln!(
             "ai-memory hook warning: failed to spool lifecycle event; capture for this event was skipped"
         );
+    }
+    if AgentKind::from_wire(&args.agent) == AgentKind::Devin && args.event == "session-end" {
+        clear_session_id(&dd, AgentKind::Devin);
     }
 
     // Mid-session catch-up: per-event hooks only enqueue, so a heavy session
@@ -327,6 +435,37 @@ fn resolve_data_dir(data_dir: Option<&Path>) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn devin_hook_args(event: &str) -> HookArgs {
+        HookArgs {
+            event: event.into(),
+            agent: "devin".into(),
+            server_url: "http://127.0.0.1:1".into(),
+            auth_token: None,
+            project_strategy: None,
+        }
+    }
+
+    fn read_spooled_entries(spool: &Path) -> Vec<hook_spool::SpoolEntry> {
+        let mut entries = std::fs::read_dir(spool)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter(|path| path.extension().and_then(|ext| ext.to_str()) == Some("json"))
+            .collect::<Vec<_>>();
+        entries.sort();
+        entries
+            .into_iter()
+            .map(|path| serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap())
+            .collect()
+    }
+
+    fn query_param<'a>(url: &'a str, key: &str) -> Option<&'a str> {
+        url.split('?')
+            .nth(1)?
+            .split('&')
+            .filter_map(|part| part.split_once('='))
+            .find_map(|(name, value)| (name == key).then_some(value))
+    }
 
     #[test]
     fn resolve_data_dir_strips_verbatim_prefix_from_baked_arg() {
@@ -446,6 +585,320 @@ mod tests {
         );
     }
 
+    #[test]
+    fn devin_query_session_id_is_stable_across_payloads_without_native_id() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path();
+        let session_start = serde_json::json!({
+            "hook_event_name": "SessionStart",
+            "source": "startup"
+        });
+        let post_tool_use = serde_json::json!({
+            "hook_event_name": "PostToolUse",
+            "tool_name": "exec",
+            "tool_input": {"command": "ls"},
+            "tool_use_id": "call_c101a272288d400b831e1498",
+            "tool_response": {"success": true, "output": "ok", "error": null}
+        });
+
+        let first = session_id_query_suffix(data_dir, "devin", "session-start", &session_start);
+        let second = session_id_query_suffix(data_dir, "devin", "post-tool-use", &post_tool_use);
+
+        assert!(first.starts_with("&session_id="), "{first}");
+        assert_eq!(second, first);
+        assert_eq!(
+            stored_session_id(data_dir, AgentKind::Devin).as_deref(),
+            first.strip_prefix("&session_id=")
+        );
+    }
+
+    #[tokio::test]
+    async fn devin_session_start_real_fixture_without_session_id_or_cwd_is_accepted() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path().to_path_buf();
+        let spool = hook_spool::spool_dir(&data_dir);
+        let mut stdout = Vec::new();
+        let payload = serde_json::json!({
+            "hook_event_name": "SessionStart",
+            "source": "startup"
+        });
+
+        run_with_payload(
+            Some(data_dir),
+            devin_hook_args("session-start"),
+            payload.to_string(),
+            &mut stdout,
+            |_| Ok(()),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(stdout, b"{}\n");
+        let entries = read_spooled_entries(&spool);
+        assert_eq!(entries.len(), 1);
+        assert!(entries[0].url.contains("event=session-start"));
+        assert!(entries[0].url.contains("agent=devin"));
+        assert!(
+            query_param(&entries[0].url, "session_id").is_some(),
+            "{}",
+            entries[0].url
+        );
+        assert!(
+            query_param(&entries[0].url, "cwd").is_some(),
+            "{}",
+            entries[0].url
+        );
+    }
+
+    #[tokio::test]
+    async fn devin_post_tool_use_real_fixture_without_session_id_or_cwd_is_accepted() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path().to_path_buf();
+        let spool = hook_spool::spool_dir(&data_dir);
+        let mut stdout = Vec::new();
+        let payload = serde_json::json!({
+            "hook_event_name": "PostToolUse",
+            "tool_name": "exec",
+            "tool_input": {"command": "ls"},
+            "tool_use_id": "call_c101a272288d400b831e1498",
+            "tool_response": {"success": true, "output": "ok", "error": null}
+        });
+
+        run_with_payload(
+            Some(data_dir),
+            devin_hook_args("post-tool-use"),
+            payload.to_string(),
+            &mut stdout,
+            |_| Ok(()),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(stdout, b"{}\n");
+        let entries = read_spooled_entries(&spool);
+        assert_eq!(entries.len(), 1);
+        assert!(entries[0].url.contains("event=post-tool-use"));
+        assert!(entries[0].url.contains("agent=devin"));
+        assert!(
+            query_param(&entries[0].url, "session_id").is_some(),
+            "{}",
+            entries[0].url
+        );
+        assert!(
+            query_param(&entries[0].url, "cwd").is_some(),
+            "{}",
+            entries[0].url
+        );
+    }
+
+    #[tokio::test]
+    async fn devin_events_share_session_id_when_payload_omits_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path().to_path_buf();
+        let spool = hook_spool::spool_dir(&data_dir);
+        let mut stdout = Vec::new();
+
+        run_with_payload(
+            Some(data_dir.clone()),
+            devin_hook_args("session-start"),
+            serde_json::json!({
+                "hook_event_name": "SessionStart",
+                "source": "startup"
+            })
+            .to_string(),
+            &mut stdout,
+            |_| Ok(()),
+        )
+        .await
+        .unwrap();
+        run_with_payload(
+            Some(data_dir),
+            devin_hook_args("post-tool-use"),
+            serde_json::json!({
+                "hook_event_name": "PostToolUse",
+                "tool_name": "exec",
+                "tool_input": {"command": "ls"},
+                "tool_use_id": "call_c101a272288d400b831e1498",
+                "tool_response": {"success": true, "output": "ok", "error": null}
+            })
+            .to_string(),
+            &mut stdout,
+            |_| Ok(()),
+        )
+        .await
+        .unwrap();
+
+        let entries = read_spooled_entries(&spool);
+        assert_eq!(entries.len(), 2);
+        let first = query_param(&entries[0].url, "session_id").unwrap();
+        let second = query_param(&entries[1].url, "session_id").unwrap();
+        assert_eq!(first, second);
+    }
+
+    #[test]
+    fn devin_query_session_id_does_not_override_native_payload_id() {
+        let tmp = tempfile::tempdir().unwrap();
+        let with_session = serde_json::json!({
+            "session_id": "native-session",
+            "hook_event_name": "PostToolUse"
+        });
+
+        let suffix = session_id_query_suffix(tmp.path(), "devin", "post-tool-use", &with_session);
+
+        assert!(suffix.is_empty());
+        assert!(stored_session_id(tmp.path(), AgentKind::Devin).is_none());
+    }
+
+    #[test]
+    fn session_id_query_suffix_is_devin_only() {
+        let tmp = tempfile::tempdir().unwrap();
+        let raw = serde_json::json!({"hook_event_name": "PostToolUse"});
+
+        let suffix = session_id_query_suffix(tmp.path(), "claude-code", "post-tool-use", &raw);
+
+        assert!(suffix.is_empty());
+        assert!(stored_session_id(tmp.path(), AgentKind::ClaudeCode).is_none());
+    }
+
+    #[test]
+    fn devin_missing_cwd_uses_devin_project_dir_before_process_cwd() {
+        let raw = serde_json::json!({
+            "hook_event_name": "SessionStart",
+            "source": "startup"
+        });
+
+        let suffix = cwd_query_suffix_with(
+            "devin",
+            &raw,
+            None,
+            |name| (name == "DEVIN_PROJECT_DIR").then(|| "env-project".into()),
+            || Some(PathBuf::from("process-project")),
+        );
+
+        assert_eq!(suffix, "&cwd=env-project");
+    }
+
+    #[test]
+    fn devin_missing_cwd_uses_process_cwd_when_env_is_missing() {
+        let raw = serde_json::json!({
+            "hook_event_name": "PostToolUse",
+            "tool_name": "exec"
+        });
+
+        let suffix = cwd_query_suffix_with(
+            "devin",
+            &raw,
+            None,
+            |_| None,
+            || Some(PathBuf::from("process-project")),
+        );
+
+        assert_eq!(suffix, "&cwd=process-project");
+    }
+
+    #[test]
+    fn devin_missing_cwd_uses_env_or_process_cwd() {
+        let raw = serde_json::json!({
+            "hook_event_name": "PostToolUse",
+            "tool_name": "exec"
+        });
+
+        let from_env = cwd_query_suffix_with(
+            "devin",
+            &raw,
+            None,
+            |name| (name == "DEVIN_PROJECT_DIR").then(|| "env-project".into()),
+            || Some(PathBuf::from("process-project")),
+        );
+        let from_process = cwd_query_suffix_with(
+            "devin",
+            &raw,
+            None,
+            |_| None,
+            || Some(PathBuf::from("process-project")),
+        );
+
+        assert_eq!(from_env, "&cwd=env-project");
+        assert_eq!(from_process, "&cwd=process-project");
+    }
+
+    #[test]
+    fn devin_payload_cwd_wins_over_fallbacks() {
+        let raw = serde_json::json!({
+            "hook_event_name": "PostToolUse",
+            "cwd": "payload-project"
+        });
+
+        let suffix = cwd_query_suffix_with(
+            "devin",
+            &raw,
+            None,
+            |name| (name == "DEVIN_PROJECT_DIR").then(|| "env-project".into()),
+            || Some(PathBuf::from("process-project")),
+        );
+
+        assert_eq!(suffix, "&cwd=payload-project");
+    }
+
+    #[test]
+    fn missing_cwd_process_fallback_is_devin_only() {
+        let raw = serde_json::json!({"hook_event_name": "PostToolUse"});
+
+        let suffix = cwd_query_suffix_with(
+            "claude-code",
+            &raw,
+            None,
+            |_| Some("env-project".into()),
+            || Some(PathBuf::from("process-project")),
+        );
+
+        assert!(suffix.is_empty());
+    }
+
+    #[tokio::test]
+    async fn devin_post_compaction_summary_without_payload_cwd_uses_same_session() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path().to_path_buf();
+        let spool = hook_spool::spool_dir(&data_dir);
+        let summary = "Context compacted: 15000/20000 tokens used";
+        let mut stdout = Vec::new();
+
+        run_with_payload(
+            Some(data_dir.clone()),
+            devin_hook_args("session-start"),
+            serde_json::json!({
+                "hook_event_name": "SessionStart",
+                "source": "startup"
+            })
+            .to_string(),
+            &mut stdout,
+            |_| Ok(()),
+        )
+        .await
+        .unwrap();
+        run_with_payload(
+            Some(data_dir),
+            devin_hook_args("post-compaction"),
+            serde_json::json!({
+                "hook_event_name": "PostCompaction",
+                "summary": summary
+            })
+            .to_string(),
+            &mut stdout,
+            |_| Ok(()),
+        )
+        .await
+        .unwrap();
+
+        let entries = read_spooled_entries(&spool);
+        assert_eq!(entries.len(), 2);
+        let first = query_param(&entries[0].url, "session_id").unwrap();
+        let second = query_param(&entries[1].url, "session_id").unwrap();
+        assert_eq!(first, second);
+        assert!(query_param(&entries[1].url, "cwd").is_some());
+        assert!(entries[1].body.contains(summary));
+    }
+
     #[tokio::test]
     async fn session_end_run_enqueues_outputs_empty_json_and_spawns_after_enqueue() {
         let tmp = tempfile::tempdir().unwrap();
@@ -548,6 +1001,47 @@ mod tests {
 
         assert_eq!(stdout, b"{}\n");
         assert_eq!(hook_spool::spool_len(&spool), 1);
+    }
+
+    #[tokio::test]
+    async fn devin_session_end_spools_stored_session_id_then_clears_state() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path().to_path_buf();
+        let spool = hook_spool::spool_dir(&data_dir);
+        store_session_id(&data_dir, AgentKind::Devin, "stable-devin-session");
+        let mut stdout = Vec::new();
+        let args = HookArgs {
+            event: "session-end".into(),
+            agent: "devin".into(),
+            server_url: "http://127.0.0.1:1".into(),
+            auth_token: None,
+            project_strategy: None,
+        };
+
+        run_with_payload(
+            Some(data_dir.clone()),
+            args,
+            r#"{"hook_event_name":"SessionEnd"}"#.into(),
+            &mut stdout,
+            |_| Ok(()),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(stdout, b"{}\n");
+        assert!(stored_session_id(&data_dir, AgentKind::Devin).is_none());
+        let entries: Vec<_> = std::fs::read_dir(&spool)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .collect();
+        assert_eq!(entries.len(), 1);
+        let entry: hook_spool::SpoolEntry =
+            serde_json::from_slice(&std::fs::read(&entries[0]).unwrap()).unwrap();
+        assert!(
+            entry.url.contains("&session_id=stable-devin-session"),
+            "{}",
+            entry.url
+        );
     }
 
     #[test]

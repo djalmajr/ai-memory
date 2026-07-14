@@ -7,6 +7,62 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- `audit-contamination` no longer flags an observation whose project differs
+  from its session's home project (the old `observation_session_drift` CHECK
+  B, including the `observations_drifted` summary count and the finding's
+  `session_id` field). With per-event cwd resolution, an agent that
+  legitimately `cd`s across repos in one session produces exactly that shape
+  — it is correct attribution, not contamination — so the check drowned
+  multi-repo instances in false positives. CHECK A (`session_wrong_bucket`,
+  anchored on the session's own cwd evidence) is unchanged and remains the
+  high-precision signal ([#182]).
+
+### Added
+- New read-only admin endpoint `GET /admin/projects`: the authoritative
+  `(workspace, project)` inventory with page counts and last-updated
+  timestamps. Gives dashboards, exports, and backup/mirror tooling a
+  first-class list to reconcile against — a mirror directory whose project
+  no longer appears here is an orphan and can be pruned. Root-only in
+  multi-user mode, like every `/admin/*` route ([#180]).
+- `memory_delete_page` / admin `delete-page` now write one attributed
+  `audit_log` row pointing at the deleted page id, in the same transaction
+  as the delete — completing the "who deleted the gotcha page about X?"
+  trail that purge/rename attribution started. Idempotent no-op deletes
+  write nothing. The handoff lifecycle (insert / accept / cancel) is also
+  audited, scoped to the handoff's workspace/project with a NULL author by
+  design — handoffs are agent/session-keyed, not owned by a DB user
+  ([#179]).
+- Devin CLI is now a supported MCP + lifecycle-hook integration. `install-mcp
+  --client devin` writes Devin's `mcpServers` config, `install-hooks --agent
+  devin` writes Devin lifecycle hooks, `setup-agent --agent devin` emits
+  host-copyable hook snippets, and `uninstall` removes only ai-memory-owned
+  Devin entries. Devin hook capture covers `SessionStart`,
+  `UserPromptSubmit`, `PreToolUse`, `PostToolUse`, `PostCompaction`, `Stop`,
+  and `SessionEnd`; `PostCompaction` is stored as a dedicated observation kind
+  and captures Devin's `summary` field. Devin does not expose subagent hook
+  events, so subagent capture is not installed for Devin.
+- Managed Agent Skills can now target Devin: project installs use
+  `.devin/skills`; global installs use `%APPDATA%\devin\skills` on Windows and
+  `~/.devin/skills` elsewhere.
+- The store migration set now admits `devin` as a persisted
+  `sessions.agent_kind`, preserving the same workspace/project invariants as
+  the other supported agents.
+
+### Fixed
+- `install-mcp` and `install-hooks` now honor an explicit `--server-url` even
+  when it matches the compiled default. Previously that value was
+  indistinguishable from "flag omitted" and could be overridden by
+  `AI_MEMORY_SERVER_URL`, which could write config for the wrong local server.
+- Devin hook capture now derives `cwd` when the native payload omits it:
+  payload `cwd` still wins, followed by `DEVIN_PROJECT_DIR`, then the hook
+  process working directory. This keeps real Devin `SessionStart` /
+  `PostToolUse` fixtures routable without inventing a payload field.
+  Payloads without a `session_id` are bridged the same way: a per-host id is
+  minted at `SessionStart`, reused for later events, and cleared at
+  `SessionEnd`; set `AI_MEMORY_SESSION_ID` in the hook environment to pin an
+  externally managed run id. A payload-supplied id always wins.
+
 ## [1.12.0] - 2026-07-12
 
 ### Added

@@ -1551,10 +1551,21 @@ async fn process(
     // the working state before the agent's compaction throws it out
     // of context. Does NOT end the session and does NOT create a
     // handoff. The eventual SessionEnd supersedes this page.
-    if matches!(env.event, HookEvent::PreCompact)
-        && let Err(e) = consolidate_or_synth(state, session_id, ws, proj).await
+    //
+    // On PostCompaction (Devin), refresh `sessions/<id>.md` after the
+    // agent's compaction has completed. This is a post-facto checkpoint
+    // that captures the state after compaction. Does NOT end the session
+    // and does NOT create a handoff. The eventual SessionEnd supersedes
+    // this page.
+    let checkpoint_label = match env.event {
+        HookEvent::PreCompact => Some("pre-compact"),
+        HookEvent::PostCompaction => Some("post-compaction"),
+        _ => None,
+    };
+    if let Some(checkpoint_label) = checkpoint_label
+        && let Err(e) = consolidate_or_synth(state, session_id, ws, proj, checkpoint_label).await
     {
-        warn!(error = %e, "PreCompact consolidation failed; continuing");
+        warn!(error = %e, "PreCompact/PostCompaction consolidation failed; continuing");
     }
 
     // On SessionEnd, synthesize the summary page, end the session, and
@@ -1735,23 +1746,26 @@ fn build_auto_handoff(
 }
 
 /// Write a fresh `sessions/<id>.md` for the current session without
-/// ending it. Used by the PreCompact branch to checkpoint state before
-/// the agent's working context collapses.
+/// ending it. Used by the PreCompact and PostCompaction branches to checkpoint
+/// state before/after the agent's working context collapses.
 async fn consolidate_or_synth(
     state: &HookState,
     session_id: SessionId,
     workspace_id: WorkspaceId,
     project_id: ProjectId,
+    checkpoint_label: &str,
 ) -> anyhow::Result<()> {
     if let Some(c) = state.consolidator.as_ref() {
         let outcome = c.consolidate_session(session_id, false).await?;
         debug!(
             session = %session_id,
             path = %outcome.path,
-            "PreCompact: LLM consolidation written",
+            "{}: LLM consolidation written",
+            checkpoint_label
         );
         let _ = state.wiki.commit_all(&format!(
-            "pre-compact(session {}): checkpoint",
+            "{}(session {}): checkpoint",
+            checkpoint_label,
             short_id(&session_id.to_string()),
         ));
         return Ok(());
@@ -1778,10 +1792,11 @@ async fn consolidate_or_synth(
         })
         .await?;
     let _ = state.wiki.commit_all(&format!(
-        "pre-compact(session {}): checkpoint",
+        "{}(session {}): checkpoint",
+        checkpoint_label,
         short_id(&session_id.to_string()),
     ));
-    debug!(session = %session_id, "PreCompact: rule-based checkpoint written");
+    debug!(session = %session_id, "{}: rule-based checkpoint written", checkpoint_label);
     Ok(())
 }
 
@@ -1794,7 +1809,7 @@ const fn importance_for(event: HookEvent) -> u8 {
         HookEvent::SessionStart | HookEvent::SessionEnd => 7,
         HookEvent::UserPrompt => 8,
         HookEvent::PostToolUse | HookEvent::PreToolUse => 5,
-        HookEvent::Stop | HookEvent::PreCompact => 6,
+        HookEvent::Stop | HookEvent::PreCompact | HookEvent::PostCompaction => 6,
         HookEvent::Notification
         | HookEvent::Other
         | HookEvent::SubagentStart
@@ -5435,6 +5450,159 @@ mod tests {
         assert_ne!(
             proj_a, state.project_id,
             "Windows path must not fall back to the server-default project"
+        );
+    }
+
+    #[test]
+    fn post_compaction_captures_summary_field() {
+        let query = HookQuery {
+            event: "post-compaction".into(),
+            agent: Some("devin".into()),
+            ..Default::default()
+        };
+        let raw = serde_json::json!({
+            "hook_event_name": "PostCompaction",
+            "summary": "Test summary field"
+        });
+
+        let env = HookEnvelope::from_query_and_body(query, raw);
+        assert_eq!(
+            env.title_hint.as_deref(),
+            Some("Test summary field"),
+            "PostCompaction should extract summary as title hint"
+        );
+        assert_eq!(
+            env.body_excerpt.as_deref(),
+            Some("Test summary field"),
+            "PostCompaction should extract summary as body excerpt"
+        );
+    }
+
+    #[test]
+    fn post_compaction_priority_is_mapped() {
+        let query = HookQuery {
+            event: "post-compaction".into(),
+            agent: Some("devin".into()),
+            ..Default::default()
+        };
+        let raw = serde_json::json!({
+            "hook_event_name": "PostCompaction",
+            "summary": "Test"
+        });
+
+        let env = HookEnvelope::from_query_and_body(query, raw);
+        assert_eq!(
+            importance_for(env.event),
+            6,
+            "PostCompaction should have importance 6 (same as Stop/PreCompact)"
+        );
+    }
+
+    #[tokio::test]
+    async fn post_compaction_writes_rule_based_session_checkpoint_without_consolidator() {
+        let tmp = TempDir::new().unwrap();
+        let state = make_state(&tmp).await;
+        let sid = "44444444-4444-4444-4444-444444444444";
+        let session_path = format!("sessions/{sid}.md");
+        let summary = "Context compacted: 15000/20000 tokens used";
+
+        let start = HookEnvelope::from_query_and_body(
+            HookQuery {
+                event: "session-start".into(),
+                agent: Some("devin".into()),
+                ..Default::default()
+            },
+            serde_json::json!({
+                "hook_event_name": "SessionStart",
+                "session_id": sid,
+                "source": "startup"
+            }),
+        );
+        process(&state, start, None).await.unwrap();
+
+        let pages_before = state
+            .reader
+            .recent_pages_for_project(state.workspace_id, state.project_id, 20)
+            .await
+            .unwrap();
+        assert!(
+            pages_before.iter().all(|p| p.path.as_str() != session_path),
+            "SessionStart alone must not write a sessions/<id>.md checkpoint"
+        );
+
+        let post_compaction = HookEnvelope::from_query_and_body(
+            HookQuery {
+                event: "post-compaction".into(),
+                agent: Some("devin".into()),
+                ..Default::default()
+            },
+            serde_json::json!({
+                "hook_event_name": "PostCompaction",
+                "session_id": sid,
+                "summary": summary
+            }),
+        );
+        process(&state, post_compaction, None).await.unwrap();
+
+        let pages_after = state
+            .reader
+            .recent_pages_for_project(state.workspace_id, state.project_id, 20)
+            .await
+            .unwrap();
+        assert!(
+            pages_after.iter().any(|p| p.path.as_str() == session_path),
+            "PostCompaction must write the rule-based sessions/<id>.md checkpoint; got {:?}",
+            pages_after
+                .iter()
+                .map(|p| p.path.as_str())
+                .collect::<Vec<_>>()
+        );
+
+        let page = state
+            .reader
+            .page_body_by_ids(state.workspace_id, state.project_id, &session_path)
+            .await
+            .unwrap()
+            .expect("PostCompaction checkpoint page must be readable from the store");
+        assert!(
+            page.body.contains("post-compaction"),
+            "checkpoint body must include the PostCompaction raw observation: {}",
+            page.body
+        );
+        assert!(
+            page.body.contains(summary),
+            "checkpoint body must include the Devin summary field: {}",
+            page.body
+        );
+        let checkpoints = state.wiki.recent_checkpoints(5).unwrap();
+        assert!(
+            checkpoints
+                .iter()
+                .any(|checkpoint| checkpoint.summary.starts_with("post-compaction(")),
+            "PostCompaction checkpoint must use the post-compaction commit label; got {:?}",
+            checkpoints
+                .iter()
+                .map(|checkpoint| checkpoint.summary.as_str())
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            checkpoints
+                .iter()
+                .all(|checkpoint| !checkpoint.summary.starts_with("pre-compact(")),
+            "PostCompaction checkpoint must not be labelled as pre-compact; got {:?}",
+            checkpoints
+                .iter()
+                .map(|checkpoint| checkpoint.summary.as_str())
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            state
+                .reader
+                .latest_open_handoff(state.workspace_id, state.project_id, None)
+                .await
+                .unwrap()
+                .is_none(),
+            "PostCompaction checkpoint must not create a handoff"
         );
     }
 }

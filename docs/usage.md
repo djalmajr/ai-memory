@@ -100,7 +100,7 @@ and writes a timestamped backup before changing an existing instruction file.
 `install-instructions --print` previews the instruction snippet only; use
 `install-skills --print` to preview skill payloads. Skill flags mirror
 `install-skills` with an `--skills-` prefix:
-`--skills-scope project|global`, `--skills-agent claude-code|agents|both`,
+`--skills-scope project|global`, `--skills-agent claude-code|agents|devin|both`,
 `--skills-target-dir <dir>`, and `--skills-force`.
 
 Auto-detect extends `CLAUDE.md` when it exists, `AGENTS.md` when it
@@ -115,18 +115,25 @@ To refresh only the managed Agent Skills:
 ```bash
 ai-memory install-skills
 ai-memory install-skills --scope global --agent agents
+ai-memory install-skills --scope global --agent devin
 ai-memory install-skills --agent both --print
 ai-memory install-skills --target-dir .custom/skills --force
 ```
 
-Project-local skill roots are `.claude/skills` for Claude-compatible installs
-and `.agents/skills` for cross-client installs. Global roots are
-`~/.claude/skills` and `~/.agents/skills`. `--target-dir` points at an explicit
-skill root and bypasses scope/agent inference. `--print` previews target paths
-and `SKILL.md` contents. `--force` allows replacement of unmanaged same-name
-skills; without it, user-authored skills are preserved. Uninstall removes
-ai-memory-managed skills from the default project/global roots after marker
-validation; custom `--target-dir` roots are a manual cleanup path.
+For Devin, project-local skills are installed under `.devin/skills`. Global
+Devin installs use `%APPDATA%\devin\skills` on Windows and `~/.devin/skills`
+on non-Windows systems.
+
+Project-local skill roots are `.claude/skills` for Claude-compatible installs,
+`.agents/skills` for cross-client installs, and `.devin/skills` for Devin
+installs. Global Claude/Agents roots are `~/.claude/skills` and
+`~/.agents/skills`; global Devin roots are platform-specific as described
+above. `--target-dir` points at an explicit skill root and bypasses scope/agent
+inference. `--print` previews target paths and `SKILL.md` contents. `--force`
+allows replacement of unmanaged same-name skills; without it, user-authored
+skills are preserved. Uninstall removes ai-memory-managed skills from the
+default project/global roots after marker validation; custom `--target-dir`
+roots are a manual cleanup path.
 
 This is prompt packaging only. ai-memory does not run a runtime skill router,
 does not store durable memory in `SKILL.md`, and does not turn the
@@ -183,6 +190,8 @@ Client cleanup hints:
 
 - Claude Code: check plugins, hooks, old SessionStart injection, and MCP servers.
 - Codex: check MCP config plus session/user-prompt/tool/compaction/stop hooks.
+- Devin CLI: check `.devin/config.json`, `.devin/hooks.v1.json`, and
+  `.devin/skills` for stale MCP, hook, or routing-skill entries.
 - Gemini CLI and Antigravity CLI: check `settings.json` or equivalent hook/MCP
   config files.
 - OpenCode, OpenClaw, and OMP: check MCP config and plugin/extension directories;
@@ -277,7 +286,7 @@ docker exec ai-memory git -C /data/wiki log --oneline
 ## Rules vs facts
 
 Durable project rules belong in the agent's rules file, not only in the
-wiki. For Claude Code that is `CLAUDE.md`; for Codex, OpenCode,
+wiki. For Claude Code that is `CLAUDE.md`; for Codex, Devin CLI, OpenCode,
 Cursor, and Gemini CLI it is usually `AGENTS.md`.
 
 The consolidator classifies compiled observations as `decision`,

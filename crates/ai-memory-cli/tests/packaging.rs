@@ -214,6 +214,13 @@ fn run_wrapper_with_fake_docker(args: &[&str], docker_info_stdout: &str) -> Stri
     run_wrapper_with_fake_docker_and_uname(args, docker_info_stdout, None)
 }
 
+// The wrapper also shells out to `id -u` / `id -g` when choosing its default
+// Docker uid mapping. Arch container tests often run as root, which would make
+// the default mapping `-u 0:0` and produce a false positive in the assertions
+// below. Shadow `id` too so these tests exercise the rootless/rootful branch
+// logic, not the uid of the test runner. This shadow is unconditional
+// (unlike `uname`, which only matters for the macOS-simulation callers)
+// because every caller of this helper is exposed to the flakiness.
 #[cfg(unix)]
 fn run_wrapper_with_fake_docker_and_uname(
     args: &[&str],
@@ -224,6 +231,7 @@ fn run_wrapper_with_fake_docker_and_uname(
     let docker_args = tmp.path().join("docker-args.txt");
     let docker = tmp.path().join("docker");
     let uname = tmp.path().join("uname");
+    let id = tmp.path().join("id");
     std::fs::write(
         &docker,
         format!(
@@ -243,6 +251,16 @@ fn run_wrapper_with_fake_docker_and_uname(
         )
         .unwrap();
     }
+    std::fs::write(
+        &id,
+        "#!/usr/bin/env bash\n\
+         case \"$1\" in\n\
+           -u) printf '1000\\n' ;;\n\
+           -g) printf '1000\\n' ;;\n\
+           *) printf 'uid=1000 gid=1000 groups=1000\\n' ;;\n\
+         esac\n",
+    )
+    .unwrap();
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -250,29 +268,26 @@ fn run_wrapper_with_fake_docker_and_uname(
         if uname_stdout.is_some() {
             std::fs::set_permissions(&uname, std::fs::Permissions::from_mode(0o755)).unwrap();
         }
+        std::fs::set_permissions(&id, std::fs::Permissions::from_mode(0o755)).unwrap();
     }
 
-    let path = if uname_stdout.is_some() {
-        Some(format!(
-            "{}:{}",
-            shell_path(tmp.path()),
-            std::env::var("PATH").unwrap_or_default()
-        ))
-    } else {
-        None
-    };
-
+    // Always prepend the fake-binary dir to PATH: `id` is shadowed
+    // unconditionally (see comment above), so PATH must always change, even
+    // when `uname_stdout` is None and only `docker`/`id` are shadowed.
+    let path = format!(
+        "{}:{}",
+        shell_path(tmp.path()),
+        std::env::var("PATH").unwrap_or_default()
+    );
     let mut command = shell_script_command(&repo_root().join("bin/ai-memory"));
     command
         .args(args)
+        .env("PATH", path)
         .env("AI_MEMORY_DOCKER", shell_path(&docker))
         .env("AI_MEMORY_NO_VERSION_CHECK", "1")
         .env("AI_MEMORY_DATA_VOLUME", "test-ai-memory-data")
         .env("HOME", shell_path(tmp.path()))
         .env_remove("AI_MEMORY_SERVER_URL");
-    if let Some(path) = path {
-        command.env("PATH", path);
-    }
     let output = command.output().unwrap();
     assert!(
         output.status.success(),

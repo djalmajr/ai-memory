@@ -57,6 +57,22 @@ ai_memory_extract_cwd() {
         | head -n 1
 }
 
+# Resolve cwd for agents whose native hook payload omits it. Payload wins,
+# then Devin's project env var, then the hook process cwd.
+ai_memory_resolve_cwd() {
+    payload="${1:-$(cat)}"
+    cwd=$(ai_memory_extract_cwd "$payload")
+    if [ -n "$cwd" ]; then
+        printf '%s' "$cwd"
+        return 0
+    fi
+    if [ -n "${DEVIN_PROJECT_DIR:-}" ]; then
+        printf '%s' "$DEVIN_PROJECT_DIR"
+        return 0
+    fi
+    pwd 2>/dev/null || true
+}
+
 # URL-encode the minimal set of characters that have meaning in a query
 # string. Sufficient for the schema's value regex (`^[a-z0-9][a-z0-9._-]*$`)
 # plus a defensive pass for anything a hand-edited marker might contain.
@@ -136,6 +152,58 @@ ai_memory_marker_qs() {
     # interprets truthiness (1/true/...) and scopes the drop to this project.
     [ -n "$ds" ] && qs="${qs}&drop_subagent=$(ai_memory_url_encode "$ds")"
     printf '%s' "$qs"
+}
+
+# Local bridge state for agents whose hook payloads do not carry a session id.
+# The value is intentionally non-secret; the server hashes non-UUID ids into its
+# typed SessionId domain. `AI_MEMORY_SESSION_ID` may be supplied by advanced
+# launchers to pin an externally managed run id.
+ai_memory_state_dir() {
+    if [ -n "${AI_MEMORY_DATA_DIR:-}" ]; then
+        printf '%s' "$AI_MEMORY_DATA_DIR"
+    elif [ -n "${XDG_DATA_HOME:-}" ]; then
+        printf '%s/ai-memory' "$XDG_DATA_HOME"
+    elif [ -n "${HOME:-}" ]; then
+        printf '%s/.local/share/ai-memory' "$HOME"
+    else
+        printf '.ai-memory'
+    fi
+}
+
+ai_memory_session_id_file() {
+    agent="$1"
+    printf '%s/hook-state/%s-session-id' "$(ai_memory_state_dir)" "$agent"
+}
+
+ai_memory_new_session_id() {
+    agent="$1"
+    now=$(date +%s 2>/dev/null || printf '0')
+    printf '%s-%s-%s' "$agent" "$now" "$$"
+}
+
+ai_memory_session_id_qs() {
+    agent="$1"; event="$2"
+    if [ -n "${AI_MEMORY_SESSION_ID:-}" ]; then
+        printf '&session_id=%s' "$(ai_memory_url_encode "$AI_MEMORY_SESSION_ID")"
+        return 0
+    fi
+    file=$(ai_memory_session_id_file "$agent")
+    sid=""
+    if [ "$event" != "session-start" ] && [ -f "$file" ]; then
+        sid=$(sed -n '1p' "$file" 2>/dev/null)
+    fi
+    if [ -z "$sid" ]; then
+        sid=$(ai_memory_new_session_id "$agent")
+        dir=$(dirname "$file")
+        mkdir -p "$dir" 2>/dev/null || true
+        printf '%s\n' "$sid" > "$file" 2>/dev/null || true
+    fi
+    printf '&session_id=%s' "$(ai_memory_url_encode "$sid")"
+}
+
+ai_memory_clear_session_id() {
+    agent="$1"
+    rm -f "$(ai_memory_session_id_file "$agent")" 2>/dev/null || true
 }
 
 # POST stdin to "$1" as JSON, fire-and-forget. Adds an

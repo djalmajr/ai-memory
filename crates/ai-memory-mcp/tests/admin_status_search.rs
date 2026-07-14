@@ -122,6 +122,74 @@ async fn status_returns_counts_and_paths() {
 }
 
 #[tokio::test]
+async fn list_projects_returns_workspace_project_pairs() {
+    let tmp = TempDir::new().unwrap();
+    let (state, store) = make_admin_state(&tmp).await;
+    // Seed pages in two distinct (workspace, project) scopes.
+    seed_page(&store, "A", "notes/a.md", "body a").await; // default/scratch
+    let ws = store
+        .writer
+        .get_or_create_workspace("acme".to_string())
+        .await
+        .unwrap();
+    let proj = store
+        .writer
+        .get_or_create_project(ws, "infra".to_string(), None)
+        .await
+        .unwrap();
+    store
+        .writer
+        .upsert_page(NewPage {
+            workspace_id: ws,
+            project_id: proj,
+            path: PagePath::new("notes/b.md").unwrap(),
+            title: "B".into(),
+            body: "body b".into(),
+            tier: Tier::Semantic,
+            frontmatter_json: serde_json::json!({}),
+            pinned: false,
+            links: Vec::new(),
+            author_id: None,
+        })
+        .await
+        .unwrap();
+    let app = admin_router(state);
+
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/admin/projects")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let body: serde_json::Value = serde_json::from_slice(&body_bytes(resp).await).unwrap();
+    let pairs: Vec<(String, String)> = body["projects"]
+        .as_array()
+        .expect("projects array")
+        .iter()
+        .map(|p| {
+            (
+                p["workspace_name"].as_str().unwrap().to_string(),
+                p["project_name"].as_str().unwrap().to_string(),
+            )
+        })
+        .collect();
+    assert!(
+        pairs.contains(&("default".to_string(), "scratch".to_string())),
+        "{pairs:?}"
+    );
+    assert!(
+        pairs.contains(&("acme".to_string(), "infra".to_string())),
+        "{pairs:?}"
+    );
+}
+
+#[tokio::test]
 async fn search_returns_matching_hits() {
     let tmp = TempDir::new().unwrap();
     let (state, store) = make_admin_state(&tmp).await;

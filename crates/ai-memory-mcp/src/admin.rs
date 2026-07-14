@@ -8,6 +8,7 @@
 //! - `POST /admin/auto-improve/report` — read-only auto-improve telemetry report.
 //! - `POST /admin/curator`        — dry-run or stage a rule-based curator report.
 //! - `GET  /admin/status`         — lifetime counts + server data-dir info.
+//! - `GET  /admin/projects`       — authoritative `(workspace, project)` list.
 //! - `GET  /admin/search?q=`      — FTS5 hits against the wiki index.
 //! - `POST /admin/reorg`          — retro-fit sessions to per-cwd projects.
 //! - `POST /admin/lint`           — run the M8 lint pass.
@@ -523,6 +524,7 @@ pub fn admin_router(state: AdminState) -> Router {
             post(handle_pending_write_reject),
         )
         .route("/admin/status", get(handle_status))
+        .route("/admin/projects", get(handle_list_projects))
         .route(
             "/admin/audit-contamination",
             get(handle_audit_contamination),
@@ -750,6 +752,24 @@ pub struct StatusReport {
     pub derived: ai_memory_store::DerivedIndexStatus,
     /// Passive process-scoped provider health.
     pub providers: ProviderHealthSnapshot,
+}
+
+/// `GET /admin/projects` — the authoritative list of `(workspace, project)`
+/// pairs (with page counts + last-updated), read-only. Useful to any external
+/// consumer that needs the live project inventory: a dashboard, an export, or
+/// a backup/mirror that lays the wiki out as `wiki/<workspace>/<project>/` and
+/// wants to reconcile against it — any directory whose project no longer
+/// appears here is an orphan (e.g. from a delete that bypassed the admission
+/// chain, such as an offline `--data-dir` purge or a direct DB edit) and can
+/// be pruned so the copy reflects the live server.
+async fn handle_list_projects(State(state): State<Arc<AdminState>>) -> impl IntoResponse {
+    match state.reader.list_projects_with_stats().await {
+        Ok(projects) => (
+            StatusCode::OK,
+            Json(serde_json::json!({ "projects": projects })),
+        ),
+        Err(e) => internal_err(e.to_string()),
+    }
 }
 
 async fn handle_status(State(state): State<Arc<AdminState>>) -> impl IntoResponse {
@@ -4411,6 +4431,7 @@ async fn handle_delete_page(
     State(state): State<Arc<AdminState>>,
     actor_ext: Option<axum::Extension<ai_memory_core::ActorContext>>,
     level_ext: Option<axum::Extension<ai_memory_core::AuthLevel>>,
+    author_ext: Option<axum::Extension<ai_memory_core::UserId>>,
     headers: HeaderMap,
     Json(req): Json<DeletePageAdminRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<serde_json::Value>)> {
@@ -4451,9 +4472,10 @@ async fn handle_delete_page(
         None
     };
 
+    let author_id = author_ext.map(|axum::Extension(u)| u);
     state
         .wiki
-        .delete_page(ws, proj, &path, admission_ctx)
+        .delete_page(ws, proj, &path, admission_ctx, author_id)
         .await
         .map_err(|e| internal_err(e.to_string()))?;
     let checkpoint = checkpoint_or_warn(

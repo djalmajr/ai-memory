@@ -10,6 +10,8 @@ pub const MANAGED_MARKER: &str = "<!-- ai-memory-managed: routing-skill -->";
 pub const CLAUDE_SKILL_DIR: &str = ".claude";
 /// AGENTS-aware cross-client Agent Skill directory below a project or home root.
 pub const AGENTS_SKILL_DIR: &str = ".agents";
+/// Devin-compatible Agent Skill directory below a project or home root.
+pub const DEVIN_SKILL_DIR: &str = ".devin";
 /// Leaf directory that contains individual Agent Skill directories.
 pub const SKILLS_DIR: &str = "skills";
 

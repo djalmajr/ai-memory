@@ -481,6 +481,8 @@ pub enum InstallSkillsAgent {
     ClaudeCode,
     /// Cross-agent `.agents/skills` directory.
     Agents,
+    /// Devin's `.devin/skills` directory.
+    Devin,
     /// Install into both Claude Code and `.agents` skill directories.
     Both,
 }
@@ -825,6 +827,12 @@ pub enum AgentChoice {
     /// handoff injection does not — recover the prior session's handoff
     /// via the MCP `memory_handoff_accept` tool.
     Zero,
+    /// Devin CLI — JSON-config hooks in
+    /// `~/.devin/hooks.v1.json` or `~/.devin/config.json` hooks key.
+    /// Native `ai-memory hook --event` integration using Devin-specific
+    /// hook scripts. Devin consumes the handoff via
+    /// `hookSpecificOutput.additionalContext` on `SessionStart`.
+    Devin,
 }
 
 impl AgentChoice {
@@ -848,6 +856,7 @@ impl AgentChoice {
             Self::AntigravityCli => AgentKind::AntigravityCli,
             Self::Grok => AgentKind::Grok,
             Self::Zero => AgentKind::Zero,
+            Self::Devin => AgentKind::Devin,
         }
     }
 
@@ -922,6 +931,8 @@ pub enum McpClient {
     /// Zero coding agent (Gitlawb/zero) — `~/.config/zero/config.json`,
     /// `mcp.servers` map with native HTTP transport + bearer headers.
     Zero,
+    /// Devin CLI — `~/.devin/config.json`.
+    Devin,
     /// VS Code GitHub Copilot (agent mode) — per-workspace
     /// `.vscode/mcp.json`. Copilot's agent mode reads MCP servers
     /// from VS Code's own MCP framework (top-level `servers` key),
@@ -1246,8 +1257,15 @@ pub struct InstallHooksArgs {
     /// `server_url` / AI_MEMORY_SERVER_URL when set, else loopback. If neither
     /// is configured, apply-mode also reuses an existing ai-memory MCP entry
     /// for the same agent when one is present.
-    #[arg(long, default_value_t = crate::config::DEFAULT_SERVER_URL.to_string())]
-    pub server_url: String,
+    ///
+    /// `Option` (no `default_value_t`) is deliberate: it lets
+    /// `effective_hook_server_url` distinguish "not passed" from "passed
+    /// and happens to equal the compiled default" — a plain `String` with
+    /// a default can't tell those apart, which let `AI_MEMORY_SERVER_URL`
+    /// silently override an explicit `--server-url <default>` (found
+    /// 2026-07-12 during Devin real-acceptance A/B testing).
+    #[arg(long)]
+    pub server_url: Option<String>,
     /// Bearer token to embed in the hook config's `env` block. When
     /// set, every hook call carries `Authorization: Bearer <token>`,
     /// matching what the server requires when AI_MEMORY_AUTH_TOKEN
@@ -1297,7 +1315,7 @@ pub struct InstallHooksArgs {
 }
 
 /// Arguments for `install-mcp`.
-#[derive(Debug, Args)]
+#[derive(Debug, Clone, Args)]
 pub struct InstallMcpArgs {
     /// Which MCP client to render configuration for.
     #[arg(long, value_enum, default_value_t = McpClient::ClaudeCode)]
@@ -1305,8 +1323,11 @@ pub struct InstallMcpArgs {
     /// MCP HTTP endpoint URL the client should connect to. Defaults to the
     /// configured `server_url` / AI_MEMORY_SERVER_URL plus `/mcp` when set,
     /// else loopback.
-    #[arg(long, default_value_t = crate::config::DEFAULT_MCP_URL.to_string())]
-    pub server_url: String,
+    ///
+    /// `Option` (no `default_value_t`) is deliberate: see the matching
+    /// comment on `InstallHooksArgs::server_url` — same bug, same fix.
+    #[arg(long)]
+    pub server_url: Option<String>,
     /// Friendly name the client should show for this server entry.
     #[arg(long, default_value = "ai-memory")]
     pub name: String,
@@ -1729,6 +1750,23 @@ mod tests {
             panic!("expected install-hooks command for grok");
         };
         assert!(matches!(hook_args.agent, AgentChoice::Grok));
+    }
+
+    #[test]
+    fn devin_hook_agent_parses() {
+        let hook_cli = Cli::try_parse_from([
+            "ai-memory",
+            "install-hooks",
+            "--agent",
+            "devin",
+            "--server-url",
+            "http://example.test:49374",
+        ])
+        .unwrap_or_else(|e| panic!("failed to parse install-hooks --agent devin: {e}"));
+        let Command::InstallHooks(hook_args) = hook_cli.command else {
+            panic!("expected install-hooks command for devin");
+        };
+        assert!(matches!(hook_args.agent, AgentChoice::Devin));
     }
 
     #[test]

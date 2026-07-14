@@ -32,9 +32,26 @@ If `cargo-deny` or `cargo-audit` are not installed:
 cargo install cargo-deny cargo-audit
 ```
 
-## Workflow rules (condensed from CLAUDE.md)
+## CHANGELOG is a merge gate
 
-The full authoritative rules are in [`CLAUDE.md`](CLAUDE.md). Short version:
+Every **user-facing** change must add a `CHANGELOG.md` entry under
+`## [Unreleased]` in the same PR. User-facing means: a new CLI flag or
+subcommand, env var, HTTP/admin endpoint, MCP tool or tool-response field,
+`.ai-memory.toml` marker key, any changed behaviour or default, or an
+observable bug fix. Internal refactors, dead-code removal, and test-only
+churn are exempt.
+
+This has been the single most-forgotten obligation across review batches,
+so reviewers treat a missing entry as **blocking** — the PR template has a
+checkbox for it. Follow the existing entry style (past-tense summary,
+trailing `([#NNN])` PR/issue reference) and place it under the right
+`### Added` / `### Changed` / `### Fixed` heading.
+
+## Workflow rules (condensed from AGENTS.md)
+
+The full authoritative rules are in [`AGENTS.md`](AGENTS.md) — the single
+canonical agent/contributor rules file (`CLAUDE.md` is just a pointer to
+it). Short version:
 
 1. Work milestone by milestone. Do not start M(n+1) until every "Done when"
    bullet in M(n) passes (see `docs/design-decisions.md`).
@@ -49,7 +66,8 @@ The full authoritative rules are in [`CLAUDE.md`](CLAUDE.md). Short version:
 
 ## Cross-cutting invariants
 
-Never violate any of the invariants in `CLAUDE.md §Cross-cutting invariants`.
+Never violate any of the invariants in [`AGENTS.md`](AGENTS.md) (see the
+"Rust Engineering Rules" and "Project Maintenance Rules" sections).
 Highlights for contributors:
 
 - All SQLite writes go through the single writer actor (`WriterHandle`).

@@ -47,6 +47,22 @@ pub(crate) const CLAUDE_CODE_EVENTS: [(&str, &str); 9] = [
     ("SubagentStop", "subagent-stop.sh"),
 ];
 
+/// Devin lifecycle events ai-memory hooks. Each pair is
+/// `(event-name-in-Devin-settings, POSIX hook-script-filename)`.
+///
+/// Devin uses the same event vocabulary as Claude Code, but with two differences:
+/// - `PostCompaction` instead of `PreCompact` (triggers *after* compaction with a `summary` field)
+/// - No `SubagentStart`/`SubagentStop` (Devin does not expose subagent boundaries as hook events)
+pub(crate) const DEVIN_EVENTS: [(&str, &str); 7] = [
+    ("SessionStart", "session-start.sh"),
+    ("UserPromptSubmit", "user-prompt-submit.sh"),
+    ("PreToolUse", "pre-tool-use.sh"),
+    ("PostToolUse", "post-tool-use.sh"),
+    ("PostCompaction", "post-compaction.sh"),
+    ("Stop", "stop.sh"),
+    ("SessionEnd", "session-end.sh"),
+];
+
 /// Format an `Authorization: Bearer <token>` header value, or `None`
 /// when no token is supplied. Used by every MCP client renderer in
 /// `install-mcp` and every hook-config renderer that wants to
@@ -238,6 +254,30 @@ pub(crate) fn build_zero_hooks_config(
     serde_json::json!({ "enabled": true, "hooks": hooks })
 }
 
+/// Devin hook payload for docker/setup-agent script snippets.
+/// Devin uses HookShape::Nested (same as Claude Code/Grok) but with
+/// DEVIN_EVENTS (PostCompaction instead of PreCompact, no subagent events).
+#[must_use]
+pub(crate) fn build_devin_payload(
+    emit_root: &Path,
+    server_url: &str,
+    auth_token: Option<&str>,
+) -> serde_json::Value {
+    build_hook_payload_for_platform(
+        &DEVIN_EVENTS,
+        emit_root,
+        server_url,
+        auth_token,
+        HookShape::Nested,
+        HookCommandContext::new(
+            HookCommandPlatform::for_bash_script_runner(),
+            "devin",
+            None,
+            None,
+        ),
+    )
+}
+
 /// Grok Build CLI hook payload for apply/render paths. Native commands are the
 /// default; explicit script fallback still points at the Grok script bundle.
 pub(crate) fn build_grok_payload_with_data_dir(
@@ -256,6 +296,33 @@ pub(crate) fn build_grok_payload_with_data_dir(
         HookCommandContext::new(
             HookCommandPlatform::for_bash_runner(),
             "grok",
+            data_dir,
+            project_strategy,
+        ),
+    )
+}
+
+/// Devin hook payload for apply/render paths. Native commands are the
+/// default; explicit script fallback still points at the Devin script bundle.
+/// Devin uses HookShape::Nested (same as Claude Code/Grok) but with
+/// DEVIN_EVENTS (PostCompaction instead of PreCompact, no subagent events).
+#[must_use]
+pub(crate) fn build_devin_payload_with_data_dir(
+    emit_root: &Path,
+    server_url: &str,
+    auth_token: Option<&str>,
+    data_dir: Option<&Path>,
+    project_strategy: Option<&str>,
+) -> serde_json::Value {
+    build_hook_payload_for_platform(
+        &DEVIN_EVENTS,
+        emit_root,
+        server_url,
+        auth_token,
+        HookShape::Nested,
+        HookCommandContext::new(
+            HookCommandPlatform::for_bash_runner(),
+            "devin",
             data_dir,
             project_strategy,
         ),
@@ -1066,6 +1133,59 @@ mod tests {
             "{command}"
         );
         assert!(!command.contains("claude-code"), "{command}");
+    }
+
+    #[test]
+    fn devin_payload_has_all_events() {
+        let root = PathBuf::from("/host/hooks/devin");
+        let v = build_devin_payload(&root, "http://localhost:49374", None);
+        let hooks = v.get("hooks").and_then(|h| h.as_object()).unwrap();
+        assert_eq!(hooks.len(), DEVIN_EVENTS.len());
+        for (event, _) in DEVIN_EVENTS {
+            assert!(hooks.contains_key(event), "missing event {event}");
+        }
+    }
+
+    #[test]
+    fn devin_native_payload_uses_devin_agent() {
+        let root = PathBuf::from("/host/hooks/devin");
+        let v = build_hook_payload_for_platform(
+            &DEVIN_EVENTS,
+            &root,
+            "http://localhost:49374",
+            None,
+            HookShape::Nested,
+            HookCommandContext::new(HookCommandPlatform::PosixNative, "devin", None, None),
+        );
+        let command = v
+            .pointer("/hooks/SessionStart/0/hooks/0/command")
+            .and_then(|s| s.as_str())
+            .unwrap();
+        assert!(command.contains("--agent devin"), "{command}");
+        assert!(!command.contains("grok"), "{command}");
+    }
+
+    #[test]
+    fn devin_script_payload_uses_devin_bundle() {
+        let root = PathBuf::from("/host/hooks/devin");
+        let v = build_hook_payload_for_platform(
+            &DEVIN_EVENTS,
+            &root,
+            "http://localhost:49374",
+            None,
+            HookShape::Nested,
+            HookCommandContext::new(HookCommandPlatform::Posix, "devin", None, None),
+        );
+        let command = v
+            .pointer("/hooks/SessionStart/0/hooks/0/command")
+            .and_then(|s| s.as_str())
+            .unwrap();
+        let normalized = command.replace('\\', "/");
+        assert!(
+            normalized.contains("/host/hooks/devin/session-start.sh"),
+            "{command}"
+        );
+        assert!(!command.contains("grok"), "{command}");
     }
 
     #[test]

@@ -24,8 +24,6 @@ struct Report {
 struct Summary {
     #[serde(default)]
     sessions_misbucketed: usize,
-    #[serde(default)]
-    observations_drifted: usize,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -40,8 +38,6 @@ struct Finding {
     expected_project: Option<String>,
     #[serde(default)]
     cwd: Option<String>,
-    #[serde(default)]
-    session_id: Option<String>,
 }
 
 /// Run the `audit-contamination` subcommand.
@@ -60,12 +56,12 @@ pub async fn run(config: &Config, args: AuditContaminationArgs) -> Result<()> {
     }
 
     if report.findings.is_empty() {
-        println!("No structural contamination found (sessions + observations consistent).");
+        println!("No structural contamination found (no session mis-bucketed by cwd).");
         return Ok(());
     }
     println!(
-        "Contamination audit: {} session(s) mis-bucketed, {} observation(s) drifted.",
-        report.summary.sessions_misbucketed, report.summary.observations_drifted
+        "Contamination audit: {} session(s) mis-bucketed.",
+        report.summary.sessions_misbucketed
     );
     for f in &report.findings {
         let expected = f.expected_project.as_deref().unwrap_or("?");
@@ -77,15 +73,6 @@ pub async fn run(config: &Config, args: AuditContaminationArgs) -> Result<()> {
                 f.landed_workspace,
                 f.landed_project,
                 f.cwd.as_deref().unwrap_or("?"),
-                expected,
-            ),
-            "observation_session_drift" => println!(
-                "  [{}] observation {} in {}/{} but its session ({}) is in project {}",
-                f.confidence,
-                f.entity_id,
-                f.landed_workspace,
-                f.landed_project,
-                f.session_id.as_deref().unwrap_or("?"),
                 expected,
             ),
             other => println!(

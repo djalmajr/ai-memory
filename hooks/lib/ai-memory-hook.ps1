@@ -20,6 +20,21 @@ function Get-AiMemoryCwd {
     return $null
 }
 
+function Resolve-AiMemoryCwd {
+    param([string] $Payload, [string] $Agent)
+    $Cwd = Get-AiMemoryCwd -Payload $Payload
+    if ($Cwd) { return $Cwd }
+    if ($Agent -eq "devin" -and $env:DEVIN_PROJECT_DIR) { return $env:DEVIN_PROJECT_DIR }
+    if ($Agent -eq "devin") {
+        try {
+            $Location = (Get-Location).Path
+            if ($Location) { return $Location }
+        } catch {
+        }
+    }
+    return $null
+}
+
 function Get-AiMemoryMarkerToml {
     param([string] $Cwd)
     if (-not $Cwd) { return $null }
@@ -99,6 +114,50 @@ function Get-AiMemoryMarkerQuery {
     return $qs
 }
 
+function Get-AiMemoryStateDir {
+    if ($env:AI_MEMORY_DATA_DIR) { return $env:AI_MEMORY_DATA_DIR }
+    if ($env:XDG_DATA_HOME) { return (Join-Path $env:XDG_DATA_HOME "ai-memory") }
+    if ($env:LOCALAPPDATA) { return (Join-Path $env:LOCALAPPDATA "ai-memory") }
+    if ($env:HOME) { return (Join-Path $env:HOME ".local/share/ai-memory") }
+    return ".ai-memory"
+}
+
+function Get-AiMemorySessionIdPath {
+    param([string] $Agent)
+    return (Join-Path (Join-Path (Get-AiMemoryStateDir) "hook-state") "$Agent-session-id")
+}
+
+function New-AiMemorySessionId {
+    param([string] $Agent)
+    return "$Agent-$([DateTimeOffset]::UtcNow.ToUnixTimeSeconds())-$PID"
+}
+
+function Get-AiMemorySessionIdQuery {
+    param([string] $Agent, [string] $Event)
+    if ($env:AI_MEMORY_SESSION_ID) {
+        return "&session_id=$([uri]::EscapeDataString($env:AI_MEMORY_SESSION_ID))"
+    }
+
+    $Path = Get-AiMemorySessionIdPath -Agent $Agent
+    $SessionId = $null
+    if ($Event -ne "session-start" -and (Test-Path $Path -PathType Leaf)) {
+        $SessionId = (Get-Content $Path -TotalCount 1 -ErrorAction SilentlyContinue)
+    }
+    if (-not $SessionId) {
+        $SessionId = New-AiMemorySessionId -Agent $Agent
+        $Parent = Split-Path $Path -Parent
+        New-Item -ItemType Directory -Force -Path $Parent -ErrorAction SilentlyContinue | Out-Null
+        Set-Content -Path $Path -Value $SessionId -NoNewline -ErrorAction SilentlyContinue
+    }
+    return "&session_id=$([uri]::EscapeDataString($SessionId))"
+}
+
+function Clear-AiMemorySessionId {
+    param([string] $Agent)
+    $Path = Get-AiMemorySessionIdPath -Agent $Agent
+    Remove-Item -Force -ErrorAction SilentlyContinue $Path
+}
+
 function Read-AiMemoryStdin {
     try {
         if (-not [Console]::IsInputRedirected) { return "" }
@@ -128,8 +187,12 @@ function Invoke-AiMemoryHook {
 
     $Server = if ($env:AI_MEMORY_HOOK_URL) { $env:AI_MEMORY_HOOK_URL } else { "http://127.0.0.1:49374" }
     $Payload = Read-AiMemoryStdin
-    $Cwd = Get-AiMemoryCwd -Payload $Payload
+    $Cwd = Resolve-AiMemoryCwd -Payload $Payload -Agent $Agent
     $QS = Get-AiMemoryMarkerQuery -Cwd $Cwd
+    $SessionQS = ""
+    if ($Agent -eq "devin") {
+        $SessionQS = Get-AiMemorySessionIdQuery -Agent $Agent -Event $Event
+    }
     $Headers = @{}
 
     if ($env:AI_MEMORY_AUTH_TOKEN) {
@@ -141,11 +204,14 @@ function Invoke-AiMemoryHook {
             -UseBasicParsing `
             -TimeoutSec 3 `
             -Method Post `
-            -Uri "$Server/hook?event=$Event&agent=$Agent$QS" `
+            -Uri "$Server/hook?event=$Event&agent=$Agent$QS$SessionQS" `
             -Headers $Headers `
             -ContentType "application/json" `
             -Body $Payload | Out-Null
     } catch {
+    }
+    if ($Agent -eq "devin" -and $Event -eq "session-end") {
+        Clear-AiMemorySessionId -Agent $Agent
     }
 
     if ($FetchHandoff) {

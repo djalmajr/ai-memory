@@ -459,6 +459,7 @@ impl Wiki {
         project_id: ProjectId,
         path: &PagePath,
         admission_ctx: Option<AdmissionContext>,
+        author_id: Option<ai_memory_core::UserId>,
     ) -> WikiResult<()> {
         let _guard = self.mutation_lock.read().await;
         self.ensure_project_workspace(workspace_id, project_id)
@@ -482,7 +483,7 @@ impl Wiki {
 
         let delete_result = self
             .writer
-            .delete_page(workspace_id, project_id, path.clone())
+            .delete_page(workspace_id, project_id, path.clone(), author_id)
             .await;
         if let Err(e) = delete_result {
             if let Some(quarantine) = &quarantined

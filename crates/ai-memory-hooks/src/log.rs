@@ -89,6 +89,7 @@ fn format_line(when: Timestamp, event: HookEvent, title: &str) -> String {
         HookEvent::PreToolUse => "pre-tool-use",
         HookEvent::PostToolUse => "post-tool-use",
         HookEvent::PreCompact => "pre-compact",
+        HookEvent::PostCompaction => "post-compaction",
         HookEvent::Notification => "notification",
         HookEvent::Stop => "stop",
         HookEvent::SessionEnd => "session-end",

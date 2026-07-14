@@ -15,7 +15,7 @@ use crate::commands::path_util::home_dir;
 use crate::commands::{data_purge, install_hooks, install_mcp, openclaw_plugin};
 use crate::config::Config;
 use ai_memory_core::routing_skills::{
-    AGENTS_SKILL_DIR, CLAUDE_SKILL_DIR, MANAGED_MARKER, MANAGED_SKILLS, SKILLS_DIR,
+    AGENTS_SKILL_DIR, CLAUDE_SKILL_DIR, DEVIN_SKILL_DIR, MANAGED_MARKER, MANAGED_SKILLS, SKILLS_DIR,
 };
 use ai_memory_core::{MARKER_END, MARKER_START, find_marker_line};
 use anyhow::{Context, Result};
@@ -33,7 +33,7 @@ enum RewriteOp {
     /// CLAUDE.md / AGENTS.md routing block.
     Instructions,
     /// Standard JSON hook table under `hooks`.
-    HooksJson,
+    HooksJson(HookConfigShape),
     /// Antigravity CLI named hook group under top-level `ai-memory`.
     AntigravityHooksJson,
     /// Zero hooks.json — `hooks` array entries whose `id` carries the
@@ -43,6 +43,14 @@ enum RewriteOp {
     McpJson(McpClient),
     /// Codex TOML MCP config.
     McpToml,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HookConfigShape {
+    /// Standard agent configs: `{ "hooks": { "Event": [...] } }`.
+    NestedHooksKey,
+    /// Devin `hooks.v1.json`: the file itself is `{ "Event": [...] }`.
+    FlatHookFile,
 }
 
 /// Generated files that uninstall may delete after content re-validation.
@@ -129,26 +137,55 @@ fn build_plan(args: &UninstallArgs) -> anyhow::Result<Vec<PlannedChange>> {
     // ---- Hooks (JSON configs) ----
     if want(crate::cli::UninstallOnly::Hooks) {
         let hook_files = [
-            install_hooks::claude_settings_path()?,
-            install_hooks::codex_hooks_path()?,
-            install_hooks::cursor_hooks_path()?,
-            install_hooks::gemini_settings_path()?,
+            (
+                install_hooks::claude_settings_path()?,
+                HookConfigShape::NestedHooksKey,
+            ),
+            (
+                install_hooks::codex_hooks_path()?,
+                HookConfigShape::NestedHooksKey,
+            ),
+            (
+                install_hooks::cursor_hooks_path()?,
+                HookConfigShape::NestedHooksKey,
+            ),
+            (
+                install_hooks::gemini_settings_path()?,
+                HookConfigShape::NestedHooksKey,
+            ),
             // Grok's ~/.grok/hooks/ai-memory.json shares Claude Code's
             // JSON shape, so the same strip pass removes our entries.
-            install_hooks::grok_hooks_path()?,
+            (
+                install_hooks::grok_hooks_path()?,
+                HookConfigShape::NestedHooksKey,
+            ),
+            // Devin's default hooks.v1.json is flat: the file itself is the
+            // event map. Its config.json alternative stores the same entries
+            // under the usual hooks key.
+            (
+                install_hooks::devin_hooks_path()?,
+                HookConfigShape::FlatHookFile,
+            ),
+            (
+                install_hooks::devin_config_path()?,
+                HookConfigShape::NestedHooksKey,
+            ),
         ];
-        for path in hook_files {
+        for (path, shape) in hook_files {
             if !path.exists() {
                 continue;
             }
             let content = std::fs::read_to_string(&path)
                 .with_context(|| format!("reading {}", path.display()))?;
-            let removal = strip_ai_memory_hooks(&content)?;
+            let removal = match shape {
+                HookConfigShape::NestedHooksKey => strip_ai_memory_hooks(&content)?,
+                HookConfigShape::FlatHookFile => strip_ai_memory_hooks_flat(&content)?,
+            };
             push_rewrite(
                 &mut plan,
                 path,
                 removal.removed_events,
-                RewriteOp::HooksJson,
+                RewriteOp::HooksJson(shape),
             );
         }
 
@@ -220,6 +257,7 @@ fn build_plan(args: &UninstallArgs) -> anyhow::Result<Vec<PlannedChange>> {
             AntigravityCli,
             Zero,
             VsCodeCopilot,
+            Devin,
         ] {
             let Ok(path) = install_mcp::mcp_config_path(client) else {
                 continue;
@@ -269,7 +307,8 @@ fn build_plan(args: &UninstallArgs) -> anyhow::Result<Vec<PlannedChange>> {
     if want(crate::cli::UninstallOnly::Skills) {
         let cwd = std::env::current_dir().context("getting CWD for skill removal")?;
         let home = home_dir();
-        for root in skill_roots(&cwd, home.as_deref()) {
+        let appdata = std::env::var_os("APPDATA").map(PathBuf::from);
+        for root in skill_roots(&cwd, home.as_deref(), appdata.as_deref()) {
             for skill in MANAGED_SKILLS {
                 push_generated_delete(
                     &mut plan,
@@ -283,13 +322,20 @@ fn build_plan(args: &UninstallArgs) -> anyhow::Result<Vec<PlannedChange>> {
     Ok(plan)
 }
 
-fn skill_roots(cwd: &Path, home: Option<&Path>) -> Vec<PathBuf> {
-    let mut roots = Vec::with_capacity(4);
+fn skill_roots(cwd: &Path, home: Option<&Path>, appdata: Option<&Path>) -> Vec<PathBuf> {
+    let mut roots = Vec::with_capacity(7);
     push_unique_skill_root(&mut roots, cwd.join(CLAUDE_SKILL_DIR).join(SKILLS_DIR));
     push_unique_skill_root(&mut roots, cwd.join(AGENTS_SKILL_DIR).join(SKILLS_DIR));
+    push_unique_skill_root(&mut roots, cwd.join(DEVIN_SKILL_DIR).join(SKILLS_DIR));
     if let Some(home) = home {
         push_unique_skill_root(&mut roots, home.join(CLAUDE_SKILL_DIR).join(SKILLS_DIR));
         push_unique_skill_root(&mut roots, home.join(AGENTS_SKILL_DIR).join(SKILLS_DIR));
+        push_unique_skill_root(&mut roots, home.join(DEVIN_SKILL_DIR).join(SKILLS_DIR));
+    }
+    // Windows global Devin installs live under %APPDATA%\devin\skills, not
+    // $HOME/.devin/skills — sweep it too or uninstall orphans those skills.
+    if let Some(appdata) = appdata {
+        push_unique_skill_root(&mut roots, appdata.join("devin").join(SKILLS_DIR));
     }
     roots
 }
@@ -351,7 +397,12 @@ fn apply_change(change: &PlannedChange, name: Option<&str>, url: &str) -> anyhow
                 for op in ops {
                     out = match *op {
                         RewriteOp::Instructions => strip_instructions_block(&out).0,
-                        RewriteOp::HooksJson => strip_ai_memory_hooks(&out)?.new_content,
+                        RewriteOp::HooksJson(HookConfigShape::NestedHooksKey) => {
+                            strip_ai_memory_hooks(&out)?.new_content
+                        }
+                        RewriteOp::HooksJson(HookConfigShape::FlatHookFile) => {
+                            strip_ai_memory_hooks_flat(&out)?.new_content
+                        }
                         RewriteOp::AntigravityHooksJson => {
                             strip_antigravity_hooks(&out)?.new_content
                         }
@@ -584,6 +635,30 @@ fn strip_hook_entry(entry: &mut serde_json::Value) -> (bool, bool) {
     (false, false)
 }
 
+fn strip_hook_events(
+    hooks: &mut serde_json::Map<String, serde_json::Value>,
+    removed_events: &mut Vec<String>,
+) {
+    let events: Vec<String> = hooks.keys().cloned().collect();
+    for event in events {
+        let Some(arr) = hooks.get_mut(&event).and_then(|v| v.as_array_mut()) else {
+            continue;
+        };
+        let mut removed_from_event = false;
+        arr.retain_mut(|entry| {
+            let (removed, remove_entry) = strip_hook_entry(entry);
+            removed_from_event |= removed;
+            !remove_entry
+        });
+        if removed_from_event {
+            removed_events.push(event.clone());
+        }
+        if arr.is_empty() {
+            hooks.remove(&event);
+        }
+    }
+}
+
 /// Remove ai-memory hook entries from a settings/hooks JSON document.
 /// Preserves third-party entries (including siblings under the same
 /// event). Prunes an event key when emptied and the `hooks` object
@@ -595,24 +670,7 @@ fn strip_ai_memory_hooks(content: &str) -> Result<HookRemoval> {
         let Some(hooks) = root.get_mut("hooks").and_then(|h| h.as_object_mut()) else {
             return Ok(());
         };
-        let events: Vec<String> = hooks.keys().cloned().collect();
-        for event in events {
-            let Some(arr) = hooks.get_mut(&event).and_then(|v| v.as_array_mut()) else {
-                continue;
-            };
-            let mut removed_from_event = false;
-            arr.retain_mut(|entry| {
-                let (removed, remove_entry) = strip_hook_entry(entry);
-                removed_from_event |= removed;
-                !remove_entry
-            });
-            if removed_from_event {
-                removed_events.push(event.clone());
-            }
-            if arr.is_empty() {
-                hooks.remove(&event);
-            }
-        }
+        strip_hook_events(hooks, &mut removed_events);
         if hooks.is_empty() {
             root.remove("hooks");
         }
@@ -645,6 +703,21 @@ fn strip_zero_hooks(content: &str) -> Result<HookRemoval> {
             }
             !ours
         });
+        Ok(())
+    })?;
+    Ok(HookRemoval {
+        new_content,
+        removed_events,
+    })
+}
+
+/// Remove ai-memory hook entries from Devin's `hooks.v1.json`, whose root
+/// object is the hook-event map. This is intentionally separate from
+/// `strip_ai_memory_hooks` so we never infer a flat shape for other agents.
+fn strip_ai_memory_hooks_flat(content: &str) -> Result<HookRemoval> {
+    let mut removed_events = Vec::new();
+    let new_content = mutate_json(content, |root| {
+        strip_hook_events(root, &mut removed_events);
         Ok(())
     })?;
     Ok(HookRemoval {
@@ -757,7 +830,8 @@ fn mcp_servers_path(client: McpClient) -> Option<&'static [&'static str]> {
         | McpClient::Cursor
         | McpClient::GeminiCli
         | McpClient::Omp
-        | McpClient::AntigravityCli => Some(&["mcpServers"]),
+        | McpClient::AntigravityCli
+        | McpClient::Devin => Some(&["mcpServers"]),
         McpClient::OpenCode => Some(&["mcp"]),
         McpClient::Openclaw | McpClient::Zero => Some(&["mcp", "servers"]),
         McpClient::VsCodeCopilot => Some(&["servers"]),
@@ -893,6 +967,25 @@ fn strip_mcp_toml(content: &str, name: Option<&str>, url: &str) -> Result<(Strin
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The Windows global Devin skill root (`%APPDATA%\devin\skills`) is
+    /// swept alongside the cwd/home roots — `install-skills --scope global`
+    /// writes there on Windows, so uninstall must plan its removal too.
+    #[test]
+    fn skill_roots_include_windows_appdata_devin_root() {
+        let cwd = Path::new("/repo");
+        let home = Path::new("/home/alice");
+        let appdata = Path::new("C:/Users/Alice/AppData/Roaming");
+
+        let roots = skill_roots(cwd, Some(home), Some(appdata));
+        assert!(
+            roots.contains(&appdata.join("devin").join(SKILLS_DIR)),
+            "{roots:?}"
+        );
+
+        let without = skill_roots(cwd, Some(home), None);
+        assert_eq!(without.len(), 6, "no phantom root when APPDATA is unset");
+    }
 
     #[test]
     fn strip_instructions_round_trips_with_install_append() {
@@ -1174,6 +1267,40 @@ mod tests {
             root["enabled"],
             serde_json::json!(true),
             "the top-level enabled flag is not ours to touch"
+        );
+    }
+
+    // Devin's hooks.v1.json: the root object IS the event map (no "hooks"
+    // wrapper). Mirrors strip_zero_hooks_removes_only_prefixed_ids above,
+    // but for Devin's flat shape and command-signature ownership (entries
+    // have no "id" field to prefix-match on).
+    #[test]
+    fn strip_ai_memory_hooks_flat_removes_only_ours_and_preserves_third_party() {
+        let content = r#"{
+            "SessionStart": [
+                {"type": "command", "command": "AI_MEMORY_HOOK_URL=http://h /x/session-start.sh"}
+            ],
+            "PostToolUse": [
+                {"type": "command", "command": "AI_MEMORY_HOOK_URL=http://h /x/post-tool-use.sh"},
+                {"type": "command", "command": "/home/u/scripts/my-logger.sh"}
+            ]
+        }"#;
+        let out = strip_ai_memory_hooks_flat(content).unwrap();
+        assert_eq!(
+            out.removed_events,
+            vec!["SessionStart".to_string(), "PostToolUse".to_string()]
+        );
+        let v: serde_json::Value = serde_json::from_str(&out.new_content).unwrap();
+        assert!(v.get("SessionStart").is_none(), "emptied event key removed");
+        let post_tool_use = v["PostToolUse"].as_array().unwrap();
+        assert_eq!(post_tool_use.len(), 1, "only ours removed");
+        assert_eq!(
+            post_tool_use[0]["command"].as_str(),
+            Some("/home/u/scripts/my-logger.sh")
+        );
+        assert!(
+            v.get("hooks").is_none(),
+            "flat file must not gain a nested 'hooks' wrapper"
         );
     }
 

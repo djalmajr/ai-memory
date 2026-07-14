@@ -986,12 +986,29 @@ pub fn soft_delete_for_decay(conn: &mut Connection, page_ids: &[PageId]) -> Stor
 /// drop outgoing links + embeddings; the `pages_fts_ad` trigger keeps FTS in
 /// sync; incoming links are set to NULL (unresolved). Idempotent.
 pub fn delete_page(
-    conn: &Connection,
+    conn: &mut Connection,
     workspace_id: WorkspaceId,
     project_id: ProjectId,
     path: &PagePath,
+    author_id: Option<ai_memory_core::UserId>,
 ) -> StoreResult<()> {
-    conn.execute(
+    let tx = conn.transaction()?;
+    // Capture the latest page id BEFORE the delete so the audit row can point
+    // at it. None when the page is absent (delete is an idempotent no-op).
+    let page_id: Option<[u8; 16]> = tx
+        .query_row(
+            "SELECT id FROM pages WHERE workspace_id = ?1 AND project_id = ?2 \
+             AND path = ?3 AND is_latest = 1 LIMIT 1",
+            params![
+                workspace_id.as_bytes(),
+                project_id.as_bytes(),
+                path.as_str()
+            ],
+            |row| row.get::<_, Vec<u8>>(0),
+        )
+        .optional()?
+        .and_then(|v| <[u8; 16]>::try_from(v.as_slice()).ok());
+    let rows = tx.execute(
         "DELETE FROM pages WHERE workspace_id = ?1 AND project_id = ?2 AND path = ?3",
         params![
             workspace_id.as_bytes(),
@@ -999,6 +1016,20 @@ pub fn delete_page(
             path.as_str()
         ],
     )?;
+    // Only audit a real deletion — a no-op delete (0 rows) writes nothing, so
+    // the trail isn't polluted with idempotent misses.
+    if rows > 0 {
+        audit(
+            &tx,
+            "delete_page",
+            Some(workspace_id.as_bytes()),
+            Some(project_id.as_bytes()),
+            page_id.as_ref(),
+            author_id.as_ref().map(ai_memory_core::UserId::as_bytes),
+            Timestamp::now().as_microsecond(),
+        )?;
+    }
+    tx.commit()?;
     Ok(())
 }
 
@@ -1047,7 +1078,11 @@ pub fn insert_handoff(conn: &mut Connection, h: &NewHandoff) -> StoreResult<Hand
     });
     let from_agent = h.from_agent.as_str();
     let to_agent = h.to_agent.map(AgentKind::as_str);
-    conn.execute(
+    // Insert + audit atomically. Handoffs are keyed by agent/session, not a DB
+    // user, so the audit author is NULL — the row records the lifecycle event
+    // (op + workspace/project + time), not an operator identity.
+    let tx = conn.transaction()?;
+    tx.execute(
         "INSERT INTO handoffs \
          (id, workspace_id, project_id, from_session_id, from_agent, to_agent, cwd, summary, \
           open_questions, next_steps, files_touched, state, created_at) \
@@ -1067,7 +1102,43 @@ pub fn insert_handoff(conn: &mut Connection, h: &NewHandoff) -> StoreResult<Hand
             now,
         ],
     )?;
+    audit(
+        &tx,
+        "insert_handoff",
+        Some(h.workspace_id.as_bytes()),
+        Some(h.project_id.as_bytes()),
+        None,
+        None,
+        now,
+    )?;
+    tx.commit()?;
     Ok(id)
+}
+
+/// A handoff's `(workspace_id, project_id)` as raw 16-byte ids, for tagging
+/// its audit rows. Either component is `None` when the handoff row is absent.
+type HandoffScope = (Option<[u8; 16]>, Option<[u8; 16]>);
+
+/// The `(workspace_id, project_id)` a handoff belongs to, for tagging its
+/// audit rows. `(None, None)` when the handoff row is absent.
+fn handoff_scope(
+    tx: &rusqlite::Transaction<'_>,
+    handoff_id: &HandoffId,
+) -> StoreResult<HandoffScope> {
+    let row = tx
+        .query_row(
+            "SELECT workspace_id, project_id FROM handoffs WHERE id = ?1",
+            params![handoff_id.as_bytes()],
+            |r| Ok((r.get::<_, Vec<u8>>(0)?, r.get::<_, Vec<u8>>(1)?)),
+        )
+        .optional()?;
+    Ok(match row {
+        Some((ws, proj)) => (
+            <[u8; 16]>::try_from(ws.as_slice()).ok(),
+            <[u8; 16]>::try_from(proj.as_slice()).ok(),
+        ),
+        None => (None, None),
+    })
 }
 
 /// Mark a handoff accepted by `accepting_agent` / `accepting_session`.
@@ -1080,21 +1151,51 @@ pub fn accept_handoff(
     let now = Timestamp::now().as_microsecond();
     let agent = accepting_agent.as_str();
     let session: Option<&[u8]> = accepting_session.map(|s| &s.as_bytes()[..]);
-    conn.execute(
+    let tx = conn.transaction()?;
+    let (ws, proj) = handoff_scope(&tx, handoff_id)?;
+    let changed = tx.execute(
         "UPDATE handoffs SET state = 'accepted', accepted_by = ?1, accepted_at = ?2, \
          accepted_by_session = ?3 \
          WHERE id = ?4 AND state = 'open'",
         params![agent, now, session, handoff_id.as_bytes()],
     )?;
+    // Only a real state transition ('open' -> 'accepted') is audited.
+    if changed > 0 {
+        audit(
+            &tx,
+            "accept_handoff",
+            ws.as_ref(),
+            proj.as_ref(),
+            None,
+            None,
+            now,
+        )?;
+    }
+    tx.commit()?;
     Ok(())
 }
 
 /// Mark an open handoff expired so it will no longer be consumed.
 pub fn cancel_handoff(conn: &mut Connection, handoff_id: &HandoffId) -> StoreResult<bool> {
-    let changed = conn.execute(
+    let now = Timestamp::now().as_microsecond();
+    let tx = conn.transaction()?;
+    let (ws, proj) = handoff_scope(&tx, handoff_id)?;
+    let changed = tx.execute(
         "UPDATE handoffs SET state = 'expired' WHERE id = ?1 AND state = 'open'",
         params![handoff_id.as_bytes()],
     )?;
+    if changed > 0 {
+        audit(
+            &tx,
+            "cancel_handoff",
+            ws.as_ref(),
+            proj.as_ref(),
+            None,
+            None,
+            now,
+        )?;
+    }
+    tx.commit()?;
     Ok(changed > 0)
 }
 
@@ -2307,6 +2408,67 @@ mod tests {
         assert!(second.is_ok(), "double-accept must not error");
     }
 
+    /// The handoff lifecycle (insert / accept / cancel) writes audit rows,
+    /// scoped to the handoff's workspace/project, with a NULL author (handoffs
+    /// are agent/session-keyed, not owned by a DB user).
+    #[test]
+    fn audit_log_records_handoff_lifecycle_with_null_author() {
+        let (_tmp, mut conn, ws, proj) = fresh_db();
+        let new = || NewHandoff {
+            workspace_id: ws,
+            project_id: proj,
+            from_session_id: None,
+            from_agent: AgentKind::ClaudeCode,
+            to_agent: None,
+            cwd: None,
+            summary: "s".into(),
+            open_questions: vec![],
+            next_steps: vec![],
+            files_touched: vec![],
+        };
+        let id = insert_handoff(&mut conn, &new()).unwrap();
+        accept_handoff(&mut conn, &id, AgentKind::Codex, None).unwrap();
+        let id2 = insert_handoff(&mut conn, &new()).unwrap();
+        assert!(cancel_handoff(&mut conn, &id2).unwrap());
+
+        for op in ["insert_handoff", "accept_handoff", "cancel_handoff"] {
+            let (count, author) = audit_row_for(&conn, op);
+            assert!(count >= 1, "{op} must be audited");
+            assert!(author.is_none(), "{op} audit author must be NULL");
+        }
+        assert_eq!(
+            audit_row_for(&conn, "insert_handoff").0,
+            2,
+            "two inserts → two rows"
+        );
+        // Idempotent misses stay out of the trail: a double-accept and a
+        // cancel of an already-accepted handoff change no row, audit nothing.
+        accept_handoff(&mut conn, &id, AgentKind::Codex, None).unwrap();
+        assert!(!cancel_handoff(&mut conn, &id).unwrap());
+        assert_eq!(
+            audit_row_for(&conn, "accept_handoff").0,
+            1,
+            "a no-op double-accept must not write a second audit row"
+        );
+        assert_eq!(
+            audit_row_for(&conn, "cancel_handoff").0,
+            1,
+            "cancelling a non-open handoff must not write an audit row"
+        );
+        let ws_bytes: Option<Vec<u8>> = conn
+            .query_row(
+                "SELECT workspace_id FROM audit_log WHERE op = 'accept_handoff'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            ws_bytes.as_deref(),
+            Some(&ws.as_bytes()[..]),
+            "handoff audit is scoped to its workspace"
+        );
+    }
+
     /// The stored cwd is normalized (trailing path separator stripped) at insert time
     /// so trailing-slash drift between agent payloads cannot break the next
     /// session's path-boundary match. Covers both manual and auto handoffs,
@@ -2409,6 +2571,7 @@ mod tests {
             AgentKind::Omp,
             AgentKind::Pi,
             AgentKind::Grok,
+            AgentKind::Devin,
             AgentKind::Other,
         ] {
             let sid = SessionId::new();
@@ -3383,6 +3546,113 @@ mod tests {
             "V25 must recreate the V22 scheduler/session pairing trigger"
         );
 
+        let fk_violations: i64 = conn
+            .query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(fk_violations, 0, "V25 must leave foreign keys clean");
+    }
+
+    #[test]
+    fn v28_adds_devin_and_preserves_sessions_invariants_on_upgraded_db() {
+        use ai_memory_core::{AgentKind, NewSession, SessionId};
+
+        let tmp = TempDir::new().unwrap();
+        let db_path = tmp.path().join("test.sqlite");
+        let ws;
+        let proj;
+        let existing_sid = SessionId::new();
+
+        {
+            let mut conn = Connection::open(&db_path).unwrap();
+            conn.pragma_update(None, "foreign_keys", "OFF").unwrap();
+            crate::migrations::run_to(&mut conn, 25).unwrap();
+            conn.pragma_update(None, "foreign_keys", "ON").unwrap();
+            ws = get_or_create_workspace(&mut conn, "default").unwrap();
+            proj = get_or_create_project(&mut conn, &ws, "scratch", None).unwrap();
+            begin_session(
+                &mut conn,
+                &NewSession {
+                    id: existing_sid,
+                    workspace_id: ws,
+                    project_id: proj,
+                    agent_kind: AgentKind::ClaudeCode,
+                    cwd: None,
+                },
+            )
+            .unwrap();
+        }
+
+        // Run through V26 (Zero) and V27 (unrelated data repair) too, not
+        // just straight to V28: this proves the whole upgrade chain composes
+        // on a pre-V26 database, not just V28 applied in isolation.
+        let mut conn = Connection::open(&db_path).unwrap();
+        conn.pragma_update(None, "foreign_keys", "OFF").unwrap();
+        crate::migrations::run_to(&mut conn, 28).unwrap();
+        conn.pragma_update(None, "foreign_keys", "ON").unwrap();
+
+        begin_session(
+            &mut conn,
+            &NewSession {
+                id: SessionId::new(),
+                workspace_id: ws,
+                project_id: proj,
+                agent_kind: AgentKind::Devin,
+                cwd: None,
+            },
+        )
+        .unwrap();
+
+        let session_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM sessions", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(session_count, 2, "V28 must preserve existing sessions");
+
+        let index_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master \
+                 WHERE type = 'index' \
+                   AND name IN ('idx_sessions_recent', 'idx_sessions_project', 'idx_sessions_started_at', 'idx_sessions_scope_ended')",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(index_count, 4, "V28 must recreate sessions indexes");
+
+        let trigger_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master \
+                 WHERE type = 'trigger' AND name = 'sessions_ws_proj_pairing_ai'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            trigger_count, 1,
+            "V28 must recreate the V18 pairing trigger"
+        );
+
+        let scheduler_trigger_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master \
+                 WHERE type = 'trigger' AND name = 'auto_improve_scheduler_claims_session_pairing_ai'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            scheduler_trigger_count, 1,
+            "V28 must recreate the V22 scheduler/session pairing trigger"
+        );
+
+        let fk_violations: i64 = conn
+            .query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(fk_violations, 0, "V28 must leave foreign keys clean");
+
         let other_ws = get_or_create_workspace(&mut conn, "other").unwrap();
         let other_proj =
             get_or_create_project(&mut conn, &other_ws, "other-project", None).unwrap();
@@ -3392,7 +3662,7 @@ mod tests {
                 id: SessionId::new(),
                 workspace_id: ws,
                 project_id: other_proj,
-                agent_kind: AgentKind::Pi,
+                agent_kind: AgentKind::Devin,
                 cwd: None,
             },
         )
@@ -3400,7 +3670,7 @@ mod tests {
         assert!(
             err.to_string()
                 .contains("sessions.workspace_id does not match"),
-            "pairing trigger must reject split-brain sessions after V25: {err}"
+            "pairing trigger must reject split-brain sessions after V28: {err}"
         );
 
         let fk_violations: i64 = conn
@@ -3408,7 +3678,10 @@ mod tests {
                 r.get(0)
             })
             .unwrap();
-        assert_eq!(fk_violations, 0, "V25 must leave foreign keys clean");
+        assert_eq!(
+            fk_violations, 0,
+            "V28 must leave foreign keys clean after pairing test"
+        );
     }
 
     /// V19 is idempotent: re-running on a repaired DB is a no-op.
@@ -3734,6 +4007,57 @@ mod tests {
 
         let (count, _) = audit_row_for(&conn, "rename_project");
         assert_eq!(count, 0, "a rolled-back rename must leave no audit row");
+    }
+
+    /// Deleting an existing page writes ONE attributed `delete_page` audit row
+    /// pointing at the deleted page id — the "who deleted the gotcha page?"
+    /// case V16 names.
+    #[test]
+    fn audit_log_records_delete_page_with_author_and_page_id() {
+        let (_tmp, mut conn, ws, proj) = fresh_db();
+        let author = seed_user(&conn, "dave");
+        let pid = upsert_page(&mut conn, &page(ws, proj, "notes/doomed.md", "body")).unwrap();
+
+        delete_page(
+            &mut conn,
+            ws,
+            proj,
+            &PagePath::new("notes/doomed.md").unwrap(),
+            Some(author),
+        )
+        .unwrap();
+
+        let (count, op_author) = audit_row_for(&conn, "delete_page");
+        assert_eq!(count, 1, "exactly one delete_page audit row");
+        assert_eq!(op_author.as_deref(), Some(&author.as_bytes()[..]));
+        let page_id: Option<Vec<u8>> = conn
+            .query_row(
+                "SELECT page_id FROM audit_log WHERE op = 'delete_page'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            page_id.as_deref(),
+            Some(&pid.as_bytes()[..]),
+            "audit row must point at the deleted page id"
+        );
+    }
+
+    /// A delete that matches no row (idempotent no-op) writes NO audit row.
+    #[test]
+    fn audit_log_omits_delete_page_noop() {
+        let (_tmp, mut conn, ws, proj) = fresh_db();
+        delete_page(
+            &mut conn,
+            ws,
+            proj,
+            &PagePath::new("notes/ghost.md").unwrap(),
+            None,
+        )
+        .unwrap();
+        let (count, _) = audit_row_for(&conn, "delete_page");
+        assert_eq!(count, 0, "a no-op delete must leave no audit row");
     }
 
     /// Run the reader's exact FTS5 `MATCH` against the real, populated
