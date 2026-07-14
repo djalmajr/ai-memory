@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- `audit-contamination` no longer flags an observation whose project differs
+  from its session's home project (the old `observation_session_drift` CHECK
+  B, including the `observations_drifted` summary count and the finding's
+  `session_id` field). With per-event cwd resolution, an agent that
+  legitimately `cd`s across repos in one session produces exactly that shape
+  — it is correct attribution, not contamination — so the check drowned
+  multi-repo instances in false positives. CHECK A (`session_wrong_bucket`,
+  anchored on the session's own cwd evidence) is unchanged and remains the
+  high-precision signal ([#182]).
+
 ### Added
 - New read-only admin endpoint `GET /admin/projects`: the authoritative
   `(workspace, project)` inventory with page counts and last-updated
