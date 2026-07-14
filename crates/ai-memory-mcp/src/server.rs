@@ -1134,14 +1134,7 @@ impl AiMemoryServer {
         // `global` / `scopes` / `workspace` / `project` arg always wins, so
         // this only fires when the caller passed none of them.
         let explicit_scoping = !args.scopes.is_empty()
-            || args
-                .workspace
-                .as_deref()
-                .is_some_and(|s| !s.trim().is_empty())
-            || args
-                .project
-                .as_deref()
-                .is_some_and(|s| !s.trim().is_empty());
+            || named_scope_args_present(args.workspace.as_deref(), args.project.as_deref());
         let recall_global = !explicit_scoping
             && !args.global.unwrap_or(false)
             && self.active_project.default_global_for(&aps_actor);
@@ -1345,14 +1338,8 @@ impl AiMemoryServer {
         // unscoped `memory_recent` to "most recent across every project", each
         // hit annotated with its workspace + project. An explicit
         // `workspace`/`project` always wins (same precedence as memory_query).
-        let explicit_scoping = args
-            .workspace
-            .as_deref()
-            .is_some_and(|s| !s.trim().is_empty())
-            || args
-                .project
-                .as_deref()
-                .is_some_and(|s| !s.trim().is_empty());
+        let explicit_scoping =
+            named_scope_args_present(args.workspace.as_deref(), args.project.as_deref());
         if !explicit_scoping && self.active_project.default_global_for(&aps_actor) {
             let global_hits = self
                 .reader
@@ -2531,6 +2518,14 @@ impl AiMemoryServer {
             }
         });
     }
+}
+
+/// True when the caller explicitly scoped the read by name — a non-empty
+/// `workspace` or `project` argument. Explicit scoping always wins over the
+/// `[recall] default_global` marker broadening; `memory_query` also counts
+/// its `scopes` list on top of this.
+fn named_scope_args_present(workspace: Option<&str>, project: Option<&str>) -> bool {
+    workspace.is_some_and(|s| !s.trim().is_empty()) || project.is_some_and(|s| !s.trim().is_empty())
 }
 
 fn ok_json<T: Serialize>(value: &T) -> Result<CallToolResult, McpError> {

@@ -19,6 +19,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   high-precision signal ([#182]).
 
 ### Added
+- The `[recall] default_global` marker now broadens `memory_recent` too,
+  completing the pair started with `memory_query` in v1.12.0: an unscoped
+  `memory_recent` from an opted-in repo returns the most-recently-updated
+  pages across every project as `global_hits` (workspace + project
+  annotated). Explicit `workspace`/`project` arguments still scope exactly
+  as before, and the plain project-scoped response shape is unchanged
+  ([#181]).
 - New read-only admin endpoint `GET /admin/projects`: the authoritative
   `(workspace, project)` inventory with page counts and last-updated
   timestamps. Gives dashboards, exports, and backup/mirror tooling a

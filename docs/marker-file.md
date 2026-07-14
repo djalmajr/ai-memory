@@ -65,7 +65,8 @@ drop_subagent_captures = "true"
 
 # Optional. Broaden this repo's DEFAULT memory recall to every project:
 # an unscoped `memory_query` from sessions in this tree behaves as
-# `global=true` (each hit annotated with its workspace + project).
+# `global=true`, and an unscoped `memory_recent` returns the most recent
+# pages across every project (each hit annotated with workspace + project).
 # Meant for meta-repos that constantly need sibling-project context.
 # Explicit args always win — passing `workspace`/`project`/`scopes`/
 # `global` overrides this for that call. Off by default. Note: while

@@ -1001,6 +1001,11 @@ impl ReaderPool {
     /// cross-project analog of [`Self::recent_pages_for_project`]; used when a
     /// read's scope broadens to global.
     ///
+    /// Recency has no FTS relevance score, so the reused
+    /// [`PageHitWithMeta::rank`] field carries `updated_at` (µs, cast to
+    /// REAL) — larger still means "ranks first", callers must not read it
+    /// as an FTS rank.
+    ///
     /// # Errors
     /// Propagates any SQL or pool error.
     pub async fn recent_pages_global(&self, limit: usize) -> StoreResult<Vec<PageHitWithMeta>> {
