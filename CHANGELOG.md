@@ -25,6 +25,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   fingerprints, or native session ids. The Docker shell wrapper routes the
   command through its native host client so repository identity remains
   correct. (#499)
+- Human password login, web sessions, and native `aim_` API credentials, so the
+  console is no longer a Bearer pasted into the browser. `POST /auth/login`
+  issues an `HttpOnly` `ai_memory_session` cookie plus CSRF; `/mcp`, hooks, and
+  workstreams stay Bearer-only. Greenfield bootstrap consumes
+  `AI_MEMORY_AUTH__INITIAL_ROOT_PASSWORD` once; break-glass recovery is
+  `AI_MEMORY_AUTH__RECOVERY_TOKEN` and never opens a session. `ai-memory user
+  add|list|reset-password|disable|enable|patch` manages people;
+  `ai-memory api-key add|list|rotate|revoke` manages machine secrets. Existing
+  32-byte `users.token_hash` values copy losslessly into `api_credentials`.
+  `users.token_hash` and the V52 mirror triggers stay in place for rollback
+  until a later soak; this cutover does not drop them. Recovery tokens must
+  be at least 32 characters; public recovery failures share one 401 body.
+- `EMBEDDING_API_KEY`, an optional embedding-only credential resolved ahead of
+  `OPENAI_API_KEY` and `LLM_API_KEY`. Embeddings are already independently
+  configurable — `AI_MEMORY_EMBEDDING_PROVIDER`, `_MODEL`, `_DIM` and
+  `_BASE_URL` each have their own setting — but there was no key to go with
+  them, so pointing `AI_MEMORY_EMBEDDING_BASE_URL` at a second provider sent it
+  whichever credential the chat model happened to use. `openai_embedding_api_key`
+  returned `OPENAI_API_KEY` before the base-URL check ran, and the `LLM_API_KEY`
+  fallback only fired when `OPENAI_API_KEY` was absent — which also takes the
+  `openai` chat provider down, since it reads that same variable. `voyage` and
+  `google`/`gemini` were unaffected: they already name their own key.
+  Scoped to the two embedders that borrowed another role's key. `openai` now
+  resolves `EMBEDDING_API_KEY` → `OPENAI_API_KEY` → `LLM_API_KEY` (the last still
+  only with a custom base URL); `openai-compat` resolves `EMBEDDING_API_KEY` →
+  `LLM_API_KEY` and stays keyless when neither is set. With the new variable
+  absent, resolution is byte-identical to before. Both `NotConfigured` messages
+  name it, since that error is where an operator hits the missing-key path.
+  Unprefixed to match the other credentials read from the process environment
+  (`LLM_API_KEY`, `OPENAI_API_KEY`, `VOYAGE_API_KEY`). (#514)
 
 ## [1.33.1] - 2026-08-28
 
@@ -64,6 +94,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   persisted session row, so LLM rewrites, compaction checkpoints, spool
   drains, and superseding versions do not mistake the later writer for the
   origin; manual page writes remain unattributed. (#494)
+
+### Changed
+- `/admin/*` and `/api/v1/*` accept a web session or a machine Bearer
+  (dual-auth). Custom SPA HTML at `/web` is public static; the builtin wiki
+  browser stays authenticated. HTTP Basic and the legacy `ai_memory_auth`
+  cookie no longer authenticate. Native API-key lookup reads
+  `api_credentials`, not `users.token_hash`.
+
+### Removed
+- `ai-memory user expire|revive|rotate-token` and the matching
+  `/admin/users/{username}/expire|revive|rotate-token` endpoints. Use
+  `user disable|enable` for human login and `api-key rotate|revoke` for
+  machine secrets.
 
 ### Fixed
 - Prevented stored Markdown from automatically fetching external image URLs
