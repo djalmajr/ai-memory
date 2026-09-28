@@ -375,6 +375,9 @@ fn build_llm_provider(
         auth,
         base_url: base_url.map(str::to_string),
         compat_strict: true,
+        // Comparisons must not differ by engine-side thinking behaviour;
+        // keep the product default (off) for every candidate.
+        compat_disable_thinking: false,
         request_timeout_secs: ai_memory_llm::DEFAULT_REQUEST_TIMEOUT_SECS,
         reasoning_effort: None,
         extra_headers: ai_memory_llm::ExtraHeaders::default(),

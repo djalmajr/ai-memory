@@ -298,6 +298,15 @@ pub struct Config {
     /// already supplies its own schema. Set
     /// `AI_MEMORY_LLM_COMPAT_STRICT=false` for an incompatible endpoint.
     pub llm_compat_strict: bool,
+    /// OpenAI-compat only: send
+    /// `chat_template_kwargs: {"enable_thinking": false}` with every chat
+    /// request, for thinking-capable local engines (vLLM / SGLang serving
+    /// Qwen3-class models): the engine otherwise spends the output budget
+    /// on a reasoning pass before the structured payload and can truncate
+    /// it mid-JSON. Ignored by every other provider; off by default. Set
+    /// with `AI_MEMORY_LLM_COMPAT_DISABLE_THINKING` (or
+    /// `llm_compat_disable_thinking = true` in `config.toml`).
+    pub llm_compat_disable_thinking: bool,
     /// Per-request timeout (seconds) applied to every chat
     /// completion request and to the Copilot token exchange; the
     /// openai-oauth token refresh keeps the built-in default ceiling
@@ -865,6 +874,7 @@ impl Default for Config {
             llm_model: None,
             llm_base_url: None,
             llm_compat_strict: true,
+            llm_compat_disable_thinking: false,
             llm_timeout_secs: ai_memory_llm::DEFAULT_REQUEST_TIMEOUT_SECS,
             llm_max_input_tokens: None,
             llm_tokenizer_path: None,
@@ -1583,6 +1593,7 @@ impl Config {
             auth: self.provider_auth(provider, None),
             base_url: self.resolve_base_url(provider),
             compat_strict: self.llm_compat_strict,
+            compat_disable_thinking: self.llm_compat_disable_thinking,
             request_timeout_secs: self.llm_timeout_secs,
             reasoning_effort: self.llm_reasoning_effort,
             extra_headers: self.llm_extra_headers()?,
@@ -1639,6 +1650,7 @@ impl Config {
             auth: self.fallback_provider_auth(provider, resolved_key),
             base_url: non_empty(profile.base_url.as_deref()).map(str::to_string),
             compat_strict: self.llm_compat_strict,
+            compat_disable_thinking: self.llm_compat_disable_thinking,
             request_timeout_secs: self.llm_timeout_secs,
             reasoning_effort: self.llm_reasoning_effort,
             extra_headers: self.llm_extra_headers()?,
@@ -3474,6 +3486,45 @@ mod tests {
         cfg.llm_compat_strict = false;
         let provider = cfg.llm_provider_config().unwrap().unwrap();
         assert!(!provider.compat_strict);
+    }
+
+    /// The thinking switch is opt-in: off by default (existing vLLM /
+    /// Ollama / LM Studio setups are unchanged) and forwarded verbatim to
+    /// the provider config when the operator turns it on.
+    #[test]
+    fn openai_compat_disable_thinking_defaults_off_and_is_forwarded() {
+        let mut cfg = Config {
+            llm_provider: Some("openai-compat".into()),
+            llm_model: Some("qwen3.8-27b".into()),
+            llm_base_url: Some("http://localhost:8000/v1".into()),
+            ..Config::default()
+        };
+
+        let provider = cfg.llm_provider_config().unwrap().unwrap();
+        assert!(!provider.compat_disable_thinking);
+
+        cfg.llm_compat_disable_thinking = true;
+        let provider = cfg.llm_provider_config().unwrap().unwrap();
+        assert!(provider.compat_disable_thinking);
+    }
+
+    /// TOML key loads and stays independent from the strict-mode default.
+    #[test]
+    fn load_accepts_llm_compat_disable_thinking_from_toml() {
+        let tmp = TempDir::new().unwrap();
+        let config_path = tmp.path().join("config.toml");
+        std::fs::write(&config_path, "llm_compat_disable_thinking = true\n").unwrap();
+        let cfg = Config::load(Some(&config_path), Some(tmp.path().to_path_buf())).unwrap();
+        assert!(cfg.llm_compat_disable_thinking);
+        // The sibling strict knob keeps its own default — independent keys.
+        assert!(cfg.llm_compat_strict);
+    }
+
+    #[test]
+    fn load_defaults_llm_compat_disable_thinking_off() {
+        let tmp = TempDir::new().unwrap();
+        let cfg = Config::load(None, Some(tmp.path().to_path_buf())).unwrap();
+        assert!(!cfg.llm_compat_disable_thinking);
     }
 
     #[test]

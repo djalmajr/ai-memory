@@ -8,6 +8,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- Added `AI_MEMORY_LLM_COMPAT_DISABLE_THINKING` for the `openai-compat`
+  provider (opt-in, off by default, ignored by every other provider): when
+  set, every chat request carries
+  `chat_template_kwargs: {"enable_thinking": false}`, so thinking-capable
+  local engines (vLLM / SGLang serving Qwen3-class models) spend the output
+  budget on the structured payload instead of a reasoning pass. Structured
+  responses that stop at the output budget
+  (`finish_reason = "length"`) and 2xx responses with a missing, empty, or
+  whitespace-only `message.content` now fail fast with the terminal errors
+  `truncated-response` / `empty-content` instead of surfacing as retryable
+  parse failures — no retry, no second HTTP call, and the error text carries
+  no response content.
 - Added process-local admission for all server LLM jobs: one chat request in
   flight, a bounded waiting queue with wait logs, and an optional input cap
   counted with the configured model tokenizer before HTTP. The cap requires
