@@ -14,12 +14,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `chat_template_kwargs: {"enable_thinking": false}`, so thinking-capable
   local engines (vLLM / SGLang serving Qwen3-class models) spend the output
   budget on the structured payload instead of a reasoning pass.
-  (PR reference pending local validation)
+  (#2)
 - Added process-local admission for all server LLM jobs: one chat request in
   flight, a bounded waiting queue with wait logs, and an optional input cap
   counted with the configured model tokenizer before HTTP. The cap requires
   `llm_tokenizer_path` and rejects fallback chains until their tokenizers can
-  be checked independently. (PR reference pending local validation)
+  be checked independently. (#2)
 
 ### Fixed
 - Structured LLM responses stopped at the output budget
@@ -27,17 +27,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   with redacted terminal errors. SessionEnd consolidation stops its durable
   queue on those errors, malformed JSON, and unexpected response shapes
   instead of repeating the same expensive prompt; pre-send connection and
-  capacity failures retain bounded backoff. (PR reference pending local validation)
+  capacity failures retain bounded backoff. (#2)
 - LLM degradation in `memory_query(answer=true)` and `memory_explore` now
   reports the error class without copying an upstream provider response body
-  into MCP results or server logs. (PR reference pending local validation)
+  into MCP results or server logs. (#2)
 - Timeout and ambiguous 499/5xx LLM failures now receive at most one replay
   after a 60-second cooldown plus jitter. Fast retries remain for connection
   failures, 429 with Retry-After, and 503 explicitly marked as capacity;
   SessionEnd and auto-improve do not queue a third attempt after an ambiguous
   replay fails. The dream scheduler stops on a terminal LLM failure, and a
   timed-out rerank finishes its provider call before releasing admission.
-  (PR reference pending local validation)
+  (#2)
 - Grok Build CLI tool observations are no longer stored with an empty body.
   Grok posts Claude Code's snake_case tool fields (`tool_name` / `tool_input` /
   `tool_use_id`), but it was missing from both `closed_tool_agent` and the
