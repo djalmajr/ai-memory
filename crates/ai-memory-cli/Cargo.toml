@@ -94,6 +94,10 @@ ai-memory-test-support.workspace = true
 tempfile.workspace = true
 rstest.workspace = true
 tower.workspace = true
+# Read-only queue-row inspection in the SessionEnd consolidation tests
+# (`last_error` has no dedicated reader API); the same workspace dep the
+# store crate links.
+rusqlite.workspace = true
 tokio = { workspace = true, features = ["test-util"] }
 
 [lints]

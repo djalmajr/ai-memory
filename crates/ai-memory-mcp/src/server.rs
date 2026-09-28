@@ -3242,7 +3242,12 @@ impl AiMemoryServer {
             let outcomes = consolidator
                 .consolidate_session_multi(session_id, dry, actor, author_id, instructions)
                 .await
-                .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+                .map_err(|e| {
+                    McpError::internal_error(
+                        ai_memory_consolidate::redacted_error_summary(&e),
+                        None,
+                    )
+                })?;
             if !dry {
                 self.reconcile_consolidation_job(session_id).await;
             }
@@ -3251,7 +3256,12 @@ impl AiMemoryServer {
             let outcome = consolidator
                 .consolidate_session(session_id, dry, actor, author_id, instructions)
                 .await
-                .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+                .map_err(|e| {
+                    McpError::internal_error(
+                        ai_memory_consolidate::redacted_error_summary(&e),
+                        None,
+                    )
+                })?;
             if !dry {
                 self.reconcile_consolidation_job(session_id).await;
             }
@@ -5807,8 +5817,8 @@ mod tests {
     }
 
     use ai_memory_core::{
-        ActorContext, AuthLevel, NewObservation, NewPage, NewSession, NewUser, ObservationKind,
-        PagePath, Tier,
+        ActorContext, AgentKind, AuthLevel, NewObservation, NewPage, NewSession, NewUser,
+        ObservationKind, PagePath, SessionId, Tier,
     };
     use ai_memory_store::Store;
     use ai_memory_wiki::{Wiki, WritePageRequest};
@@ -10842,6 +10852,214 @@ mod tests {
                 "provider body leaked: {text}"
             );
         }
+    }
+
+    /// Provider failure for the `memory_consolidate` redaction tests: a 400
+    /// whose private body must never reach the MCP error message.
+    struct ConsolidationBodyFailure;
+
+    #[async_trait::async_trait]
+    impl LlmProvider for ConsolidationBodyFailure {
+        fn name(&self) -> &'static str {
+            "consolidation-body-failure"
+        }
+
+        fn model(&self) -> &str {
+            "test"
+        }
+
+        async fn complete(
+            &self,
+            _request: ai_memory_llm::ChatRequest,
+        ) -> ai_memory_llm::LlmResult<ai_memory_llm::ChatResponse> {
+            Err(ai_memory_llm::LlmError::Provider {
+                status: 400,
+                body: "SENTINEL_PRIVATE_BODY".into(),
+            })
+        }
+
+        async fn complete_structured_raw(
+            &self,
+            _request: ai_memory_llm::ChatRequest,
+            _schema: serde_json::Value,
+        ) -> ai_memory_llm::LlmResult<serde_json::Value> {
+            Err(ai_memory_llm::LlmError::Provider {
+                status: 400,
+                body: "SENTINEL_PRIVATE_BODY".into(),
+            })
+        }
+    }
+
+    /// A completed session with one observation: the minimum a real
+    /// consolidation can reach the LLM with.
+    async fn seeded_completed_session(
+        store: &Store,
+        ws: WorkspaceId,
+        proj: ProjectId,
+    ) -> SessionId {
+        let session_id = SessionId::new();
+        store
+            .writer
+            .begin_session(NewSession {
+                occurred_at: None,
+                id: session_id,
+                workspace_id: ws,
+                project_id: proj,
+                agent_kind: AgentKind::Codex,
+                cwd: None,
+                actor_user: None,
+            })
+            .await
+            .unwrap();
+        store
+            .writer
+            .insert_observation(Sanitized::new(
+                NewObservation {
+                    occurred_at: None,
+                    session_id,
+                    workspace_id: ws,
+                    project_id: proj,
+                    kind: ObservationKind::UserPrompt,
+                    extension: None,
+                    source_event: None,
+                    title: "finish".into(),
+                    body: "end the session".into(),
+                    importance: 8,
+                },
+                &Sanitizer::default(),
+            ))
+            .await
+            .unwrap();
+        store.writer.end_session(session_id, None).await.unwrap();
+        session_id
+    }
+
+    /// Build a server whose consolidator fails with the private-body 400.
+    async fn consolidating_server_failing_with_private_body(
+        tmp: &TempDir,
+        store: &Store,
+        ws: WorkspaceId,
+        proj: ProjectId,
+    ) -> AiMemoryServer {
+        let wiki = Wiki::new(tmp.path(), store.writer.clone())
+            .unwrap()
+            .with_store_reader(store.reader.clone());
+        let llm: Arc<dyn LlmProvider> = Arc::new(ConsolidationBodyFailure);
+        let consolidator = Arc::new(Consolidator::new(
+            store.reader.clone(),
+            store.writer.clone(),
+            wiki.clone(),
+            llm.clone(),
+            ws,
+            proj,
+        ));
+        AiMemoryServer::new(store.reader.clone(), store.writer.clone(), ws, proj)
+            .with_consolidator_arc(wiki, llm, consolidator)
+    }
+
+    // Mutation captured: mapping the consolidator error's `Display` into the
+    // `McpError` copies the bounded provider body to the tool caller in both
+    // consolidation modes; only the redacted class/status summary may go out.
+    #[tokio::test]
+    async fn memory_consolidate_single_redacts_provider_body_from_mcp_error() {
+        let (tmp, store, _server, ws, proj) = setup_server().await;
+        let session_id = seeded_completed_session(&store, ws, proj).await;
+        let server = consolidating_server_failing_with_private_body(&tmp, &store, ws, proj).await;
+
+        let err = server
+            .memory_consolidate(
+                Parameters(
+                    serde_json::from_value(serde_json::json!({
+                        "session_id": session_id.to_string()
+                    }))
+                    .unwrap(),
+                ),
+                OptionalParts(test_parts_default()),
+            )
+            .await
+            .expect_err("the provider failure must surface as an MCP error");
+        assert_eq!(
+            err.message, "consolidation failed: class=provider status=400",
+            "the MCP error must carry only the redacted class/status summary"
+        );
+        assert!(
+            !err.message.contains("SENTINEL_PRIVATE_BODY"),
+            "provider body leaked into the MCP error: {}",
+            err.message
+        );
+    }
+
+    // Same leak, multi-page mode: the fan-out shares the single helper, and
+    // the failure must land before any page write.
+    #[tokio::test]
+    async fn memory_consolidate_multi_redacts_provider_body_from_mcp_error() {
+        let (tmp, store, _server, ws, proj) = setup_server().await;
+        let session_id = seeded_completed_session(&store, ws, proj).await;
+        let server = consolidating_server_failing_with_private_body(&tmp, &store, ws, proj).await;
+
+        let err = server
+            .memory_consolidate(
+                Parameters(
+                    serde_json::from_value(serde_json::json!({
+                        "session_id": session_id.to_string(),
+                        "multi_page": true
+                    }))
+                    .unwrap(),
+                ),
+                OptionalParts(test_parts_default()),
+            )
+            .await
+            .expect_err("the provider failure must surface as an MCP error");
+        assert_eq!(
+            err.message, "consolidation failed: class=provider status=400",
+            "the MCP error must carry only the redacted class/status summary"
+        );
+        assert!(
+            !err.message.contains("SENTINEL_PRIVATE_BODY"),
+            "provider body leaked into the MCP error: {}",
+            err.message
+        );
+        let path = format!("sessions/{session_id}.md");
+        assert!(
+            store
+                .reader
+                .page_body_by_ids(ws, proj, &path)
+                .await
+                .unwrap()
+                .is_none(),
+            "a failed consolidation must not write the session page"
+        );
+    }
+
+    // Control: a non-LLM failure (no observations) must report its own class
+    // with `status=none` — the caller can still tell configuration, provider,
+    // and parse failures apart — and carry no body at all.
+    #[tokio::test]
+    async fn memory_consolidate_non_llm_failure_reports_class_without_body() {
+        let (tmp, store, _server, ws, proj) = setup_server().await;
+        let server = consolidating_server_failing_with_private_body(&tmp, &store, ws, proj).await;
+
+        // A valid UUID that never had a session row: the consolidator fails
+        // before the LLM with `EmptySession`, so the provider body cannot be
+        // involved at all.
+        let missing = SessionId::new();
+        let err = server
+            .memory_consolidate(
+                Parameters(
+                    serde_json::from_value(serde_json::json!({
+                        "session_id": missing.to_string()
+                    }))
+                    .unwrap(),
+                ),
+                OptionalParts(test_parts_default()),
+            )
+            .await
+            .expect_err("the missing session must surface as an MCP error");
+        assert_eq!(
+            err.message,
+            "consolidation failed: class=empty-session status=none"
+        );
+        assert!(!err.message.contains("SENTINEL_PRIVATE_BODY"));
     }
 
     #[test]

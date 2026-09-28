@@ -44,6 +44,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - LLM degradation in `memory_query(answer=true)` and `memory_explore` now
   reports the error class without copying an upstream provider response body
   into MCP results or server logs. (#2)
+- SessionEnd consolidation failures and `memory_consolidate` errors now
+  persist and report a redacted `consolidation failed: class=... status=...`
+  summary instead of the full error text, so a provider response body no
+  longer reaches the queue's `last_error`, the MCP error, or the
+  consolidation retry log. The class and status keep configuration, provider,
+  and parse failures distinguishable; retry scheduling and terminal
+  decisions are unchanged. (#2)
 - Timeout and ambiguous 499/5xx LLM failures now receive at most one replay
   after a 60-second cooldown plus jitter. Fast retries remain for connection
   failures, 429 with Retry-After, and 503 explicitly marked as capacity;

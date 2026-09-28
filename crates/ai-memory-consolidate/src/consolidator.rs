@@ -63,6 +63,36 @@ impl From<serde_json::Error> for ConsolidatorError {
     }
 }
 
+/// Redacted one-line summary of a consolidation failure:
+/// `consolidation failed: class=<class> status=<status-or-none>`.
+///
+/// For typed boundaries where the full error text would leak a provider
+/// response body — the SessionEnd queue's persisted `last_error` and the
+/// `McpError` returned by `memory_consolidate`. It keeps what an operator
+/// needs to diagnose: `class` is a fixed label per `ConsolidatorError`
+/// variant (or [`LlmError::class`] for LLM failures) and `status` is the
+/// HTTP status captured by the failure ([`LlmError::http_status`]), or
+/// `none`. It never carries the cause's `Display`, a response body, URL,
+/// prompt, token, or headers.
+#[must_use]
+pub fn redacted_error_summary(error: &ConsolidatorError) -> String {
+    let (class, status) = match error {
+        ConsolidatorError::Memory(_) => ("memory", None),
+        ConsolidatorError::Store(_) => ("store", None),
+        ConsolidatorError::Wiki(_) => ("wiki", None),
+        ConsolidatorError::Llm(llm) => (llm.class(), llm.http_status()),
+        ConsolidatorError::Serde(_) => ("serde", None),
+        ConsolidatorError::SessionNotFound(_) => ("session-not-found", None),
+        ConsolidatorError::EmptySession(_) => ("empty-session", None),
+    };
+    format!(
+        "consolidation failed: class={class} status={}",
+        status
+            .map(|status| status.to_string())
+            .unwrap_or_else(|| "none".into())
+    )
+}
+
 /// Result alias used by the consolidator.
 pub type ConsolidatorResult<T> = Result<T, ConsolidatorError>;
 
@@ -93,10 +123,14 @@ where
         match complete_structured_with_operation_id::<T>(llm, request.clone(), operation_id).await {
             Ok(value) => return Ok(value),
             Err(e) if attempt < CONSOLIDATION_LLM_MAX_ATTEMPTS && e.is_fast_retryable() => {
+                // Redacted fields only: this log line is on the consolidation
+                // path, and the `Display` of a capacity failure carries the
+                // provider body while an HTTP error's can carry the URL.
                 warn!(
                     attempt,
                     max = CONSOLIDATION_LLM_MAX_ATTEMPTS,
-                    error = %e,
+                    error_class = %e.class(),
+                    error_status = ?e.http_status(),
                     "consolidation hit a transient LLM error; retrying shortly",
                 );
                 tokio::time::sleep(retry_delay).await;
@@ -1779,6 +1813,64 @@ mod tests {
     use ai_memory_core::{ObservationId, ObservationKind, ProjectId, SessionId, WorkspaceId};
     use jiff::Timestamp;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// Body a fake provider returns in the redaction tests; the summary must
+    /// never contain it.
+    const REDACTION_SENTINEL: &str = "SENTINEL_PRIVATE_BODY";
+
+    /// The summary is the only failure text the SessionEnd queue persists and
+    /// the `memory_consolidate` MCP call returns, so it must expose the
+    /// class/status and drop the provider body.
+    #[test]
+    fn redacted_summary_exposes_class_and_status_without_body() {
+        let error = ConsolidatorError::Llm(LlmError::Provider {
+            status: 400,
+            body: REDACTION_SENTINEL.into(),
+        });
+        let summary = redacted_error_summary(&error);
+        assert_eq!(summary, "consolidation failed: class=provider status=400");
+        assert!(!summary.contains(REDACTION_SENTINEL));
+    }
+
+    /// Switching the variant to `Serde` changes only the allowed fields:
+    /// the stable shape stays, `class`/`status` take the new values, and the
+    /// body still never enters the summary.
+    #[test]
+    fn redacted_summary_variant_switch_changes_only_class_and_status() {
+        let provider = ConsolidatorError::Llm(LlmError::Provider {
+            status: 400,
+            body: REDACTION_SENTINEL.into(),
+        });
+        let serde_error = ConsolidatorError::Serde(REDACTION_SENTINEL.into());
+        let provider_summary = redacted_error_summary(&provider);
+        let serde_summary = redacted_error_summary(&serde_error);
+        assert_eq!(
+            provider_summary,
+            "consolidation failed: class=provider status=400"
+        );
+        assert_eq!(
+            serde_summary,
+            "consolidation failed: class=serde status=none"
+        );
+        for summary in [&provider_summary, &serde_summary] {
+            assert!(summary.starts_with("consolidation failed: class="));
+            assert!(!summary.contains(REDACTION_SENTINEL));
+        }
+    }
+
+    /// Dropping the HTTP status changes only the status field to `none`;
+    /// the class still comes from the LLM error's fixed label.
+    #[test]
+    fn redacted_summary_without_http_status_reports_none() {
+        let without_status =
+            ConsolidatorError::Llm(LlmError::NotConfigured(REDACTION_SENTINEL.into()));
+        let summary = redacted_error_summary(&without_status);
+        assert_eq!(
+            summary,
+            "consolidation failed: class=not-configured status=none"
+        );
+        assert!(!summary.contains(REDACTION_SENTINEL));
+    }
 
     /// Helper for prompt construction tests.
     fn obs_of_size(body_len: usize) -> Observation {

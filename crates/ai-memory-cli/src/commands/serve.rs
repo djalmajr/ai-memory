@@ -883,7 +883,11 @@ async fn run_session_consolidation_worker(
                 let retry_at = session_consolidation_retry_at(attempts, &error);
                 let terminal = retry_at.is_none();
                 if let Err(store_error) = writer
-                    .fail_session_consolidation(job, error.to_string(), retry_at)
+                    .fail_session_consolidation(
+                        job,
+                        ai_memory_consolidate::redacted_error_summary(&error),
+                        retry_at,
+                    )
                     .await
                 {
                     tracing::warn!(
@@ -3809,6 +3813,9 @@ mod tests {
         /// A timeout/5xx after send survived the admission provider's one
         /// delayed replay — the worker must not add a third send.
         AmbiguousRetryExhausted,
+        /// The provider answered HTTP 400 with a private body; the persisted
+        /// `last_error` must stay a redacted class/status summary.
+        Provider400,
     }
 
     /// Structured-output failure fixture: counts calls (proving the prompt
@@ -3869,6 +3876,10 @@ mod tests {
                             status: Some(502),
                         }
                     }
+                    ConsolidationFailure::Provider400 => LlmError::Provider {
+                        status: 400,
+                        body: "SENTINEL_PRIVATE_BODY".into(),
+                    },
                 })
             })
         }
@@ -4461,6 +4472,152 @@ mod tests {
     #[tokio::test]
     async fn session_end_worker_makes_post_send_502_terminal_without_replay() {
         session_end_worker_terminates_on(ConsolidationFailure::AmbiguousRetryExhausted).await;
+    }
+
+    // Mutation captured: persisting the error's `Display` writes the private
+    // provider body into the queue row; the worker must persist only the
+    // redacted class/status summary, and a retryable 400 keeps its scheduled
+    // retry instead of flipping terminal.
+    #[tokio::test]
+    async fn session_end_worker_persists_redacted_summary_not_provider_body() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let workspace_id = store
+            .writer
+            .get_or_create_workspace("default")
+            .await
+            .unwrap();
+        let project_id = store
+            .writer
+            .get_or_create_project(workspace_id, "project", None)
+            .await
+            .unwrap();
+        let session_id = SessionId::new();
+        store
+            .writer
+            .begin_session(NewSession {
+                occurred_at: None,
+                id: session_id,
+                workspace_id,
+                project_id,
+                agent_kind: AgentKind::Codex,
+                cwd: None,
+                actor_user: None,
+            })
+            .await
+            .unwrap();
+        store
+            .writer
+            .insert_observation(Sanitized::new(
+                NewObservation {
+                    occurred_at: None,
+                    session_id,
+                    workspace_id,
+                    project_id,
+                    kind: ObservationKind::UserPrompt,
+                    extension: None,
+                    source_event: None,
+                    title: "finish".into(),
+                    body: "end the session".into(),
+                    importance: 8,
+                },
+                &Sanitizer::default(),
+            ))
+            .await
+            .unwrap();
+        store.writer.end_session(session_id, None).await.unwrap();
+        store
+            .writer
+            .enqueue_session_consolidation(workspace_id, project_id, session_id)
+            .await
+            .unwrap();
+
+        let calls = std::sync::Arc::new(AtomicUsize::new(0));
+        let consolidator = Arc::new(Consolidator::new(
+            store.reader.clone(),
+            store.writer.clone(),
+            Wiki::new(tmp.path(), store.writer.clone()).unwrap(),
+            Arc::new(FailingConsolidationLlm {
+                failure: ConsolidationFailure::Provider400,
+                calls: calls.clone(),
+            }),
+            workspace_id,
+            project_id,
+        ));
+        let notify = Arc::new(tokio::sync::Notify::new());
+        let completed = Arc::new(tokio::sync::Notify::new());
+        let cancel = CancellationToken::new();
+        let task = tokio::spawn(run_session_consolidation_worker(
+            store.writer.clone(),
+            consolidator,
+            notify.clone(),
+            cancel.child_token(),
+            completed.clone(),
+        ));
+        notify.notify_one();
+
+        // Wait for the provider call, then for the failure row to settle.
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while calls.load(Ordering::SeqCst) < 1 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "worker never called the LLM"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        // Read the queue row through a read-only connection (WAL readers do
+        // not block the writer): the row exists from enqueue, is `running`
+        // while claimed, and settles with a `last_error` once the failure
+        // lands.
+        let db = rusqlite::Connection::open(store.db_path()).unwrap();
+        let (state, last_error, next_attempt_at) = loop {
+            let row = db
+                .query_row(
+                    "SELECT state, last_error, next_attempt_at \
+                     FROM session_consolidation_jobs WHERE session_id = ?1",
+                    rusqlite::params![session_id.as_bytes()],
+                    |r| {
+                        Ok::<(String, Option<String>, Option<i64>), _>((
+                            r.get(0)?,
+                            r.get(1)?,
+                            r.get(2)?,
+                        ))
+                    },
+                )
+                .ok();
+            if let Some(row) = &row
+                && &row.0 != "running"
+                && row.1.is_some()
+            {
+                break row.clone();
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "failure row never settled"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        };
+        cancel.cancel();
+        task.await.unwrap();
+
+        assert_eq!(
+            last_error.as_deref(),
+            Some("consolidation failed: class=provider status=400"),
+            "only the redacted class/status summary may be persisted"
+        );
+        let last_error = last_error.expect("checked above");
+        assert!(
+            !last_error.contains("SENTINEL_PRIVATE_BODY"),
+            "provider body leaked into the queue row: {last_error}"
+        );
+        assert_eq!(
+            state, "pending",
+            "a 400 is not terminal: the row must keep the queue's retry"
+        );
+        assert!(
+            next_attempt_at.is_some(),
+            "the retryable failure must keep a scheduled retry"
+        );
     }
 
     async fn two_project_wiki() -> (TempDir, Store, Wiki, WorkspaceId, ProjectId, ProjectId) {
