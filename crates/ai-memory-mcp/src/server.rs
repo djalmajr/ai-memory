@@ -2143,20 +2143,31 @@ impl AiMemoryServer {
         let scored = match tokio::time::timeout(timeout, rerank_task).await {
             Ok(Ok(Ok(scores))) => scores,
             Ok(Ok(Err(e))) => {
+                // Redacted fields only: the `Display` of a provider failure
+                // carries the upstream response body.
                 tracing::warn!(
                     reranker = reranker.name(),
                     model = reranker.model(),
-                    error = %e,
+                    error_class = %e.class(),
+                    error_status = ?e.http_status(),
                     "reranker failed; keeping pre-rerank order"
                 );
                 hits.truncate(limit);
                 return hits;
             }
             Ok(Err(e)) => {
+                // A `JoinError` is a task failure, not a provider error: a
+                // static class label keeps the branch explicit without
+                // echoing any request content.
+                let task_error_class = if e.is_cancelled() {
+                    "task-cancelled"
+                } else {
+                    "task-failed"
+                };
                 tracing::warn!(
                     reranker = reranker.name(),
                     model = reranker.model(),
-                    error = %e,
+                    error_class = %task_error_class,
                     "reranker task failed; keeping pre-rerank order"
                 );
                 hits.truncate(limit);
@@ -3375,7 +3386,12 @@ impl AiMemoryServer {
         let report =
             run_auto_improve_review(&self.reader, &**llm, ws, proj, session_id, cfg.clone())
                 .await
-                .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+                .map_err(|e| {
+                    McpError::internal_error(
+                        ai_memory_consolidate::redacted_auto_improve_summary(&e),
+                        None,
+                    )
+                })?;
         // Whose suggestion this is; it also scopes the one-pending-per-target
         // rule (V42). Only meaningful where operators are actually told apart:
         // on a single-operator server the caller would otherwise stage into
@@ -5900,6 +5916,11 @@ mod tests {
         Scores(Vec<ai_memory_llm::RerankScore>),
         Reverse,
         Fail,
+        /// A provider failure with a private body: the degradation warning
+        /// must carry class/status only.
+        ProviderFail,
+        /// Panics inside the rerank task: exercises the `JoinError` branch.
+        Panic,
     }
 
     struct StubReranker {
@@ -5945,6 +5966,11 @@ mod tests {
                 StubRerankOutcome::Fail => Err(ai_memory_llm::LlmError::UnexpectedShape(
                     "stub failure".into(),
                 )),
+                StubRerankOutcome::ProviderFail => Err(ai_memory_llm::LlmError::Provider {
+                    status: 400,
+                    body: "SENTINEL_PRIVATE_BODY".into(),
+                }),
+                StubRerankOutcome::Panic => panic!("stub reranker task failure"),
             }
         }
     }
@@ -6139,6 +6165,168 @@ mod tests {
             original_ids
         );
         assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    /// Captures everything a subscriber writes so a test can assert on it.
+    /// `set_default` is thread-local and each `#[tokio::test]` runs on its
+    /// own thread, so parallel tests do not share (or fight over) a capture.
+    #[derive(Clone, Default)]
+    struct CapturedLog(Arc<Mutex<Vec<u8>>>);
+
+    impl CapturedLog {
+        fn text(&self) -> String {
+            String::from_utf8_lossy(&self.0.lock().unwrap()).into_owned()
+        }
+    }
+
+    impl std::io::Write for CapturedLog {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CapturedLog {
+        type Writer = Self;
+
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    /// Mutation captured: formatting the `LlmError`'s `Display` into the
+    /// degradation warning copies the provider body into the server log. The
+    /// warning must carry class/status only, the hits keep the pre-rerank
+    /// order and the limit, and the failure must not read as a successful
+    /// rerank (no `rerank_score` stamped).
+    #[tokio::test]
+    async fn reranker_provider_failure_warning_carries_class_status_not_body() {
+        let captured = CapturedLog::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(captured.clone())
+            .with_max_level(tracing::Level::WARN)
+            .with_ansi(false)
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        let (_tmp, _store, server, _ws, _proj) = setup_server().await;
+        let hits = rerank_test_hits(4);
+        let original_ids: Vec<PageId> = hits.iter().map(|(hit, _)| hit.id).collect();
+        let (reranker, calls, _) = stub_reranker(StubRerankOutcome::ProviderFail, Duration::ZERO);
+        let server = server.with_reranker(reranker);
+
+        let result = server.rerank_hits("query", hits, 2).await;
+
+        // Degradation, not success: pre-rerank order, truncated to the limit,
+        // and no hit may carry a rerank score.
+        assert_eq!(result.len(), 2);
+        assert_eq!(
+            result.iter().map(|(hit, _)| hit.id).collect::<Vec<_>>(),
+            original_ids[..2].to_vec()
+        );
+        assert!(
+            result.iter().all(|(_, explain)| explain
+                .as_ref()
+                .and_then(|explain| explain.rerank_score)
+                .is_none()),
+            "a failed rerank must not stamp rerank scores"
+        );
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+        let logged = captured.text();
+        assert!(
+            logged.contains("reranker failed; keeping pre-rerank order"),
+            "the degradation warning must still fire; captured log was: {logged:?}"
+        );
+        assert!(
+            logged.contains("error_class=provider"),
+            "the failure class must stay diagnosable: {logged}"
+        );
+        assert!(
+            logged.contains("error_status=Some(400)"),
+            "the status must stay: {logged}"
+        );
+        assert!(
+            !logged.contains("SENTINEL_PRIVATE_BODY"),
+            "provider body leaked into the reranker log: {logged}"
+        );
+    }
+
+    /// A task failure (`JoinError`) and a timeout are different classes from
+    /// a provider error: both keep the pre-rerank order without request
+    /// content in the log, and neither may read as a successful rerank.
+    #[tokio::test]
+    async fn reranker_task_failure_and_timeout_stay_degraded_without_request_content() {
+        let captured = CapturedLog::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(captured.clone())
+            .with_max_level(tracing::Level::WARN)
+            .with_ansi(false)
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        let (_tmp, _store, server, _ws, _proj) = setup_server().await;
+        let hits = rerank_test_hits(4);
+        let original_ids: Vec<PageId> = hits.iter().map(|(hit, _)| hit.id).collect();
+
+        // Task failure: a panic inside the rerank task surfaces as a
+        // `JoinError`, not a `LlmError`.
+        let (reranker, calls, _) = stub_reranker(StubRerankOutcome::Panic, Duration::ZERO);
+        let result = server
+            .clone()
+            .with_reranker(reranker)
+            .rerank_hits("query", hits.clone(), 4)
+            .await;
+        assert_eq!(
+            result.iter().map(|(hit, _)| hit.id).collect::<Vec<_>>(),
+            original_ids
+        );
+        assert!(result.iter().all(|(_, explain)| {
+            explain
+                .as_ref()
+                .and_then(|explain| explain.rerank_score)
+                .is_none()
+        }));
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+        // Timeout: the provider never answered in time.
+        let (reranker, _, _) = stub_reranker(StubRerankOutcome::Reverse, Duration::from_millis(50));
+        let server = server.with_reranker(reranker);
+        let result = server
+            .rerank_hits_with_timeout("query", hits, 4, Duration::from_millis(1))
+            .await;
+        assert_eq!(
+            result.iter().map(|(hit, _)| hit.id).collect::<Vec<_>>(),
+            original_ids
+        );
+        assert!(result.iter().all(|(_, explain)| {
+            explain
+                .as_ref()
+                .and_then(|explain| explain.rerank_score)
+                .is_none()
+        }));
+
+        let logged = captured.text();
+        assert!(
+            logged.contains("reranker task failed; keeping pre-rerank order"),
+            "the task-failure warning must fire: {logged}"
+        );
+        assert!(
+            logged.contains("error_class=task-failed"),
+            "the task branch must keep its static class label: {logged}"
+        );
+        assert!(
+            logged.contains("reranker timed out; keeping pre-rerank order"),
+            "the timeout warning must fire: {logged}"
+        );
+        assert!(
+            !logged.contains("SENTINEL_PRIVATE_BODY"),
+            "no provider body may reach the log: {logged}"
+        );
     }
 
     #[tokio::test]
@@ -13609,6 +13797,219 @@ mod tests {
                 "rejected_candidates": []
             }))
         }
+    }
+
+    /// A provider that fails the auto-improve review with a private body:
+    /// the `McpError` must carry only the redacted class/status summary.
+    struct AutoImproveSentinelLlm;
+
+    fn auto_improve_sentinel_error() -> ai_memory_llm::LlmError {
+        ai_memory_llm::LlmError::Provider {
+            status: 400,
+            body: "SENTINEL_PRIVATE_BODY".into(),
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ai_memory_llm::LlmProvider for AutoImproveSentinelLlm {
+        fn name(&self) -> &'static str {
+            "auto-improve-sentinel"
+        }
+
+        fn model(&self) -> &str {
+            "sentinel-model"
+        }
+
+        async fn complete(
+            &self,
+            _request: ai_memory_llm::ChatRequest,
+        ) -> ai_memory_llm::LlmResult<ai_memory_llm::ChatResponse> {
+            Err(auto_improve_sentinel_error())
+        }
+
+        async fn complete_structured_raw(
+            &self,
+            _request: ai_memory_llm::ChatRequest,
+            _schema: serde_json::Value,
+        ) -> ai_memory_llm::LlmResult<serde_json::Value> {
+            Err(auto_improve_sentinel_error())
+        }
+    }
+
+    /// A completed-scope session with one observation, enough for a review
+    /// whose minimums are lowered to pass the preflight and reach the LLM.
+    async fn seeded_auto_improve_session(
+        store: &Store,
+        ws: WorkspaceId,
+        proj: ProjectId,
+    ) -> SessionId {
+        let session_id = SessionId::new();
+        store
+            .writer
+            .begin_session(NewSession {
+                occurred_at: None,
+                id: session_id,
+                workspace_id: ws,
+                project_id: proj,
+                agent_kind: AgentKind::Other,
+                cwd: None,
+                actor_user: None,
+            })
+            .await
+            .unwrap();
+        store
+            .writer
+            .insert_observation(Sanitized::new(
+                NewObservation {
+                    occurred_at: None,
+                    session_id,
+                    workspace_id: ws,
+                    project_id: proj,
+                    kind: ObservationKind::UserPrompt,
+                    extension: None,
+                    source_event: None,
+                    title: "prompt".into(),
+                    body: "durable lesson worth capturing".into(),
+                    importance: 5,
+                },
+                &Sanitizer::builtin(),
+            ))
+            .await
+            .unwrap();
+        session_id
+    }
+
+    /// Build the server fixture the auto-improve tests share: real store and
+    /// wiki, the sentinel provider, and a consolidator so `self.llm`/`self.wiki`
+    /// are set.
+    async fn auto_improve_server_with_sentinel_llm() -> (
+        TempDir,
+        Store,
+        AiMemoryServer,
+        WorkspaceId,
+        ProjectId,
+        SessionId,
+    ) {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let wiki = Wiki::new(tmp.path(), store.writer.clone())
+            .unwrap()
+            .with_store_reader(store.reader.clone());
+        let ws = store
+            .writer
+            .get_or_create_workspace("default")
+            .await
+            .unwrap();
+        let proj = store
+            .writer
+            .get_or_create_project(ws, "scratch", None)
+            .await
+            .unwrap();
+        let session_id = seeded_auto_improve_session(&store, ws, proj).await;
+        let llm: Arc<dyn LlmProvider> = Arc::new(AutoImproveSentinelLlm);
+        let consolidator = Arc::new(Consolidator::new(
+            store.reader.clone(),
+            store.writer.clone(),
+            wiki.clone(),
+            llm.clone(),
+            ws,
+            proj,
+        ));
+        let server = AiMemoryServer::new(store.reader.clone(), store.writer.clone(), ws, proj)
+            .with_consolidator_arc(wiki, llm, consolidator);
+        (tmp, store, server, ws, proj, session_id)
+    }
+
+    /// Mutation captured: mapping the `AutoImproveError`'s `Display` into the
+    /// `McpError` copies the bounded provider body to the tool caller. Only
+    /// the redacted class/status summary may go out, and a failed review must
+    /// stage nothing.
+    #[tokio::test]
+    async fn memory_auto_improve_llm_failure_exposes_class_status_not_body() {
+        let (_tmp, store, server, ws, proj, session_id) =
+            auto_improve_server_with_sentinel_llm().await;
+
+        let err = server
+            .memory_auto_improve(
+                Parameters(AutoImproveArgs {
+                    session_id: Some(session_id.to_string()),
+                    dry_run: None,
+                    stage: None,
+                    mode: None,
+                    project: None,
+                    workspace: None,
+                    min_observations: Some(1),
+                    min_session_duration_secs: Some(0),
+                    min_confidence: Some(0.75),
+                    max_input_tokens: None,
+                    max_proposals: Some(5),
+                    include_raw_fallback: None,
+                }),
+                OptionalParts(test_parts_default()),
+            )
+            .await
+            .expect_err("the provider failure must surface as an MCP error");
+        assert_eq!(
+            err.message, "auto-improve failed: class=provider status=400",
+            "the MCP error must carry only the redacted class/status summary"
+        );
+        assert!(
+            !err.message.contains("SENTINEL_PRIVATE_BODY"),
+            "provider body leaked into the MCP error: {}",
+            err.message
+        );
+        // The review failed before staging: no proposal row may exist.
+        let proposals = store
+            .reader
+            .list_auto_improve_proposals(ws, proj, None, 100)
+            .await
+            .unwrap();
+        assert!(
+            proposals.is_empty(),
+            "a failed review must not stage proposals: {proposals:?}"
+        );
+    }
+
+    /// Control: a non-LLM failure (a session that does not exist) keeps its
+    /// own class with `status=none`, so configuration, provider, and parse
+    /// failures stay distinguishable, and still stages nothing.
+    #[tokio::test]
+    async fn memory_auto_improve_missing_session_error_keeps_class_without_body() {
+        let (_tmp, store, server, ws, proj, _seeded) =
+            auto_improve_server_with_sentinel_llm().await;
+
+        let missing = SessionId::new();
+        let err = server
+            .memory_auto_improve(
+                Parameters(AutoImproveArgs {
+                    session_id: Some(missing.to_string()),
+                    dry_run: None,
+                    stage: None,
+                    mode: None,
+                    project: None,
+                    workspace: None,
+                    min_observations: Some(1),
+                    min_session_duration_secs: Some(0),
+                    min_confidence: Some(0.75),
+                    max_input_tokens: None,
+                    max_proposals: Some(5),
+                    include_raw_fallback: None,
+                }),
+                OptionalParts(test_parts_default()),
+            )
+            .await
+            .expect_err("the missing session must surface as an MCP error");
+        assert_eq!(
+            err.message,
+            "auto-improve failed: class=session-not-found status=none"
+        );
+        assert!(!err.message.contains("SENTINEL_PRIVATE_BODY"));
+        let proposals = store
+            .reader
+            .list_auto_improve_proposals(ws, proj, None, 100)
+            .await
+            .unwrap();
+        assert!(proposals.is_empty());
     }
 
     /// Stage one pending proposal for `notes/collides.md` into

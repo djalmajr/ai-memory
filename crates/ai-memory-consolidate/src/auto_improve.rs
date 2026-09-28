@@ -214,6 +214,34 @@ pub enum AutoImproveError {
     Eval(String),
 }
 
+/// Redacted one-line summary of an auto-improve review failure:
+/// `auto-improve failed: class=<class> status=<status-or-none>`.
+///
+/// For the MCP boundary where the full `Display` of [`AutoImproveError`]
+/// would leak a provider response body to the tool caller
+/// (`AutoImproveError::Llm` is transparent to [`LlmError`]). `class` is a
+/// fixed label per variant (or [`LlmError::class`] for LLM failures) and
+/// `status` is the HTTP status captured by the failure
+/// ([`LlmError::http_status`]), or `none`. It never carries the cause's
+/// `Display`, a response body, URL, prompt, token, or headers.
+#[must_use]
+pub fn redacted_auto_improve_summary(error: &AutoImproveError) -> String {
+    let (class, status) = match error {
+        AutoImproveError::Store(_) => ("store", None),
+        AutoImproveError::Llm(llm) => (llm.class(), llm.http_status()),
+        AutoImproveError::Memory(_) => ("memory", None),
+        AutoImproveError::SessionNotFound(_) => ("session-not-found", None),
+        AutoImproveError::SessionOutOfScope { .. } => ("session-out-of-scope", None),
+        AutoImproveError::Eval(_) => ("eval", None),
+    };
+    format!(
+        "auto-improve failed: class={class} status={}",
+        status
+            .map(|status| status.to_string())
+            .unwrap_or_else(|| "none".into())
+    )
+}
+
 /// Result alias for auto-improvement review.
 pub type AutoImproveResult<T> = Result<T, AutoImproveError>;
 
@@ -1893,10 +1921,63 @@ mod tests {
     use ai_memory_core::{
         AgentKind, NewObservation, NewSession, ObservationId, ObservationKind, Sanitized, Sanitizer,
     };
-    use ai_memory_llm::{ChatResponse, LlmResult};
+    use ai_memory_llm::{ChatResponse, LlmError, LlmResult};
     use ai_memory_store::Store;
     use jiff::Timestamp;
     use tempfile::TempDir;
+
+    /// Body a fake provider returns in the redaction tests; the summary must
+    /// never contain it.
+    const AUTO_IMPROVE_REDACTION_SENTINEL: &str = "SENTINEL_PRIVATE_BODY";
+
+    /// The summary is the only failure text the `memory_auto_improve` MCP
+    /// call returns, so it must expose class/status and drop the provider
+    /// body.
+    #[test]
+    fn auto_improve_redacted_summary_exposes_class_and_status_without_body() {
+        let error = AutoImproveError::Llm(LlmError::Provider {
+            status: 400,
+            body: AUTO_IMPROVE_REDACTION_SENTINEL.into(),
+        });
+        let summary = redacted_auto_improve_summary(&error);
+        assert_eq!(summary, "auto-improve failed: class=provider status=400");
+        assert!(!summary.contains(AUTO_IMPROVE_REDACTION_SENTINEL));
+    }
+
+    /// Non-LLM variants take a static label with `status=none`; the shape
+    /// stays stable and the cause's `Display` never enters the summary.
+    #[test]
+    fn auto_improve_redacted_summary_non_llm_variants_report_none_status() {
+        for (error, class) in [
+            (
+                AutoImproveError::SessionNotFound(ai_memory_core::SessionId::new()),
+                "session-not-found",
+            ),
+            (
+                AutoImproveError::SessionOutOfScope {
+                    session_id: ai_memory_core::SessionId::new(),
+                },
+                "session-out-of-scope",
+            ),
+            (
+                AutoImproveError::Eval(AUTO_IMPROVE_REDACTION_SENTINEL.into()),
+                "eval",
+            ),
+            (
+                AutoImproveError::Llm(LlmError::NotConfigured(
+                    AUTO_IMPROVE_REDACTION_SENTINEL.into(),
+                )),
+                "not-configured",
+            ),
+        ] {
+            let summary = redacted_auto_improve_summary(&error);
+            assert_eq!(
+                summary,
+                format!("auto-improve failed: class={class} status=none")
+            );
+            assert!(!summary.contains(AUTO_IMPROVE_REDACTION_SENTINEL));
+        }
+    }
 
     struct FakeLlm;
 

@@ -12,7 +12,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::str::FromStr;
 use std::sync::{Arc, Weak};
 
-use ai_memory_consolidate::{Consolidator, ConsolidatorError};
+use ai_memory_consolidate::{Consolidator, ConsolidatorError, redacted_error_summary};
 use ai_memory_core::{
     ActiveProject, ActorKey, AgentKind, DEFAULT_WORKSPACE_NAME, Handoff, IdentityKey,
     MANAGED_WORKSTREAM_PACKET_MARKER, ManagedRunId, MidSessionRouting, NewHandoff, NewObservation,
@@ -3404,13 +3404,11 @@ async fn consolidate_or_synth(
                         checkpoint_label,
                         short_id(&session_id.to_string()),
                     ))
-                    .map_err(|e| {
-                        tracing::warn!(
-                            error = %e,
-                            "{}: checkpoint auto-commit failed",
-                            checkpoint_label
-                        );
-                        e
+                    .inspect_err(|_| {
+                        // No cause text in the event: the wiki error can
+                        // carry paths, and this log line is the only operator
+                        // trace of a checkpoint auto-commit failure.
+                        tracing::warn!("{}: checkpoint auto-commit failed", checkpoint_label);
                     });
                 return Ok(());
             }
@@ -3419,7 +3417,7 @@ async fn consolidate_or_synth(
             Err(ConsolidatorError::EmptySession(_)) => return Ok(()),
             Err(e) if checkpoint_degrades_to_synth(&e) => {
                 warn!(
-                    error = %e,
+                    error_summary = %redacted_error_summary(&e),
                     session = %session_id,
                     "{}: LLM consolidation unavailable; falling back to rule-based checkpoint",
                     checkpoint_label
@@ -3467,9 +3465,9 @@ async fn consolidate_or_synth(
             checkpoint_label,
             short_id(&session_id.to_string()),
         ))
-        .map_err(|e| {
-            tracing::warn!(error = %e, "{}: checkpoint auto-commit failed", checkpoint_label);
-            e
+        .inspect_err(|_| {
+            // Same rule as the LLM path above: no cause text in the event.
+            tracing::warn!("{}: checkpoint auto-commit failed", checkpoint_label);
         });
     debug!(session = %session_id, "{}: rule-based checkpoint written", checkpoint_label);
     Ok(())
@@ -3867,6 +3865,272 @@ mod tests {
             page.body.contains("**observations:** 1"),
             "fallback page must account for every captured observation, got: {}",
             page.body
+        );
+    }
+
+    /// A provider that fails with a private body: the checkpoint fallback
+    /// warning must carry class/status only, never the body.
+    struct CheckpointSentinelLlm;
+
+    #[async_trait::async_trait]
+    impl LlmProvider for CheckpointSentinelLlm {
+        fn name(&self) -> &'static str {
+            "checkpoint-sentinel"
+        }
+
+        fn model(&self) -> &str {
+            "sentinel-model"
+        }
+
+        async fn complete(&self, _request: ChatRequest) -> LlmResult<ChatResponse> {
+            Err(self.fail())
+        }
+
+        async fn complete_structured_raw(
+            &self,
+            _request: ChatRequest,
+            _schema: serde_json::Value,
+        ) -> LlmResult<serde_json::Value> {
+            Err(self.fail())
+        }
+    }
+
+    impl CheckpointSentinelLlm {
+        fn fail(&self) -> ai_memory_llm::LlmError {
+            ai_memory_llm::LlmError::Provider {
+                status: 400,
+                body: "SENTINEL_PRIVATE_BODY".into(),
+            }
+        }
+    }
+
+    /// A provider that answers the single-page consolidation schema, so the
+    /// checkpoint reaches the auto-commit step.
+    struct CheckpointSuccessLlm;
+
+    #[async_trait::async_trait]
+    impl LlmProvider for CheckpointSuccessLlm {
+        fn name(&self) -> &'static str {
+            "checkpoint-success"
+        }
+
+        fn model(&self) -> &str {
+            "success-model"
+        }
+
+        async fn complete(&self, _request: ChatRequest) -> LlmResult<ChatResponse> {
+            Err(ai_memory_llm::LlmError::UnexpectedShape(
+                "checkpoint tests use structured output".into(),
+            ))
+        }
+
+        async fn complete_structured_raw(
+            &self,
+            _request: ChatRequest,
+            _schema: serde_json::Value,
+        ) -> LlmResult<serde_json::Value> {
+            Ok(serde_json::json!({
+                "title": "Checkpointed session",
+                "body_markdown": "# Checkpointed session\n\nstate that must survive compaction."
+            }))
+        }
+    }
+
+    /// Captures everything a subscriber writes so a test can assert on it.
+    /// `set_default` is thread-local and each `#[tokio::test]` runs on its
+    /// own thread, so parallel tests do not share (or fight over) a capture.
+    #[derive(Clone, Default)]
+    struct CapturedLog(Arc<Mutex<Vec<u8>>>);
+
+    impl CapturedLog {
+        fn text(&self) -> String {
+            String::from_utf8_lossy(&self.0.lock().unwrap()).into_owned()
+        }
+    }
+
+    impl std::io::Write for CapturedLog {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CapturedLog {
+        type Writer = Self;
+
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    /// Mutation captured: logging the `ConsolidatorError`'s `Display` on the
+    /// fallback path copies the provider body into the hook log. Both
+    /// checkpoint flavors (PreCompact and PostCompaction) run the same
+    /// function, so both labels are driven against the sentinel provider.
+    #[tokio::test]
+    async fn checkpoint_fallback_log_carries_class_status_not_provider_body() {
+        let captured = CapturedLog::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(captured.clone())
+            .with_max_level(tracing::Level::WARN)
+            .with_ansi(false)
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        let tmp = TempDir::new().unwrap();
+        let mut state = make_state(&tmp).await;
+        state.consolidator = Some(Arc::new(Consolidator::new(
+            state.reader.clone(),
+            state.writer.clone(),
+            state.wiki.clone(),
+            Arc::new(CheckpointSentinelLlm),
+            state.workspace_id,
+            state.project_id,
+        )));
+
+        for checkpoint_label in ["pre-compact", "post-compaction"] {
+            let session_id = seed_checkpoint_observation(&state, "keep-this-working-state").await;
+            consolidate_or_synth(
+                &state,
+                session_id,
+                state.workspace_id,
+                state.project_id,
+                AgentKind::ClaudeCode,
+                checkpoint_label,
+                ai_memory_core::ActorContext::anonymous(),
+            )
+            .await
+            .expect("a provider 400 must not lose the checkpoint");
+
+            let path = ai_memory_core::PagePath::new(format!("sessions/{session_id}.md")).unwrap();
+            let page = state
+                .wiki
+                .read_page(state.workspace_id, state.project_id, &path)
+                .unwrap_or_else(|e| panic!("rule-based checkpoint page missing: {e}"));
+            assert!(
+                page.body.contains("keep-this-working-state"),
+                "fallback page must carry the session's observations, got: {}",
+                page.body
+            );
+        }
+
+        let logged = captured.text();
+        for checkpoint_label in ["pre-compact", "post-compaction"] {
+            assert!(
+                logged.contains(&format!(
+                    "{checkpoint_label}: LLM consolidation unavailable; falling back to rule-based checkpoint"
+                )),
+                "the fallback warning must fire for {checkpoint_label}; captured log was: {logged:?}"
+            );
+        }
+        assert!(
+            logged.contains("class=provider status=400"),
+            "the redacted class/status must stay diagnosable: {logged}"
+        );
+        assert!(
+            !logged.contains("SENTINEL_PRIVATE_BODY"),
+            "provider body leaked into the checkpoint log: {logged}"
+        );
+    }
+
+    /// Mutation captured: logging the wiki error's `Display` on the
+    /// auto-commit failure would put paths/error text into the event. The
+    /// event keeps its distinguishing label and nothing else; the LLM path
+    /// still succeeds and the page still lands.
+    #[tokio::test]
+    async fn checkpoint_auto_commit_failure_log_carries_no_error_text() {
+        let captured = CapturedLog::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(captured.clone())
+            .with_max_level(tracing::Level::WARN)
+            .with_ansi(false)
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        let tmp = TempDir::new().unwrap();
+        let mut state = make_state(&tmp).await;
+        state.consolidator = Some(Arc::new(Consolidator::new(
+            state.reader.clone(),
+            state.writer.clone(),
+            state.wiki.clone(),
+            Arc::new(CheckpointSuccessLlm),
+            state.workspace_id,
+            state.project_id,
+        )));
+
+        // Park the wiki git repo so `commit_all` fails deterministically.
+        let git_dir = tmp.path().join("wiki").join(".git");
+        std::fs::rename(&git_dir, git_dir.with_file_name(".git-parked")).unwrap();
+
+        let session_id = seed_checkpoint_observation(&state, "checkpoint-commit-failure").await;
+        consolidate_or_synth(
+            &state,
+            session_id,
+            state.workspace_id,
+            state.project_id,
+            AgentKind::ClaudeCode,
+            "pre-compact",
+            ai_memory_core::ActorContext::anonymous(),
+        )
+        .await
+        .expect("an auto-commit failure must not lose the checkpoint");
+
+        // The LLM page still landed; only the git commit is missing.
+        let path = ai_memory_core::PagePath::new(format!("sessions/{session_id}.md")).unwrap();
+        let page = state
+            .wiki
+            .read_page(state.workspace_id, state.project_id, &path)
+            .unwrap_or_else(|e| panic!("LLM checkpoint page missing: {e}"));
+        assert!(page.body.contains("Checkpointed session"));
+
+        // The rule-based path carries the same auto-commit event: fail the
+        // provider and let the fallback write hit the parked repo too.
+        state.consolidator = Some(Arc::new(Consolidator::new(
+            state.reader.clone(),
+            state.writer.clone(),
+            state.wiki.clone(),
+            Arc::new(CheckpointSentinelLlm),
+            state.workspace_id,
+            state.project_id,
+        )));
+        let fallback_session = seed_checkpoint_observation(&state, "fallback-commit-failure").await;
+        consolidate_or_synth(
+            &state,
+            fallback_session,
+            state.workspace_id,
+            state.project_id,
+            AgentKind::ClaudeCode,
+            "pre-compact",
+            ai_memory_core::ActorContext::anonymous(),
+        )
+        .await
+        .expect("an auto-commit failure must not lose the fallback checkpoint");
+
+        let logged = captured.text();
+        let marker = "pre-compact: checkpoint auto-commit failed";
+        let marker_lines: Vec<&str> = logged
+            .lines()
+            .filter(|line| line.contains(marker))
+            .collect();
+        assert!(
+            marker_lines.len() >= 2,
+            "both the LLM and the rule-based auto-commit warnings must fire; captured log was: {logged:?}"
+        );
+        // Only the router's own event lines are in scope: no cause text may
+        // share any of them with the marker.
+        for line in marker_lines {
+            assert!(
+                !line.contains("could not find repository at") && !line.contains("code=NotFound"),
+                "wiki error text leaked into the checkpoint auto-commit event: {line}"
+            );
+        }
+        assert!(
+            !logged.contains("SENTINEL_PRIVATE_BODY"),
+            "no provider body may reach the checkpoint log: {logged}"
         );
     }
 

@@ -51,6 +51,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   consolidation retry log. The class and status keep configuration, provider,
   and parse failures distinguishable; retry scheduling and terminal
   decisions are unchanged. (#2)
+- The remaining LLM error surfaces report the same redacted class/status
+  only: the PreCompact/PostCompaction checkpoint fallback log, the
+  `memory_auto_improve` MCP error (now an `auto-improve failed:` summary), and the reranker degradation warning (task failures keep a
+  separate static class). A provider response body, prompt, token, URL, or
+  header no longer reaches those logs or the MCP response; fallback
+  behavior, search ordering, and retry policy are unchanged. (#2)
 - Timeout and ambiguous 499/5xx LLM failures now receive at most one replay
   after a 60-second cooldown plus jitter. Fast retries remain for connection
   failures, 429 with Retry-After, and 503 explicitly marked as capacity;
