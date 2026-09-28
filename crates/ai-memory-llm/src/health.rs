@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 use crate::embedding::Embedder;
 use crate::error::{LlmError, LlmResult};
 use crate::provider::LlmProvider;
-use crate::types::{ChatRequest, ChatResponse};
+use crate::types::{ChatRequest, ChatResponse, LlmOperationId};
 
 const MAX_ERROR_MESSAGE_CHARS: usize = 1024;
 
@@ -345,12 +345,48 @@ impl LlmProvider for HealthRecordingLlmProvider {
         result
     }
 
+    /// Forward the caller's operation id to the inner provider instead of
+    /// falling through to the trait default, which would drop it and make
+    /// the inner admission layer mint a fresh one — an external retry of the
+    /// same logical operation (the consolidator's fast retry) must keep the
+    /// id that correlated the first attempt on the wire. One observation per
+    /// return, exactly like the id-less path.
+    async fn complete_with_operation_id(
+        &self,
+        request: ChatRequest,
+        operation_id: LlmOperationId,
+    ) -> LlmResult<ChatResponse> {
+        let result = self
+            .inner
+            .complete_with_operation_id(request, operation_id)
+            .await;
+        self.health.record_result(&result);
+        result
+    }
+
     async fn complete_structured_raw(
         &self,
         request: ChatRequest,
         schema: serde_json::Value,
     ) -> LlmResult<serde_json::Value> {
         let result = self.inner.complete_structured_raw(request, schema).await;
+        self.health.record_result(&result);
+        result
+    }
+
+    /// Same id-forwarding contract as [`Self::complete_with_operation_id`]
+    /// for the structured path, which is the one the consolidator's retry
+    /// loop actually drives.
+    async fn complete_structured_raw_with_operation_id(
+        &self,
+        request: ChatRequest,
+        schema: serde_json::Value,
+        operation_id: LlmOperationId,
+    ) -> LlmResult<serde_json::Value> {
+        let result = self
+            .inner
+            .complete_structured_raw_with_operation_id(request, schema, operation_id)
+            .await;
         self.health.record_result(&result);
         result
     }
@@ -425,6 +461,7 @@ fn truncate_error_message(message: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
     struct FakeLlm {
         fail: bool,
@@ -466,6 +503,237 @@ mod tests {
     }
 
     struct TaskAwareEmbedder;
+
+    /// Captures the operation ids the inner provider actually receives and
+    /// counts id-less invocations, so the wrapper tests can assert the id
+    /// survives the recording layer and exactly one inner call (one health
+    /// observation) happens per external return.
+    struct IdCapturingLlm {
+        chat_ids: Mutex<Vec<LlmOperationId>>,
+        structured_ids: Mutex<Vec<LlmOperationId>>,
+        /// Any id-less invocation means the wrapper lost the operation
+        /// identity in the trait-default fallback.
+        id_less_calls: AtomicUsize,
+        /// When set, the first structured call fails transiently (sentinel
+        /// body only — never real request material).
+        fail_first_structured: AtomicBool,
+    }
+
+    impl std::default::Default for IdCapturingLlm {
+        fn default() -> Self {
+            Self {
+                chat_ids: Mutex::new(Vec::new()),
+                structured_ids: Mutex::new(Vec::new()),
+                id_less_calls: AtomicUsize::new(0),
+                fail_first_structured: AtomicBool::new(false),
+            }
+        }
+    }
+
+    impl IdCapturingLlm {
+        fn failing_first_structured() -> Self {
+            Self {
+                fail_first_structured: AtomicBool::new(true),
+                ..Self::default()
+            }
+        }
+    }
+
+    #[async_trait]
+    impl LlmProvider for IdCapturingLlm {
+        fn name(&self) -> &'static str {
+            "id-capturing"
+        }
+
+        fn model(&self) -> &str {
+            "fake-model"
+        }
+
+        async fn complete(&self, _request: ChatRequest) -> LlmResult<ChatResponse> {
+            self.id_less_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(ChatResponse {
+                text: "pong".to_string(),
+                usage: None,
+                model: "fake-model".to_string(),
+            })
+        }
+
+        async fn complete_with_operation_id(
+            &self,
+            _request: ChatRequest,
+            operation_id: LlmOperationId,
+        ) -> LlmResult<ChatResponse> {
+            self.chat_ids.lock().unwrap().push(operation_id);
+            Ok(ChatResponse {
+                text: "pong".to_string(),
+                usage: None,
+                model: "fake-model".to_string(),
+            })
+        }
+
+        async fn complete_structured_raw(
+            &self,
+            _request: ChatRequest,
+            _schema: serde_json::Value,
+        ) -> LlmResult<serde_json::Value> {
+            self.id_less_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(serde_json::json!({ "ok": true }))
+        }
+
+        async fn complete_structured_raw_with_operation_id(
+            &self,
+            _request: ChatRequest,
+            _schema: serde_json::Value,
+            operation_id: LlmOperationId,
+        ) -> LlmResult<serde_json::Value> {
+            self.structured_ids.lock().unwrap().push(operation_id);
+            if self.fail_first_structured.swap(false, Ordering::SeqCst) {
+                return Err(LlmError::Provider {
+                    status: 503,
+                    body: "sentinel transient failure".to_string(),
+                });
+            }
+            Ok(serde_json::json!({ "ok": true }))
+        }
+    }
+
+    /// Acceptance 1: the wrapper forwards the caller's id — not a minted
+    /// one — to the inner provider on both the chat and the structured path.
+    /// Removing either override makes this fail: the trait default would
+    /// reach the id-less inner methods and nothing would be captured.
+    #[tokio::test]
+    async fn llm_wrapper_preserves_the_operation_id_for_chat_and_structured() {
+        let health = ProviderHealth::default();
+        let fake = Arc::new(IdCapturingLlm::default());
+        let llm = health.wrap_llm_provider(
+            Arc::clone(&fake) as Arc<dyn LlmProvider>,
+            "fake",
+            "fake-model",
+            None,
+        );
+
+        let chat_id = LlmOperationId::new();
+        let chat = llm
+            .complete_with_operation_id(ChatRequest::user_prompt("ping"), chat_id)
+            .await
+            .unwrap();
+        assert_eq!(chat.text, "pong");
+
+        let structured_id = LlmOperationId::new();
+        assert_ne!(
+            chat_id, structured_id,
+            "distinct operations are distinct ids"
+        );
+        let value = llm
+            .complete_structured_raw_with_operation_id(
+                ChatRequest::user_prompt("ping"),
+                serde_json::json!({ "type": "object" }),
+                structured_id,
+            )
+            .await
+            .unwrap();
+        assert_eq!(value, serde_json::json!({ "ok": true }));
+
+        let chat_ids = fake.chat_ids.lock().unwrap().clone();
+        let structured_ids = fake.structured_ids.lock().unwrap().clone();
+        assert_eq!(
+            chat_ids,
+            vec![chat_id],
+            "chat path forwards the caller's id"
+        );
+        assert_eq!(
+            structured_ids,
+            vec![structured_id],
+            "structured path forwards the caller's id"
+        );
+        assert_eq!(
+            fake.id_less_calls.load(Ordering::SeqCst),
+            0,
+            "the wrapper must not fall back to the id-less inner methods"
+        );
+
+        // One observation per return: two returns, no error, last state Ok.
+        let after = health.snapshot().llm;
+        assert_eq!(after.status, ProviderHealthStatus::Ok);
+        assert!(after.last_call_at.is_some());
+        assert!(after.last_success_at.is_some());
+        assert!(after.last_error_at.is_none());
+        assert!(after.last_error_message.is_none());
+    }
+
+    /// Acceptance 2: two external structured calls with the same id — first
+    /// failing transiently, second succeeding, as the consolidator's fast
+    /// retry does — both reach the inner provider with that one id, and the
+    /// health role observes each return (error, then success).
+    #[tokio::test]
+    async fn llm_wrapper_keeps_one_id_across_retries_and_records_each_return() {
+        let health = ProviderHealth::default();
+        let fake = Arc::new(IdCapturingLlm::failing_first_structured());
+        let llm = health.wrap_llm_provider(
+            Arc::clone(&fake) as Arc<dyn LlmProvider>,
+            "fake",
+            "fake-model",
+            None,
+        );
+
+        let operation_id = LlmOperationId::new();
+        let schema = serde_json::json!({ "type": "object" });
+
+        let first = llm
+            .complete_structured_raw_with_operation_id(
+                ChatRequest::user_prompt("ping"),
+                schema.clone(),
+                operation_id,
+            )
+            .await;
+        let LlmError::Provider { status, .. } = first.as_ref().unwrap_err() else {
+            panic!("the first attempt must fail: {first:?}");
+        };
+        assert_eq!(*status, 503);
+        assert!(
+            first.as_ref().unwrap_err().is_transient(),
+            "the failure is fast-retryable, like the consolidator's retry budget"
+        );
+        let after_failure = health.snapshot().llm;
+        assert_eq!(after_failure.status, ProviderHealthStatus::Error);
+        assert_eq!(after_failure.last_error_status, Some(503));
+        assert!(after_failure.last_call_at.is_some());
+
+        let second = llm
+            .complete_structured_raw_with_operation_id(
+                ChatRequest::user_prompt("ping"),
+                schema,
+                operation_id,
+            )
+            .await
+            .unwrap();
+        assert_eq!(second, serde_json::json!({ "ok": true }));
+        let after_success = health.snapshot().llm;
+        assert_eq!(after_success.status, ProviderHealthStatus::Ok);
+        assert!(after_success.last_success_at.is_some());
+        assert!(
+            after_success.last_error_at.is_none(),
+            "the success observation supersedes the error"
+        );
+        assert!(after_success.last_error_message.is_none());
+
+        let ids = fake.structured_ids.lock().unwrap().clone();
+        assert_eq!(
+            ids.len(),
+            2,
+            "one inner call per external return, no internal re-dispatch"
+        );
+        let (id_1, id_2) = (ids[0], ids[1]);
+        assert_eq!(
+            id_1, id_2,
+            "both attempts of one operation carry the same id"
+        );
+        assert_eq!(
+            id_1, operation_id,
+            "the inner provider sees the caller's id"
+        );
+        assert_eq!(fake.id_less_calls.load(Ordering::SeqCst), 0);
+    }
 
     #[async_trait]
     impl Embedder for TaskAwareEmbedder {
