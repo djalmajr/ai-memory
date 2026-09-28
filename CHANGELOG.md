@@ -18,9 +18,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   with the operation id, status/error class, and duration — never prompt,
   response, error body, tokens, header values, or the URL. A static
   `x-request-id` entry in `AI_MEMORY_LLM_HEADERS` is refused at startup for
-  this provider; the official `openai` and `opencode` providers are
-  unchanged (`opencode` keeps its `x-opencode-session` contract). (PR
-  reference pending local validation)
+  this provider. The official `openai` and `opencode` providers do not send
+  this header (`opencode` keeps its `x-opencode-session` contract); their Chat
+  Completions requests share the new attempt logs. (#2)
 - Added `AI_MEMORY_LLM_COMPAT_DISABLE_THINKING` for the `openai-compat`
   provider (opt-in, off by default, ignored by every other provider): when
   set, every chat request carries
