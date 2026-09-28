@@ -13,13 +13,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   set, every chat request carries
   `chat_template_kwargs: {"enable_thinking": false}`, so thinking-capable
   local engines (vLLM / SGLang serving Qwen3-class models) spend the output
-  budget on the structured payload instead of a reasoning pass. Structured
-  responses that stop at the output budget
-  (`finish_reason = "length"`) and 2xx responses with a missing, empty, or
-  whitespace-only `message.content` now fail fast with the terminal errors
-  `truncated-response` / `empty-content` instead of surfacing as retryable
-  parse failures — no retry, no second HTTP call, and the error text carries
-  no response content.
+  budget on the structured payload instead of a reasoning pass.
+  (PR reference pending local validation)
 - Added process-local admission for all server LLM jobs: one chat request in
   flight, a bounded waiting queue with wait logs, and an optional input cap
   counted with the configured model tokenizer before HTTP. The cap requires
@@ -27,6 +22,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   be checked independently. (PR reference pending local validation)
 
 ### Fixed
+- Structured LLM responses stopped at the output budget
+  (`finish_reason = "length"`) or returned without usable content now fail
+  with redacted terminal errors. SessionEnd consolidation stops its durable
+  queue on those errors, malformed JSON, and unexpected response shapes
+  instead of repeating the same expensive prompt; pre-send connection and
+  capacity failures retain bounded backoff. (PR reference pending local validation)
+- LLM degradation in `memory_query(answer=true)` and `memory_explore` now
+  reports the error class without copying an upstream provider response body
+  into MCP results or server logs. (PR reference pending local validation)
 - Timeout and ambiguous 499/5xx LLM failures now receive at most one replay
   after a 60-second cooldown plus jitter. Fast retries remain for connection
   failures, 429 with Retry-After, and 503 explicitly marked as capacity;

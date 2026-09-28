@@ -755,9 +755,10 @@ fn session_consolidation_retry_delay(attempt: u32) -> Duration {
 /// expensive prompt cannot clear them.
 ///
 /// Deterministic structured-response failures — malformed JSON (`Serde`), an
-/// unexpected response shape (`UnexpectedShape`) — reproduce on identical
-/// inputs, so the job goes terminal and the heuristic page the SessionEnd
-/// hook already wrote remains. The pre-send input limit never fits, and for
+/// unexpected response shape (`UnexpectedShape`), an output-budget stop, or
+/// empty content — reproduce on identical inputs, so the job goes terminal.
+/// The heuristic page the SessionEnd hook already wrote remains. The pre-send
+/// input limit never fits, and for
 /// ambiguous deliveries (a timeout, 499, or 5xx after send) the admission
 /// provider already made its one delayed replay before surfacing
 /// `AmbiguousRetryExhausted`; a queue retry would be a third send of the
@@ -775,6 +776,8 @@ fn is_terminal_session_consolidation_error(
                     | ai_memory_llm::LlmError::InputLimit { .. }
                     | ai_memory_llm::LlmError::Serde(_)
                     | ai_memory_llm::LlmError::UnexpectedShape(_)
+                    | ai_memory_llm::LlmError::TruncatedResponse { .. }
+                    | ai_memory_llm::LlmError::EmptyContent { .. }
             )
     )
 }
@@ -3799,6 +3802,10 @@ mod tests {
     enum ConsolidationFailure {
         /// The provider answered with a shape the structured decoder rejects.
         UnexpectedShape,
+        /// The provider stopped at its output budget before completing JSON.
+        TruncatedResponse,
+        /// The provider returned HTTP 2xx with no usable content.
+        EmptyContent,
         /// A timeout/5xx after send survived the admission provider's one
         /// delayed replay — the worker must not add a third send.
         AmbiguousRetryExhausted,
@@ -3849,6 +3856,13 @@ mod tests {
                     ConsolidationFailure::UnexpectedShape => {
                         LlmError::UnexpectedShape("no tool block".into())
                     }
+                    ConsolidationFailure::TruncatedResponse => LlmError::TruncatedResponse {
+                        model: "qwen3.8-27b".into(),
+                        completion_tokens: Some(8000),
+                    },
+                    ConsolidationFailure::EmptyContent => LlmError::EmptyContent {
+                        model: "qwen3.8-27b".into(),
+                    },
                     ConsolidationFailure::AmbiguousRetryExhausted => {
                         LlmError::AmbiguousRetryExhausted {
                             class: "provider",
@@ -4079,6 +4093,15 @@ mod tests {
                 ai_memory_llm::LlmError::UnexpectedShape("no tool block".into()),
             ),
             ai_memory_consolidate::ConsolidatorError::Serde("truncated json".into()),
+            ai_memory_consolidate::ConsolidatorError::Llm(
+                ai_memory_llm::LlmError::TruncatedResponse {
+                    model: "qwen3.8-27b".into(),
+                    completion_tokens: Some(8000),
+                },
+            ),
+            ai_memory_consolidate::ConsolidatorError::Llm(ai_memory_llm::LlmError::EmptyContent {
+                model: "qwen3.8-27b".into(),
+            }),
         ];
         for error in &failures {
             // Every queue attempt of the sequence the old 3x5 product walked
@@ -4111,8 +4134,7 @@ mod tests {
         drop(listener);
         let connect = reqwest::get(format!("http://{addr}/v1"))
             .await
-            .err()
-            .expect("a closed loopback port must refuse the connection");
+            .expect_err("a closed loopback port must refuse the connection");
         assert!(
             connect.is_connect(),
             "the fixture must be a pre-send connection failure"
@@ -4423,6 +4445,14 @@ mod tests {
     #[tokio::test]
     async fn session_end_worker_makes_deterministic_structured_failure_terminal() {
         session_end_worker_terminates_on(ConsolidationFailure::UnexpectedShape).await;
+    }
+
+    // Mutation captured: removing either provider error from the terminal
+    // queue set causes a second claim of the same truncated or empty output.
+    #[tokio::test]
+    async fn session_end_worker_makes_truncated_and_empty_output_terminal() {
+        session_end_worker_terminates_on(ConsolidationFailure::TruncatedResponse).await;
+        session_end_worker_terminates_on(ConsolidationFailure::EmptyContent).await;
     }
 
     // Mutation captured: a timeout/5xx after send already spent the admission

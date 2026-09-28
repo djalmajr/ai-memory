@@ -2723,10 +2723,16 @@ impl AiMemoryServer {
                         ),
                         Err(e) => {
                             tracing::warn!(
-                                error = %e,
+                                operation = "memory_query_answer",
+                                result = "degraded",
+                                error_class = e.class(),
+                                error_status = ?e.http_status(),
                                 "memory_query answer synthesis failed; returning hits without an answer"
                             );
-                            (None, Some(format!("answer synthesis failed: {e}")))
+                            (
+                                None,
+                                Some(format!("answer synthesis failed ({})", e.class())),
+                            )
                         }
                     }
                 }
@@ -4944,10 +4950,16 @@ impl AiMemoryServer {
         let text = match provider.complete(request).await {
             Ok(resp) => resp.text,
             Err(e) => {
-                tracing::warn!(error = %e, "memory_explore LLM call failed; degrading to briefing");
+                tracing::warn!(
+                    operation = "memory_explore",
+                    result = "degraded",
+                    error_class = e.class(),
+                    error_status = ?e.http_status(),
+                    "memory_explore LLM call failed; degrading to briefing"
+                );
                 return ok_json(&serde_json::json!({
                     "prose": null,
-                    "reason": format!("LLM call failed: {e}"),
+                    "reason": format!("LLM call failed ({})", e.class()),
                     "briefing": snapshot,
                 }));
             }
@@ -10731,6 +10743,105 @@ mod tests {
             text.contains("\"briefing\":"),
             "expected briefing payload\n{text}"
         );
+    }
+
+    struct ProviderBodyFailure;
+
+    #[async_trait::async_trait]
+    impl LlmProvider for ProviderBodyFailure {
+        fn name(&self) -> &'static str {
+            "provider-body-failure"
+        }
+
+        fn model(&self) -> &str {
+            "test"
+        }
+
+        async fn complete(
+            &self,
+            _request: ai_memory_llm::ChatRequest,
+        ) -> ai_memory_llm::LlmResult<ai_memory_llm::ChatResponse> {
+            Err(ai_memory_llm::LlmError::Provider {
+                status: 502,
+                body: "private-provider-body-sentinel".into(),
+            })
+        }
+
+        async fn complete_structured_raw(
+            &self,
+            _request: ai_memory_llm::ChatRequest,
+            _schema: serde_json::Value,
+        ) -> ai_memory_llm::LlmResult<serde_json::Value> {
+            Err(ai_memory_llm::LlmError::Provider {
+                status: 502,
+                body: "private-provider-body-sentinel".into(),
+            })
+        }
+    }
+
+    // Mutation captured: formatting the provider error into either degraded
+    // MCP response exposes its bounded upstream body to the tool caller.
+    #[tokio::test]
+    async fn llm_degradation_exposes_class_without_provider_body() {
+        let (tmp, store, _server, ws, proj) = setup_server().await;
+        let wiki = Wiki::new(tmp.path(), store.writer.clone())
+            .unwrap()
+            .with_store_reader(store.reader.clone());
+        let llm: Arc<dyn LlmProvider> = Arc::new(ProviderBodyFailure);
+        let consolidator = Arc::new(Consolidator::new(
+            store.reader.clone(),
+            store.writer.clone(),
+            wiki.clone(),
+            llm.clone(),
+            ws,
+            proj,
+        ));
+        let server = AiMemoryServer::new(store.reader.clone(), store.writer.clone(), ws, proj)
+            .with_consolidator_arc(wiki, llm, consolidator);
+
+        let query = server
+            .memory_query(
+                Parameters(
+                    serde_json::from_value(serde_json::json!({
+                        "query": "missing-topic",
+                        "answer": true
+                    }))
+                    .unwrap(),
+                ),
+                OptionalParts(test_parts_default()),
+            )
+            .await
+            .unwrap();
+        let explore = server
+            .memory_explore(
+                Parameters(ExploreArgs {
+                    focus: None,
+                    recent_pages_limit: Some(5),
+                    project: None,
+                    workspace: None,
+                    reasoning: None,
+                }),
+                OptionalParts(test_parts_default()),
+            )
+            .await
+            .unwrap();
+
+        for result in [query, explore] {
+            let text = result
+                .content
+                .first()
+                .and_then(|content| content.as_text())
+                .map(|content| content.text.as_str())
+                .unwrap_or_default();
+            assert!(
+                text.contains("provider"),
+                "the failure class must be visible: {text}"
+            );
+            assert!(
+                !text.contains("private-provider-body-sentinel"),
+                "provider body leaked: {text}"
+            );
+        }
     }
 
     #[test]
