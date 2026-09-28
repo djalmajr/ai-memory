@@ -659,19 +659,74 @@ pub fn record_claim_failure(
     session_id: SessionId,
     error: &str,
 ) -> StoreResult<u32> {
+    record_claim_failure_with_attempts(conn, workspace_id, project_id, session_id, error, None)
+}
+
+/// Record a terminal scheduled review failure and park its claim immediately.
+///
+/// Terminal provider failures have already exhausted the provider's own safe
+/// retry policy (or were rejected before sending), so replaying the same
+/// session on later scheduler ticks cannot improve the outcome. Keeping the
+/// claim with its terminal error makes the failure operator-visible while
+/// preventing a third request for an ambiguous delivery.
+///
+/// Returns `0` when no claim exists, which is the manual path.
+///
+/// # Errors
+/// Returns an error when the underlying SQLite statement fails.
+pub fn park_claim_failure(
+    conn: &Connection,
+    workspace_id: WorkspaceId,
+    project_id: ProjectId,
+    session_id: SessionId,
+    error: &str,
+) -> StoreResult<u32> {
+    record_claim_failure_with_attempts(
+        conn,
+        workspace_id,
+        project_id,
+        session_id,
+        error,
+        Some(AUTO_IMPROVE_CLAIM_MAX_ATTEMPTS),
+    )
+}
+
+fn record_claim_failure_with_attempts(
+    conn: &Connection,
+    workspace_id: WorkspaceId,
+    project_id: ProjectId,
+    session_id: SessionId,
+    error: &str,
+    terminal_attempts: Option<u32>,
+) -> StoreResult<u32> {
     let now = Timestamp::now().as_microsecond();
-    let updated = conn.execute(
-        "UPDATE auto_improve_scheduler_claims \
-         SET attempts = attempts + 1, last_error = ?4, last_failed_at = ?5 \
-         WHERE workspace_id = ?1 AND project_id = ?2 AND session_id = ?3",
-        params![
-            workspace_id.as_bytes(),
-            project_id.as_bytes(),
-            session_id.as_bytes(),
-            error,
-            now,
-        ],
-    )?;
+    let updated = match terminal_attempts {
+        Some(attempts) => conn.execute(
+            "UPDATE auto_improve_scheduler_claims \
+             SET attempts = ?5, last_error = ?4, last_failed_at = ?6 \
+             WHERE workspace_id = ?1 AND project_id = ?2 AND session_id = ?3",
+            params![
+                workspace_id.as_bytes(),
+                project_id.as_bytes(),
+                session_id.as_bytes(),
+                error,
+                attempts,
+                now,
+            ],
+        )?,
+        None => conn.execute(
+            "UPDATE auto_improve_scheduler_claims \
+             SET attempts = attempts + 1, last_error = ?4, last_failed_at = ?5 \
+             WHERE workspace_id = ?1 AND project_id = ?2 AND session_id = ?3",
+            params![
+                workspace_id.as_bytes(),
+                project_id.as_bytes(),
+                session_id.as_bytes(),
+                error,
+                now,
+            ],
+        )?,
+    };
     if updated == 0 {
         return Ok(0);
     }

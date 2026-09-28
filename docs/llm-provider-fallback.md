@@ -16,8 +16,8 @@ single-provider paths unchanged.
 
 ## Goals
 
-- Fail over only after a transient provider failure, using the established
-  `LlmError::is_transient()` policy.
+- Fail over immediately only when delivery is known to be safe to repeat:
+  connection failure or a capacity 503 carrying `Retry-After`.
 - Preserve the original request, JSON schema, and logical operation id on every
   candidate attempt.
 - Keep credentials in the existing one-time configuration load and out of logs,
@@ -107,9 +107,11 @@ the wrapper, while callers still receive `Option<Arc<dyn LlmProvider>>`.
 
 | Failure | Try next candidate? | Rationale |
 | --- | --- | --- |
-| 429 | Yes | Existing transient policy. |
-| 5xx | Yes | Existing transient policy. |
-| timeout / connection error | Yes | Existing transient policy. |
+| 429 with `Retry-After` | No immediate failover | The admission wrapper waits for the requested delay and retries once. |
+| 429 without `Retry-After` | No immediate failover | No server delay is known; the caller receives the error. |
+| 503 with `Retry-After` | Yes | Explicit capacity response before model admission. |
+| Connection failure | Yes | No request reached the HTTP endpoint. |
+| Timeout, 499, 502, other 5xx | No immediate failover | Delivery may have happened. The admission wrapper waits at least 60 s plus jitter and replays at most once. |
 | 400 / 401 / 403 / 404 / 422 | No | Usually request, capability, model, or credential configuration. |
 | schema / response-shape / deserialize error | No | Same input would deterministically fail again. |
 
@@ -143,8 +145,8 @@ or trigger background recovery traffic.
 
 1. Unit-test chain order with fake `LlmProvider` instances.
 2. Verify all four trait methods preserve request/schema/operation id.
-3. Verify `429`, `5xx`, timeout, and connection failures advance; verify
-   deterministic errors stop on the first candidate.
+3. Verify only connection and explicit capacity failures advance immediately;
+   ambiguous delivery and deterministic errors stop on the first candidate.
 4. Verify an open circuit skips only its `(provider, model)` candidate and a
    success closes it.
 5. Test configuration validation, including missing/empty profiles and missing

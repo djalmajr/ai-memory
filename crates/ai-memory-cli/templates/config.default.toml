@@ -177,6 +177,17 @@ per_user = false
 max_input_tokens = 100000
 max_output_tokens = 32000
 
+# Optional hard pre-send ceiling for every chat job, including consolidation,
+# review, bootstrap, lint, dream and LLM reranking. Requires the exact
+# tokenizer.json for the configured model and currently rejects LLM fallback
+# chains because they may use a different tokenizer. The provider counts tokens in
+# each message and the JSON schema, plus a conservative chat-framing reserve;
+# an oversized call fails locally before HTTP. The server also admits only
+# one chat call at a time and bounds its waiting queue to 32 requests.
+# Env: AI_MEMORY_LLM_MAX_INPUT_TOKENS and AI_MEMORY_LLM_TOKENIZER_PATH.
+# llm_max_input_tokens = 16000
+# llm_tokenizer_path = "/path/to/model/tokenizer.json"
+
 # Auto-improvement reviewer.
 #
 # The background scheduler reviews newly-completed sessions in every project

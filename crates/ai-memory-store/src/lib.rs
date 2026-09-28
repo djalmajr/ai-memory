@@ -4259,6 +4259,93 @@ mod tests {
         );
     }
 
+    // Mutation captured: routing a terminal LLM error through the retryable
+    // failure path would leave the same session eligible for a later replay.
+    #[tokio::test]
+    async fn terminal_auto_improve_claim_failure_parks_on_first_attempt() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let ws = store
+            .writer
+            .get_or_create_workspace("default")
+            .await
+            .unwrap();
+        let proj = store
+            .writer
+            .get_or_create_project(ws, "ai-memory", None)
+            .await
+            .unwrap();
+        store
+            .writer
+            .ensure_auto_improve_scheduler_state(ws, proj)
+            .await
+            .unwrap();
+
+        tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        let session = SessionId::new();
+        store
+            .writer
+            .begin_session(NewSession {
+                occurred_at: None,
+                id: session,
+                workspace_id: ws,
+                project_id: proj,
+                agent_kind: AgentKind::OpenCode,
+                cwd: None,
+                actor_user: None,
+            })
+            .await
+            .unwrap();
+        store.writer.end_session(session, None).await.unwrap();
+
+        let candidate = store
+            .reader
+            .auto_improve_candidate_sessions(ws, proj, 0, 1)
+            .await
+            .unwrap()
+            .pop()
+            .expect("newly ended session should be claimable");
+        assert!(
+            store
+                .writer
+                .claim_auto_improve_scheduler_session(ws, proj, session, candidate.ended_at)
+                .await
+                .unwrap()
+        );
+
+        let attempts = store
+            .writer
+            .park_auto_improve_claim_failure(
+                ws,
+                proj,
+                session,
+                "LLM input token limit exceeded: 20000 > 16000",
+            )
+            .await
+            .unwrap();
+        assert_eq!(attempts, AUTO_IMPROVE_CLAIM_MAX_ATTEMPTS);
+        assert!(
+            store
+                .reader
+                .auto_improve_candidate_sessions(ws, proj, 0, 10)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+
+        let parked = store
+            .reader
+            .auto_improve_parked_claims(ws, proj)
+            .await
+            .unwrap();
+        assert_eq!(parked.len(), 1);
+        assert_eq!(parked[0].attempts, AUTO_IMPROVE_CLAIM_MAX_ATTEMPTS);
+        assert_eq!(
+            parked[0].last_error.as_deref(),
+            Some("LLM input token limit exceeded: 20000 > 16000")
+        );
+    }
+
     #[tokio::test]
     async fn auto_improve_scheduler_claim_is_unique_across_store_instances() {
         let tmp = TempDir::new().unwrap();

@@ -783,6 +783,12 @@ LLM_BASE_URL               the unprefixed cross-tool convention, accepted for
                            rewrite every Gemini request into a 404
 AI_MEMORY_LLM_COMPAT_STRICT true by default; false disables response_format=json_schema
 AI_MEMORY_LLM_TIMEOUT_SECS  per-request timeout for chat providers; 300 by default
+AI_MEMORY_LLM_MAX_INPUT_TOKENS  optional pre-send tokenized input ceiling for
+                           every chat job; requires the configured model's
+                           tokenizer.json. Includes schema and chat overhead.
+AI_MEMORY_LLM_TOKENIZER_PATH  local tokenizer.json path; required with the
+                           ceiling. A capped fallback chain is rejected at
+                           startup because its models may tokenize differently.
 AI_MEMORY_LLM_REASONING_EFFORT  optional reasoning/thinking effort
                            (none|minimal|low|medium|high|xhigh|max|ultra|persistent)
                            mapped per provider: OpenAI `reasoning_effort`,

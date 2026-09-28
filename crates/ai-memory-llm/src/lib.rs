@@ -67,6 +67,7 @@ pub const OPENROUTER_HTTP_REFERER: &str = "https://github.com/akitaonrails/ai-me
 /// `X-Title` ai-memory sends to OpenRouter. See [`OPENROUTER_HTTP_REFERER`].
 pub const OPENROUTER_X_TITLE: &str = "ai-memory";
 
+pub mod admission;
 pub mod anthropic;
 pub mod auth;
 pub mod codex;
@@ -95,6 +96,7 @@ mod response;
 mod stored_token;
 mod text;
 
+pub use admission::AdmittedLlmProvider;
 pub use anthropic::AnthropicProvider;
 pub use auth::{
     AuthRequirement, CodexAuth, CopilotAuth, Credential, CredentialSource, ProviderAuth,

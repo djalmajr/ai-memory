@@ -28,7 +28,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use ai_memory_consolidate::{DreamCancel, DreamConfig, EmbeddingCoord, run_dream_pass};
 use ai_memory_core::{ActorContext, PageId, PagePath, ProjectId, Tier, WorkspaceId};
 use ai_memory_llm::{
-    ChatRequest, ChatResponse, Embedder, LlmProvider, LlmResult, SyntheticEmbedder,
+    ChatRequest, ChatResponse, Embedder, LlmError, LlmProvider, LlmResult, SyntheticEmbedder,
 };
 use ai_memory_store::{DecayParams, Store};
 use ai_memory_wiki::{Wiki, WritePageRequest};
@@ -47,6 +47,7 @@ struct FakeMergeLlm {
     calls: Arc<AtomicUsize>,
     saw_schema_field: Arc<AtomicUsize>,
     cancel_after_first: Option<DreamCancel>,
+    terminal: bool,
 }
 
 impl FakeMergeLlm {
@@ -55,6 +56,7 @@ impl FakeMergeLlm {
             calls: Arc::new(AtomicUsize::new(0)),
             saw_schema_field: Arc::new(AtomicUsize::new(0)),
             cancel_after_first: None,
+            terminal: false,
         }
     }
 }
@@ -94,8 +96,15 @@ impl LlmProvider for FakeMergeLlm {
         let calls = self.calls.clone();
         let saw_schema = self.saw_schema_field.clone();
         let cancel = self.cancel_after_first.clone();
+        let terminal = self.terminal;
         Box::pin(async move {
             let n = calls.fetch_add(1, Ordering::SeqCst);
+            if terminal {
+                return Err(LlmError::AmbiguousRetryExhausted {
+                    class: "provider",
+                    status: Some(502),
+                });
+            }
             // Invariant #7: the merge must be a JSON-schema structured call, and
             // the schema must be the DreamMergedPage contract.
             if serde_json::to_string(&schema)
@@ -122,6 +131,41 @@ impl LlmProvider for FakeMergeLlm {
             }))
         })
     }
+}
+
+#[tokio::test]
+async fn terminal_llm_failure_stops_dream_pass_before_replaying_cluster() {
+    let fx = seed_fixture(true).await;
+    for (path, body) in [
+        ("sessions/a.md", DUP_A),
+        ("sessions/b.md", DUP_B),
+        ("sessions/far.md", K8S_A),
+    ] {
+        write(&fx, path, body).await;
+        backdate_latest(&fx, path, COLD_DAYS);
+    }
+    let mut llm = FakeMergeLlm::new();
+    llm.terminal = true;
+    let calls = llm.calls.clone();
+    let report = run_dream_pass(
+        &fx.store.reader,
+        &fx.wiki,
+        Some(&llm),
+        fx.ws,
+        fx.proj,
+        &DecayParams::default(),
+        0.0,
+        &dream_on(),
+        &DreamCancel::new(),
+        false,
+    )
+    .await
+    .unwrap();
+    assert!(report.terminal_llm_failure);
+    assert_eq!(report.skipped, 1);
+    assert_eq!(report.clusters_merged, 0);
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    assert_eq!(superseded_row_count(&fx), 0);
 }
 
 struct Fixture {

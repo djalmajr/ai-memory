@@ -486,7 +486,36 @@ impl OpenAiProvider {
         let resp = request.json(body).send().await?;
         let status = resp.status();
         if !status.is_success() {
+            let retry_after_secs = resp
+                .headers()
+                .get(reqwest::header::RETRY_AFTER)
+                .and_then(|value| value.to_str().ok())
+                .and_then(|value| value.parse::<u64>().ok());
             let body = provider_error_body(resp).await;
+            if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+                return Err(LlmError::RateLimited {
+                    body,
+                    retry_after_secs,
+                });
+            }
+            if status == reqwest::StatusCode::SERVICE_UNAVAILABLE
+                && let Some(retry_after_secs) = retry_after_secs
+                && serde_json::from_str::<serde_json::Value>(&body)
+                    .ok()
+                    .is_some_and(|value| {
+                        matches!(
+                            value
+                                .pointer("/error/type")
+                                .and_then(serde_json::Value::as_str),
+                            Some("llm_capacity" | "llm_backend_capacity")
+                        )
+                    })
+            {
+                return Err(LlmError::Capacity {
+                    body,
+                    retry_after_secs,
+                });
+            }
             return Err(LlmError::Provider {
                 status: status.as_u16(),
                 body,

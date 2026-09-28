@@ -1,17 +1,12 @@
 //! Integration coverage for `FallbackLlmProvider` against real network
-//! failures: a genuine connection-refused and a genuine client-side
-//! timeout, each produced by a real `reqwest::Error` rather than a
-//! hand-built `LlmError`. `fallback.rs`'s own unit tests cover the pure
-//! chain-order/circuit/redaction logic with fake providers; this file
-//! proves `LlmError::is_transient()` sees those two real failure classes
-//! the same way when they arrive through an actual `OpenAiCompatProvider`
-//! HTTP call, matching `docs/llm-provider-fallback.md`'s delivery-sequence
-//! scenario (a candidate that first fails transiently, then a working one).
+//! failures: a genuine connection-refused may fail over immediately, while
+//! a genuine client-side timeout must not duplicate a possibly accepted
+//! request on another candidate.
 
 use std::time::Duration;
 
 use ai_memory_llm::types::ChatRequest;
-use ai_memory_llm::{Candidate, FallbackLlmProvider, LlmProvider, OpenAiCompatProvider};
+use ai_memory_llm::{Candidate, FallbackLlmProvider, LlmError, LlmProvider, OpenAiCompatProvider};
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -75,7 +70,7 @@ async fn a_real_connection_error_advances_to_the_next_candidate() {
 }
 
 #[tokio::test]
-async fn a_real_client_timeout_advances_to_the_next_candidate() {
+async fn a_real_client_timeout_does_not_fail_over_immediately() {
     let slow = MockServer::start().await;
     Mock::given(method("POST"))
         .and(path("/v1/chat/completions"))
@@ -103,9 +98,69 @@ async fn a_real_client_timeout_advances_to_the_next_candidate() {
         Candidate::new("openai-compat", "second-model", std::sync::Arc::new(second)),
     ]);
 
-    let response = chain
+    let result = chain.complete(ChatRequest::user_prompt("hi")).await;
+    assert!(
+        result.is_err(),
+        "a timeout may have reached the first model"
+    );
+    assert!(
+        working.received_requests().await.unwrap().is_empty(),
+        "the second model must not receive an immediate replay"
+    );
+}
+
+// Mutation captured: dropping Retry-After before consuming the response
+// would make the admission wrapper lose the server's requested delay.
+#[tokio::test]
+async fn rate_limit_carries_retry_after_from_the_wire() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(429).insert_header("Retry-After", "2"))
+        .mount(&server)
+        .await;
+    let provider = compat_provider(server.uri(), "model", 5);
+    let error = provider
         .complete(ChatRequest::user_prompt("hi"))
         .await
-        .expect("a real client timeout must advance to the next candidate");
-    assert_eq!(response.text, "second answer");
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        LlmError::RateLimited {
+            retry_after_secs: Some(2),
+            ..
+        }
+    ));
+}
+
+// Mutation captured: Retry-After alone does not prove that the backend never
+// accepted a request. The gateway's explicit capacity code is also required.
+#[tokio::test]
+async fn capacity_requires_gateway_code_and_retry_after_on_the_wire() {
+    for (header, code, capacity) in [
+        (None, "llm_capacity", false),
+        (Some("1"), "llm_capacity", true),
+        (Some("1"), "llm_backend_capacity", true),
+        (Some("1"), "llm_unavailable", false),
+        (Some("1"), "generic_failure", false),
+    ] {
+        let server = MockServer::start().await;
+        let mut response =
+            ResponseTemplate::new(503).set_body_json(serde_json::json!({"error": {"type": code}}));
+        if let Some(value) = header {
+            response = response.insert_header("Retry-After", value);
+        }
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(response)
+            .mount(&server)
+            .await;
+        let provider = compat_provider(server.uri(), "model", 5);
+        let error = provider
+            .complete(ChatRequest::user_prompt("hi"))
+            .await
+            .unwrap_err();
+        assert_eq!(error.is_fast_retryable(), capacity);
+        assert_eq!(error.is_ambiguous_delivery(), !capacity);
+    }
 }

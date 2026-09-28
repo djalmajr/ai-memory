@@ -16,7 +16,7 @@
 use std::sync::Arc;
 
 use ai_memory_core::{ActorContext, PagePath, ProjectId, SessionId, WorkspaceId};
-use ai_memory_llm::LlmProvider;
+use ai_memory_llm::{LlmError, LlmProvider};
 use ai_memory_store::{
     ApproveAutoImproveProposalResult, AutoImproveProposalOperation, NewAutoImproveProposal,
     ReaderPool, SkippedProposal, StageAutoImproveRun, WriterHandle,
@@ -25,7 +25,9 @@ use ai_memory_wiki::Wiki;
 use anyhow::Result;
 use tracing::info;
 
-use crate::{AutoImproveReport, AutoImproveReviewConfig, run_auto_improve_review};
+use crate::{
+    AutoImproveError, AutoImproveReport, AutoImproveReviewConfig, run_auto_improve_review,
+};
 
 /// Settings for the scheduled auto-improvement loop, already mapped from
 /// the host's configuration. Bundles the review config with the
@@ -236,6 +238,30 @@ pub async fn run_auto_improve_scheduler_tick(
                         }
                         Err(e) => {
                             outcome.errors += 1;
+                            if is_terminal_llm_error(&e) {
+                                match writer
+                                    .mark_experience_pass_run(scope.workspace_id, scope.project_id)
+                                    .await
+                                {
+                                    Ok(()) => {
+                                        tracing::info!(
+                                            workspace = %scope.workspace_name,
+                                            project = %scope.project_name,
+                                            error = %e,
+                                            "experience pass terminal LLM failure anchored cadence"
+                                        );
+                                    }
+                                    Err(mark_error) => {
+                                        outcome.errors += 1;
+                                        tracing::warn!(
+                                            workspace = %scope.workspace_name,
+                                            project = %scope.project_name,
+                                            error = %mark_error,
+                                            "experience pass terminal failure cadence anchor failed"
+                                        );
+                                    }
+                                }
+                            }
                             tracing::warn!(
                                 workspace = %scope.workspace_name,
                                 project = %scope.project_name,
@@ -333,18 +359,29 @@ pub async fn run_auto_improve_scheduler_tick(
                     // candidate query excludes on it, so leaving it behind dropped the
                     // session from every future tick — silently, because the tick
                     // reports `errors=1` once and clean runs forever after. Release it
-                    // so the next tick retries, and let the attempt counter park it
-                    // once a deterministic failure has proved it will not recover.
-                    let attempts = match ctx
-                        .writer
-                        .record_auto_improve_claim_failure(
-                            ctx.workspace_id,
-                            ctx.project_id,
-                            candidate.session_id,
-                            &e.to_string(),
-                        )
-                        .await
-                    {
+                    // so retryable failures get another tick. The admission wrapper's
+                    // terminal errors have already exhausted their safe retry policy,
+                    // so park those claims immediately and prevent a third replay.
+                    let terminal = is_terminal_llm_error(&e);
+                    let attempts = match if terminal {
+                        ctx.writer
+                            .park_auto_improve_claim_failure(
+                                ctx.workspace_id,
+                                ctx.project_id,
+                                candidate.session_id,
+                                &e.to_string(),
+                            )
+                            .await
+                    } else {
+                        ctx.writer
+                            .record_auto_improve_claim_failure(
+                                ctx.workspace_id,
+                                ctx.project_id,
+                                candidate.session_id,
+                                &e.to_string(),
+                            )
+                            .await
+                    } {
                         Ok(attempts) => Some(attempts),
                         Err(release_err) => {
                             // The review already failed; a failed release is a second,
@@ -370,6 +407,7 @@ pub async fn run_auto_improve_scheduler_tick(
                         session_id = %candidate.session_id,
                         error = %e,
                         attempts = attempts.unwrap_or(0),
+                        terminal,
                         parked,
                         "scheduled auto-improve failed"
                     );
@@ -379,6 +417,26 @@ pub async fn run_auto_improve_scheduler_tick(
     }
 
     Ok(outcome)
+}
+
+fn is_terminal_llm_error(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        if let Some(review_error) = cause.downcast_ref::<AutoImproveError>() {
+            matches!(
+                review_error,
+                AutoImproveError::Llm(
+                    LlmError::AmbiguousRetryExhausted { .. } | LlmError::InputLimit { .. }
+                )
+            )
+        } else {
+            cause.downcast_ref::<LlmError>().is_some_and(|llm_error| {
+                matches!(
+                    llm_error,
+                    LlmError::AmbiguousRetryExhausted { .. } | LlmError::InputLimit { .. }
+                )
+            })
+        }
+    })
 }
 
 async fn run_scheduled_auto_improve(
@@ -594,11 +652,12 @@ mod tests {
     use ai_memory_core::{
         AgentKind, NewObservation, NewSession, ObservationKind, Sanitized, Sanitizer,
     };
-    use ai_memory_llm::{ChatRequest, ChatResponse, LlmResult};
+    use ai_memory_llm::{ChatRequest, ChatResponse, LlmError, LlmResult};
     use ai_memory_store::Store;
     use std::future::Future;
     use std::pin::Pin;
     use std::sync::Mutex;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use tempfile::TempDir;
 
     struct PanicLlm;
@@ -634,6 +693,147 @@ mod tests {
         {
             Box::pin(async move { panic!("preflight-skipped scheduler test must not call LLM") })
         }
+    }
+
+    struct TerminalLlm {
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl LlmProvider for TerminalLlm {
+        fn name(&self) -> &'static str {
+            "terminal"
+        }
+
+        fn model(&self) -> &str {
+            "terminal-model"
+        }
+
+        fn complete<'life0, 'async_trait>(
+            &'life0 self,
+            _request: ChatRequest,
+        ) -> Pin<Box<dyn Future<Output = LlmResult<ChatResponse>> + Send + 'async_trait>>
+        where
+            'life0: 'async_trait,
+            Self: 'async_trait,
+        {
+            Box::pin(async move {
+                Err(LlmError::InputLimit {
+                    tokens: 20_000,
+                    max: 16_000,
+                })
+            })
+        }
+
+        fn complete_structured_raw<'life0, 'async_trait>(
+            &'life0 self,
+            _request: ChatRequest,
+            _schema: serde_json::Value,
+        ) -> Pin<Box<dyn Future<Output = LlmResult<serde_json::Value>> + Send + 'async_trait>>
+        where
+            'life0: 'async_trait,
+            Self: 'async_trait,
+        {
+            let calls = Arc::clone(&self.calls);
+            Box::pin(async move {
+                calls.fetch_add(1, Ordering::SeqCst);
+                Err(LlmError::InputLimit {
+                    tokens: 20_000,
+                    max: 16_000,
+                })
+            })
+        }
+    }
+
+    #[test]
+    fn terminal_llm_errors_are_found_through_the_typed_error_chain() {
+        for error in [
+            LlmError::AmbiguousRetryExhausted {
+                class: "provider",
+                status: Some(503),
+            },
+            LlmError::InputLimit {
+                tokens: 20_000,
+                max: 16_000,
+            },
+        ] {
+            let wrapped = anyhow::Error::new(crate::AutoImproveError::Llm(error));
+            assert!(is_terminal_llm_error(&wrapped));
+        }
+
+        let retryable = anyhow::Error::new(crate::AutoImproveError::Llm(LlmError::Capacity {
+            body: "busy".into(),
+            retry_after_secs: 1,
+        }));
+        assert!(!is_terminal_llm_error(&retryable));
+    }
+
+    // Mutation captured: treating an admission terminal error as retryable
+    // leaves the claim eligible for another scheduler tick.
+    #[tokio::test]
+    async fn terminal_per_session_failure_parks_claim_without_a_second_tick() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let wiki = Wiki::new(tmp.path(), store.writer.clone()).unwrap();
+        let ws = store
+            .writer
+            .get_or_create_workspace("default")
+            .await
+            .unwrap();
+        let project = store
+            .writer
+            .get_or_create_project(ws, "terminal-session", None)
+            .await
+            .unwrap();
+        initialize_auto_improve_scheduler_scopes(&store.reader, &store.writer)
+            .await
+            .unwrap();
+        let session_id = seed_reviewable_session(&store, ws, project).await;
+        let calls = Arc::new(AtomicUsize::new(0));
+        let llm: Arc<dyn LlmProvider> = Arc::new(TerminalLlm {
+            calls: Arc::clone(&calls),
+        });
+        let settings = ScheduledAutoImproveSettings {
+            review: AutoImproveReviewConfig {
+                min_observations: 3,
+                min_session_duration_secs: 0,
+                ..AutoImproveReviewConfig::default()
+            },
+            require_approval: true,
+            min_session_age_secs: 0,
+            max_sessions_per_tick: 10,
+            experience: None,
+        };
+
+        let first =
+            run_auto_improve_scheduler_tick(&store.reader, &store.writer, &wiki, &llm, &settings)
+                .await
+                .unwrap();
+        assert_eq!(first.errors, 1, "terminal review failure must be reported");
+        assert_eq!(
+            first.parked, 1,
+            "terminal review failure must park the claim"
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+        let parked = store
+            .reader
+            .auto_improve_parked_claims(ws, project)
+            .await
+            .unwrap();
+        assert_eq!(parked.len(), 1);
+        assert_eq!(parked[0].session_id, session_id);
+        assert_eq!(
+            parked[0].attempts,
+            ai_memory_store::AUTO_IMPROVE_CLAIM_MAX_ATTEMPTS
+        );
+
+        let second =
+            run_auto_improve_scheduler_tick(&store.reader, &store.writer, &wiki, &llm, &settings)
+                .await
+                .unwrap();
+        assert_eq!(second.errors, 0, "parked claim must not be retried");
+        assert_eq!(second.reviewed, 0);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]
@@ -931,6 +1131,106 @@ mod tests {
         .unwrap();
         assert!(approved.contains("type: Procedure"), "{approved}");
         assert!(approved.contains("generated:"), "{approved}");
+    }
+
+    // Mutation captured: leaving the experience watermark unchanged after a
+    // terminal LLM error replays the same corpus on every scheduler tick.
+    #[tokio::test]
+    async fn terminal_experience_failure_advances_cadence_anchor() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let wiki = Wiki::new(tmp.path(), store.writer.clone()).unwrap();
+        let ws = store
+            .writer
+            .get_or_create_workspace("default")
+            .await
+            .unwrap();
+        let project = store
+            .writer
+            .get_or_create_project(ws, "terminal-experience", None)
+            .await
+            .unwrap();
+        initialize_auto_improve_scheduler_scopes(&store.reader, &store.writer)
+            .await
+            .unwrap();
+
+        tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+        for _ in 0..3 {
+            let session_id = SessionId::new();
+            store
+                .writer
+                .begin_session(NewSession {
+                    occurred_at: None,
+                    id: session_id,
+                    workspace_id: ws,
+                    project_id: project,
+                    agent_kind: AgentKind::OpenCode,
+                    cwd: None,
+                    actor_user: None,
+                })
+                .await
+                .unwrap();
+            store.writer.end_session(session_id, None).await.unwrap();
+            wiki.write_page(ai_memory_wiki::WritePageRequest {
+                workspace_id: ws,
+                project_id: project,
+                path: PagePath::new(format!("sessions/{session_id}.md")).unwrap(),
+                frontmatter: serde_json::json!({"title": "session"}),
+                body: "repeated workflow evidence".into(),
+                tier: ai_memory_core::Tier::Episodic,
+                pinned: false,
+                title: None,
+                admission_ctx: None,
+                author_id: None,
+                actor: ActorContext::anonymous(),
+                evidence: Vec::new(),
+            })
+            .await
+            .unwrap();
+        }
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let llm: Arc<dyn LlmProvider> = Arc::new(TerminalLlm {
+            calls: Arc::clone(&calls),
+        });
+        let settings = ScheduledAutoImproveSettings {
+            review: AutoImproveReviewConfig::default(),
+            require_approval: true,
+            // Keep the per-session path out of this test; only experience
+            // cadence is under test.
+            min_session_age_secs: 86_400,
+            max_sessions_per_tick: 10,
+            experience: Some(crate::ExperienceConfig {
+                sessions: 10,
+                min_new_sessions: 3,
+                ..crate::ExperienceConfig::default()
+            }),
+        };
+
+        let first =
+            run_auto_improve_scheduler_tick(&store.reader, &store.writer, &wiki, &llm, &settings)
+                .await
+                .unwrap();
+        assert_eq!(
+            first.errors, 1,
+            "terminal experience error must be reported"
+        );
+        assert_eq!(first.experience_runs, 0);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+        let (newer, _) = store.reader.experience_pass_due(ws, project).await.unwrap();
+        assert_eq!(
+            newer, 0,
+            "terminal failure must consume this cadence window"
+        );
+
+        let second =
+            run_auto_improve_scheduler_tick(&store.reader, &store.writer, &wiki, &llm, &settings)
+                .await
+                .unwrap();
+        assert_eq!(second.experience_runs, 0);
+        assert_eq!(second.errors, 0);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
 
     /// Below the cadence floor nothing runs at all — no LLM call, no

@@ -281,8 +281,11 @@ pub struct DreamReport {
     /// Members superseded into survivors (kept reachable, invariant #16).
     pub pages_superseded: usize,
     /// Clusters skipped after selection (admission rejected, read/LLM/apply
-    /// failure). A skip is retried on the next run; no source is touched.
+    /// failure). No source is touched.
     pub skipped: usize,
+    /// A sent request failed after its one delayed replay, or exceeded the
+    /// token ceiling. The scheduler must not replay this cluster next tick.
+    pub terminal_llm_failure: bool,
     /// `true` when the run stopped early because activity returned (B3).
     pub cancelled: bool,
     /// Per-cluster detail (planned on a dry run, applied on a real run).
@@ -299,9 +302,8 @@ impl DreamReport {
     }
 }
 
-/// Errors raised by the dream pass. LLM failures are deliberately NOT here:
-/// a failed completion skips its cluster (reported, retried next run) rather than
-/// aborting the pass, exactly as A3 tolerates a failed batch.
+/// Errors raised by the dream pass. LLM failures are reported per cluster;
+/// terminal delivery uncertainty stops the pass without another request.
 #[derive(Debug, Error)]
 #[non_exhaustive]
 pub enum DreamError {
@@ -549,6 +551,11 @@ pub async fn run_dream_pass(
                 });
             }
             MergeOutcome::Skipped => report.skipped += 1,
+            MergeOutcome::TerminalLlm => {
+                report.skipped += 1;
+                report.terminal_llm_failure = true;
+                break;
+            }
         }
     }
 
@@ -561,6 +568,7 @@ enum MergeOutcome {
         superseded: usize,
     },
     Skipped,
+    TerminalLlm,
 }
 
 /// Merge one selected cluster: preflight admission → LLM rewrite → `apply_batch`
@@ -622,8 +630,17 @@ async fn merge_one_cluster(
     let merged: DreamMergedPage = match complete_structured(llm, request).await {
         Ok(page) => page,
         Err(error) => {
-            tracing::warn!(path = %survivor.path.as_str(), %error, "dream pass: LLM merge failed; skipping cluster (retried next run)");
-            return MergeOutcome::Skipped;
+            let terminal = matches!(
+                error,
+                ai_memory_llm::LlmError::AmbiguousRetryExhausted { .. }
+                    | ai_memory_llm::LlmError::InputLimit { .. }
+            );
+            tracing::warn!(path = %survivor.path.as_str(), %error, terminal, "dream pass: LLM merge failed; skipping cluster");
+            return if terminal {
+                MergeOutcome::TerminalLlm
+            } else {
+                MergeOutcome::Skipped
+            };
         }
     };
 

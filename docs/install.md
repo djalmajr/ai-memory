@@ -1850,7 +1850,20 @@ docker run -d --name ai-memory \
 ```
 
 There is no safe default model for `openai-compat`; the env var is
-required. For OpenRouter (Kimi, DeepSeek, etc.):
+required.
+
+On a shared GPU, `serve` admits one chat request at a time per process and
+allows at most 32 waiting requests. To reject oversized input before it
+reaches the provider, set `AI_MEMORY_LLM_MAX_INPUT_TOKENS=16000` and mount
+the configured model's `tokenizer.json` at
+`AI_MEMORY_LLM_TOKENIZER_PATH=/models/tokenizer.json`. The cap counts each
+message and structured-output schema with that tokenizer, plus a conservative
+chat-framing reserve; it applies to all LLM jobs. A capped setup currently
+rejects fallback chains because their tokenizers may differ. An ambiguous timeout or 499/502
+waits at least 60 seconds plus jitter before its sole replay; a connection
+failure or explicit capacity 503 can retry quickly.
+
+For OpenRouter (Kimi, DeepSeek, etc.):
 
 ```bash
 -e AI_MEMORY_LLM_PROVIDER=openai-compat

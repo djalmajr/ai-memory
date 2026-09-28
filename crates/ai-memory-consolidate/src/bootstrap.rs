@@ -322,14 +322,10 @@ const BOOTSTRAP_CHUNK_RETRY_DELAY: Duration = Duration::from_secs(2);
 
 /// Run one chunk's structured LLM call with a short, bounded retry.
 ///
-/// A chunk that fails on a *transient* error ([`LlmError::is_transient`] —
-/// `429`, any `5xx`, or a transport timeout/connect failure) would otherwise
-/// abort the whole multi-chunk run and discard every earlier chunk's pages
-/// (they live only in the in-memory accumulator). The reporter's own bootstrap
-/// runs died repeatedly this way to provider `520`s and connection resets
-/// (#617). A few short retries turn those into a completed run; deterministic
-/// failures (auth, schema, a `4xx`, bad JSON) are not retried — they would only
-/// burn another expensive call.
+/// A connection failure or an explicit capacity 503 may retry quickly;
+/// the admission provider handles a timeout or 5xx of uncertain delivery
+/// with one delayed replay. The chunk accumulator remains in memory until
+/// the full run completes, so a terminal error publishes no partial batch.
 async fn complete_chunk_with_retry(
     llm: &(dyn LlmProvider + 'static),
     request: ChatRequest,
@@ -339,7 +335,7 @@ async fn complete_chunk_with_retry(
     loop {
         match complete_structured::<BootstrapBatch>(llm, request.clone()).await {
             Ok(batch) => return Ok(batch),
-            Err(e) if attempt < BOOTSTRAP_CHUNK_MAX_ATTEMPTS && e.is_transient() => {
+            Err(e) if attempt < BOOTSTRAP_CHUNK_MAX_ATTEMPTS && e.is_fast_retryable() => {
                 warn!(
                     attempt,
                     max = BOOTSTRAP_CHUNK_MAX_ATTEMPTS,
@@ -1579,9 +1575,9 @@ mod tests {
                 return Err(LlmError::Auth("nope".into()));
             }
             if n < self.transient_failures {
-                return Err(LlmError::Provider {
-                    status: 503,
+                return Err(LlmError::Capacity {
                     body: "busy".into(),
+                    retry_after_secs: 1,
                 });
             }
             Ok(serde_json::json!({ "pages": [], "rationale": "ok" }))

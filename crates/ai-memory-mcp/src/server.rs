@@ -2110,7 +2110,7 @@ impl AiMemoryServer {
             hits.truncate(limit);
             return hits;
         }
-        let Ok(_permit) = self.rerank_gate.clone().try_acquire_owned() else {
+        let Ok(permit) = self.rerank_gate.clone().try_acquire_owned() else {
             tracing::debug!(
                 reranker = reranker.name(),
                 model = reranker.model(),
@@ -2129,15 +2129,35 @@ impl AiMemoryServer {
                 snippet: hit.snippet.clone(),
             })
             .collect();
-        let scored = match tokio::time::timeout(timeout, reranker.rerank(query, &candidates)).await
-        {
-            Ok(Ok(scores)) => scores,
-            Ok(Err(e)) => {
+        // The query can stop waiting after 20s, but cancelling an HTTP LLM
+        // future here would release admission while the server may still be
+        // decoding it. Keep the bounded rerank task and its gate permit alive
+        // until the provider resolves or reaches its own timeout.
+        let task_reranker = Arc::clone(reranker);
+        let task_query = query.to_owned();
+        let task_candidates = candidates.clone();
+        let rerank_task = tokio::spawn(async move {
+            let _permit = permit;
+            task_reranker.rerank(&task_query, &task_candidates).await
+        });
+        let scored = match tokio::time::timeout(timeout, rerank_task).await {
+            Ok(Ok(Ok(scores))) => scores,
+            Ok(Ok(Err(e))) => {
                 tracing::warn!(
                     reranker = reranker.name(),
                     model = reranker.model(),
                     error = %e,
                     "reranker failed; keeping pre-rerank order"
+                );
+                hits.truncate(limit);
+                return hits;
+            }
+            Ok(Err(e)) => {
+                tracing::warn!(
+                    reranker = reranker.name(),
+                    model = reranker.model(),
+                    error = %e,
+                    "reranker task failed; keeping pre-rerank order"
                 );
                 hits.truncate(limit);
                 return hits;
@@ -6055,8 +6075,8 @@ mod tests {
 
         let (reranker, calls, _) =
             stub_reranker(StubRerankOutcome::Reverse, Duration::from_millis(50));
+        let server = server.with_reranker(reranker);
         let result = server
-            .with_reranker(reranker)
             .rerank_hits_with_timeout("query", hits, 4, Duration::from_millis(1))
             .await;
         assert_eq!(
@@ -6064,6 +6084,19 @@ mod tests {
             original_ids
         );
         assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        // Mutation captured: cancelling the provider future at the caller's
+        // deadline frees a slot even though the backend may still be running.
+        assert_eq!(
+            server.rerank_gate.available_permits(),
+            RERANK_MAX_IN_FLIGHT - 1
+        );
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while server.rerank_gate.available_permits() != RERANK_MAX_IN_FLIGHT {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
     }
 
     #[tokio::test]

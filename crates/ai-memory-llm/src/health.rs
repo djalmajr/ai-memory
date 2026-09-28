@@ -405,6 +405,9 @@ fn error_status_and_message(err: &LlmError) -> (Option<u16>, String) {
             truncate_error_message(&e.to_string()),
         ),
         LlmError::Provider { status, body } => (Some(*status), truncate_error_message(body)),
+        LlmError::RateLimited { .. }
+        | LlmError::Capacity { .. }
+        | LlmError::AmbiguousRetryExhausted { .. } => (err.http_status(), err.class().to_string()),
         _ => (None, truncate_error_message(&err.to_string())),
     }
 }

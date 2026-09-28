@@ -2,11 +2,11 @@
 //!
 //! See `docs/llm-provider-fallback.md` (issue #648) for the full design.
 //! `FallbackLlmProvider` wraps an ordered list of already-constructed
-//! providers behind the same [`LlmProvider`] trait: on a transient failure
-//! (`LlmError::is_transient()`) it advances to the next eligible candidate,
+//! providers behind the same [`LlmProvider`] trait: on a safe fast failure
+//! (`LlmError::is_fast_retryable()`) it advances to the next eligible candidate,
 //! preserving the original request, schema, and operation id; a
-//! deterministic failure (bad request, auth, unsupported schema, malformed
-//! response) returns immediately without trying the rest of the chain.
+//! failure of uncertain delivery or a deterministic failure returns
+//! immediately without trying the rest of the chain.
 //! `Config::llm_provider_chain` in `ai-memory-cli` is the sole place that
 //! builds one; `build_provider` remains the sole construction path for each
 //! candidate.
@@ -22,7 +22,7 @@ use crate::health::CandidateHealth;
 use crate::provider::LlmProvider;
 use crate::types::{ChatRequest, ChatResponse, LlmOperationId};
 
-/// How long a candidate's circuit stays open after a transient failure
+/// How long a candidate's circuit stays open after a fast-retryable failure
 /// before it is eligible again. Restarting the process clears all circuit
 /// state; there is no durable or cross-process cooldown.
 pub const CIRCUIT_COOLDOWN: Duration = Duration::from_secs(30);
@@ -74,7 +74,7 @@ struct CandidateEntry {
 /// Ordered LLM provider fallback chain.
 ///
 /// Tries each eligible candidate in declaration order, advancing only on a
-/// transient failure; a deterministic failure returns immediately. See the
+/// safe fast failure; any other failure returns immediately. See the
 /// module docs and `docs/llm-provider-fallback.md`.
 pub struct FallbackLlmProvider {
     entries: Vec<CandidateEntry>,
@@ -128,7 +128,7 @@ impl FallbackLlmProvider {
         state.last_error_at = Some(Timestamp::now());
         state.last_error_status = err.http_status();
         state.last_error_class = Some(err.class());
-        if err.is_transient() {
+        if err.is_fast_retryable() {
             state.circuit_open_until = Some(Instant::now() + CIRCUIT_COOLDOWN);
         }
     }
@@ -187,7 +187,7 @@ impl LlmProvider for FallbackLlmProvider {
                     return Ok(response);
                 }
                 Err(err) => {
-                    let transient = err.is_transient();
+                    let transient = err.is_fast_retryable();
                     summary.push(self.describe_failure(i, &err));
                     self.record_error(i, &err);
                     if !transient {
@@ -222,7 +222,7 @@ impl LlmProvider for FallbackLlmProvider {
                     return Ok(response);
                 }
                 Err(err) => {
-                    let transient = err.is_transient();
+                    let transient = err.is_fast_retryable();
                     summary.push(self.describe_failure(i, &err));
                     self.record_error(i, &err);
                     if !transient {
@@ -257,7 +257,7 @@ impl LlmProvider for FallbackLlmProvider {
                     return Ok(value);
                 }
                 Err(err) => {
-                    let transient = err.is_transient();
+                    let transient = err.is_fast_retryable();
                     summary.push(self.describe_failure(i, &err));
                     self.record_error(i, &err);
                     if !transient {
@@ -297,7 +297,7 @@ impl LlmProvider for FallbackLlmProvider {
                     return Ok(value);
                 }
                 Err(err) => {
-                    let transient = err.is_transient();
+                    let transient = err.is_fast_retryable();
                     summary.push(self.describe_failure(i, &err));
                     self.record_error(i, &err);
                     if !transient {
@@ -420,6 +420,13 @@ mod tests {
                 status: *status,
                 body: body.clone(),
             },
+            LlmError::Capacity {
+                body,
+                retry_after_secs,
+            } => LlmError::Capacity {
+                body: body.clone(),
+                retry_after_secs: *retry_after_secs,
+            },
             LlmError::Serde(msg) => LlmError::Serde(msg.clone()),
             LlmError::UnexpectedShape(msg) => LlmError::UnexpectedShape(msg.clone()),
             LlmError::NotConfigured(msg) => LlmError::NotConfigured(msg.clone()),
@@ -478,6 +485,12 @@ mod tests {
     }
 
     fn transient(status: u16) -> LlmError {
+        if status == 503 {
+            return LlmError::Capacity {
+                body: "upstream body that must never leak".to_string(),
+                retry_after_secs: 1,
+            };
+        }
         LlmError::Provider {
             status,
             body: "upstream body that must never leak".to_string(),
@@ -505,7 +518,7 @@ mod tests {
 
     #[tokio::test]
     async fn all_four_methods_preserve_request_schema_and_operation_id() {
-        let first = Arc::new(ScriptedLlm::err("primary", "m1", transient(500)));
+        let first = Arc::new(ScriptedLlm::err("primary", "m1", transient(503)));
         let second = Arc::new(ScriptedLlm::ok("secondary", "m2", "ok"));
         let chain = FallbackLlmProvider::new(vec![
             Candidate::new("primary", "m1", first.clone()),
@@ -548,8 +561,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn transient_statuses_advance_to_the_next_candidate() {
-        for status in [429, 500, 502, 503, 504] {
+    async fn only_capacity_status_advances_to_the_next_candidate() {
+        for status in [503] {
             let first = Arc::new(ScriptedLlm::err("primary", "m1", transient(status)));
             let second = Arc::new(ScriptedLlm::ok("secondary", "m2", "ok"));
             let chain = FallbackLlmProvider::new(vec![
@@ -560,6 +573,31 @@ mod tests {
             let result = chain.complete(ChatRequest::user_prompt("hi")).await;
             assert!(result.is_ok(), "status {status} should have advanced");
             assert_eq!(second.calls(), 1, "status {status} should have advanced");
+        }
+    }
+
+    // Mutation captured: treating a completed 502/499 response as fast
+    // failover would duplicate an expensive request on the second model.
+    #[tokio::test]
+    async fn ambiguous_statuses_do_not_fail_over_immediately() {
+        for status in [499, 500, 502, 504] {
+            let first = Arc::new(ScriptedLlm::err("primary", "m1", transient(status)));
+            let second = Arc::new(ScriptedLlm::ok("secondary", "m2", "duplicate"));
+            let chain = FallbackLlmProvider::new(vec![
+                Candidate::new("primary", "m1", first),
+                Candidate::new("secondary", "m2", second.clone()),
+            ]);
+            assert!(
+                chain
+                    .complete(ChatRequest::user_prompt("hi"))
+                    .await
+                    .is_err()
+            );
+            assert_eq!(
+                second.calls(),
+                0,
+                "status {status} caused an immediate replay"
+            );
         }
     }
 
@@ -616,7 +654,7 @@ mod tests {
         let first = Arc::new(ScriptedLlm::err(
             "primary",
             "m1",
-            transient_with_body(500, "primary secret body"),
+            transient_with_body(503, "primary secret body"),
         ));
         let second = Arc::new(ScriptedLlm::err(
             "secondary",
@@ -637,7 +675,7 @@ mod tests {
                 assert_eq!(*attempted, 2);
                 assert!(summary.contains("primary/m1"));
                 assert!(summary.contains("secondary/m2"));
-                assert!(summary.contains("500"));
+                assert!(summary.contains("503"));
                 assert!(summary.contains("503"));
                 assert!(!summary.contains("secret body"));
             }
@@ -646,6 +684,12 @@ mod tests {
     }
 
     fn transient_with_body(status: u16, body: &str) -> LlmError {
+        if status == 503 {
+            return LlmError::Capacity {
+                body: body.to_string(),
+                retry_after_secs: 1,
+            };
+        }
         LlmError::Provider {
             status,
             body: body.to_string(),
@@ -654,7 +698,7 @@ mod tests {
 
     #[tokio::test]
     async fn an_open_circuit_skips_only_its_candidate() {
-        let first = Arc::new(ScriptedLlm::err("primary", "m1", transient(500)));
+        let first = Arc::new(ScriptedLlm::err("primary", "m1", transient(503)));
         let second = Arc::new(ScriptedLlm::ok("secondary", "m2", "ok"));
         let chain = FallbackLlmProvider::new(vec![
             Candidate::new("primary", "m1", first.clone()),
@@ -722,7 +766,7 @@ mod tests {
         let first = Arc::new(ScriptedLlm::err(
             "primary",
             "m1",
-            transient_with_body(500, "must not leak"),
+            transient_with_body(503, "must not leak"),
         ));
         let second = Arc::new(ScriptedLlm::ok("secondary", "m2", "ok"));
         let chain = FallbackLlmProvider::new(vec![
@@ -740,8 +784,8 @@ mod tests {
         assert_eq!(health[0].provider, "primary");
         assert_eq!(health[0].model, "m1");
         assert!(!health[0].last_selected);
-        assert_eq!(health[0].last_error_status, Some(500));
-        assert_eq!(health[0].last_error_class.as_deref(), Some("provider"));
+        assert_eq!(health[0].last_error_status, Some(503));
+        assert_eq!(health[0].last_error_class.as_deref(), Some("capacity"));
         assert!(health[0].circuit_open_until.is_some());
         assert!(health[1].last_selected);
         assert!(health[1].last_success_at.is_some());

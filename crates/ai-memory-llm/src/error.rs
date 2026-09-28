@@ -22,6 +22,46 @@ pub enum LlmError {
         body: String,
     },
 
+    /// Rate limit carrying the server's delta-seconds Retry-After value.
+    #[error("provider error 429: {body}")]
+    RateLimited {
+        /// Bounded response body.
+        body: String,
+        /// Delay requested by the provider, if it supplied delta seconds.
+        retry_after_secs: Option<u64>,
+    },
+
+    /// A 503 explicitly marked as admission/capacity by Retry-After.
+    #[error("provider error 503: {body}")]
+    Capacity {
+        /// Bounded response body.
+        body: String,
+        /// Retry-After delta seconds from the provider.
+        retry_after_secs: u64,
+    },
+
+    /// The request may have reached the model. One delayed replay also failed.
+    #[error("ambiguous LLM request failed after one delayed retry ({class}{status:?})")]
+    AmbiguousRetryExhausted {
+        /// Redacted class of the second failure.
+        class: &'static str,
+        /// HTTP status of the second failure, when available.
+        status: Option<u16>,
+    },
+
+    /// Bounded admission queue is full.
+    #[error("LLM admission queue is full")]
+    AdmissionFull,
+
+    /// Tokenized input exceeds the configured pre-send limit.
+    #[error("LLM input token limit exceeded: {tokens} > {max}")]
+    InputLimit {
+        /// Count made with the configured tokenizer and chat overhead reserve.
+        tokens: usize,
+        /// Configured limit.
+        max: usize,
+    },
+
     /// JSON (de)serialization failure.
     #[error("serde: {0}")]
     Serde(String),
@@ -59,22 +99,50 @@ pub enum LlmError {
 }
 
 impl LlmError {
-    /// Whether this failure is worth a short, bounded retry.
+    /// Whether this failure might clear on a later attempt.
     ///
-    /// True only for errors that a subsequent identical request could plausibly
-    /// succeed on: a server-side `Provider` status (`429` or any `5xx`,
-    /// including Cloudflare's `52x`), or an `Http` transport timeout / connect
-    /// failure. Everything else — auth, schema, a malformed-request `4xx`, a
-    /// deserialization or unexpected-shape error — is deterministic: retrying
-    /// only burns another expensive call. Callers must keep the retry *short
-    /// and bounded* (a few attempts, seconds apart); this is not a license for
-    /// tenacity-style 8–128s backoff (see the cognee #2840 lesson in `lib.rs`).
+    /// This remains useful for passive health classification. Callers that
+    /// actually send another request use [`Self::is_fast_retryable`] or the
+    /// admission wrapper's one delayed ambiguous-delivery retry.
     #[must_use]
     pub fn is_transient(&self) -> bool {
         match self {
             Self::Provider { status, .. } => *status == 429 || (500..=599).contains(status),
+            Self::RateLimited { .. } => true,
+            Self::Capacity { .. } => true,
             Self::Http(e) => e.is_timeout() || e.is_connect(),
             _ => false,
+        }
+    }
+
+    /// A retry that cannot duplicate an accepted model request.
+    #[must_use]
+    pub fn is_fast_retryable(&self) -> bool {
+        match self {
+            Self::Capacity { .. } => true,
+            Self::Http(error) => error.is_connect(),
+            _ => false,
+        }
+    }
+
+    /// The upstream may still have consumed the request after this error.
+    #[must_use]
+    pub fn is_ambiguous_delivery(&self) -> bool {
+        match self {
+            Self::Provider { status, .. } => *status == 499 || *status >= 500,
+            Self::Http(error) => error.is_timeout(),
+            _ => false,
+        }
+    }
+
+    /// Delta-seconds Retry-After for an explicit 429 response.
+    #[must_use]
+    pub fn retry_after_secs(&self) -> Option<u64> {
+        match self {
+            Self::RateLimited {
+                retry_after_secs, ..
+            } => *retry_after_secs,
+            _ => None,
         }
     }
 
@@ -84,6 +152,9 @@ impl LlmError {
         match self {
             Self::Http(e) => e.status().map(|status| status.as_u16()),
             Self::Provider { status, .. } => Some(*status),
+            Self::RateLimited { .. } => Some(429),
+            Self::Capacity { .. } => Some(503),
+            Self::AmbiguousRetryExhausted { status, .. } => *status,
             _ => None,
         }
     }
@@ -95,6 +166,11 @@ impl LlmError {
         match self {
             Self::Http(_) => "http",
             Self::Provider { .. } => "provider",
+            Self::RateLimited { .. } => "rate_limit",
+            Self::Capacity { .. } => "capacity",
+            Self::AmbiguousRetryExhausted { .. } => "ambiguous_retry_exhausted",
+            Self::AdmissionFull => "admission_full",
+            Self::InputLimit { .. } => "input_limit",
             Self::Serde(_) => "serde",
             Self::UnexpectedShape(_) => "unexpected-shape",
             Self::NotConfigured(_) => "not-configured",
@@ -145,6 +221,34 @@ mod tests {
                 "status {status} must not be treated as transient"
             );
         }
+    }
+
+    // Mutation captured: treating any 503 or 502 as pre-admission capacity
+    // would immediately duplicate a request the backend may have processed.
+    #[test]
+    fn fast_retry_requires_explicit_capacity_or_connection_failure() {
+        assert!(
+            LlmError::Capacity {
+                body: String::new(),
+                retry_after_secs: 1,
+            }
+            .is_fast_retryable()
+        );
+        for status in [499, 500, 502, 503, 504] {
+            let error = LlmError::Provider {
+                status,
+                body: String::new(),
+            };
+            assert!(!error.is_fast_retryable(), "status {status}");
+            assert!(error.is_ambiguous_delivery(), "status {status}");
+        }
+        assert!(
+            !LlmError::RateLimited {
+                body: String::new(),
+                retry_after_secs: None,
+            }
+            .is_fast_retryable()
+        );
     }
 
     #[test]

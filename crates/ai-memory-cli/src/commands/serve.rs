@@ -751,6 +751,32 @@ fn session_consolidation_retry_delay(attempt: u32) -> Duration {
     Duration::from_secs(30_u64.saturating_mul(1_u64 << exponent))
 }
 
+fn session_consolidation_retry_at(
+    attempts: u32,
+    error: &ai_memory_consolidate::ConsolidatorError,
+) -> Option<i64> {
+    // The provider already made the sole delayed replay. A queue retry would
+    // send the same expensive prompt a third time.
+    if attempts >= ai_memory_store::SESSION_CONSOLIDATION_MAX_ATTEMPTS
+        || matches!(
+            error,
+            ai_memory_consolidate::ConsolidatorError::Llm(
+                ai_memory_llm::LlmError::AmbiguousRetryExhausted { .. }
+                    | ai_memory_llm::LlmError::InputLimit { .. }
+            )
+        )
+    {
+        return None;
+    }
+    let delay = session_consolidation_retry_delay(attempts);
+    let delay_micros = i64::try_from(delay.as_micros()).unwrap_or(i64::MAX);
+    Some(
+        jiff::Timestamp::now()
+            .as_microsecond()
+            .saturating_add(delay_micros),
+    )
+}
+
 async fn run_session_consolidation_worker(
     writer: WriterHandle,
     consolidator: Arc<Consolidator>,
@@ -829,17 +855,7 @@ async fn run_session_consolidation_worker(
                 ),
             },
             Err(error) => {
-                let retry_at = if attempts < ai_memory_store::SESSION_CONSOLIDATION_MAX_ATTEMPTS {
-                    let delay = session_consolidation_retry_delay(attempts);
-                    let delay_micros = i64::try_from(delay.as_micros()).unwrap_or(i64::MAX);
-                    Some(
-                        jiff::Timestamp::now()
-                            .as_microsecond()
-                            .saturating_add(delay_micros),
-                    )
-                } else {
-                    None
-                };
+                let retry_at = session_consolidation_retry_at(attempts, &error);
                 let terminal = retry_at.is_none();
                 if let Err(store_error) = writer
                     .fail_session_consolidation(job, error.to_string(), retry_at)
@@ -2098,6 +2114,7 @@ async fn run_dream_scheduler_loop(
         let mut merged = 0usize;
         let mut superseded = 0usize;
         let mut cancelled = false;
+        let mut terminal_llm_failure = false;
         for scope in scopes {
             if cancel.is_cancelled() {
                 cancelled = true;
@@ -2121,6 +2138,10 @@ async fn run_dream_scheduler_loop(
                     merged += report.clusters_merged;
                     superseded += report.pages_superseded;
                     cancelled |= report.cancelled;
+                    if report.terminal_llm_failure {
+                        terminal_llm_failure = true;
+                        break;
+                    }
                 }
                 Err(error) => tracing::warn!(
                     workspace = %scope.workspace_name,
@@ -2138,6 +2159,12 @@ async fn run_dream_scheduler_loop(
             elapsed_ms = started.elapsed().as_millis(),
             "dream pass tick completed"
         );
+        if terminal_llm_failure {
+            tracing::warn!(
+                "dream scheduler stopped after terminal LLM failure to avoid replaying the same cluster"
+            );
+            return;
+        }
     }
 }
 
@@ -2515,8 +2542,8 @@ fn configure_consolidator(
     let retry_hint = llm_retry_hint(&provider_name, &model, cfg.base_url.as_deref());
     // Routes through the same construction `llm_provider_config` just
     // confirmed is `Some`: wraps `[primary, fallbacks...]` in a
-    // `FallbackLlmProvider` when `llm_fallbacks` is non-empty, else returns
-    // the plain provider unchanged (existing single-provider behavior).
+    // `FallbackLlmProvider` when `llm_fallbacks` is non-empty, then gives
+    // every server LLM consumer the same process-local admission wrapper.
     let llm = config
         .llm_provider_chain()
         .context("building LLM provider chain from config")?
@@ -3877,6 +3904,31 @@ mod tests {
             None,
             "no seed is taken while a real publish already stands"
         );
+    }
+
+    // Mutation captured: scheduling a durable queue retry after the provider
+    // exhausted its one delayed replay would produce a third GPU request.
+    #[test]
+    fn ambiguous_llm_failure_is_terminal_for_session_end_queue() {
+        let exhausted = ai_memory_consolidate::ConsolidatorError::Llm(
+            ai_memory_llm::LlmError::AmbiguousRetryExhausted {
+                class: "provider",
+                status: Some(502),
+            },
+        );
+        assert!(session_consolidation_retry_at(1, &exhausted).is_none());
+        let oversized =
+            ai_memory_consolidate::ConsolidatorError::Llm(ai_memory_llm::LlmError::InputLimit {
+                tokens: 16_001,
+                max: 16_000,
+            });
+        assert!(session_consolidation_retry_at(1, &oversized).is_none());
+        let capacity =
+            ai_memory_consolidate::ConsolidatorError::Llm(ai_memory_llm::LlmError::Capacity {
+                body: "capacity".into(),
+                retry_after_secs: 1,
+            });
+        assert!(session_consolidation_retry_at(1, &capacity).is_some());
     }
 
     #[tokio::test]

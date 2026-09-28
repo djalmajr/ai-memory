@@ -75,13 +75,10 @@ const CONSOLIDATION_LLM_RETRY_DELAY: Duration = Duration::from_secs(2);
 
 /// Run one consolidation structured call with a short, bounded retry.
 ///
-/// A provider answering `429`, any `5xx`, or dropping the connection used to
-/// end the consolidation after a single attempt: over MCP the operator saw an
-/// opaque internal error and had to re-issue the whole call by hand. A couple
-/// of seconds apart, one more identical request rides out those windows.
-/// Deterministic failures — auth, schema, a malformed-request `4xx`, an
-/// unparseable or truncated body — are not retried: the retry would burn
-/// another expensive call and hit the same wall.
+/// Only a connection failure or an explicit capacity 503 may retry quickly.
+/// A timeout, 499, or 502 may have reached the model; the admission provider
+/// gives that delivery one delayed replay instead. Auth, schema, malformed
+/// request, and truncated responses are not retried here.
 async fn complete_structured_with_retry<T>(
     llm: &(dyn LlmProvider + 'static),
     request: ChatRequest,
@@ -95,7 +92,7 @@ where
     loop {
         match complete_structured_with_operation_id::<T>(llm, request.clone(), operation_id).await {
             Ok(value) => return Ok(value),
-            Err(e) if attempt < CONSOLIDATION_LLM_MAX_ATTEMPTS && e.is_transient() => {
+            Err(e) if attempt < CONSOLIDATION_LLM_MAX_ATTEMPTS && e.is_fast_retryable() => {
                 warn!(
                     attempt,
                     max = CONSOLIDATION_LLM_MAX_ATTEMPTS,
@@ -3232,9 +3229,9 @@ mod tests {
             let n = self.calls.fetch_add(1, Ordering::SeqCst);
             if n < self.failures {
                 return Err(match self.failure {
-                    ScriptedFailure::Transient => LlmError::Provider {
-                        status: 503,
+                    ScriptedFailure::Transient => LlmError::Capacity {
                         body: "This model is currently experiencing high demand.".into(),
+                        retry_after_secs: 1,
                     },
                     ScriptedFailure::Deterministic => LlmError::Auth("expired".into()),
                 });

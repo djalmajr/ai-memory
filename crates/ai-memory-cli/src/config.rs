@@ -10,9 +10,9 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use ai_memory_llm::{
-    AuthRequirement, Candidate, EmbedderChoice, EmbedderConfig, ExtraHeaders, FallbackLlmProvider,
-    LlmError, LlmProvider, LlmResult, OPENCODE_DEFAULT_MODEL, ProviderAuth, ProviderChoice,
-    ProviderConfig, ReasoningEffort, build_provider,
+    AdmittedLlmProvider, AuthRequirement, Candidate, EmbedderChoice, EmbedderConfig, ExtraHeaders,
+    FallbackLlmProvider, LlmError, LlmProvider, LlmResult, OPENCODE_DEFAULT_MODEL, ProviderAuth,
+    ProviderChoice, ProviderConfig, ReasoningEffort, build_provider,
 };
 use anyhow::{Context, Result};
 use figment::{
@@ -217,8 +217,8 @@ impl DecaySettings {
 }
 
 /// One `[[llm_fallbacks]]` entry: an ordered LLM provider tried only after
-/// the primary (`llm_provider`) fails a transient call
-/// (`LlmError::is_transient()`). See `docs/llm-provider-fallback.md`.
+/// the primary (`llm_provider`) fails before delivery or reports explicit
+/// capacity (`LlmError::is_fast_retryable()`). See `docs/llm-provider-fallback.md`.
 ///
 /// `Config::load` validates every profile and resolves its credential once,
 /// at startup — a missing/empty provider or model, an unknown provider, or
@@ -308,6 +308,13 @@ pub struct Config {
     /// ceiling (observed with free aggregator tiers). Set with
     /// `AI_MEMORY_LLM_TIMEOUT_SECS`.
     pub llm_timeout_secs: u64,
+    /// Optional tokenized input ceiling across all LLM jobs. Requires
+    /// `llm_tokenizer_path` for the configured model; no byte/character
+    /// heuristic is used. Env: `AI_MEMORY_LLM_MAX_INPUT_TOKENS`.
+    pub llm_max_input_tokens: Option<usize>,
+    /// Path to this model's Hugging Face tokenizer.json. Used only when
+    /// `llm_max_input_tokens` is set. Env: `AI_MEMORY_LLM_TOKENIZER_PATH`.
+    pub llm_tokenizer_path: Option<PathBuf>,
     /// Optional reasoning / thinking effort. Omitted when unset so the
     /// model default applies. Env: `AI_MEMORY_LLM_REASONING_EFFORT`.
     /// Values: `none`, `minimal`, `low`, `medium`, `high`, `xhigh`,
@@ -333,7 +340,7 @@ pub struct Config {
     /// overriding it. Values are never logged.
     pub llm_headers: Vec<String>,
     /// Ordered LLM fallback chain, tried after the primary provider only on
-    /// a transient failure (`LlmError::is_transient()`); empty by default
+    /// a safe fast failure (`LlmError::is_fast_retryable()`); empty by default
     /// (no behavior change). See [`FallbackProfile`] and
     /// `docs/llm-provider-fallback.md`. Configure via TOML:
     /// ```toml
@@ -859,6 +866,8 @@ impl Default for Config {
             llm_base_url: None,
             llm_compat_strict: true,
             llm_timeout_secs: ai_memory_llm::DEFAULT_REQUEST_TIMEOUT_SECS,
+            llm_max_input_tokens: None,
+            llm_tokenizer_path: None,
             llm_reasoning_effort: None,
             llm_headers: Vec::new(),
             llm_fallbacks: Vec::new(),
@@ -1446,6 +1455,17 @@ impl Config {
                 config.llm_timeout_secs
             );
         }
+        if config.llm_max_input_tokens == Some(0) {
+            anyhow::bail!("llm_max_input_tokens must be greater than zero");
+        }
+        if config.llm_max_input_tokens.is_some() && config.llm_tokenizer_path.is_none() {
+            anyhow::bail!("llm_tokenizer_path is required with llm_max_input_tokens");
+        }
+        if config.llm_max_input_tokens.is_some() && !config.llm_fallbacks.is_empty() {
+            anyhow::bail!(
+                "llm_max_input_tokens requires one model; fallback tokenizers may differ"
+            );
+        }
         // Parsed (and discarded) here so a malformed header list is rejected
         // at startup rather than on the first consolidation pass. The typed
         // value is rebuilt by `llm_provider_config`: `ExtraHeaders` is not
@@ -1692,16 +1712,19 @@ impl Config {
     /// Build the configured LLM provider, including any ordered
     /// `llm_fallbacks` chain.
     ///
-    /// `None` when no LLM is configured; the plain provider when no
-    /// fallback is configured (existing single-provider callers are
-    /// unaffected); otherwise a [`FallbackLlmProvider`] wrapping the
-    /// primary and its fallbacks in declaration order. See
-    /// `docs/llm-provider-fallback.md`.
+    /// `None` when no LLM is configured; otherwise one shared admission
+    /// wrapper around the plain provider or an ordered
+    /// [`FallbackLlmProvider`] chain. See `docs/llm-provider-fallback.md`.
     ///
     /// # Errors
     /// Propagates any error from constructing the primary or a fallback
     /// provider (`build_provider` is the sole construction path for both).
     pub fn llm_provider_chain(&self) -> LlmResult<Option<Arc<dyn LlmProvider>>> {
+        if self.llm_max_input_tokens.is_some() && !self.llm_fallback_configs.is_empty() {
+            return Err(LlmError::NotConfigured(
+                "llm_max_input_tokens requires one model; fallback tokenizers may differ".into(),
+            ));
+        }
         // A chain with a profile silently dropped would look healthy until
         // the primary has an outage.
         if let Some(message) = self.llm_fallback_unresolved.first() {
@@ -1710,23 +1733,29 @@ impl Config {
         let Some(primary_cfg) = self.llm_provider_config()? else {
             return Ok(None);
         };
-        if self.llm_fallback_configs.is_empty() {
-            return Ok(Some(build_provider(primary_cfg)?));
-        }
-        let mut candidates = Vec::with_capacity(1 + self.llm_fallback_configs.len());
-        candidates.push(Candidate::new(
-            primary_cfg.provider.name(),
-            primary_cfg.model.clone(),
-            build_provider(primary_cfg)?,
-        ));
-        for cfg in &self.llm_fallback_configs {
+        let inner: Arc<dyn LlmProvider> = if self.llm_fallback_configs.is_empty() {
+            build_provider(primary_cfg)?
+        } else {
+            let mut candidates = Vec::with_capacity(1 + self.llm_fallback_configs.len());
             candidates.push(Candidate::new(
-                cfg.provider.name(),
-                cfg.model.clone(),
-                build_provider(cfg.clone())?,
+                primary_cfg.provider.name(),
+                primary_cfg.model.clone(),
+                build_provider(primary_cfg)?,
             ));
-        }
-        Ok(Some(Arc::new(FallbackLlmProvider::new(candidates))))
+            for cfg in &self.llm_fallback_configs {
+                candidates.push(Candidate::new(
+                    cfg.provider.name(),
+                    cfg.model.clone(),
+                    build_provider(cfg.clone())?,
+                ));
+            }
+            Arc::new(FallbackLlmProvider::new(candidates))
+        };
+        Ok(Some(Arc::new(AdmittedLlmProvider::new(
+            inner,
+            self.llm_max_input_tokens,
+            self.llm_tokenizer_path.as_deref(),
+        )?)))
     }
 
     /// OpenAI-compatible embedding key. `EMBEDDING_API_KEY` is checked first
@@ -2697,6 +2726,26 @@ mod tests {
         let cfg = Config::load(Some(&config_path), Some(tmp.path().to_path_buf())).unwrap();
         assert_eq!(cfg.consolidation.max_input_tokens, 7_000);
         assert_eq!(cfg.consolidation.max_output_tokens, 1_000);
+    }
+
+    // Mutation captured: accepting a cap without its model tokenizer would
+    // silently fall back to the old character estimate at send time.
+    #[test]
+    fn tokenized_llm_cap_requires_a_tokenizer_and_one_model() {
+        let tmp = TempDir::new().unwrap();
+        let config_path = tmp.path().join("config.toml");
+        std::fs::write(&config_path, "llm_max_input_tokens = 16000\n").unwrap();
+        let error = Config::load(Some(&config_path), Some(tmp.path().to_path_buf())).unwrap_err();
+        assert!(error.to_string().contains("llm_tokenizer_path"));
+
+        std::fs::write(
+            &config_path,
+            "llm_max_input_tokens = 16000\nllm_tokenizer_path = \"/tmp/model/tokenizer.json\"\n\
+             [[llm_fallbacks]]\nprovider = \"openai-compat\"\nmodel = \"other\"\nbase_url = \"http://127.0.0.1:9\"\n",
+        )
+        .unwrap();
+        let error = Config::load(Some(&config_path), Some(tmp.path().to_path_buf())).unwrap_err();
+        assert!(error.to_string().contains("fallback tokenizers may differ"));
     }
 
     /// `AI_MEMORY_LLM_TIMEOUT_SECS` (figment maps it to this field) exists so
