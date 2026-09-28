@@ -751,20 +751,40 @@ fn session_consolidation_retry_delay(attempt: u32) -> Duration {
     Duration::from_secs(30_u64.saturating_mul(1_u64 << exponent))
 }
 
+/// Failures that must terminate a SessionEnd queue job: re-sending the same
+/// expensive prompt cannot clear them.
+///
+/// Deterministic structured-response failures — malformed JSON (`Serde`), an
+/// unexpected response shape (`UnexpectedShape`) — reproduce on identical
+/// inputs, so the job goes terminal and the heuristic page the SessionEnd
+/// hook already wrote remains. The pre-send input limit never fits, and for
+/// ambiguous deliveries (a timeout, 499, or 5xx after send) the admission
+/// provider already made its one delayed replay before surfacing
+/// `AmbiguousRetryExhausted`; a queue retry would be a third send of the
+/// same prompt. Pre-send connection failures and explicit capacity
+/// rejections never reached the model and keep the queue's bounded,
+/// backoff-scheduled retry.
+fn is_terminal_session_consolidation_error(
+    error: &ai_memory_consolidate::ConsolidatorError,
+) -> bool {
+    matches!(
+        error,
+        ai_memory_consolidate::ConsolidatorError::Serde(_)
+            | ai_memory_consolidate::ConsolidatorError::Llm(
+                ai_memory_llm::LlmError::AmbiguousRetryExhausted { .. }
+                    | ai_memory_llm::LlmError::InputLimit { .. }
+                    | ai_memory_llm::LlmError::Serde(_)
+                    | ai_memory_llm::LlmError::UnexpectedShape(_)
+            )
+    )
+}
+
 fn session_consolidation_retry_at(
     attempts: u32,
     error: &ai_memory_consolidate::ConsolidatorError,
 ) -> Option<i64> {
-    // The provider already made the sole delayed replay. A queue retry would
-    // send the same expensive prompt a third time.
     if attempts >= ai_memory_store::SESSION_CONSOLIDATION_MAX_ATTEMPTS
-        || matches!(
-            error,
-            ai_memory_consolidate::ConsolidatorError::Llm(
-                ai_memory_llm::LlmError::AmbiguousRetryExhausted { .. }
-                    | ai_memory_llm::LlmError::InputLimit { .. }
-            )
-        )
+        || is_terminal_session_consolidation_error(error)
     {
         return None;
     }
@@ -838,6 +858,8 @@ async fn run_session_consolidation_worker(
             Ok(outcome) => match writer.complete_session_consolidation(job).await {
                 Ok(()) => {
                     info!(
+                        operation = "session_end_consolidation",
+                        result = "completed",
                         session = %session_id,
                         generation,
                         attempts,
@@ -869,7 +891,10 @@ async fn run_session_consolidation_worker(
                     );
                 } else if terminal {
                     tracing::error!(
-                        %error,
+                        operation = "session_end_consolidation",
+                        result = "exhausted",
+                        error_class = consolidation_error_class(&error),
+                        error_status = ?consolidation_error_status(&error),
                         session = %session_id,
                         generation,
                         attempts,
@@ -877,10 +902,14 @@ async fn run_session_consolidation_worker(
                     );
                 } else {
                     tracing::warn!(
-                        %error,
+                        operation = "session_end_consolidation",
+                        result = "retry_scheduled",
+                        error_class = consolidation_error_class(&error),
+                        error_status = ?consolidation_error_status(&error),
                         session = %session_id,
                         generation,
                         attempts,
+                        retry_at = ?retry_at,
                         "SessionEnd LLM consolidation failed; queued for retry",
                     );
                 }
@@ -940,6 +969,35 @@ fn keepalive_listener(
             tracing::warn!(%error, "failed to set TCP keepalive on accepted connection");
         }
     })
+}
+
+/// Redacted class of a consolidation failure for structured logs.
+///
+/// Stable and enumerable so operators can group LLM operations (SessionEnd
+/// jobs, auto-improve, MCP calls) by what broke. Deliberately narrow: it
+/// never carries a response body, prompt text, or secret.
+fn consolidation_error_class(error: &ai_memory_consolidate::ConsolidatorError) -> &'static str {
+    match error {
+        ai_memory_consolidate::ConsolidatorError::Memory(_) => "memory",
+        ai_memory_consolidate::ConsolidatorError::Store(_) => "store",
+        ai_memory_consolidate::ConsolidatorError::Wiki(_) => "wiki",
+        ai_memory_consolidate::ConsolidatorError::Llm(error) => error.class(),
+        ai_memory_consolidate::ConsolidatorError::Serde(_) => "serde",
+        ai_memory_consolidate::ConsolidatorError::SessionNotFound(_) => "session-not-found",
+        ai_memory_consolidate::ConsolidatorError::EmptySession(_) => "empty-session",
+        // `ConsolidatorError` is non-exhaustive: a future variant must not
+        // leak an unredacted Display into the structured fields.
+        _ => "other",
+    }
+}
+
+/// HTTP status captured by the failure, when the error carries one (429,
+/// 499, 5xx...). Never a body.
+fn consolidation_error_status(error: &ai_memory_consolidate::ConsolidatorError) -> Option<u16> {
+    match error {
+        ai_memory_consolidate::ConsolidatorError::Llm(error) => error.http_status(),
+        _ => None,
+    }
 }
 
 /// Run the `serve` subcommand.
@@ -1994,6 +2052,8 @@ async fn start_maintenance_scheduler(
                 .await
                 {
                     Ok(outcome) => info!(
+                        operation = "auto_improve",
+                        result = "completed",
                         scopes = outcome.scopes,
                         scopes_with_candidates = outcome.scopes_with_candidates,
                         reviewed = outcome.reviewed,
@@ -2003,7 +2063,12 @@ async fn start_maintenance_scheduler(
                         "scheduled auto-improve tick completed"
                     ),
                     Err(e) => {
-                        tracing::warn!(error = %e, "scheduled auto-improve tick failed")
+                        tracing::warn!(
+                            operation = "auto_improve",
+                            result = "failed",
+                            error = %e,
+                            "scheduled auto-improve tick failed"
+                        )
                     }
                 };
             }
@@ -2809,12 +2874,13 @@ mod tests {
         AgentKind, ApiCredentialId, NewObservation, NewSession, NewUser, ObservationKind, PagePath,
         Sanitized, Sanitizer, SessionId, Tier,
     };
-    use ai_memory_llm::{ChatRequest, ChatResponse, LlmResult, SyntheticEmbedder};
+    use ai_memory_llm::{ChatRequest, ChatResponse, LlmError, LlmResult, SyntheticEmbedder};
     use ai_memory_wiki::WritePageRequest;
     use axum::http::Request;
     use secrecy::SecretString;
     use std::future::Future;
     use std::pin::Pin;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use tempfile::TempDir;
     use tower::ServiceExt;
 
@@ -3728,6 +3794,72 @@ mod tests {
         }
     }
 
+    /// Which deterministic failure a [`FailingConsolidationLlm`] surfaces.
+    #[derive(Clone, Copy)]
+    enum ConsolidationFailure {
+        /// The provider answered with a shape the structured decoder rejects.
+        UnexpectedShape,
+        /// A timeout/5xx after send survived the admission provider's one
+        /// delayed replay — the worker must not add a third send.
+        AmbiguousRetryExhausted,
+    }
+
+    /// Structured-output failure fixture: counts calls (proving the prompt
+    /// is never re-sent) and fails every structured completion with the
+    /// fixed error class.
+    struct FailingConsolidationLlm {
+        failure: ConsolidationFailure,
+        calls: std::sync::Arc<AtomicUsize>,
+    }
+
+    impl LlmProvider for FailingConsolidationLlm {
+        fn name(&self) -> &'static str {
+            "failing-consolidation"
+        }
+
+        fn model(&self) -> &str {
+            "test"
+        }
+
+        fn complete<'life0, 'async_trait>(
+            &'life0 self,
+            _request: ChatRequest,
+        ) -> Pin<Box<dyn Future<Output = LlmResult<ChatResponse>> + Send + 'async_trait>>
+        where
+            'life0: 'async_trait,
+            Self: 'async_trait,
+        {
+            Box::pin(async move { panic!("session consolidation uses structured output") })
+        }
+
+        fn complete_structured_raw<'life0, 'async_trait>(
+            &'life0 self,
+            _request: ChatRequest,
+            _schema: serde_json::Value,
+        ) -> Pin<Box<dyn Future<Output = LlmResult<serde_json::Value>> + Send + 'async_trait>>
+        where
+            'life0: 'async_trait,
+            Self: 'async_trait,
+        {
+            let calls = self.calls.clone();
+            let failure = self.failure;
+            Box::pin(async move {
+                calls.fetch_add(1, Ordering::SeqCst);
+                Err(match failure {
+                    ConsolidationFailure::UnexpectedShape => {
+                        LlmError::UnexpectedShape("no tool block".into())
+                    }
+                    ConsolidationFailure::AmbiguousRetryExhausted => {
+                        LlmError::AmbiguousRetryExhausted {
+                            class: "provider",
+                            status: Some(502),
+                        }
+                    }
+                })
+            })
+        }
+    }
+
     /// #678: the pointer is process memory, so `systemctl restart` mid-session
     /// drops it. An unscoped read then resolved through the baked default scope
     /// and reported zero counts for a project holding thousands of observations,
@@ -3931,6 +4063,105 @@ mod tests {
         assert!(session_consolidation_retry_at(1, &capacity).is_some());
     }
 
+    // Mutation captured: re-queueing a deterministic structured-response
+    // failure re-sends the same expensive prompt. The old code scheduled
+    // four more queue attempts for it — the old 3x5 product (five queue
+    // claims, each spending up to three inner provider attempts) — although
+    // the identical inputs reproduce the identical failure. The job must now
+    // end terminal on the first failure and keep the heuristic page.
+    #[test]
+    fn deterministic_structured_response_failure_is_terminal_on_every_old_3x5_step() {
+        let failures = [
+            ai_memory_consolidate::ConsolidatorError::Llm(ai_memory_llm::LlmError::Serde(
+                "missing field `title`".into(),
+            )),
+            ai_memory_consolidate::ConsolidatorError::Llm(
+                ai_memory_llm::LlmError::UnexpectedShape("no tool block".into()),
+            ),
+            ai_memory_consolidate::ConsolidatorError::Serde("truncated json".into()),
+        ];
+        for error in &failures {
+            // Every queue attempt of the sequence the old 3x5 product walked
+            // is terminal now: the prompt is not re-sent at any step.
+            for attempts in 1..=ai_memory_store::SESSION_CONSOLIDATION_MAX_ATTEMPTS {
+                assert!(
+                    session_consolidation_retry_at(attempts, error).is_none(),
+                    "a deterministic structured-response failure must be terminal at queue attempt {attempts}"
+                );
+            }
+        }
+    }
+
+    // Mutation captured: capping the queue or skipping the backoff on a safe
+    // pre-send failure (explicit capacity, a connection that never left the
+    // machine) would drop retries the provider explicitly invited.
+    #[tokio::test]
+    async fn safe_pre_send_failures_keep_the_backed_off_queue_retry() {
+        // Explicit capacity rejection: pre-admission, the model never saw
+        // the request — the queue may retry with escalating backoff.
+        let capacity =
+            ai_memory_consolidate::ConsolidatorError::Llm(ai_memory_llm::LlmError::Capacity {
+                body: "capacity".into(),
+                retry_after_secs: 60,
+            });
+        // A real pre-send connection failure, built the same way the LLM
+        // suite builds one: a closed loopback port refuses immediately.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        drop(listener);
+        let connect = reqwest::get(format!("http://{addr}/v1"))
+            .await
+            .err()
+            .expect("a closed loopback port must refuse the connection");
+        assert!(
+            connect.is_connect(),
+            "the fixture must be a pre-send connection failure"
+        );
+        let connect =
+            ai_memory_consolidate::ConsolidatorError::Llm(ai_memory_llm::LlmError::Http(connect));
+
+        assert_eq!(
+            session_consolidation_retry_delay(1),
+            Duration::from_secs(30)
+        );
+        assert_eq!(
+            session_consolidation_retry_delay(2),
+            Duration::from_secs(60)
+        );
+        assert_eq!(
+            session_consolidation_retry_delay(3),
+            Duration::from_secs(120)
+        );
+        assert_eq!(
+            session_consolidation_retry_delay(4),
+            Duration::from_secs(240)
+        );
+
+        for error in [&capacity, &connect] {
+            for attempts in 1..ai_memory_store::SESSION_CONSOLIDATION_MAX_ATTEMPTS {
+                let now = jiff::Timestamp::now().as_microsecond();
+                let retry_at = session_consolidation_retry_at(attempts, error)
+                    .expect("a safe pre-send failure must stay queued");
+                let expected = session_consolidation_retry_delay(attempts).as_micros();
+                let delta =
+                    u128::try_from(retry_at).unwrap_or(0) - u128::try_from(now).unwrap_or(0);
+                assert!(
+                    (expected.saturating_sub(1_000_000)..=expected + 1_000_000).contains(&delta),
+                    "queue attempt {attempts} should retry in ~{expected}µs, got {delta}µs"
+                );
+            }
+            // The cap still bounds the queue: the fifth claim is terminal
+            // even for a safe error — the old 3x5 product stays at most 3x5.
+            assert!(
+                session_consolidation_retry_at(
+                    ai_memory_store::SESSION_CONSOLIDATION_MAX_ATTEMPTS,
+                    error
+                )
+                .is_none()
+            );
+        }
+    }
+
     #[tokio::test]
     async fn session_consolidation_worker_consumes_and_completes_durable_job() {
         let tmp = TempDir::new().unwrap();
@@ -4033,6 +4264,173 @@ mod tests {
                 .is_none(),
             "completed work must not be claimed again"
         );
+    }
+
+    /// Run the real SessionEnd worker against a session whose structured LLM
+    /// call fails with `failure`, and prove the old 3x5 repetition is gone:
+    /// the prompt goes out exactly once (no inner replay, no queue re-send),
+    /// the job settles terminal — a claim far enough in the future that a
+    /// re-queued job (first backoff is 30s) would be claimable finds none —
+    /// and the heuristic page the SessionEnd hook wrote before enqueuing is
+    /// untouched. The settle window (5 × 100ms) is measured: a writer
+    /// round-trip is millisecond-scale, so probing past it is deterministic
+    /// for a single-row SQLite update.
+    async fn session_end_worker_terminates_on(failure: ConsolidationFailure) {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let workspace_id = store
+            .writer
+            .get_or_create_workspace("default")
+            .await
+            .unwrap();
+        let project_id = store
+            .writer
+            .get_or_create_project(workspace_id, "project", None)
+            .await
+            .unwrap();
+        let session_id = SessionId::new();
+        store
+            .writer
+            .begin_session(NewSession {
+                occurred_at: None,
+                id: session_id,
+                workspace_id,
+                project_id,
+                agent_kind: AgentKind::Codex,
+                cwd: None,
+                actor_user: None,
+            })
+            .await
+            .unwrap();
+        store
+            .writer
+            .insert_observation(Sanitized::new(
+                NewObservation {
+                    occurred_at: None,
+                    session_id,
+                    workspace_id,
+                    project_id,
+                    kind: ObservationKind::UserPrompt,
+                    extension: None,
+                    source_event: None,
+                    title: "finish".into(),
+                    body: "end the session".into(),
+                    importance: 8,
+                },
+                &Sanitizer::default(),
+            ))
+            .await
+            .unwrap();
+        store.writer.end_session(session_id, None).await.unwrap();
+
+        // The SessionEnd hook writes this heuristic page before enqueuing the
+        // LLM job; a terminal failure must leave it exactly in place.
+        let wiki = Wiki::new(tmp.path(), store.writer.clone()).unwrap();
+        let path = format!("sessions/{session_id}.md");
+        write_test_page(
+            &wiki,
+            workspace_id,
+            project_id,
+            &path,
+            "heuristic",
+            Tier::Episodic,
+        )
+        .await;
+        let heuristic_body = store
+            .reader
+            .page_body_by_ids(workspace_id, project_id, &path)
+            .await
+            .unwrap()
+            .expect("the heuristic page was written")
+            .body;
+        store
+            .writer
+            .enqueue_session_consolidation(workspace_id, project_id, session_id)
+            .await
+            .unwrap();
+
+        let calls = std::sync::Arc::new(AtomicUsize::new(0));
+        let consolidator = Arc::new(Consolidator::new(
+            store.reader.clone(),
+            store.writer.clone(),
+            wiki,
+            Arc::new(FailingConsolidationLlm {
+                failure,
+                calls: calls.clone(),
+            }),
+            workspace_id,
+            project_id,
+        ));
+        let notify = Arc::new(tokio::sync::Notify::new());
+        let completed = Arc::new(tokio::sync::Notify::new());
+        let cancel = CancellationToken::new();
+        let task = tokio::spawn(run_session_consolidation_worker(
+            store.writer.clone(),
+            consolidator,
+            notify.clone(),
+            cancel.child_token(),
+            completed.clone(),
+        ));
+        notify.notify_one();
+
+        // The prompt must go out exactly once.
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while calls.load(Ordering::SeqCst) < 1 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "worker never called the LLM"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        // Let the writer settle the failure row, then probe with a clock 60s
+        // ahead: a re-queued job (first backoff 30s) would be claimable, a
+        // terminal row is not.
+        for _ in 0..5 {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            let probe_now = jiff::Timestamp::now().as_microsecond() + 60 * 1_000_000;
+            assert!(
+                store
+                    .writer
+                    .claim_session_consolidation(probe_now, probe_now - 10 * 60 * 1_000_000)
+                    .await
+                    .unwrap()
+                    .is_none(),
+                "the failure must not re-queue the same prompt"
+            );
+            assert_eq!(
+                calls.load(Ordering::SeqCst),
+                1,
+                "no immediate replay or queue re-send of the same prompt"
+            );
+        }
+        cancel.cancel();
+        task.await.unwrap();
+        let body = store
+            .reader
+            .page_body_by_ids(workspace_id, project_id, &path)
+            .await
+            .unwrap();
+        assert_eq!(
+            body.map(|page| page.body),
+            Some(heuristic_body.clone()),
+            "the heuristic page must survive a terminal failure untouched"
+        );
+    }
+
+    // Mutation captured: treating a deterministic structured-response failure
+    // like a transient one re-queues the same expensive prompt (the old 3x5
+    // product); the worker must settle the job terminal after the single send.
+    #[tokio::test]
+    async fn session_end_worker_makes_deterministic_structured_failure_terminal() {
+        session_end_worker_terminates_on(ConsolidationFailure::UnexpectedShape).await;
+    }
+
+    // Mutation captured: a timeout/5xx after send already spent the admission
+    // provider's one delayed replay; an immediate replay or an extra queue
+    // repetition here would duplicate a request the model may have accepted.
+    #[tokio::test]
+    async fn session_end_worker_makes_post_send_502_terminal_without_replay() {
+        session_end_worker_terminates_on(ConsolidationFailure::AmbiguousRetryExhausted).await;
     }
 
     async fn two_project_wiki() -> (TempDir, Store, Wiki, WorkspaceId, ProjectId, ProjectId) {
