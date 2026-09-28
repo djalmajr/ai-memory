@@ -8,6 +8,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- The `openai-compat` provider now sends `X-Request-Id` with every chat
+  attempt, carrying the logical operation id shared by all attempts of one
+  operation — including the strict-to-tolerant fallback and the single
+  replay after an ambiguous delivery. A gateway that records the header
+  (for example as `req=<id>`) can now correlate every attempt of the same
+  operation and forward it to the engine. Every chat attempt also logs its
+  outcome (start, success, timeout, failure) at a production-visible level
+  with the operation id, status/error class, and duration — never prompt,
+  response, error body, tokens, header values, or the URL. A static
+  `x-request-id` entry in `AI_MEMORY_LLM_HEADERS` is refused at startup for
+  this provider; the official `openai` and `opencode` providers are
+  unchanged (`opencode` keeps its `x-opencode-session` contract). (PR
+  reference pending local validation)
 - Added `AI_MEMORY_LLM_COMPAT_DISABLE_THINKING` for the `openai-compat`
   provider (opt-in, off by default, ignored by every other provider): when
   set, every chat request carries

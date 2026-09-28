@@ -171,6 +171,21 @@ also set `COPILOT_GITHUB_TOKEN`, `GH_TOKEN`, or `GITHUB_TOKEN` on the server.
 > retry, no second HTTP call, and the error text carries no response
 > content.
 
+> [!TIP]
+> **`openai-compat` sends `X-Request-Id` on every chat attempt.** Each HTTP
+> attempt of one logical operation — including the strict-to-tolerant
+> fallback and the single replay after an ambiguous delivery — carries the
+> same operation id (a 36-character UUID v7) in the `X-Request-Id` header,
+> so a gateway that records it (for example as `req=<id>`) can correlate
+> every attempt of the same operation and forward it to the engine (vLLM).
+> One operation is the invocation that enters the server's LLM admission:
+> a fresh durable queue execution of the same session is a new operation
+> and a new id. The official `openai` provider and `opencode` do not send
+> this header — `opencode` keeps its own `x-opencode-session` contract. Because
+> ai-memory owns the header on the `openai-compat` path, a static
+> `x-request-id` entry in `AI_MEMORY_LLM_HEADERS` is refused at startup for
+> that provider; the dynamic value must not be shadowed or duplicated.
+
 For small-context local models, configure both consolidation limits. The input
 target accounts for the complete rendered prompt, including bounded slot and
 current-page context plus the structured-output schema; the output limit is

@@ -1,12 +1,12 @@
 //! OpenAI Chat Completions client (with `response_format` JSON schema for
 //! structured output).
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use secrecy::{ExposeSecret, SecretString};
 use serde::{Deserialize, Serialize};
-use tracing::debug;
+use tracing::{info, warn};
 
 use crate::error::{LlmError, LlmResult};
 use crate::provider::LlmProvider;
@@ -29,6 +29,16 @@ pub const DEFAULT_BASE_URL: &str = "https://api.openai.com";
 /// engines (vLLM / LM Studio) sometimes echo this name in error
 /// messages and logs — naming it makes those messages discoverable.
 pub(crate) const STRUCTURED_OUTPUT_SCHEMA_NAME: &str = "Result";
+
+/// `X-Request-Id` header the `openai-compat` provider sends on every chat
+/// attempt, carrying the [`LlmOperationId`] all attempts of one operation
+/// share (strict-to-tolerant fallbacks and the admission replay included).
+/// A gateway that records it (for example as `req=<id>`) can correlate
+/// every attempt of the same operation and forward it to the engine. The
+/// factory enables it only for the configured `openai-compat` provider and
+/// refuses a static `AI_MEMORY_LLM_HEADERS` entry for this name there;
+/// the official OpenAI and OpenCode providers keep their own contracts.
+pub(crate) const REQUEST_ID_HEADER: &str = "x-request-id";
 
 /// Build the full URL for an OpenAI-style endpoint. Tolerates the
 /// conventions found in the wild:
@@ -101,6 +111,11 @@ pub struct OpenAiProvider {
     /// Caller-identifying defaults a provider opts into. Layered *under*
     /// `extra_headers`.
     client_headers: Option<ClientHeaders>,
+    /// OpenAI-compat only: send [`REQUEST_ID_HEADER`] with the logical
+    /// operation id on every chat attempt. Off by default; the factory
+    /// turns it on only for the configured `openai-compat` provider, so
+    /// the official OpenAI and OpenCode providers never gain the header.
+    request_id_header: bool,
     /// OpenAI-compat only: send `chat_template_kwargs` with every chat
     /// request (see [`Self::with_disable_thinking`]). Ignored by the
     /// `Official` dialect, which would 400 on the unknown parameter.
@@ -134,6 +149,7 @@ impl OpenAiProvider {
             reasoning_effort: None,
             extra_headers: ExtraHeaders::default(),
             client_headers: None,
+            request_id_header: false,
             disable_thinking: false,
         })
     }
@@ -214,6 +230,20 @@ impl OpenAiProvider {
     #[must_use]
     pub(crate) fn with_disable_thinking(mut self, enabled: bool) -> Self {
         self.disable_thinking = enabled;
+        self
+    }
+
+    /// Send [`REQUEST_ID_HEADER`] with the logical operation id on every
+    /// chat attempt. The id is created before the first attempt and reused
+    /// by every fallback and the admission replay, so all attempts of one
+    /// operation carry exactly the same value. Enabled by the factory only
+    /// for the configured `openai-compat` provider; a static
+    /// `AI_MEMORY_LLM_HEADERS` entry for this name is refused there at
+    /// startup, and [`ExtraHeaders::apply`] replaces per name either way,
+    /// so one value always reaches the wire.
+    #[must_use]
+    pub(crate) fn with_request_id_header(mut self) -> Self {
+        self.request_id_header = true;
         self
     }
 
@@ -555,7 +585,15 @@ impl OpenAiProvider {
         operation_id: LlmOperationId,
     ) -> LlmResult<OpenAiResponse> {
         let url = normalize_openai_base(&self.base_url, "chat/completions");
-        debug!(url, "POST openai");
+        // One structured line per HTTP attempt at a production-visible
+        // level, so an operator can correlate client attempts with the
+        // gateway's `req=<id>` record. `operation_id` is the shared
+        // correlation value; status/class and duration describe the
+        // outcome. Prompt, response body, error body, header values,
+        // tokens, and the URL (which may carry a query) are never
+        // logged — that is why this replaces the old `debug!(url, …)`.
+        let started = Instant::now();
+        info!(operation_id = %operation_id, "LLM chat attempt starting");
         let builder = self
             .client
             .post(&url)
@@ -567,9 +605,23 @@ impl OpenAiProvider {
         // — two `user-agent` values whenever the operator configures one, and
         // a duplicate is worse than either value alone. `set_default` leaves
         // an operator entry untouched, so the layering is explicit here
-        // rather than dependent on call order.
+        // rather than dependent on call order. The dynamic `x-request-id`
+        // is the one header ai-memory *owns* on this path: `insert`
+        // (not `set_default`) plus the factory's refuse-up-front keep
+        // exactly one value on the wire, the operation's.
         let request = match self.client_headers {
-            None => self.extra_headers.apply(builder),
+            None => {
+                let mut headers = self.extra_headers.clone();
+                if self.request_id_header {
+                    // A UUID is always a valid header value; on the
+                    // impossible failure, omitting a correlation header
+                    // beats failing the consolidation pass that carries it.
+                    if let Ok(value) = HeaderValue::from_str(&operation_id.to_string()) {
+                        headers.insert(HeaderName::from_static(REQUEST_ID_HEADER), value);
+                    }
+                }
+                headers.apply(builder)
+            }
             Some(client) => {
                 let mut headers = self.extra_headers.clone();
                 headers.set_default(
@@ -588,22 +640,44 @@ impl OpenAiProvider {
                 headers.apply(builder)
             }
         };
-        let resp = request.json(body).send().await?;
-        let status = resp.status();
+        let response = match request.json(body).send().await {
+            Ok(response) => response,
+            Err(error) => {
+                let timed_out = error.is_timeout();
+                let error = LlmError::from(error);
+                let duration_ms = started.elapsed().as_millis() as u64;
+                if timed_out {
+                    warn!(
+                        operation_id = %operation_id,
+                        class = error.class(),
+                        duration_ms,
+                        "LLM chat attempt timed out"
+                    );
+                } else {
+                    warn!(
+                        operation_id = %operation_id,
+                        class = error.class(),
+                        duration_ms,
+                        "LLM chat attempt failed"
+                    );
+                }
+                return Err(error);
+            }
+        };
+        let status = response.status();
         if !status.is_success() {
-            let retry_after_secs = resp
+            let retry_after_secs = response
                 .headers()
                 .get(reqwest::header::RETRY_AFTER)
                 .and_then(|value| value.to_str().ok())
                 .and_then(|value| value.parse::<u64>().ok());
-            let body = provider_error_body(resp).await;
-            if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
-                return Err(LlmError::RateLimited {
+            let body = provider_error_body(response).await;
+            let error = if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+                LlmError::RateLimited {
                     body,
                     retry_after_secs,
-                });
-            }
-            if status == reqwest::StatusCode::SERVICE_UNAVAILABLE
+                }
+            } else if status == reqwest::StatusCode::SERVICE_UNAVAILABLE
                 && let Some(retry_after_secs) = retry_after_secs
                 && serde_json::from_str::<serde_json::Value>(&body)
                     .ok()
@@ -616,17 +690,32 @@ impl OpenAiProvider {
                         )
                     })
             {
-                return Err(LlmError::Capacity {
+                LlmError::Capacity {
                     body,
                     retry_after_secs,
-                });
-            }
-            return Err(LlmError::Provider {
-                status: status.as_u16(),
-                body,
-            });
+                }
+            } else {
+                LlmError::Provider {
+                    status: status.as_u16(),
+                    body,
+                }
+            };
+            warn!(
+                operation_id = %operation_id,
+                status = status.as_u16(),
+                class = error.class(),
+                duration_ms = started.elapsed().as_millis() as u64,
+                "LLM chat attempt failed"
+            );
+            return Err(error);
         }
-        response_json_limited::<OpenAiResponse>(resp).await
+        info!(
+            operation_id = %operation_id,
+            status = status.as_u16(),
+            duration_ms = started.elapsed().as_millis() as u64,
+            "LLM chat attempt completed"
+        );
+        response_json_limited::<OpenAiResponse>(response).await
     }
 }
 
@@ -817,16 +906,19 @@ fn max_output_tokens_for(model: &str) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::{
-        OpenAiJsonSchema, OpenAiProvider, OpenAiResponse, OpenAiResponseFormat, RequestDialect,
-        STRUCTURED_OUTPUT_SCHEMA_NAME, enforce_strict_object_schemas, is_length_truncated,
-        model_requires_max_completion_tokens, normalize_openai_base,
+        OpenAiJsonSchema, OpenAiProvider, OpenAiResponse, OpenAiResponseFormat, REQUEST_ID_HEADER,
+        RequestDialect, STRUCTURED_OUTPUT_SCHEMA_NAME, enforce_strict_object_schemas,
+        is_length_truncated, model_requires_max_completion_tokens, normalize_openai_base,
     };
-    use crate::types::{ChatMessage, ChatRequest, ReasoningEffort, Role};
+    use crate::provider::LlmProvider;
+    use crate::types::{ChatMessage, ChatRequest, LlmOperationId, ReasoningEffort, Role};
     use rstest::rstest;
     use schemars::JsonSchema;
     use secrecy::SecretString;
     use serde::{Deserialize, Serialize};
     use serde_json::json;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
 
     fn provider_for(model: &str) -> OpenAiProvider {
         OpenAiProvider::new(SecretString::new("test-key".into()), model).unwrap()
@@ -1595,5 +1687,238 @@ mod tests {
             normalize_openai_base("https://api.z.ai/api/coding/paas/v4", ep),
             "https://api.z.ai/api/coding/paas/v4/embeddings"
         );
+        assert_eq!(
+            normalize_openai_base("https://api.z.ai/api/coding/paas/v4/embeddings", ep),
+            "https://api.z.ai/api/coding/paas/v4/embeddings"
+        );
+    }
+
+    // ── per-attempt structured logs (acceptance f) ─────────────────────────
+
+    /// Acceptance (e): the official OpenAI provider keeps its contract —
+    /// without the openai-compat opt-in it never sends `x-request-id`.
+    #[tokio::test]
+    async fn the_official_provider_sends_no_request_id_header() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "model": "gpt-4o-mini",
+                "choices": [{ "message": { "content": "ok" } }],
+            })))
+            .mount(&server)
+            .await;
+
+        let provider = OpenAiProvider::new(SecretString::from("sk-test"), "gpt-4o-mini")
+            .unwrap()
+            .with_base_url(server.uri());
+        provider
+            .complete_with_operation_id(ChatRequest::user_prompt("hi"), LlmOperationId::new())
+            .await
+            .expect("completion succeeds");
+
+        let requests = server.received_requests().await.expect("requests");
+        assert_eq!(requests.len(), 1);
+        assert!(
+            requests[0].headers.get(REQUEST_ID_HEADER).is_none(),
+            "the official provider must not gain the openai-compat header"
+        );
+    }
+
+    /// Collects everything a subscriber writes so a test can assert on it.
+    #[derive(Clone, Default)]
+    struct CapturedLog(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl CapturedLog {
+        fn text(&self) -> String {
+            String::from_utf8_lossy(&self.0.lock().unwrap()).into_owned()
+        }
+    }
+
+    impl std::io::Write for CapturedLog {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CapturedLog {
+        type Writer = Self;
+
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    fn install_capture() -> (CapturedLog, tracing::subscriber::DefaultGuard) {
+        let captured = CapturedLog::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(captured.clone())
+            .with_max_level(tracing::Level::INFO)
+            .with_ansi(false)
+            .finish();
+        let guard = tracing::subscriber::set_default(subscriber);
+        (captured, guard)
+    }
+
+    /// Acceptance (f): the success log is production-visible (INFO), carries
+    /// the operation id, the HTTP status and a duration — and none of the
+    /// prompt, the response payload, or the API key.
+    #[tokio::test]
+    async fn the_success_log_carries_the_id_status_and_no_payload_or_secret() {
+        let (captured, _guard) = install_capture();
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "model": "model-x",
+                "choices": [{ "message": { "content": "ANSWER-PAYLOAD-MARKER" } }],
+            })))
+            .mount(&server)
+            .await;
+
+        let api_key = "sk-request-id-log-test-key";
+        let provider = OpenAiProvider::new(SecretString::from(api_key), "model-x")
+            .unwrap()
+            .with_dialect(RequestDialect::Compat)
+            .with_base_url(server.uri())
+            .with_request_id_header();
+        let operation_id = LlmOperationId::new();
+        provider
+            .complete_with_operation_id(
+                ChatRequest::user_prompt("PROMPT-PAYLOAD-MARKER"),
+                operation_id,
+            )
+            .await
+            .expect("completion succeeds");
+
+        let logged = captured.text();
+        let id = operation_id.to_string();
+        let start = logged
+            .lines()
+            .find(|line| line.contains("LLM chat attempt starting"))
+            .unwrap_or_else(|| panic!("start line missing; log was: {logged}"));
+        assert!(start.contains(&format!("operation_id={id}")), "{start}");
+        let success = logged
+            .lines()
+            .find(|line| line.contains("LLM chat attempt completed"))
+            .unwrap_or_else(|| panic!("success line missing; log was: {logged}"));
+        assert!(
+            success.contains(" INFO "),
+            "visible in production: {success}"
+        );
+        assert!(success.contains(&format!("operation_id={id}")), "{success}");
+        assert!(success.contains("status=200"), "{success}");
+        assert!(success.contains("duration_ms="), "{success}");
+        // Nothing that is not meant for a log line:
+        assert!(!logged.contains("PROMPT-PAYLOAD-MARKER"), "{logged}");
+        assert!(!logged.contains("ANSWER-PAYLOAD-MARKER"), "{logged}");
+        assert!(!logged.contains(api_key), "{logged}");
+        // The old `debug!(url, …)` line is gone: no URL is logged.
+        assert!(
+            !logged.contains(server.uri().as_str()),
+            "no URL in logs: {logged}"
+        );
+    }
+
+    /// Acceptance (f): a rejected attempt logs the operation id, the HTTP
+    /// status and the redacted error class — never the error body.
+    #[tokio::test]
+    async fn the_failure_log_carries_the_id_status_and_class_not_the_body() {
+        let (captured, _guard) = install_capture();
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(500).set_body_string("ERROR-BODY-MARKER"))
+            .mount(&server)
+            .await;
+
+        let provider = OpenAiProvider::new(SecretString::from("sk-test"), "model-x")
+            .unwrap()
+            .with_dialect(RequestDialect::Compat)
+            .with_base_url(server.uri())
+            .with_request_id_header();
+        let operation_id = LlmOperationId::new();
+        let error = provider
+            .complete_with_operation_id(ChatRequest::user_prompt("hi"), operation_id)
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            crate::LlmError::Provider { status: 500, .. }
+        ));
+
+        let logged = captured.text();
+        let id = operation_id.to_string();
+        let failed = logged
+            .lines()
+            .find(|line| line.contains("LLM chat attempt failed"))
+            .unwrap_or_else(|| panic!("failure line missing; log was: {logged}"));
+        assert!(failed.contains(" WARN "), "{failed}");
+        assert!(failed.contains(&format!("operation_id={id}")), "{failed}");
+        assert!(failed.contains("status=500"), "{failed}");
+        assert!(failed.contains("class=\"provider\""), "{failed}");
+        assert!(failed.contains("duration_ms="), "{failed}");
+        assert!(
+            !logged.contains("ERROR-BODY-MARKER"),
+            "no error body: {logged}"
+        );
+    }
+
+    /// Acceptance (f): a timed-out attempt is logged as its own outcome with
+    /// the operation id and the redacted class, and the error still classifies
+    /// as an ambiguous delivery (the replay policy is untouched).
+    #[tokio::test]
+    async fn the_timeout_log_carries_the_id_and_class() {
+        let (captured, _guard) = install_capture();
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200).set_delay(std::time::Duration::from_millis(2_000)),
+            )
+            .mount(&server)
+            .await;
+
+        let provider = OpenAiProvider::new(SecretString::from("sk-test"), "model-x")
+            .unwrap()
+            .with_dialect(RequestDialect::Compat)
+            .with_base_url(server.uri())
+            .with_timeout_secs(1)
+            .with_request_id_header();
+        let operation_id = LlmOperationId::new();
+        let error = provider
+            .complete_with_operation_id(ChatRequest::user_prompt("hi"), operation_id)
+            .await
+            .unwrap_err();
+        assert!(
+            error.is_ambiguous_delivery(),
+            "the replay policy is unchanged: {error}"
+        );
+        let crate::LlmError::Http(reqwest_error) = &error else {
+            panic!("expected a transport error, got {error}");
+        };
+        assert!(
+            reqwest_error.is_timeout(),
+            "the failure is a real reqwest timeout"
+        );
+
+        let logged = captured.text();
+        let id = operation_id.to_string();
+        let timed_out = logged
+            .lines()
+            .find(|line| line.contains("LLM chat attempt timed out"))
+            .unwrap_or_else(|| panic!("timeout line missing; log was: {logged}"));
+        assert!(timed_out.contains(" WARN "), "{timed_out}");
+        assert!(
+            timed_out.contains(&format!("operation_id={id}")),
+            "{timed_out}"
+        );
+        assert!(timed_out.contains("class=\"http\""), "{timed_out}");
+        assert!(timed_out.contains("duration_ms="), "{timed_out}");
     }
 }

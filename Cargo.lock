@@ -196,6 +196,7 @@ dependencies = [
  "tokenizers",
  "tokio",
  "tracing",
+ "tracing-subscriber",
  "uuid",
  "wiremock",
 ]

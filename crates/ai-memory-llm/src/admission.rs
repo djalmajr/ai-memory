@@ -668,4 +668,74 @@ mod tests {
         assert!(!error.is_fast_retryable());
         assert_eq!(inner.calls.load(Ordering::Acquire), 2);
     }
+
+    // Wire proof for the gateway contract: the single delayed replay after an
+    // ambiguous delivery is the SAME operation, so the real HTTP server sees
+    // the same `x-request-id` on the first attempt and on the replay.
+    #[tokio::test]
+    async fn the_delayed_replay_reuses_the_request_id_on_the_wire() {
+        let server = MockServer::start().await;
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let attempts_for_mock = Arc::clone(&attempts);
+        Mock::given(wiremock::matchers::method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(move |_request: &wiremock::Request| {
+                if attempts_for_mock.fetch_add(1, Ordering::SeqCst) == 0 {
+                    ResponseTemplate::new(502).set_body_string("bad gateway")
+                } else {
+                    // The replay takes the strict path again, so the reply
+                    // must be a chat completion whose content is the JSON.
+                    ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                        "model": "model-x",
+                        "choices": [{ "message": { "content": "{\"ok\":true}" } }],
+                    }))
+                }
+            })
+            .mount(&server)
+            .await;
+
+        let inner: Arc<dyn LlmProvider> = Arc::new(
+            crate::openai_compat::OpenAiCompatProvider::new(server.uri(), None, "model-x")
+                .expect("provider builds")
+                .with_strict(true)
+                .with_request_id_header(),
+        );
+        let mut admitted = AdmittedLlmProvider::new(inner, None, None).expect("admission builds");
+        admitted.ambiguous_cooldown = Duration::from_millis(1);
+        // `% 1` keeps the jitter at zero, so the test stays fast.
+        admitted.jitter_max_secs = 1;
+
+        let operation_id = LlmOperationId::new();
+        let value = admitted
+            .complete_structured_raw_with_operation_id(
+                ChatRequest::user_prompt("emit JSON"),
+                serde_json::json!({
+                    "type": "object",
+                    "properties": { "ok": { "type": "boolean" } },
+                    "required": ["ok"],
+                }),
+                operation_id,
+            )
+            .await
+            .expect("the delayed replay succeeds");
+
+        assert_eq!(value, serde_json::json!({ "ok": true }));
+        assert_eq!(
+            attempts.load(Ordering::Acquire),
+            2,
+            "one ambiguous attempt plus the sole delayed replay"
+        );
+        let requests = server.received_requests().await.expect("requests");
+        let expected = operation_id.to_string();
+        for request in &requests {
+            assert_eq!(
+                request
+                    .headers
+                    .get(crate::openai::REQUEST_ID_HEADER)
+                    .and_then(|value| value.to_str().ok()),
+                Some(expected.as_str()),
+                "every attempt of one operation carries the same id on the wire"
+            );
+        }
+    }
 }

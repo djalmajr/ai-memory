@@ -329,6 +329,29 @@ impl ExtraHeaders {
         }
     }
 
+    /// Insert `name: value`, replacing any existing value for that name.
+    ///
+    /// Unlike [`Self::set_default`], this overrides an operator entry: it is
+    /// reserved for headers ai-memory sets itself per request (the
+    /// openai-compat `x-request-id`, which carries the logical operation id).
+    /// The factory refuses a static `AI_MEMORY_LLM_HEADERS` entry for those
+    /// names up front, so on the configured path this can never silently
+    /// replace operator material — and [`Self::apply`] replaces per name
+    /// either way, so one value always goes on the wire.
+    pub(crate) fn insert(
+        &mut self,
+        name: reqwest::header::HeaderName,
+        value: reqwest::header::HeaderValue,
+    ) {
+        self.0.insert(name, value);
+    }
+
+    /// Whether `name` is configured (header-name comparison is
+    /// case-insensitive, as on the wire).
+    pub(crate) fn contains(&self, name: &str) -> bool {
+        self.0.contains_key(name)
+    }
+
     /// Attach the configured headers to `builder`.
     ///
     /// Uses `RequestBuilder::headers`, which *replaces* any value already set
@@ -537,6 +560,25 @@ mod tests {
             reqwest::header::HeaderValue::from_static("fallback/1"),
         );
         assert_eq!(headers.get("user-agent"), Some("fallback/1"));
+    }
+
+    /// `insert` is the per-request override used for headers ai-memory owns
+    /// (the openai-compat `x-request-id`): an existing entry is *replaced*,
+    /// so exactly one value survives, and `contains` sees it case-insensitively.
+    #[test]
+    fn insert_replaces_an_existing_value() {
+        let mut headers = ExtraHeaders::parse(["x-request-id: static-1"]).expect("valid");
+        assert!(headers.contains("x-request-id"));
+        headers.insert(
+            reqwest::header::HeaderName::from_static("x-request-id"),
+            reqwest::header::HeaderValue::from_static("dynamic-1"),
+        );
+        assert_eq!(headers.get("x-request-id"), Some("dynamic-1"));
+        // The header-name match used by the factory's refuse check is
+        // case-insensitive, so a mixed-case operator entry is caught too.
+        let mixed = ExtraHeaders::parse(["X-Request-Id: static-2"]).expect("valid");
+        assert!(mixed.contains("x-request-id"));
+        assert!(!mixed.contains("x-opencode-session"));
     }
 
     /// `ProviderConfig` derives `Debug` and gets rendered into configuration
