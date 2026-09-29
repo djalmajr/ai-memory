@@ -4427,6 +4427,118 @@ pub fn clear_bootstrap_progress(conn: &Connection, fingerprint: &str) -> StoreRe
     Ok(())
 }
 
+/// One recorded map-reduce consolidation block, as loaded by
+/// [`load_consolidation_chunks`].
+///
+/// `created_at` is bookkeeping only: reuse decisions compare
+/// `chunk_fingerprint`, never the timestamp, so a rolled-back clock cannot
+/// change which blocks a resume reuses.
+#[derive(Debug, Clone)]
+pub struct ConsolidationChunkRecord {
+    /// Content-derived fingerprint of the block (or reduction) this row
+    /// belongs to.
+    pub chunk_fingerprint: String,
+    /// The stage's validated output, serialized as JSON.
+    pub extraction_json: String,
+    /// Record time in microseconds (never consulted by the reuse decision).
+    pub created_at: i64,
+}
+
+/// Durably record one validated map-reduce consolidation stage, keyed by the
+/// full typed scope plus a content-derived fingerprint.
+///
+/// `INSERT OR REPLACE` makes this idempotent: re-running the same block just
+/// overwrites its row. The scope triple is part of the primary key, so a
+/// foreign workspace/project/session can neither read nor clobber these rows.
+///
+/// # Errors
+/// Returns [`StoreError`] if the SQL statement fails.
+pub fn record_consolidation_chunk(
+    conn: &Connection,
+    workspace_id: &WorkspaceId,
+    project_id: &ProjectId,
+    session_id: &SessionId,
+    chunk_fingerprint: &str,
+    extraction_json: &str,
+) -> StoreResult<()> {
+    conn.execute(
+        "INSERT OR REPLACE INTO consolidation_chunk_progress \
+         (workspace_id, project_id, session_id, chunk_fingerprint, extraction_json, created_at) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        rusqlite::params![
+            workspace_id.as_bytes(),
+            project_id.as_bytes(),
+            session_id.as_bytes(),
+            chunk_fingerprint,
+            extraction_json,
+            Timestamp::now().as_microsecond(),
+        ],
+    )?;
+    Ok(())
+}
+
+/// Load every recorded block for one session's scope, ordered by
+/// `chunk_fingerprint` — a deterministic order that never consults
+/// `created_at`, keeping the resume decision independent of the wall clock.
+///
+/// # Errors
+/// Returns [`StoreError`] if the SQL statement fails.
+pub fn load_consolidation_chunks(
+    conn: &Connection,
+    workspace_id: &WorkspaceId,
+    project_id: &ProjectId,
+    session_id: &SessionId,
+) -> StoreResult<Vec<ConsolidationChunkRecord>> {
+    let mut stmt = conn.prepare(
+        "SELECT chunk_fingerprint, extraction_json, created_at \
+         FROM consolidation_chunk_progress \
+         WHERE workspace_id = ?1 AND project_id = ?2 AND session_id = ?3 \
+         ORDER BY chunk_fingerprint",
+    )?;
+    let rows = stmt
+        .query_map(
+            rusqlite::params![
+                workspace_id.as_bytes(),
+                project_id.as_bytes(),
+                session_id.as_bytes()
+            ],
+            |row| {
+                Ok(ConsolidationChunkRecord {
+                    chunk_fingerprint: row.get(0)?,
+                    extraction_json: row.get(1)?,
+                    created_at: row.get(2)?,
+                })
+            },
+        )?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(rows)
+}
+
+/// Delete every recorded block for one session's scope. Called once a
+/// consolidation publishes successfully — a published wiki has nothing left
+/// to resume; a run that crashes after publishing but before this delete is
+/// reconciled on the next run via the wiki's session-origin stamp.
+///
+/// # Errors
+/// Returns [`StoreError`] if the SQL statement fails.
+pub fn clear_consolidation_chunks(
+    conn: &Connection,
+    workspace_id: &WorkspaceId,
+    project_id: &ProjectId,
+    session_id: &SessionId,
+) -> StoreResult<()> {
+    conn.execute(
+        "DELETE FROM consolidation_chunk_progress \
+         WHERE workspace_id = ?1 AND project_id = ?2 AND session_id = ?3",
+        rusqlite::params![
+            workspace_id.as_bytes(),
+            project_id.as_bytes(),
+            session_id.as_bytes()
+        ],
+    )?;
+    Ok(())
+}
+
 pub fn purge_project(
     conn: &mut Connection,
     workspace_id: &WorkspaceId,
@@ -5906,6 +6018,94 @@ pub(crate) mod tests {
             1,
             "clearing one fingerprint must not touch another"
         );
+    }
+
+    /// Round-trip: recorded blocks come back fingerprint-ordered (never
+    /// time-ordered), re-recording replaces, and `clear` empties only this
+    /// session's scope. Fingerprint ordering is the clock guard: the load
+    /// path never consults `created_at`, so a rolled-back wall clock cannot
+    /// change which rows a resume sees.
+    #[test]
+    fn consolidation_chunk_progress_round_trips_and_clears() {
+        let (_tmp, conn, ws, proj) = fresh_db();
+        let session = SessionId::new();
+
+        record_consolidation_chunk(&conn, &ws, &proj, &session, "fp-b", r#"{"extractions":[]}"#)
+            .unwrap();
+        record_consolidation_chunk(&conn, &ws, &proj, &session, "fp-a", r#"{"extractions":[]}"#)
+            .unwrap();
+
+        let loaded = load_consolidation_chunks(&conn, &ws, &proj, &session).unwrap();
+        assert_eq!(loaded.len(), 2);
+        assert_eq!(loaded[0].chunk_fingerprint, "fp-a");
+        assert_eq!(loaded[1].chunk_fingerprint, "fp-b");
+
+        // Re-recording the same fingerprint replaces the row instead of
+        // duplicating it — `INSERT OR REPLACE` idempotency.
+        record_consolidation_chunk(
+            &conn,
+            &ws,
+            &proj,
+            &session,
+            "fp-a",
+            r#"{"extractions":[1]}"#,
+        )
+        .unwrap();
+        let loaded = load_consolidation_chunks(&conn, &ws, &proj, &session).unwrap();
+        assert_eq!(loaded.len(), 2);
+        assert_eq!(loaded[0].extraction_json, r#"{"extractions":[1]}"#);
+
+        clear_consolidation_chunks(&conn, &ws, &proj, &session).unwrap();
+        assert!(
+            load_consolidation_chunks(&conn, &ws, &proj, &session)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    /// Adversarial scope isolation: a checkpoint row written for one
+    /// `(workspace, project, session)` triple must be invisible to every
+    /// other triple, and `clear` must not cross scopes. A bare session-id
+    /// lookup would leak foreign blocks into another project's resume —
+    /// this is the test that fails if the scope triple stops being part of
+    /// the lookup key.
+    #[test]
+    fn consolidation_chunk_progress_is_scoped_per_workspace_project_session() {
+        let (_tmp, conn, ws, proj) = fresh_db();
+        let ws_other = WorkspaceId::new();
+        let proj_other = ProjectId::new();
+        let session = SessionId::new();
+        let session_other = SessionId::new();
+
+        record_consolidation_chunk(&conn, &ws, &proj, &session, "fp", "own").unwrap();
+        record_consolidation_chunk(&conn, &ws_other, &proj, &session, "fp", "foreign-ws").unwrap();
+        record_consolidation_chunk(&conn, &ws, &proj_other, &session, "fp", "foreign-proj")
+            .unwrap();
+        record_consolidation_chunk(&conn, &ws, &proj, &session_other, "fp", "foreign-session")
+            .unwrap();
+
+        let loaded = load_consolidation_chunks(&conn, &ws, &proj, &session).unwrap();
+        assert_eq!(loaded.len(), 1, "only the owning scope's row is visible");
+        assert_eq!(loaded[0].extraction_json, "own");
+
+        clear_consolidation_chunks(&conn, &ws, &proj, &session).unwrap();
+        assert!(
+            load_consolidation_chunks(&conn, &ws, &proj, &session)
+                .unwrap()
+                .is_empty(),
+            "owning scope cleared"
+        );
+        for (w, p, s) in [
+            (&ws_other, &proj, &session),
+            (&ws, &proj_other, &session),
+            (&ws, &proj, &session_other),
+        ] {
+            assert_eq!(
+                load_consolidation_chunks(&conn, w, p, s).unwrap().len(),
+                1,
+                "clearing one scope must not touch a foreign scope"
+            );
+        }
     }
 
     /// The default for a project purge is the same logical delete `#387`

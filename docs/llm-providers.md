@@ -205,6 +205,41 @@ automatic PreCompact/PostCompaction checkpoint fall back to the deterministic
 rule-based page; admission, storage, and scope errors still fail closed. The
 validated minimums are 6,000 input and 1,000 output tokens.
 
+**Map-reduce consolidation (opt-in).** For sessions whose observation log no
+longer fits one prompt — or engines whose context is simply small — set
+`chunk_input_tokens` above zero (config key, or
+`AI_MEMORY_CONSOLIDATION__CHUNK_INPUT_TOKENS`). The session log is then
+consolidated through sequential, checkpointed stages instead of one large
+prompt: a **map** stage extracts typed evidence per block, grounded in the
+observation ids the block shows; a hierarchical **reduce** merges the
+extractions until the final request itself fits the ceiling; and the
+**final** stage is the normal single-page or multi-page prompt, fed the
+merged evidence digest. Every stage's request is sized with the model's own tokenizer — the
+same counter and reserves the admission guard enforces — so each call fits
+`llm_max_input_tokens` before it reaches the guard, and the stages run
+sequentially through the same admitted provider.
+
+The opt-in is fail-closed at config load: it requires `llm_max_input_tokens`
+(a positive tokenized ceiling) and a readable `llm_tokenizer_path`, and the
+target must not exceed the ceiling. With `chunk_input_tokens = 0` (the
+default) the single-prompt pipeline is unchanged.
+
+Each stage result is checkpointed durably, keyed by a content-derived
+fingerprint (prompt version, model, and the stage's exact input — never
+timestamps). A crashed or restarted run resumes from the checkpoints: stages
+whose fingerprint still matches are reused, only stale or missing blocks are
+re-run, and a new observation re-runs only the block that contains it —
+including a clock rollback, because no reuse decision reads `created_at`.
+A map checkpoint alone never proves publication: when the session's wiki
+page already exists and carries this session's id, the run reconciles the
+already-published state without a new commit, revision, supersession, or LLM
+call, then prunes its checkpoints. One consolidation run uses one logical
+operation id across every stage, retry, and replay (carried as `X-Request-Id`
+on the `openai-compat` path), so the whole run is one correlated stream on
+the provider side. Map and reduce output is validated at ingestion: any
+hallucinated observation id, empty grounding, or out-of-range confidence
+fails the run closed rather than being written.
+
 Every chat provider bounds each completion request at 300 seconds
 (`AI_MEMORY_LLM_TIMEOUT_SECS` to override, or `llm_timeout_secs = 900` in
 config.toml; the quick openai-oauth token refresh keeps the default ceiling).

@@ -5,23 +5,27 @@
 //! [`Wiki::write_page`] so the supersession chain + git auto-commit
 //! kicks in automatically.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
+use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
 use ai_memory_core::{AgentKind, Observation, PagePath, ProjectId, SessionId, Tier, WorkspaceId};
 use ai_memory_llm::{
-    ChatMessage, ChatRequest, LlmError, LlmProvider, Role, complete_structured_with_operation_id,
+    ChatMessage, ChatRequest, LlmError, LlmOperationId, LlmProvider, Role,
+    admission::ChatTokenCounter, complete_structured_with_operation_id,
 };
 use ai_memory_store::{ReaderPool, WriterHandle};
 use ai_memory_wiki::{AdmissionContext, AdmissionOp, Wiki, WritePageRequest};
+use sha2::{Digest, Sha256};
 use thiserror::Error;
 use tracing::{debug, info, warn};
 
 use crate::path_sanitize::slugify_page_path;
 use crate::projection::{ObservationProjectionConfig, project_observations};
 use crate::types::{
-    ConsolidatedBatch, ConsolidatedPage, ConsolidationOutcome, Relations, SlotKind,
+    ConsolidatedBatch, ConsolidatedPage, ConsolidationOutcome, EvidenceExtraction,
+    ExtractionResult, Relations, SlotKind,
 };
 
 /// Errors raised by the consolidator.
@@ -55,6 +59,26 @@ pub enum ConsolidatorError {
     /// Session had no observations to consolidate.
     #[error("session {0} has no observations")]
     EmptySession(SessionId),
+
+    /// A map/reduce stage returned output that is not grounded in the
+    /// observations it was given (hallucinated observation id, empty
+    /// grounding, empty title/body, or out-of-range confidence). Fail
+    /// closed: ungrounded evidence must never reach a page.
+    #[error("consolidation stage returned ungrounded extractions: {0}")]
+    UngroundedExtractions(String),
+
+    /// A map/reduce stage did not account for every observation id in its
+    /// input: an id is neither cited by an extraction nor listed in
+    /// `no_durable_fact_ids` (or the reverse list names a foreign id).
+    /// Fail closed: a silent drop would lose evidence without a trace.
+    #[error("consolidation stage left input observation ids unaccounted: {0}")]
+    IncompleteCoverage(String),
+
+    /// A single map block or reduce group still exceeds the token ceiling
+    /// on its own — the configured budget cannot carry this content, and
+    /// silently truncating it would lose evidence. Fail closed.
+    #[error("consolidation chunk does not fit the configured token ceiling")]
+    ChunkDoesNotFit,
 }
 
 impl From<serde_json::Error> for ConsolidatorError {
@@ -122,6 +146,9 @@ pub struct Consolidator {
     per_user_slots: bool,
     /// Prompt input/output limits derived from `[consolidation]`.
     budgets: PromptBudgets,
+    /// Opt-in map-reduce chunking (`[consolidation] chunk_input_tokens > 0`);
+    /// `None` keeps the single-prompt pipeline.
+    chunking: Option<ChunkingConfig>,
 }
 
 impl Consolidator {
@@ -145,6 +172,7 @@ impl Consolidator {
             project_id,
             per_user_slots: false,
             budgets: PromptBudgets::default(),
+            chunking: None,
         }
     }
 
@@ -167,6 +195,55 @@ impl Consolidator {
     pub fn with_per_user_slots(mut self, enabled: bool) -> Self {
         self.per_user_slots = enabled;
         self
+    }
+
+    /// Enable opt-in map-reduce chunking (`[consolidation] chunk_input_tokens`
+    /// above zero).
+    ///
+    /// The active mode requires a configured `llm_max_input_tokens` ceiling
+    /// and a readable tokenizer file — `Config` validation already refuses
+    /// to start a server without them, and this builder refuses the same
+    /// misconfiguration for off-tree callers. `chunk_input_tokens == 0`
+    /// (the default) returns the consolidator unchanged: the single-prompt
+    /// pipeline is the zero-LLM-budget default path.
+    ///
+    /// # Errors
+    /// Returns a configuration [`ConsolidatorError::Llm`] when the mode is
+    /// active but the ceiling or tokenizer is missing or unreadable.
+    pub fn with_chunking(
+        self,
+        chunk_input_tokens: usize,
+        ceiling_tokens: Option<usize>,
+        tokenizer_path: Option<&Path>,
+    ) -> ConsolidatorResult<Self> {
+        if chunk_input_tokens == 0 {
+            return Ok(self);
+        }
+        let Some(ceiling) = ceiling_tokens.filter(|c| *c > 0) else {
+            return Err(ConsolidatorError::Llm(LlmError::NotConfigured(
+                "consolidation.chunk_input_tokens requires llm_max_input_tokens".into(),
+            )));
+        };
+        let Some(path) = tokenizer_path else {
+            return Err(ConsolidatorError::Llm(LlmError::NotConfigured(
+                "consolidation.chunk_input_tokens requires llm_tokenizer_path".into(),
+            )));
+        };
+        if chunk_input_tokens > ceiling {
+            return Err(ConsolidatorError::Llm(LlmError::NotConfigured(
+                "consolidation.chunk_input_tokens cannot exceed llm_max_input_tokens".into(),
+            )));
+        }
+        let counter = ChatTokenCounter::load(path)?;
+        Ok(Self {
+            chunking: Some(ChunkingConfig {
+                target_tokens: chunk_input_tokens,
+                ceiling_tokens: ceiling,
+                counter,
+                model: self.llm.model().to_string(),
+            }),
+            ..self
+        })
     }
 
     /// Consolidate a single session into a refreshed
@@ -225,6 +302,27 @@ impl Consolidator {
         let existing_titles = self
             .existing_page_titles(ws, proj, &actor, session_id)
             .await;
+        // Opt-in map-reduce pipeline (see `ChunkedRun`): the observation log
+        // is reduced through sequential, checkpointed map/reduce stages
+        // before the final single-page prompt. The single-prompt pipeline
+        // below is byte-for-byte unchanged when chunking is off.
+        if self.chunking.is_some() {
+            return self
+                .consolidate_session_chunked(
+                    session_id,
+                    path,
+                    ws,
+                    proj,
+                    agent_kind,
+                    actor,
+                    author_id,
+                    observations,
+                    &current_body,
+                    instructions.as_deref(),
+                    &existing_titles,
+                )
+                .await;
+        }
         let request = build_request(
             session_id,
             &observations,
@@ -239,13 +337,44 @@ impl Consolidator {
             model = self.llm.model(),
             "consolidating session"
         );
-        let mut page: ConsolidatedPage = complete_structured_with_retry(
+        let page: ConsolidatedPage = complete_structured_with_retry(
             &*self.llm,
             request,
             session_id.into(),
             CONSOLIDATION_LLM_RETRY_DELAY,
         )
         .await?;
+        self.apply_single_page(
+            ws,
+            proj,
+            session_id,
+            agent_kind,
+            &path,
+            actor,
+            author_id,
+            page,
+            &existing_titles,
+        )
+        .await
+    }
+
+    /// Write one consolidated single-page result: title-disambiguate, stamp
+    /// the session origin, admit, write, and auto-commit. Shared by the
+    /// single-prompt pipeline and the map-reduce pipeline so both publish
+    /// identically (same stamp, same evidence link, same commit).
+    #[allow(clippy::too_many_arguments)]
+    async fn apply_single_page(
+        &self,
+        ws: WorkspaceId,
+        proj: ProjectId,
+        session_id: SessionId,
+        agent_kind: AgentKind,
+        path: &PagePath,
+        actor: ai_memory_core::ActorContext,
+        author_id: Option<ai_memory_core::UserId>,
+        mut page: ConsolidatedPage,
+        existing_titles: &[String],
+    ) -> ConsolidatorResult<ConsolidationOutcome> {
         // Deterministic backstop for the title-uniqueness prompt rule:
         // identical harness runs produce near-identical observations, and
         // the LLM can still return the same generic title an existing
@@ -254,7 +383,7 @@ impl Consolidator {
         if let Some((new_title, new_body)) = disambiguate_colliding_session_title(
             &page.title,
             &page.body_markdown,
-            &existing_titles,
+            existing_titles,
             session_id,
         ) {
             page.body_markdown = new_body;
@@ -304,7 +433,7 @@ impl Consolidator {
             "session consolidated via LLM",
         );
         Ok(ConsolidationOutcome {
-            path,
+            path: path.clone(),
             dry_run: false,
             new_title: page.title,
             new_body_markdown: page.body_markdown,
@@ -616,6 +745,25 @@ impl Consolidator {
             }]);
         }
 
+        // Opt-in map-reduce pipeline (see `ChunkedRun`): reconcile an
+        // already-published wiki first, then run the checkpointed stages.
+        // The single-prompt pipeline below is byte-for-byte unchanged when
+        // chunking is off.
+        if self.chunking.is_some() {
+            return self
+                .consolidate_session_multi_chunked(
+                    session_id,
+                    ws,
+                    proj,
+                    agent_kind,
+                    actor,
+                    author_id,
+                    instructions,
+                    observations,
+                )
+                .await;
+        }
+
         // Two independent prompt boundaries feed this one request: slot
         // bodies are narrowed to what `actor` may see, and the project's
         // standing preferences ride along as untrusted advisory data.
@@ -644,7 +792,36 @@ impl Consolidator {
             CONSOLIDATION_LLM_RETRY_DELAY,
         )
         .await?;
+        self.apply_batch_pages(
+            ws,
+            proj,
+            session_id,
+            agent_kind,
+            actor,
+            author_id,
+            batch,
+            &existing_titles,
+        )
+        .await
+    }
 
+    /// Write one multi-page consolidation batch: run every model-chosen
+    /// update through the slot/pin/portability guards, then apply them all
+    /// atomically and auto-commit. Shared by the single-prompt pipeline and
+    /// the map-reduce pipeline so both publish identically.
+    #[allow(clippy::too_many_arguments)]
+    async fn apply_batch_pages(
+        &self,
+        ws: WorkspaceId,
+        proj: ProjectId,
+        session_id: SessionId,
+        agent_kind: AgentKind,
+        actor: ai_memory_core::ActorContext,
+        author_id: Option<ai_memory_core::UserId>,
+        batch: ConsolidatedBatch,
+        existing_titles: &[String],
+    ) -> ConsolidatorResult<Vec<ConsolidationOutcome>> {
+        let anchor = PagePath::new(format!("sessions/{session_id}.md"))?;
         // `dry_run` is always false past the early return above, so every
         // update here is a real write.
         let mut requests = Vec::with_capacity(batch.updates.len());
@@ -655,7 +832,7 @@ impl Consolidator {
                 stamp_session_origin(&mut req.frontmatter, session_id, agent_kind);
                 // Deterministic backstop for the title-uniqueness prompt
                 // rule — see the matching block in `consolidate_session`.
-                disambiguate_anchor_title(&mut req, &mut outcome, &existing_titles, session_id);
+                disambiguate_anchor_title(&mut req, &mut outcome, existing_titles, session_id);
             }
             req.evidence = vec![ai_memory_core::PageEvidence {
                 kind: ai_memory_core::PageEvidenceKind::Session,
@@ -772,6 +949,1410 @@ impl Consolidator {
             .collect();
         Ok(outcomes)
     }
+
+    // ────────────────────────────────────────────────────────────────────
+    // Opt-in map-reduce consolidation (`[consolidation] chunk_input_tokens`
+    // > 0): the observation log is reduced through sequential, checkpointed
+    // stages — map (typed evidence extraction per token-sized block, grounded
+    // in observation ids) → hierarchical reduce (merge) → final (the normal
+    // single-page or multi-page prompt, fed the evidence digest instead of
+    // the raw dump). Every call is sequential, goes through the same
+    // admitted provider as the single-prompt pipeline, is sized with the
+    // guard's own tokenizer, and carries one operation id per run.
+    // ────────────────────────────────────────────────────────────────────
+
+    /// Reconcile an already-published wiki before touching checkpoints: if
+    /// the session's anchor page exists and carries this session's origin
+    /// stamp, the publication is proven by the wiki itself (a checkpoint
+    /// row alone never is) — prune the checkpoints (the crash-after-publish
+    /// case) and report the existing page. Returns `None` when the session
+    /// page is not yet published.
+    async fn chunked_reconcile_published(
+        &self,
+        run: &ChunkedRun,
+    ) -> ConsolidatorResult<Option<(String, String)>> {
+        let anchor = PagePath::new(format!("sessions/{}.md", run.session))?;
+        let md = match self.wiki.read_page(run.ws, run.proj, &anchor) {
+            Ok(md) => md,
+            Err(ai_memory_wiki::WikiError::Io(err))
+                if err.kind() == std::io::ErrorKind::NotFound =>
+            {
+                return Ok(None);
+            }
+            Err(err) => return Err(err.into()),
+        };
+        let stamped = md
+            .frontmatter
+            .get("session_id")
+            .and_then(|v| v.as_str())
+            .is_some_and(|s| s == run.session.to_string().as_str());
+        if !stamped {
+            return Ok(None);
+        }
+        if let Err(err) = self
+            .writer
+            .clear_consolidation_chunks(run.ws, run.proj, run.session)
+            .await
+        {
+            warn!(
+                session = %run.session,
+                error = %err,
+                "failed to prune consolidation checkpoints during publish reconcile; the next run reconciles again"
+            );
+        } else {
+            debug!(session = %run.session, "pruned consolidation checkpoints during publish reconcile");
+        }
+        let title = md
+            .frontmatter
+            .get("title")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_string();
+        Ok(Some((title, md.body)))
+    }
+
+    /// Load the run's checkpoint rows into a fingerprint → payload map.
+    async fn chunked_load_checkpoints(
+        &self,
+        run: &ChunkedRun,
+    ) -> ConsolidatorResult<HashMap<String, String>> {
+        let rows = self
+            .writer
+            .load_consolidation_chunks(run.ws, run.proj, run.session)
+            .await?;
+        Ok(rows
+            .into_iter()
+            .map(|r| (r.chunk_fingerprint, r.extraction_json))
+            .collect())
+    }
+
+    /// Run the map phase: every block whose checkpoint fingerprint matches
+    /// is reused verbatim; every other block gets exactly one (retried) LLM
+    /// call whose validated output is checkpointed before the next block.
+    async fn chunked_map_extractions(
+        &self,
+        run: &ChunkedRun,
+    ) -> ConsolidatorResult<Vec<EvidenceExtraction>> {
+        let Some(cfg) = &self.chunking else {
+            return Err(ConsolidatorError::Llm(LlmError::NotConfigured(
+                "map-reduce phase called without chunking configured".into(),
+            )));
+        };
+        let blocks = plan_map_blocks(run.session, &run.observations, cfg)?;
+        let checkpoints = self.chunked_load_checkpoints(run).await?;
+        let mut all: Vec<EvidenceExtraction> = Vec::new();
+        for (idx, block) in blocks.iter().enumerate() {
+            let chunk_no = idx + 1;
+            let allowed: HashSet<String> = block.allowed_ids.iter().cloned().collect();
+            if let Some(json) = checkpoints.get(&block.fingerprint) {
+                let result: ExtractionResult = serde_json::from_str(json).map_err(|e| {
+                    ConsolidatorError::Serde(format!(
+                        "unreadable map checkpoint for block {chunk_no}: {e}"
+                    ))
+                })?;
+                validate_extraction_result(&result, &allowed)?;
+                debug!(
+                    session = %run.session,
+                    chunk = chunk_no,
+                    total = blocks.len(),
+                    extractions = result.extractions.len(),
+                    "map block reused from durable checkpoint"
+                );
+                all.extend(result.extractions);
+                continue;
+            }
+            let request = build_map_request(run.session, &block.parts, chunk_no, blocks.len());
+            info!(
+                session = %run.session,
+                operation_id = %run.operation_id,
+                stage = "map",
+                chunk = chunk_no,
+                total = blocks.len(),
+                "map-reduce map call starting"
+            );
+            let result: ExtractionResult = complete_structured_with_retry(
+                &*self.llm,
+                request,
+                run.operation_id,
+                CONSOLIDATION_LLM_RETRY_DELAY,
+            )
+            .await?;
+            validate_extraction_result(&result, &allowed)?;
+            let json = serde_json::to_string(&result)?;
+            self.writer
+                .record_consolidation_chunk(
+                    run.ws,
+                    run.proj,
+                    run.session,
+                    block.fingerprint.clone(),
+                    json,
+                )
+                .await?;
+            all.extend(result.extractions);
+        }
+        Ok(all)
+    }
+
+    /// Run the hierarchical reduce: while the evidence list still exceeds
+    /// the chunk budget, group the extractions (sized by the shared
+    /// counter) and merge each group — one checkpointed LLM call per group,
+    /// sequential, depth by depth — until a single reduce fits. A group
+    /// that already fits at depth 1 with one group is the "no reduce
+    /// needed" case: the list is returned as-is.
+    /// Merge the map's extractions until the FINAL stage's request fits the
+    /// admission ceiling — not merely one reduce request. The final request
+    /// is the one the guard admits and the one that carries the digest, so
+    /// it is the stop condition; a single reduce request fitting is not
+    /// enough. One depth per loop pass, every group checkpointed; a list
+    /// that cannot shrink any further (one extraction, digest still over
+    /// the ceiling) fails closed.
+    async fn chunked_reduce_extractions(
+        &self,
+        run: &ChunkedRun,
+        mut extractions: Vec<EvidenceExtraction>,
+        ctx: &ReduceFinalContext<'_>,
+    ) -> ConsolidatorResult<Vec<EvidenceExtraction>> {
+        let Some(cfg) = &self.chunking else {
+            return Err(ConsolidatorError::Llm(LlmError::NotConfigured(
+                "map-reduce phase called without chunking configured".into(),
+            )));
+        };
+        let checkpoints = self.chunked_load_checkpoints(run).await?;
+        let mut depth = 0usize;
+        loop {
+            if self.final_request_fits(cfg, run.session, &extractions, ctx)? {
+                return Ok(extractions);
+            }
+            if extractions.len() < 2 {
+                // One extraction whose digest still overflows the final
+                // ceiling: nothing left to merge — fail closed rather than
+                // loop or publish over the cap.
+                return Err(ConsolidatorError::ChunkDoesNotFit);
+            }
+            depth += 1;
+            if depth > MAX_REDUCE_DEPTH {
+                return Err(ConsolidatorError::ChunkDoesNotFit);
+            }
+            let groups = plan_reduce_groups(run.session, &extractions, cfg)?;
+            let mut merged: Vec<EvidenceExtraction> = Vec::new();
+            for (idx, group) in groups.iter().enumerate() {
+                let group_no = idx + 1;
+                let group_extractions: Vec<EvidenceExtraction> =
+                    group.iter().map(|i| extractions[*i].clone()).collect();
+                let fingerprint = reduce_group_fingerprint(
+                    cfg,
+                    depth,
+                    group_no,
+                    groups.len(),
+                    &group_extractions,
+                );
+                let allowed: HashSet<String> = group_extractions
+                    .iter()
+                    .flat_map(|ex| ex.observation_ids.iter())
+                    .cloned()
+                    .collect();
+                if let Some(json) = checkpoints.get(&fingerprint) {
+                    let result: ExtractionResult = serde_json::from_str(json).map_err(|e| {
+                        ConsolidatorError::Serde(format!(
+                            "unreadable reduce checkpoint at depth {depth} group {group_no}: {e}"
+                        ))
+                    })?;
+                    validate_extraction_result(&result, &allowed)?;
+                    debug!(
+                        session = %run.session,
+                        stage = "reduce",
+                        depth,
+                        group = group_no,
+                        total = groups.len(),
+                        "reduce group reused from durable checkpoint"
+                    );
+                    merged.extend(result.extractions);
+                    continue;
+                }
+                let request = build_reduce_request(
+                    run.session,
+                    depth,
+                    group_no,
+                    groups.len(),
+                    &group_extractions,
+                );
+                info!(
+                    session = %run.session,
+                    operation_id = %run.operation_id,
+                    stage = "reduce",
+                    depth,
+                    group = group_no,
+                    total = groups.len(),
+                    "map-reduce reduce call starting"
+                );
+                let result: ExtractionResult = complete_structured_with_retry(
+                    &*self.llm,
+                    request,
+                    run.operation_id,
+                    CONSOLIDATION_LLM_RETRY_DELAY,
+                )
+                .await?;
+                validate_extraction_result(&result, &allowed)?;
+                let json = serde_json::to_string(&result)?;
+                self.writer
+                    .record_consolidation_chunk(run.ws, run.proj, run.session, fingerprint, json)
+                    .await?;
+                merged.extend(result.extractions);
+            }
+            extractions = merged;
+        }
+    }
+
+    /// Count the final-stage request exactly as the final call builds it and
+    /// report whether it fits the admission ceiling. This is the reduce
+    /// loop's stop condition: the final request is what the guard admits.
+    fn final_request_fits(
+        &self,
+        cfg: &ChunkingConfig,
+        session: SessionId,
+        extractions: &[EvidenceExtraction],
+        ctx: &ReduceFinalContext<'_>,
+    ) -> ConsolidatorResult<bool> {
+        match ctx {
+            ReduceFinalContext::Single {
+                current_body,
+                instructions,
+                titles,
+            } => {
+                let request = build_final_request_single(
+                    session,
+                    extractions,
+                    current_body,
+                    *instructions,
+                    self.budgets,
+                    titles,
+                );
+                let tokens = cfg
+                    .counter
+                    .count_request(&request, schema_value::<ConsolidatedPage>().as_ref())
+                    .map_err(ConsolidatorError::Llm)?;
+                Ok(tokens <= cfg.ceiling_tokens)
+            }
+            ReduceFinalContext::Batch {
+                slots,
+                instructions,
+                titles,
+            } => {
+                let request = build_final_request_batch(
+                    session,
+                    extractions,
+                    slots,
+                    *instructions,
+                    self.budgets,
+                    titles,
+                );
+                let tokens = cfg
+                    .counter
+                    .count_request(&request, schema_value::<ConsolidatedBatch>().as_ref())
+                    .map_err(ConsolidatorError::Llm)?;
+                Ok(tokens <= cfg.ceiling_tokens)
+            }
+        }
+    }
+
+    /// Run the final stage for the single-page pipeline: the evidence digest
+    /// replaces the raw observation dump in the prompt. One checkpointed
+    /// LLM call; a matching checkpoint is reused without a call.
+    async fn chunked_final_single(
+        &self,
+        run: &ChunkedRun,
+        extractions: &[EvidenceExtraction],
+        current_body: &str,
+        instructions: Option<&str>,
+        existing_titles: &[String],
+    ) -> ConsolidatorResult<ConsolidatedPage> {
+        let Some(cfg) = &self.chunking else {
+            return Err(ConsolidatorError::Llm(LlmError::NotConfigured(
+                "map-reduce phase called without chunking configured".into(),
+            )));
+        };
+        let extra = serde_json::json!({
+            "current_body": current_body,
+            "instructions": instructions,
+            "titles": existing_titles,
+            "budgets": format!("{:?}", self.budgets),
+        });
+        let fingerprint = final_stage_fingerprint(cfg, "single", extractions, &extra);
+        let checkpoints = self.chunked_load_checkpoints(run).await?;
+        if let Some(json) = checkpoints.get(&fingerprint) {
+            let page: ConsolidatedPage = serde_json::from_str(json).map_err(|e| {
+                ConsolidatorError::Serde(format!("unreadable final checkpoint: {e}"))
+            })?;
+            debug!(session = %run.session, stage = "final", "final single-page stage reused from durable checkpoint");
+            return Ok(page);
+        }
+        let request = build_final_request_single(
+            run.session,
+            extractions,
+            current_body,
+            instructions,
+            self.budgets,
+            existing_titles,
+        );
+        info!(
+            session = %run.session,
+            operation_id = %run.operation_id,
+            stage = "final",
+            mode = "single",
+            evidence = extractions.len(),
+            "map-reduce final call starting"
+        );
+        let page: ConsolidatedPage = complete_structured_with_retry(
+            &*self.llm,
+            request,
+            run.operation_id,
+            CONSOLIDATION_LLM_RETRY_DELAY,
+        )
+        .await?;
+        let json = serde_json::to_string(&page)?;
+        self.writer
+            .record_consolidation_chunk(run.ws, run.proj, run.session, fingerprint, json)
+            .await?;
+        Ok(page)
+    }
+
+    /// Run the final stage for the multi-page pipeline: the evidence digest
+    /// replaces the raw observation dump; slots, instructions and titles
+    /// ride along exactly as in the single-prompt batch request.
+    async fn chunked_final_batch(
+        &self,
+        run: &ChunkedRun,
+        extractions: &[EvidenceExtraction],
+        slots: &[SlotSnapshot],
+        instructions: Option<&str>,
+        existing_titles: &[String],
+    ) -> ConsolidatorResult<ConsolidatedBatch> {
+        let Some(cfg) = &self.chunking else {
+            return Err(ConsolidatorError::Llm(LlmError::NotConfigured(
+                "map-reduce phase called without chunking configured".into(),
+            )));
+        };
+        let slot_lines: Vec<String> = slots
+            .iter()
+            .map(|s| format!("{}|{}|{}", s.path, s.slot_kind.as_str(), s.title))
+            .collect();
+        let extra = serde_json::json!({
+            "slots": slot_lines,
+            "instructions": instructions,
+            "titles": existing_titles,
+            "budgets": format!("{:?}", self.budgets),
+        });
+        let fingerprint = final_stage_fingerprint(cfg, "batch", extractions, &extra);
+        let checkpoints = self.chunked_load_checkpoints(run).await?;
+        if let Some(json) = checkpoints.get(&fingerprint) {
+            let batch: ConsolidatedBatch = serde_json::from_str(json).map_err(|e| {
+                ConsolidatorError::Serde(format!("unreadable final checkpoint: {e}"))
+            })?;
+            debug!(session = %run.session, stage = "final", "final batch stage reused from durable checkpoint");
+            return Ok(batch);
+        }
+        let request = build_final_request_batch(
+            run.session,
+            extractions,
+            slots,
+            instructions,
+            self.budgets,
+            existing_titles,
+        );
+        info!(
+            session = %run.session,
+            operation_id = %run.operation_id,
+            stage = "final",
+            mode = "batch",
+            evidence = extractions.len(),
+            "map-reduce final call starting"
+        );
+        let batch: ConsolidatedBatch = complete_structured_with_retry(
+            &*self.llm,
+            request,
+            run.operation_id,
+            CONSOLIDATION_LLM_RETRY_DELAY,
+        )
+        .await?;
+        let json = serde_json::to_string(&batch)?;
+        self.writer
+            .record_consolidation_chunk(run.ws, run.proj, run.session, fingerprint, json)
+            .await?;
+        Ok(batch)
+    }
+
+    /// Prune the run's checkpoints after a successful publish. A prune
+    /// failure is non-fatal: the next run's publish reconcile prunes
+    /// instead, and the published wiki is never at risk from a leftover row.
+    async fn chunked_prune(&self, run: &ChunkedRun) {
+        if let Err(err) = self
+            .writer
+            .clear_consolidation_chunks(run.ws, run.proj, run.session)
+            .await
+        {
+            warn!(
+                session = %run.session,
+                error = %err,
+                "failed to prune consolidation checkpoints after publish; the next run's publish reconcile prunes them"
+            );
+        } else {
+            debug!(session = %run.session, "pruned consolidation checkpoints after publish");
+        }
+    }
+
+    /// The map-reduce pipeline for the single-page entry: reconcile a prior
+    /// publication, then map → reduce → final → publish → prune.
+    #[allow(clippy::too_many_arguments)]
+    async fn consolidate_session_chunked(
+        &self,
+        session_id: SessionId,
+        path: PagePath,
+        ws: WorkspaceId,
+        proj: ProjectId,
+        agent_kind: AgentKind,
+        actor: ai_memory_core::ActorContext,
+        author_id: Option<ai_memory_core::UserId>,
+        observations: Vec<Observation>,
+        current_body: &str,
+        instructions: Option<&str>,
+        existing_titles: &[String],
+    ) -> ConsolidatorResult<ConsolidationOutcome> {
+        let run = ChunkedRun {
+            ws,
+            proj,
+            session: session_id,
+            actor,
+            observations,
+            operation_id: session_id.into(),
+        };
+        if let Some((title, body)) = self.chunked_reconcile_published(&run).await? {
+            info!(
+                session = %session_id,
+                "map-reduce reconcile: the session page is already published; skipping the pipeline and pruning its checkpoints"
+            );
+            return Ok(ConsolidationOutcome {
+                path,
+                dry_run: false,
+                new_title: title,
+                new_body_markdown: body,
+                page_id: None,
+                tags: Vec::new(),
+            });
+        }
+        let extractions = self.chunked_map_extractions(&run).await?;
+        let ctx = ReduceFinalContext::Single {
+            current_body,
+            instructions,
+            titles: existing_titles,
+        };
+        let extractions = self
+            .chunked_reduce_extractions(&run, extractions, &ctx)
+            .await?;
+        let page = self
+            .chunked_final_single(
+                &run,
+                &extractions,
+                current_body,
+                instructions,
+                existing_titles,
+            )
+            .await?;
+        let outcome = self
+            .apply_single_page(
+                ws,
+                proj,
+                session_id,
+                agent_kind,
+                &path,
+                run.actor.clone(),
+                author_id,
+                page,
+                existing_titles,
+            )
+            .await?;
+        self.chunked_prune(&run).await;
+        Ok(outcome)
+    }
+
+    /// The map-reduce pipeline for the multi-page entry: reconcile a prior
+    /// publication, then map → reduce → final → publish → prune.
+    #[allow(clippy::too_many_arguments)]
+    async fn consolidate_session_multi_chunked(
+        &self,
+        session_id: SessionId,
+        ws: WorkspaceId,
+        proj: ProjectId,
+        agent_kind: AgentKind,
+        actor: ai_memory_core::ActorContext,
+        author_id: Option<ai_memory_core::UserId>,
+        instructions: Option<&str>,
+        observations: Vec<Observation>,
+    ) -> ConsolidatorResult<Vec<ConsolidationOutcome>> {
+        let run = ChunkedRun {
+            ws,
+            proj,
+            session: session_id,
+            actor,
+            observations,
+            operation_id: session_id.into(),
+        };
+        if self.chunked_reconcile_published(&run).await?.is_some() {
+            info!(
+                session = %session_id,
+                "map-reduce reconcile: the session page is already published; skipping the pipeline and pruning its checkpoints"
+            );
+            return Ok(Vec::new());
+        }
+        let extractions = self.chunked_map_extractions(&run).await?;
+        // Two independent prompt boundaries feed the final request (see the
+        // single-prompt batch path): slot bodies are narrowed to what
+        // `actor` may see, and the project's standing preferences ride
+        // along as untrusted advisory data. Resolved before the reduce so
+        // the final-fit stop condition counts the same request the final
+        // call will send.
+        let slots = self.slot_snapshots(ws, proj, &run.actor).await?;
+        let instructions = self.resolve_instructions(ws, proj, instructions).await;
+        let existing_titles = self
+            .existing_page_titles(ws, proj, &run.actor, session_id)
+            .await;
+        let ctx = ReduceFinalContext::Batch {
+            slots: &slots,
+            instructions: instructions.as_deref(),
+            titles: &existing_titles,
+        };
+        let extractions = self
+            .chunked_reduce_extractions(&run, extractions, &ctx)
+            .await?;
+        let batch = self
+            .chunked_final_batch(
+                &run,
+                &extractions,
+                &slots,
+                instructions.as_deref(),
+                &existing_titles,
+            )
+            .await?;
+        let outcomes = self
+            .apply_batch_pages(
+                ws,
+                proj,
+                session_id,
+                agent_kind,
+                run.actor.clone(),
+                author_id,
+                batch,
+                &existing_titles,
+            )
+            .await?;
+        self.chunked_prune(&run).await;
+        Ok(outcomes)
+    }
+}
+
+/// Map-reduce consolidation configuration (opt-in via
+/// `[consolidation] chunk_input_tokens > 0`).
+///
+/// `target_tokens` is the content budget of one stage input (a map block,
+/// or one reduce group); `ceiling_tokens` is the hard admission ceiling
+/// every full request must fit. The fingerprint inputs (prompt versions,
+/// model, content) are chosen so a change of observations, relevant
+/// instructions, or model invalidates reuse — and a change of clock never
+/// does.
+struct ChunkingConfig {
+    /// Target token budget for one stage's content.
+    target_tokens: usize,
+    /// Hard ceiling every request must fit (the admission guard's cap).
+    ceiling_tokens: usize,
+    /// The model's tokenizer — the same file the guard loads.
+    counter: ChatTokenCounter,
+    /// Model name at configuration time; part of every fingerprint.
+    model: String,
+}
+
+/// The final-stage context the reduce loop counts against. The reduce
+/// stop condition is "the final request fits the ceiling", so it must
+/// count the same request the final call will send — including current
+/// body, slots, instructions, and titles — not an approximation.
+enum ReduceFinalContext<'a> {
+    Single {
+        current_body: &'a str,
+        instructions: Option<&'a str>,
+        titles: &'a [String],
+    },
+    Batch {
+        slots: &'a [SlotSnapshot],
+        instructions: Option<&'a str>,
+        titles: &'a [String],
+    },
+}
+
+/// One map-reduce consolidation run, in any of its resumable phases.
+///
+/// The public entries drive the phases in order; a crash between phases
+/// leaves the durable checkpoints behind, and the next run reuses every
+/// stage whose fingerprint still matches instead of re-paying for it.
+struct ChunkedRun {
+    /// Resolved target scope (where the session's observations landed).
+    ws: WorkspaceId,
+    proj: ProjectId,
+    session: SessionId,
+    actor: ai_memory_core::ActorContext,
+    observations: Vec<Observation>,
+    /// One logical operation: every map/reduce/final call — and every retry
+    /// and admission replay of each — carries this id, so one consolidation
+    /// run is one correlated request stream on the provider side.
+    operation_id: LlmOperationId,
+}
+
+/// One slice of one observation's sanitized text, each still naming its
+/// observation id. Splitting long bodies into parts keeps every map block
+/// bounded without ever losing the grounding identity.
+#[derive(Debug, Clone, serde::Serialize)]
+struct ChunkPart {
+    /// The observation id this part belongs to.
+    observation_id: String,
+    /// 1-based position of this part within its observation's parts.
+    part_index: u32,
+    /// How many parts the observation was split into.
+    part_total: u32,
+    /// The sanitized text the map prompt receives for this part.
+    text: String,
+}
+
+/// A planned map block: the parts it carries, the observation ids the map
+/// call is allowed to ground in, and its durable fingerprint.
+struct MapBlock {
+    fingerprint: String,
+    parts: Vec<ChunkPart>,
+    allowed_ids: Vec<String>,
+}
+
+/// Prompt/schema version baked into every map fingerprint: bumping it
+/// invalidates every cached block (a prompt change means old extractions
+/// were produced under a different contract).
+const MAP_PROMPT_VERSION: u32 = 1;
+const REDUCE_PROMPT_VERSION: u32 = 1;
+const FINAL_PROMPT_VERSION: u32 = 1;
+
+/// Largest observation-body part: longer bodies split into several parts,
+/// each repeating the observation header so a part alone still names its
+/// origin. Sized so a handful of parts fit one small map block.
+const MAX_CHUNK_PART_CHARS: usize = 12_000;
+/// Ceiling on extractions per stage — matches the `max_items` on
+/// [`ExtractionResult::extractions`]; enforced again at validation because
+/// the schema alone is not the boundary.
+const MAX_EXTRACTIONS_PER_STAGE: usize = 10;
+/// Safety bound on the hierarchical reduce: a model that refuses to merge
+/// small enough must not loop forever; failing closed beats an unbounded
+/// prompt.
+const MAX_REDUCE_DEPTH: usize = 8;
+/// Per-extraction body cap when rendering the evidence digest into reduce
+/// and final prompts: the digest is already reduced, so each entry stays
+/// short and bounded.
+const MAX_EXTRACTION_RENDER_BODY_CHARS: usize = 2_000;
+/// Output allowances for the small-stage calls (map / reduce). The final
+/// stage keeps the configured `max_output_tokens`.
+const MAP_MAX_OUTPUT_TOKENS: u32 = 8_192;
+const REDUCE_MAX_OUTPUT_TOKENS: u32 = 8_192;
+
+/// System prompt for the map stage: typed evidence extraction grounded in
+/// the chunk's observation ids. Inline (not a prompt file) so the version
+/// constant and the prompt evolve in one place.
+const MAP_SYSTEM_PROMPT: &str = "You are the map stage of a map-reduce wiki consolidation. You receive one chunk of a session's observation log, and each observation is labelled with its id. Extract typed, grounded evidence from the chunk:\n\n- Every extraction MUST cite the observation ids it is based on, taken from the `id:` lines of the observations you were given. Never invent or alter an id, and never ground an extraction in an id you were not given.\n- Produce at most 10 extractions. Every observation id in the chunk must be ACCOUNTED FOR: either cited by an extraction or listed in `no_durable_fact_ids` (inspected, but it carries no durable fact). If the chunk is genuinely routine, zero extractions is allowed — `no_durable_fact_ids` must then cover every id in the chunk.\n- Classify each extraction: `decision` (chose X over Y), `gotcha` (failure mode / surprise), `rule` (durable convention), `procedure` (repeated workflow), `concept` (evergreen concept), or `fact` (episodic narrative / everything else).\n- Keep `title` short and specific, `summary` one plain sentence, and `body_markdown` a short note grounded ONLY in the given text — no invented detail.\n- Set `confidence` in [0, 1] for how strongly the chunk supports the extraction.\n\nReply with ONE JSON object matching the ExtractionResult schema and nothing else. No prose, no code fences; the first character must be `{` and the last `}`.";
+
+/// System prompt for the reduce stage: merge a group of map extractions
+/// while preserving every grounding id.
+const REDUCE_SYSTEM_PROMPT: &str = "You are the reduce stage of a map-reduce wiki consolidation. You receive evidence extractions produced by earlier map calls; each cites the observation ids it is grounded in. Merge the group:\n\n- Combine overlapping or duplicate extractions, and when you merge them UNION their `observation_ids` — never drop an id from a merged extraction.\n- When two extractions genuinely conflict, keep both grounded claims (with both id sets) rather than silently choosing a side.\n- Drop pure duplicates. Keep at most 10 extractions.\n- Every observation id present in the given extractions must stay accounted for: cited by a merged extraction, or listed in `no_durable_fact_ids` when the merge drops that evidence.\n- Never invent observation ids, and never add detail beyond the given summaries and bodies.\n- `confidence` is your confidence that the merged extraction is supported, in [0, 1].\n\nReply with ONE JSON object matching the ExtractionResult schema and nothing else. No prose, no code fences; the first character must be `{` and the last `}`.";
+
+/// SHA-256 hex of a content-derived fingerprint payload. Fingerprints are
+/// content-only (prompt versions, model, ids, sanitized text) — never
+/// timestamps — so a rolled-back clock cannot change which stages a resume
+/// reuses.
+fn sha256_hex(payload: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(payload.as_bytes());
+    format!("{:x}", hasher.finalize())
+}
+
+/// The JSON value of a stage's structured-output schema — exactly what the
+/// providers send and the admission guard counts.
+fn schema_value<T: schemars::JsonSchema>() -> Option<serde_json::Value> {
+    serde_json::to_value(schemars::schema_for!(T)).ok()
+}
+
+/// Split the session's observations into ordered map parts. The full
+/// sanitized body is preserved: every part repeats the observation header
+/// (id, kind, title, importance, created_at), and bodies longer than
+/// [`MAX_CHUNK_PART_CHARS`] split into several parts, each still carrying
+/// the observation id.
+fn plan_map_parts(observations: &[Observation]) -> Vec<ChunkPart> {
+    let mut parts = Vec::new();
+    for obs in observations {
+        let chars: Vec<char> = obs.body.chars().collect();
+        let body_chars = chars.len();
+        let part_total = body_chars.div_ceil(MAX_CHUNK_PART_CHARS).max(1) as u32;
+        for index in 1..=part_total {
+            let start = (index - 1) as usize * MAX_CHUNK_PART_CHARS;
+            let end_cap = (start + MAX_CHUNK_PART_CHARS).min(body_chars);
+            // Prefer cutting on a line or word boundary in the last 400
+            // chars (the LAST one, so the part fills its budget); a hard
+            // cut at the cap is the fallback.
+            let mut end = end_cap;
+            if end_cap < body_chars {
+                let lo = end_cap.saturating_sub(400).max(start + 1);
+                let mut boundary: Option<usize> = None;
+                for (offset, c) in chars[lo..end_cap].iter().enumerate() {
+                    if *c == '\n' || *c == ' ' {
+                        boundary = Some(lo + offset + 1);
+                    }
+                }
+                if let Some(b) = boundary {
+                    end = b;
+                }
+            }
+            let slice: String = chars[start..end].iter().collect();
+            let header = format!(
+                "--- observation {} (part {}/{} of this observation) ---\nkind: {}\ntitle: {}\nimportance: {}\ncreated_at: {}\nbody:\n",
+                obs.id,
+                index,
+                part_total,
+                obs.kind.as_str(),
+                obs.title,
+                obs.importance,
+                obs.created_at,
+            );
+            let mut text = header;
+            text.push_str(&slice);
+            text.push('\n');
+            parts.push(ChunkPart {
+                observation_id: obs.id.to_string(),
+                part_index: index,
+                part_total,
+                text,
+            });
+            if end >= body_chars {
+                break;
+            }
+        }
+    }
+    parts
+}
+
+/// Render the map request's user message for the given parts. The only
+/// content that varies per block is the part text itself, so the same
+/// framing feeds both the planner's token counting and the request that
+/// actually goes out.
+fn render_map_user(
+    session_id: SessionId,
+    chunk_no: usize,
+    total_chunks: usize,
+    parts: &[ChunkPart],
+) -> String {
+    let mut user = String::new();
+    user.push_str("Session id: ");
+    user.push_str(&session_id.to_string());
+    user.push_str(&format!(
+        "\nChunk {chunk_no}/{total_chunks} of this session's observations.\n\n"
+    ));
+    for part in parts {
+        user.push_str(&part.text);
+        user.push('\n');
+    }
+    user.push_str(
+        "\nGround every extraction in the observation ids above. Reply with ONE \
+         JSON object matching the ExtractionResult schema and nothing else.",
+    );
+    user
+}
+
+/// Build the map request for one block.
+fn build_map_request(
+    session_id: SessionId,
+    parts: &[ChunkPart],
+    chunk_no: usize,
+    total_chunks: usize,
+) -> ChatRequest {
+    ChatRequest {
+        system: Some(MAP_SYSTEM_PROMPT.into()),
+        messages: vec![ChatMessage {
+            role: Role::User,
+            content: render_map_user(session_id, chunk_no, total_chunks, parts),
+        }],
+        max_tokens: MAP_MAX_OUTPUT_TOKENS,
+        temperature: Some(0.2),
+    }
+}
+
+/// Count a map request with the shared counter (the guard's tokenizer and
+/// reserves).
+fn count_map_request(
+    cfg: &ChunkingConfig,
+    session_id: SessionId,
+    parts: &[ChunkPart],
+    chunk_no: usize,
+    total_chunks: usize,
+) -> ConsolidatorResult<usize> {
+    let request = build_map_request(session_id, parts, chunk_no, total_chunks);
+    cfg.counter
+        .count_request(&request, schema_value::<ExtractionResult>().as_ref())
+        .map_err(ConsolidatorError::Llm)
+}
+
+/// Pack the session's parts into map blocks. Each block's full request
+/// (system prompt, framing, parts, schema) is counted with the shared
+/// counter and must fit the admission ceiling; the greedy target keeps
+/// blocks near `target_tokens` so the reduce stage has something to work
+/// with. Deterministic: same observations → same blocks → same
+/// fingerprints.
+fn plan_map_blocks(
+    session_id: SessionId,
+    observations: &[Observation],
+    cfg: &ChunkingConfig,
+) -> ConsolidatorResult<Vec<MapBlock>> {
+    let parts = plan_map_parts(observations);
+    // Greedy by a char-based target (the crate's 3-chars-per-token
+    // reserve): `tokens ≤ chars`, so a block whose part chars stay under
+    // `target_tokens × 3` can never exceed the target by more than the
+    // framing overhead — and the ceiling split below fixes any remainder.
+    let target_chars = cfg.target_tokens.saturating_mul(CHARS_PER_TOKEN);
+    let mut blocks: Vec<Vec<ChunkPart>> = Vec::new();
+    let mut current: Vec<ChunkPart> = Vec::new();
+    let mut current_chars = 0usize;
+    for part in parts {
+        let part_chars = count_chars(&part.text);
+        if !current.is_empty() && current_chars.saturating_add(part_chars) > target_chars {
+            blocks.push(std::mem::take(&mut current));
+            current_chars = 0;
+        }
+        current.push(part);
+        current_chars = current_chars.saturating_add(part_chars);
+    }
+    if !current.is_empty() {
+        blocks.push(current);
+    }
+    let make_block = |parts: &Vec<ChunkPart>| MapBlock {
+        fingerprint: map_block_fingerprint(cfg, parts),
+        allowed_ids: parts.iter().map(|p| p.observation_id.clone()).collect(),
+        parts: parts.clone(),
+    };
+    let mut out: Vec<MapBlock> = Vec::new();
+    for block in blocks {
+        // Ceiling enforcement: halve until the full request fits the
+        // admission ceiling; a single part that cannot fit fails closed.
+        // The count uses the `usize::MAX` chunk framing on purpose: it is
+        // the worst case for the index digits, so any real index only
+        // makes the request smaller than what was checked. Every half is
+        // verified before it is emitted, and output order follows input
+        // order (the stack pops the first half first).
+        let mut stack: Vec<Vec<ChunkPart>> = vec![block];
+        while let Some(block) = stack.pop() {
+            if count_map_request(cfg, session_id, &block, usize::MAX, usize::MAX)?
+                <= cfg.ceiling_tokens
+            {
+                out.push(make_block(&block));
+                continue;
+            }
+            if block.len() == 1 {
+                return Err(ConsolidatorError::ChunkDoesNotFit);
+            }
+            let mid = block.len() / 2;
+            let mut first = block;
+            let second: Vec<ChunkPart> = first.drain(mid..).collect();
+            stack.push(second);
+            stack.push(first);
+        }
+    }
+    Ok(out)
+}
+
+/// Content-derived fingerprint for one map block: prompt version, model,
+/// and the block's observation ids + sanitized text.
+fn map_block_fingerprint(cfg: &ChunkingConfig, parts: &[ChunkPart]) -> String {
+    let payload = serde_json::json!({
+        "stage": format!("map-v{MAP_PROMPT_VERSION}"),
+        "model": cfg.model,
+        "parts": parts,
+    });
+    sha256_hex(&payload.to_string())
+}
+
+/// Render one extraction for the reduce/final evidence digest.
+fn render_one_extraction(ex: &EvidenceExtraction) -> String {
+    let mut out = String::new();
+    out.push_str(&format!(
+        "- kind={} confidence={} title={}\n",
+        ex.kind.as_str(),
+        ex.confidence,
+        one_line(&ex.title),
+    ));
+    out.push_str(&format!(
+        "  observation_ids: {}\n",
+        ex.observation_ids.join(", ")
+    ));
+    out.push_str(&format!("  summary: {}\n", one_line(&ex.summary)));
+    if !ex.tags.is_empty() {
+        out.push_str(&format!("  tags: {}\n", ex.tags.join(", ")));
+    }
+    out.push_str("  body:\n");
+    out.push_str(&clip_for_prompt(
+        &ex.body_markdown,
+        MAX_EXTRACTION_RENDER_BODY_CHARS,
+    ));
+    out.push('\n');
+    out
+}
+
+/// Render the evidence digest that replaces the raw observation dump in
+/// reduce and final prompts.
+fn render_extractions(extractions: &[EvidenceExtraction]) -> String {
+    if extractions.is_empty() {
+        return "(none)".to_string();
+    }
+    extractions.iter().map(render_one_extraction).collect()
+}
+
+/// Build the reduce request for one group at one depth.
+fn build_reduce_request(
+    session_id: SessionId,
+    depth: usize,
+    group_no: usize,
+    total_groups: usize,
+    extractions: &[EvidenceExtraction],
+) -> ChatRequest {
+    let mut user = String::new();
+    user.push_str("Session id: ");
+    user.push_str(&session_id.to_string());
+    user.push_str(&format!(
+        "\nReduce pass {depth}, group {group_no}/{total_groups} of the evidence extracted so far.\n\n"
+    ));
+    user.push_str(&render_extractions(extractions));
+    user.push_str(
+        "\nMerge this group per your instructions. Reply with ONE JSON object \
+         matching the ExtractionResult schema and nothing else.",
+    );
+    ChatRequest {
+        system: Some(REDUCE_SYSTEM_PROMPT.into()),
+        messages: vec![ChatMessage {
+            role: Role::User,
+            content: user,
+        }],
+        max_tokens: REDUCE_MAX_OUTPUT_TOKENS,
+        temperature: Some(0.2),
+    }
+}
+
+fn count_reduce_request(
+    cfg: &ChunkingConfig,
+    session_id: SessionId,
+    depth: usize,
+    group_no: usize,
+    total_groups: usize,
+    extractions: &[EvidenceExtraction],
+) -> ConsolidatorResult<usize> {
+    let request = build_reduce_request(session_id, depth, group_no, total_groups, extractions);
+    cfg.counter
+        .count_request(&request, schema_value::<ExtractionResult>().as_ref())
+        .map_err(ConsolidatorError::Llm)
+}
+
+/// Split the extraction list into reduce groups whose full reduce request
+/// fits the admission ceiling per the shared counter. A list that already
+/// fits is a single group — the caller skips the stage entirely. A single
+/// extraction that cannot fit fails closed.
+fn plan_reduce_groups(
+    session_id: SessionId,
+    extractions: &[EvidenceExtraction],
+    cfg: &ChunkingConfig,
+) -> ConsolidatorResult<Vec<Vec<usize>>> {
+    if extractions.is_empty() {
+        return Ok(Vec::new());
+    }
+    if count_reduce_request(
+        cfg,
+        session_id,
+        usize::MAX,
+        usize::MAX,
+        usize::MAX,
+        extractions,
+    )? <= cfg.target_tokens
+    {
+        return Ok(vec![(0..extractions.len()).collect()]);
+    }
+    let target_chars = cfg.target_tokens.saturating_mul(CHARS_PER_TOKEN);
+    let mut groups: Vec<Vec<usize>> = Vec::new();
+    let mut current: Vec<usize> = Vec::new();
+    let mut current_chars = 0usize;
+    for (i, ex) in extractions.iter().enumerate() {
+        let ex_chars = count_chars(&render_one_extraction(ex));
+        if !current.is_empty() && current_chars.saturating_add(ex_chars) > target_chars {
+            groups.push(std::mem::take(&mut current));
+            current_chars = 0;
+        }
+        current.push(i);
+        current_chars = current_chars.saturating_add(ex_chars);
+    }
+    if !current.is_empty() {
+        groups.push(current);
+    }
+    let mut out: Vec<Vec<usize>> = Vec::new();
+    for group in groups {
+        // Same worst-case framing as `plan_map_blocks`: count the
+        // `usize::MAX` depth/group digits so any real call only counts
+        // less than what was checked. Every half is verified before it is
+        // emitted, and output order follows input order (the stack pops
+        // the first half first).
+        let mut stack: Vec<Vec<usize>> = vec![group];
+        while let Some(group) = stack.pop() {
+            let group_extractions: Vec<EvidenceExtraction> =
+                group.iter().map(|i| extractions[*i].clone()).collect();
+            if count_reduce_request(
+                cfg,
+                session_id,
+                usize::MAX,
+                usize::MAX,
+                usize::MAX,
+                &group_extractions,
+            )? <= cfg.ceiling_tokens
+            {
+                out.push(group);
+                continue;
+            }
+            if group.len() == 1 {
+                return Err(ConsolidatorError::ChunkDoesNotFit);
+            }
+            let mid = group.len() / 2;
+            let first = group[..mid].to_vec();
+            let second = group[mid..].to_vec();
+            stack.push(second);
+            stack.push(first);
+        }
+    }
+    Ok(out)
+}
+
+/// Content-derived fingerprint for one reduce group: prompt version, model,
+/// depth, group position, and the group's extraction content (which already
+/// carries the observation ids).
+fn reduce_group_fingerprint(
+    cfg: &ChunkingConfig,
+    depth: usize,
+    group_no: usize,
+    total_groups: usize,
+    extractions: &[EvidenceExtraction],
+) -> String {
+    let payload = serde_json::json!({
+        "stage": format!("reduce-v{REDUCE_PROMPT_VERSION}"),
+        "model": cfg.model,
+        "depth": depth,
+        "group": group_no,
+        "total_groups": total_groups,
+        "extractions": extractions,
+    });
+    sha256_hex(&payload.to_string())
+}
+
+/// Content-derived fingerprint for the final stage: prompt version, model,
+/// the reduced evidence, and every other input the final prompt renders
+/// (current page body or slots, instructions, titles, budgets). A change of
+/// any of them — a new observation upstream, edited instructions, a new
+/// title — invalidates reuse.
+fn final_stage_fingerprint(
+    cfg: &ChunkingConfig,
+    mode: &str,
+    extractions: &[EvidenceExtraction],
+    extra: &serde_json::Value,
+) -> String {
+    let payload = serde_json::json!({
+        "stage": format!("final-{mode}-v{FINAL_PROMPT_VERSION}"),
+        "model": cfg.model,
+        "extractions": extractions,
+        "inputs": extra,
+    });
+    sha256_hex(&payload.to_string())
+}
+
+/// The evidence section that replaces the raw observation dump in the final
+/// single-page prompt.
+fn render_evidence_section(extractions: &[EvidenceExtraction]) -> String {
+    let mut out = String::new();
+    out.push_str(
+        "Evidence extractions (the session's observation log was reduced to these \
+         grounded claims; cite the observation ids in the page body when grounding a \
+         claim):\n\n",
+    );
+    out.push_str(&render_extractions(extractions));
+    out
+}
+
+/// Build the final single-page request: the existing single-prompt
+/// scaffolding (system prompt, current page body, title-uniqueness, project
+/// instructions, budgets) with the observation dump replaced by the
+/// evidence digest.
+fn build_final_request_single(
+    session_id: SessionId,
+    extractions: &[EvidenceExtraction],
+    current_body: &str,
+    instructions: Option<&str>,
+    budgets: PromptBudgets,
+    existing_titles: &[String],
+) -> ChatRequest {
+    let evidence = render_evidence_section(extractions);
+    let mut prefix = String::new();
+    prefix.push_str("Session id: ");
+    prefix.push_str(&session_id.to_string());
+    prefix.push('\n');
+    prefix.push_str(&evidence);
+
+    let optional_budget =
+        budgets.optional_context_budget::<ConsolidatedPage>(SYSTEM_PROMPT, count_chars(&prefix));
+    let instructions_block =
+        render_instructions_block(instructions, optional_budget.saturating_div(2));
+    let current_body_budget = optional_budget.saturating_sub(count_chars(&instructions_block));
+    let titles_block = render_title_uniqueness_section(existing_titles);
+    let current_body_budget = current_body_budget.saturating_sub(count_chars(&titles_block));
+    let mut suffix = render_current_body_section(current_body, current_body_budget);
+    suffix.push_str(&titles_block);
+    suffix.push_str(&instructions_block);
+
+    // The evidence digest is already reduced and bounded; clip it to the
+    // remaining input budget so the prompt still fits the configured limit
+    // (same heuristic posture as the observation projection).
+    let evidence_budget = budgets.remaining_input_chars::<ConsolidatedPage>(
+        SYSTEM_PROMPT,
+        count_chars(&prefix)
+            .saturating_sub(count_chars(&evidence))
+            .saturating_add(count_chars(&suffix)),
+    );
+    let evidence = clip_for_prompt(&evidence, evidence_budget);
+    let mut user = String::new();
+    user.push_str("Session id: ");
+    user.push_str(&session_id.to_string());
+    user.push('\n');
+    user.push_str(&evidence);
+    user.push_str(&suffix);
+
+    ChatRequest {
+        system: Some(SYSTEM_PROMPT.into()),
+        messages: vec![ChatMessage {
+            role: Role::User,
+            content: user,
+        }],
+        max_tokens: budgets.max_output_tokens,
+        temperature: Some(0.2),
+    }
+}
+
+/// Build the final multi-page request: the existing batch scaffolding
+/// (slots, instructions, titles, budgets) with the observation dump
+/// replaced by the evidence digest.
+fn build_final_request_batch(
+    session_id: SessionId,
+    extractions: &[EvidenceExtraction],
+    slots: &[SlotSnapshot],
+    instructions: Option<&str>,
+    budgets: PromptBudgets,
+    existing_titles: &[String],
+) -> ChatRequest {
+    let evidence = render_evidence_section(extractions);
+    let mut prefix = String::new();
+    prefix.push_str(
+        "You are compiling a Karpathy-style multi-page wiki update. The \
+         session's observation log was reduced to the grounded evidence \
+         extractions below; produce a ConsolidatedBatch from them:\n\n",
+    );
+    prefix.push_str("Session id: ");
+    prefix.push_str(&session_id.to_string());
+    prefix.push('\n');
+    prefix.push_str(&evidence);
+
+    let mut mandatory_suffix = String::new();
+    mandatory_suffix.push_str(
+        "\nProduce up to 5 page updates. Use these path conventions:\n\
+         - sessions/<session_id>.md  (episodic, this run's narrative)\n\
+         - concepts/<slug>.md         (semantic, evergreen concept pages)\n\
+         - decisions/<short>.md       (semantic, ADR-style records)\n\
+         - gotchas/<slug>.md          (semantic, failure modes / surprises)\n\
+         - _slots/<name>.md           (pinned memory slot; use sparingly)\n\
+         \n## `tier` field — EXACTLY ONE of these four strings on every update\n\
+         Never an integer, never a synonym, never one of the `slot_kind` values below.\n\
+         - \"working\"      (the live in-progress slice of the session — rarely used here)\n\
+         - \"episodic\"     (per-session narrative; the sessions/<id>.md page)\n\
+         - \"semantic\"     (durable knowledge: concepts/, decisions/, gotchas/, rules)\n\
+         - \"procedural\"   (repeated patterns extracted from many episodic pages)\n\
+         \n## `kind` field — EXACTLY ONE of these four strings on every update\n\
+         Never an integer, never \"session\" / \"concept\" / \"note\".\n\
+         - \"decision\" (the project chose X over Y)\n\
+         - \"gotcha\"   (a failure mode or surprise worth remembering)\n\
+         - \"rule\"     (durable project convention: \"always X\", \"never Y\")\n\
+         - \"fact\"     (everything else; the default — use this for session narratives and plain concept notes)\n\
+         \nWhen you mark an update as `rule`, write the body as a clear \
+         standalone instruction the agent could follow on every relevant \
+         action. The path you suggest for a rule will be overridden — the \
+         system routes rules to `_rules/<slug>.md` automatically and the \
+         lint pass surfaces a hint to copy it into the project's CLAUDE.md.\n\
+         \n## `slot_kind` field — OPTIONAL, ONLY for `_slots/*` paths\n\
+         **Completely unrelated to `tier`.** A separate flag that controls the\n\
+         write regime for pinned memory slots. Do NOT put these values in `tier`.\n\
+         - \"state\"      (default; mutable current focus, pending items, working context)\n\
+         - \"invariant\"  (high-resistance project rules, identity, or user preferences)\n\
+         Do not emit an update for an existing invariant slot unless the evidence directly contradicts specific existing content. State slots may be refreshed normally.\n\
+         \n## Required JSON keys on every update (use these EXACT names)\n\
+         - \"path\"            (string)  required — the wiki path\n\
+         - \"title\"           (string)  required — the page title\n\
+         - \"body_markdown\"   (string)  required — the page body in Markdown; NOTE the underscore + the suffix `_markdown`, NOT just `body`\n\
+         - \"tier\"            (string)  required — one of: working | episodic | semantic | procedural\n\
+         - \"kind\"            (string)  required — one of: decision | gotcha | rule | fact\n\
+         - \"tags\"            (array of string)  required — may be empty `[]`, but the key must be present\n\
+         - \"entities\"        (array of string)  required — may be empty `[]`, but the key must be present; see below\n\
+         - \"relations\"       (object) optional — keys: \"causes\", \"fixes\", \"contradicts\"; each contains an array of existing wiki paths. Declare only evidence-backed edges; empty arrays are normal.\n\
+         - \"slot_kind\"       (string) optional — ONLY for `_slots/*`; one of \"state\" or \"invariant\"; this is the SLOT WRITE REGIME, NOT a tier value\n\
+         - \"summary\"         (string) optional — ONE line of plain prose describing the page, shown beside its title. Headings, `- **key:** value` bullets, list items, and repeated titles are discarded. Omit rather than guess.\n\
+         Use only the keys listed above. No `body`, no `content`. Field names \
+         are case-sensitive and the `_markdown` suffix matters.\n\
+         \n## `entities` field — the specific nouns the page is about\n\
+         Up to 10 short names (max 64 chars each), lowercase, taken from \
+         what the page actually names: technologies (`sqlite`, `tokio`), \
+         components (`writer actor`, `hook router`), services, crates, \
+         file or module names, and product/domain nouns. They power a \
+         retrieval stream, so a later query naming one of them finds this \
+         page even when the wording differs.\n\
+         Do NOT include: generic words (`code`, `bug`, `change`, \
+         `refactor`), the tier or kind values, whole sentences, or \
+         restatements of the title. Prefer fewer, more specific entries \
+         over padding the list. `[]` is correct for a page with no \
+         specific nouns.\n\
+         \n## Output format (read this carefully)\n\
+         Reply with ONE JSON object matching the ConsolidatedBatch schema, \
+         and nothing else. NO prose preamble, NO trailing commentary, NO \
+         markdown headers wrapping the JSON, NO ``` code fences. The very \
+         first character of your reply must be `{` and the very last `}`. \
+         Strings must be JSON strings (with double quotes), not numbers \
+         and not bare identifiers.\n\
+         \n## Top-level shape\n\
+         {\n\
+         \x20\x20\"updates\": [ /* 1-5 update objects with the keys above */ ],\n\
+         \x20\x20\"rationale\": \"<one short sentence about why this batch>\"\n\
+         }\n",
+    );
+    let titles_block = render_title_uniqueness_section(existing_titles);
+    let optional_budget = budgets.optional_context_budget::<ConsolidatedBatch>(
+        BATCH_SYSTEM_PROMPT,
+        count_chars(&prefix)
+            .saturating_add(count_chars(&mandatory_suffix))
+            .saturating_add(count_chars(&titles_block)),
+    );
+    let instructions_block =
+        render_instructions_block(instructions, optional_budget.saturating_div(2));
+    let slots_budget = optional_budget.saturating_sub(count_chars(&instructions_block));
+    let mut suffix = render_slot_snapshots(slots, slots_budget);
+    suffix.push_str(&mandatory_suffix);
+    suffix.push_str(&titles_block);
+    suffix.push_str(&instructions_block);
+
+    let evidence_budget = budgets.remaining_input_chars::<ConsolidatedBatch>(
+        BATCH_SYSTEM_PROMPT,
+        count_chars(&prefix)
+            .saturating_sub(count_chars(&evidence))
+            .saturating_add(count_chars(&suffix)),
+    );
+    let evidence = clip_for_prompt(&evidence, evidence_budget);
+    let mut user = String::new();
+    user.push_str(
+        "You are compiling a Karpathy-style multi-page wiki update. The \
+         session's observation log was reduced to the grounded evidence \
+         extractions below; produce a ConsolidatedBatch from them:\n\n",
+    );
+    user.push_str("Session id: ");
+    user.push_str(&session_id.to_string());
+    user.push('\n');
+    user.push_str(&evidence);
+    user.push_str(&suffix);
+
+    ChatRequest {
+        system: Some(BATCH_SYSTEM_PROMPT.into()),
+        messages: vec![ChatMessage {
+            role: Role::User,
+            content: user,
+        }],
+        max_tokens: budgets.max_output_tokens,
+        temperature: Some(0.2),
+    }
+}
+
+/// Validate one stage's structured output against the ids that stage was
+/// actually given. Fail closed: a hallucinated observation id, an empty
+/// grounding, an empty title/body, or an out-of-range confidence aborts the
+/// run — ungrounded evidence must never reach a page.
+fn validate_extraction_result(
+    result: &ExtractionResult,
+    allowed_ids: &HashSet<String>,
+) -> ConsolidatorResult<()> {
+    if result.extractions.len() > MAX_EXTRACTIONS_PER_STAGE {
+        return Err(ConsolidatorError::UngroundedExtractions(format!(
+            "stage returned {} extractions, above the {} ceiling",
+            result.extractions.len(),
+            MAX_EXTRACTIONS_PER_STAGE
+        )));
+    }
+    for (i, ex) in result.extractions.iter().enumerate() {
+        if ex.observation_ids.is_empty() {
+            return Err(ConsolidatorError::UngroundedExtractions(format!(
+                "extraction {i} cites no observation ids"
+            )));
+        }
+        for id in &ex.observation_ids {
+            if !allowed_ids.contains(id) {
+                return Err(ConsolidatorError::UngroundedExtractions(format!(
+                    "extraction {i} cites observation id {id}, which is not in this stage's input"
+                )));
+            }
+        }
+        if ex.title.trim().is_empty() || ex.body_markdown.trim().is_empty() {
+            return Err(ConsolidatorError::UngroundedExtractions(format!(
+                "extraction {i} has an empty title or body"
+            )));
+        }
+        if !ex.confidence.is_finite() || !(0.0..=1.0).contains(&ex.confidence) {
+            return Err(ConsolidatorError::UngroundedExtractions(format!(
+                "extraction {i} has out-of-range confidence {}",
+                ex.confidence
+            )));
+        }
+    }
+    // Coverage: every input observation id must be accounted for — cited
+    // by an extraction OR marked without a durable fact. Nothing may be
+    // cited that the stage was not given, and an id may not be both.
+    let mut accounted: HashSet<String> = result
+        .extractions
+        .iter()
+        .flat_map(|ex| ex.observation_ids.iter())
+        .cloned()
+        .collect();
+    for id in &result.no_durable_fact_ids {
+        if !allowed_ids.contains(id) {
+            return Err(ConsolidatorError::IncompleteCoverage(format!(
+                "no_durable_fact_ids names observation id {id}, which is not in this stage's input"
+            )));
+        }
+        if !accounted.insert(id.clone()) {
+            return Err(ConsolidatorError::IncompleteCoverage(format!(
+                "observation id {id} is both extracted and marked without a durable fact"
+            )));
+        }
+    }
+    let missing: Vec<&String> = allowed_ids
+        .iter()
+        .filter(|id| !accounted.contains(*id))
+        .collect();
+    if !missing.is_empty() {
+        return Err(ConsolidatorError::IncompleteCoverage(format!(
+            "{} of this stage's {} input observation id(s) are neither extracted nor marked without a durable fact (e.g. {})",
+            missing.len(),
+            allowed_ids.len(),
+            missing[0]
+        )));
+    }
+    Ok(())
 }
 
 /// Convert one LLM-produced batch update into the
@@ -1776,9 +3357,12 @@ const SYSTEM_PROMPT: &str = include_str!("../prompts/single_consolidate_system.m
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::types::ExtractionKind;
     use ai_memory_core::{ObservationId, ObservationKind, ProjectId, SessionId, WorkspaceId};
     use jiff::Timestamp;
+    use std::collections::VecDeque;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use tempfile::TempDir;
 
     /// Helper for prompt construction tests.
     fn obs_of_size(body_len: usize) -> Observation {
@@ -4457,5 +6041,1357 @@ mod tests {
             slot_page.body.contains("New focus."),
             "state slots still refresh"
         );
+    }
+
+    // ────────────────────────────────────────────────────────────────
+    // Map-reduce consolidation: planner, validation, fingerprints, and
+    // the crash/retry/clock failure matrix.
+    // ────────────────────────────────────────────────────────────────
+
+    /// Write a small word-level tokenizer (one whitespace-separated word =
+    /// one token, unknown words → `[UNK]`, still one token each) to a temp
+    /// file. Same construction the admission tests use for the shared
+    /// counter; the body words below are therefore counted exactly.
+    fn word_tokenizer_file(tmp: &TempDir) -> std::path::PathBuf {
+        use tokenizers::models::wordlevel::WordLevel;
+        use tokenizers::pre_tokenizers::whitespace::Whitespace;
+
+        let model = WordLevel::builder()
+            .vocab(
+                [("w1".to_string(), 0), ("[UNK]".to_string(), 1)]
+                    .into_iter()
+                    .collect(),
+            )
+            .unk_token("[UNK]".to_string())
+            .build()
+            .unwrap();
+        let mut tokenizer = tokenizers::Tokenizer::new(model);
+        tokenizer.with_pre_tokenizer(Some(Whitespace));
+        let path = tmp.path().join("tokenizer.json");
+        std::fs::write(&path, tokenizer.to_string(true).unwrap()).unwrap();
+        path
+    }
+
+    /// A staged fake LLM: map calls answer with one grounded `fact`
+    /// extraction citing exactly the observation ids the request showed it
+    /// (parsed from the block headers); reduce calls merge by unioning the
+    /// ids they were shown; final calls return a fixed single-page result.
+    /// Every attempt records its operation id so a test can assert the whole
+    /// run — every stage, retry, and replay — carried one id.
+    struct StagedLlm {
+        model: String,
+        fail_next: std::sync::Mutex<std::collections::VecDeque<LlmError>>,
+        /// One-shot failure served on the FINAL stage only (the map and
+        /// reduce stages succeed, then the run aborts at the final call).
+        final_fail_once: std::sync::Mutex<Option<LlmError>>,
+        map_calls: std::sync::atomic::AtomicUsize,
+        reduce_calls: std::sync::atomic::AtomicUsize,
+        final_calls: std::sync::atomic::AtomicUsize,
+        operation_ids: std::sync::Mutex<Vec<LlmOperationId>>,
+        /// When set, every request received is counted with the shared
+        /// counter (the guard's formula) using the stage's own schema, so
+        /// a test can prove every request arrived within the ceiling.
+        counter: Option<ChatTokenCounter>,
+        captured_counts: std::sync::Mutex<Vec<usize>>,
+        /// The user content of the last final-stage request.
+        final_user: std::sync::Mutex<String>,
+    }
+
+    impl StagedLlm {
+        fn new(model: &str) -> Self {
+            Self {
+                model: model.to_string(),
+                fail_next: std::sync::Mutex::new(VecDeque::new()),
+                final_fail_once: std::sync::Mutex::new(None),
+                map_calls: std::sync::atomic::AtomicUsize::new(0),
+                reduce_calls: std::sync::atomic::AtomicUsize::new(0),
+                final_calls: std::sync::atomic::AtomicUsize::new(0),
+                operation_ids: std::sync::Mutex::new(Vec::new()),
+                counter: None,
+                captured_counts: std::sync::Mutex::new(Vec::new()),
+                final_user: std::sync::Mutex::new(String::new()),
+            }
+        }
+
+        fn with_counter(mut self, counter: ChatTokenCounter) -> Self {
+            self.counter = Some(counter);
+            self
+        }
+
+        /// Every request's counted token size (shared counter, stage
+        /// schema). Empty when no counter was attached.
+        fn counts(&self) -> Vec<usize> {
+            self.captured_counts.lock().unwrap().clone()
+        }
+
+        fn final_user(&self) -> String {
+            self.final_user.lock().unwrap().clone()
+        }
+
+        fn fail_next(&self, error: LlmError) {
+            self.fail_next.lock().unwrap().push_back(error);
+        }
+
+        /// Serve `error` once, from the final stage only.
+        fn fail_final_once(&self, error: LlmError) {
+            *self.final_fail_once.lock().unwrap() = Some(error);
+        }
+
+        fn calls(&self) -> (usize, usize, usize) {
+            (
+                self.map_calls.load(std::sync::atomic::Ordering::SeqCst),
+                self.reduce_calls.load(std::sync::atomic::Ordering::SeqCst),
+                self.final_calls.load(std::sync::atomic::Ordering::SeqCst),
+            )
+        }
+
+        fn operation_ids(&self) -> Vec<LlmOperationId> {
+            self.operation_ids.lock().unwrap().clone()
+        }
+    }
+
+    fn observation_ids_in(user: &str) -> Vec<String> {
+        let re = regex::Regex::new(r"--- observation ([0-9a-fA-F-]{36})").unwrap();
+        let mut ids = re
+            .captures_iter(user)
+            .map(|c| c[1].to_string())
+            .collect::<Vec<_>>();
+        ids.dedup();
+        ids
+    }
+
+    fn merged_ids_in(user: &str) -> Vec<String> {
+        let re = regex::Regex::new(r"observation_ids: ([0-9a-fA-F, -]+)").unwrap();
+        let mut ids = Vec::new();
+        for cap in re.captures_iter(user) {
+            for piece in cap[1].split(',') {
+                let t = piece.trim().to_string();
+                if !t.is_empty() {
+                    ids.push(t);
+                }
+            }
+        }
+        ids.dedup();
+        ids
+    }
+
+    fn extraction_reply(ids: &[String]) -> serde_json::Value {
+        serde_json::json!({
+            "extractions": [{
+                "observation_ids": ids,
+                "kind": "fact",
+                "title": "Session event",
+                "summary": "what this stage's evidence shows",
+                "body_markdown": "grounded note",
+                "tags": [],
+                "entities": [],
+                "confidence": 0.9,
+            }],
+            "rationale": "stage ok",
+            "no_durable_fact_ids": [],
+        })
+    }
+
+    const FINAL_SINGLE_REPLY: &str = r##"{"title":"Session page","body_markdown":"# Session page\n\nbody citing obs ids","tags":[],"summary":"s","relations":{"causes":[],"fixes":[],"contradicts":[]}}"##;
+
+    #[async_trait::async_trait]
+    impl LlmProvider for StagedLlm {
+        fn name(&self) -> &'static str {
+            "staged"
+        }
+        fn model(&self) -> &str {
+            &self.model
+        }
+        async fn complete(
+            &self,
+            _request: ChatRequest,
+        ) -> ai_memory_llm::LlmResult<ai_memory_llm::ChatResponse> {
+            unreachable!("map-reduce only uses structured completion")
+        }
+        async fn complete_structured_raw(
+            &self,
+            request: ChatRequest,
+            _schema: serde_json::Value,
+        ) -> ai_memory_llm::LlmResult<serde_json::Value> {
+            if let Some(error) = self.fail_next.lock().unwrap().pop_front() {
+                return Err(error);
+            }
+            let system = request.system.as_deref().unwrap_or_default();
+            let user = request
+                .messages
+                .first()
+                .map(|m| m.content.as_str())
+                .unwrap_or("");
+            let is_final = system != MAP_SYSTEM_PROMPT && system != REDUCE_SYSTEM_PROMPT;
+            // Capture the request size the way the guard counts it: same
+            // tokenizer, same reserves, the stage's own schema.
+            if let Some(counter) = &self.counter {
+                let schema: serde_json::Value = if is_final {
+                    serde_json::to_value(schemars::schema_for!(ConsolidatedPage)).unwrap()
+                } else {
+                    serde_json::to_value(schemars::schema_for!(ExtractionResult)).unwrap()
+                };
+                if let Ok(tokens) = counter.count_request(&request, Some(&schema)) {
+                    self.captured_counts.lock().unwrap().push(tokens);
+                }
+            }
+            if is_final {
+                *self.final_user.lock().unwrap() = user.to_string();
+            }
+            if system == MAP_SYSTEM_PROMPT {
+                self.map_calls
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(extraction_reply(&observation_ids_in(user)))
+            } else if system == REDUCE_SYSTEM_PROMPT {
+                self.reduce_calls
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(extraction_reply(&merged_ids_in(user)))
+            } else {
+                self.final_calls
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                if let Some(error) = self.final_fail_once.lock().unwrap().take() {
+                    return Err(error);
+                }
+                Ok(serde_json::from_str(FINAL_SINGLE_REPLY).unwrap())
+            }
+        }
+        async fn complete_structured_raw_with_operation_id(
+            &self,
+            request: ChatRequest,
+            schema: serde_json::Value,
+            operation_id: LlmOperationId,
+        ) -> ai_memory_llm::LlmResult<serde_json::Value> {
+            self.operation_ids.lock().unwrap().push(operation_id);
+            self.complete_structured_raw(request, schema).await
+        }
+    }
+
+    /// A temp-store fixture wired for map-reduce chunking. Every
+    /// `consolidator` it builds shares the SAME on-disk store — the "fresh
+    /// process" in the crash tests is a new LLM + new consolidator over the
+    /// same store, which is exactly what a restart is. The chunk
+    /// target/ceiling are derived from the actual framing cost of an empty
+    /// map request (system prompt + schema + reserves), so the tests do not
+    /// depend on the prompt's exact word count: the content budget is what
+    /// the observations consume.
+    struct ChunkedTest {
+        tmp: TempDir,
+        store: ai_memory_store::Store,
+        ws: WorkspaceId,
+        proj: ProjectId,
+        tokenizer_path: std::path::PathBuf,
+        base: usize,
+    }
+
+    impl ChunkedTest {
+        async fn fresh() -> Self {
+            let tmp = TempDir::new().unwrap();
+            let store = ai_memory_store::Store::open(tmp.path()).unwrap();
+            let ws = store
+                .writer
+                .get_or_create_workspace("default")
+                .await
+                .unwrap();
+            let proj = store
+                .writer
+                .get_or_create_project(ws, "scratch", None)
+                .await
+                .unwrap();
+            let tokenizer_path = word_tokenizer_file(&tmp);
+            let counter = ChatTokenCounter::load(&tokenizer_path).unwrap();
+            let base = counter
+                .count_request(
+                    &build_map_request(SessionId::new(), &[], 1, 1),
+                    schema_value::<ExtractionResult>().as_ref(),
+                )
+                .unwrap();
+            Self {
+                tmp,
+                store,
+                ws,
+                proj,
+                tokenizer_path,
+                base,
+            }
+        }
+
+        fn consolidator(&self, llm: Arc<StagedLlm>) -> Consolidator {
+            self.consolidator_with(llm, self.base + 700, self.base + 1_600)
+        }
+
+        /// Same fixture, explicit target/ceiling (the coverage test derives
+        /// its ceiling from the irreducible final request).
+        fn consolidator_with(
+            &self,
+            llm: Arc<StagedLlm>,
+            target: usize,
+            ceiling: usize,
+        ) -> Consolidator {
+            let wiki = Wiki::new(self.tmp.path(), self.store.writer.clone()).unwrap();
+            let llm: Arc<dyn LlmProvider> = llm;
+            Consolidator::new(
+                self.store.reader.clone(),
+                self.store.writer.clone(),
+                wiki,
+                llm,
+                self.ws,
+                self.proj,
+            )
+            .with_chunking(target, Some(ceiling), Some(&self.tokenizer_path))
+            .unwrap()
+        }
+
+        async fn seed_session(&self, session: SessionId, bodies: &[String]) {
+            self.store
+                .writer
+                .begin_session(ai_memory_core::NewSession {
+                    occurred_at: None,
+                    id: session,
+                    workspace_id: self.ws,
+                    project_id: self.proj,
+                    agent_kind: ai_memory_core::AgentKind::OpenCode,
+                    cwd: None,
+                    actor_user: None,
+                })
+                .await
+                .unwrap();
+            seed_observations(&self.store.writer, self.ws, self.proj, session, bodies).await;
+        }
+
+        fn chunked_run(&self, session: SessionId, observations: Vec<Observation>) -> ChunkedRun {
+            ChunkedRun {
+                ws: self.ws,
+                proj: self.proj,
+                session,
+                actor: ai_memory_core::ActorContext::anonymous(),
+                observations,
+                operation_id: session.into(),
+            }
+        }
+
+        async fn observations(&self, session: SessionId) -> Vec<Observation> {
+            self.store
+                .reader
+                .observations_for_session(session)
+                .await
+                .unwrap()
+        }
+
+        /// Count the final single-page request for a digest, exactly as the
+        /// final call builds it (default budgets, like `Consolidator::new`).
+        /// The coverage test derives its ceiling from the irreducible case:
+        /// one extraction citing every observation id.
+        fn consolidator_base_count(
+            &self,
+            session: SessionId,
+            extractions: &[EvidenceExtraction],
+        ) -> ConsolidatorResult<usize> {
+            let request = build_final_request_single(
+                session,
+                extractions,
+                "",
+                None,
+                PromptBudgets::default(),
+                &[],
+            );
+            ChatTokenCounter::load(&self.tokenizer_path)
+                .map_err(ConsolidatorError::Llm)?
+                .count_request(&request, schema_value::<ConsolidatedPage>().as_ref())
+                .map_err(ConsolidatorError::Llm)
+        }
+
+        async fn checkpoints(
+            &self,
+            session: SessionId,
+        ) -> Vec<ai_memory_store::ConsolidationChunkRecord> {
+            self.store
+                .writer
+                .load_consolidation_chunks(self.ws, self.proj, session)
+                .await
+                .unwrap()
+        }
+    }
+
+    async fn seed_observations(
+        writer: &WriterHandle,
+        ws: WorkspaceId,
+        proj: ProjectId,
+        session: SessionId,
+        bodies: &[String],
+    ) {
+        let sanitizer = ai_memory_core::Sanitizer::builtin();
+        for body in bodies {
+            writer
+                .insert_observation(ai_memory_core::Sanitized::new(
+                    ai_memory_core::NewObservation {
+                        occurred_at: None,
+                        session_id: session,
+                        workspace_id: ws,
+                        project_id: proj,
+                        kind: ObservationKind::Other,
+                        extension: None,
+                        source_event: None,
+                        title: "t".into(),
+                        body: body.clone(),
+                        importance: 5,
+                    },
+                    &sanitizer,
+                ))
+                .await
+                .unwrap();
+        }
+    }
+
+    #[test]
+    fn chunking_builder_requires_ceiling_and_readable_tokenizer() {
+        let tmp = TempDir::new().unwrap();
+        let store = ai_memory_store::Store::open(tmp.path()).unwrap();
+        let wiki = Wiki::new(tmp.path(), store.writer.clone()).unwrap();
+        let tokenizer_path = word_tokenizer_file(&tmp);
+        let llm = Arc::new(StagedLlm::new("m1"));
+        let llm: Arc<dyn LlmProvider> = llm;
+        let build = || {
+            Consolidator::new(
+                store.reader.clone(),
+                store.writer.clone(),
+                wiki.clone(),
+                Arc::clone(&llm),
+                WorkspaceId::new(),
+                ProjectId::new(),
+            )
+        };
+
+        // The 0 default keeps the single-prompt pipeline: no preconditions.
+        assert!(build().with_chunking(0, None, None).is_ok());
+        // Active without a ceiling / without a path / above the ceiling:
+        // refused. A missing tokenizer file: refused.
+        assert!(
+            build()
+                .with_chunking(100, None, Some(&tokenizer_path))
+                .is_err()
+        );
+        assert!(build().with_chunking(100, Some(100), None).is_err());
+        assert!(
+            build()
+                .with_chunking(200, Some(100), Some(&tokenizer_path))
+                .is_err()
+        );
+        assert!(
+            build()
+                .with_chunking(100, Some(100), Some(&tmp.path().join("missing.json")))
+                .is_err()
+        );
+        // The valid combination is accepted.
+        assert!(
+            build()
+                .with_chunking(100, Some(100), Some(&tokenizer_path))
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn map_block_plan_splits_oversized_bodies_and_keeps_blocks_within_ceiling() {
+        let tmp = TempDir::new().unwrap();
+        let path = word_tokenizer_file(&tmp);
+        let counter = ChatTokenCounter::load(&path).unwrap();
+        let base = counter
+            .count_request(
+                &build_map_request(SessionId::new(), &[], 1, 1),
+                schema_value::<ExtractionResult>().as_ref(),
+            )
+            .unwrap();
+        let cfg = ChunkingConfig {
+            target_tokens: base + 6_800,
+            ceiling_tokens: base + 7_000,
+            counter,
+            model: "m1".into(),
+        };
+
+        let sid = SessionId::new();
+        // A 1500-word observation: one part (4500 chars < the part cap).
+        // Then a 5000-word observation (15000 chars): over the part cap, so
+        // it splits into a ~4000-word part and a ~1000-word part — and
+        // under this target the greedy packing keeps both parts in ONE
+        // block, whose full request still fits the generous ceiling.
+        let obs = Observation {
+            id: ObservationId::new(),
+            workspace_id: WorkspaceId::new(),
+            project_id: ProjectId::new(),
+            session_id: sid,
+            kind: ObservationKind::Other,
+            title: "t".into(),
+            body: "w1 ".repeat(1_500),
+            created_at: jiff::Timestamp::UNIX_EPOCH,
+            importance: 5,
+            extension: None,
+            source_event: None,
+        };
+        let big = Observation {
+            id: ObservationId::new(),
+            workspace_id: WorkspaceId::new(),
+            project_id: ProjectId::new(),
+            session_id: sid,
+            kind: ObservationKind::Other,
+            title: "t".into(),
+            body: "w1 ".repeat(5_000),
+            created_at: jiff::Timestamp::UNIX_EPOCH,
+            importance: 5,
+            extension: None,
+            source_event: None,
+        };
+        let blocks = plan_map_blocks(sid, std::slice::from_ref(&big), &cfg).unwrap();
+
+        // Every block's full request (counted the way the guard counts) fits
+        // the ceiling — the invariant the whole design exists for.
+        for block in &blocks {
+            let tokens = count_map_request(&cfg, sid, &block.parts, 1, 1).unwrap();
+            assert!(
+                tokens <= cfg.ceiling_tokens,
+                "block of {} part(s) counts {tokens}, ceiling {}",
+                block.parts.len(),
+                cfg.ceiling_tokens
+            );
+        }
+        // The oversized body split into exactly two parts, each still
+        // naming the same observation id (grounding survives the split).
+        let big_parts: Vec<_> = blocks
+            .iter()
+            .flat_map(|b| b.parts.iter())
+            .filter(|p| p.observation_id == big.id.to_string())
+            .collect();
+        assert_eq!(
+            big_parts.len(),
+            2,
+            "the oversized body must split into two parts"
+        );
+        assert!(
+            big_parts
+                .iter()
+                .all(|p| p.observation_id == big.id.to_string()),
+            "every part keeps its observation id"
+        );
+        // Under the generous ceiling both parts share one block.
+        assert!(
+            blocks
+                .iter()
+                .any(|b| b.parts.len() == 2 && b.allowed_ids[0] == big.id.to_string()),
+            "the two parts of the oversized body pack into one block under the generous ceiling"
+        );
+        // The small observation's id is plannable too and allowed by its
+        // own block.
+        let blocks_small = plan_map_blocks(sid, std::slice::from_ref(&obs), &cfg).unwrap();
+        assert!(
+            blocks_small
+                .iter()
+                .any(|b| b.allowed_ids.iter().any(|id| id == &obs.id.to_string()))
+        );
+        // Under a tighter ceiling the same plan must split that block: the
+        // planner's ceiling enforcement is what keeps every request
+        // admissible, not the target.
+        let cfg_tight = ChunkingConfig {
+            target_tokens: base + 6_800,
+            ceiling_tokens: base + 4_200,
+            counter: ChatTokenCounter::load(&path).unwrap(),
+            model: "m1".into(),
+        };
+        let blocks_tight = plan_map_blocks(sid, std::slice::from_ref(&big), &cfg_tight).unwrap();
+        for block in &blocks_tight {
+            let tokens = count_map_request(&cfg_tight, sid, &block.parts, 1, 1).unwrap();
+            assert!(
+                tokens <= cfg_tight.ceiling_tokens,
+                "tight-ceiling block of {} part(s) counts {tokens}, ceiling {}",
+                block.parts.len(),
+                cfg_tight.ceiling_tokens
+            );
+        }
+        assert!(
+            !blocks_tight
+                .iter()
+                .any(|b| b.parts.len() == 2 && b.allowed_ids[0] == big.id.to_string()),
+            "the tight ceiling must split the two-part block apart"
+        );
+        // Every observation id of the plan is allowed by some block.
+        let allowed: HashSet<String> = blocks
+            .iter()
+            .flat_map(|b| b.allowed_ids.iter())
+            .cloned()
+            .collect();
+        assert!(allowed.contains(&big.id.to_string()));
+    }
+
+    #[test]
+    fn map_block_fingerprint_is_content_derived() {
+        let tmp = TempDir::new().unwrap();
+        let path = word_tokenizer_file(&tmp);
+        let make_cfg = |model: &str| ChunkingConfig {
+            target_tokens: 5_000,
+            ceiling_tokens: 9_000,
+            counter: ChatTokenCounter::load(&path).unwrap(),
+            model: model.into(),
+        };
+        let sid = SessionId::new();
+        let obs = obs_of_size(100);
+        let blocks_a = plan_map_blocks(sid, std::slice::from_ref(&obs), &make_cfg("m1")).unwrap();
+        // Same content, fresh plan: identical fingerprints (stable across
+        // processes / time — the payload carries no clock input).
+        let blocks_b = plan_map_blocks(sid, std::slice::from_ref(&obs), &make_cfg("m1")).unwrap();
+        assert_eq!(blocks_a.len(), blocks_b.len());
+        for (a, b) in blocks_a.iter().zip(blocks_b.iter()) {
+            assert_eq!(a.fingerprint, b.fingerprint);
+        }
+        // A one-char body change (a new/changed observation) invalidates
+        // reuse.
+        let mut changed = obs.clone();
+        changed.body.push('x');
+        let blocks_c = plan_map_blocks(sid, &[changed], &make_cfg("m1")).unwrap();
+        assert_ne!(blocks_a[0].fingerprint, blocks_c[0].fingerprint);
+        // A model change invalidates reuse.
+        let blocks_d = plan_map_blocks(sid, std::slice::from_ref(&obs), &make_cfg("m2")).unwrap();
+        assert_ne!(blocks_a[0].fingerprint, blocks_d[0].fingerprint);
+    }
+
+    fn extraction_with(
+        ids: &[&str],
+        kind: &str,
+        title: &str,
+        confidence: f64,
+    ) -> EvidenceExtraction {
+        EvidenceExtraction {
+            observation_ids: ids.iter().map(|s| s.to_string()).collect(),
+            kind: match kind {
+                "decision" => ExtractionKind::Decision,
+                "gotcha" => ExtractionKind::Gotcha,
+                "rule" => ExtractionKind::Rule,
+                "procedure" => ExtractionKind::Procedure,
+                "concept" => ExtractionKind::Concept,
+                _ => ExtractionKind::Fact,
+            },
+            title: title.to_string(),
+            summary: "summary".to_string(),
+            body_markdown: "body".to_string(),
+            tags: Vec::new(),
+            entities: Vec::new(),
+            confidence,
+        }
+    }
+
+    #[test]
+    fn extraction_validation_rejects_ungrounded_or_out_of_range_output() {
+        let allowed: HashSet<String> = ["id-1", "id-2"].into_iter().map(String::from).collect();
+        let with = |extractions, no_durable: &[&str]| ExtractionResult {
+            extractions,
+            rationale: String::new(),
+            no_durable_fact_ids: no_durable.iter().map(|s| s.to_string()).collect(),
+        };
+
+        // A hallucinated observation id — the core grounding violation.
+        let result = with(vec![extraction_with(&["id-3"], "fact", "t", 0.9)], &[]);
+        assert!(
+            matches!(
+                validate_extraction_result(&result, &allowed),
+                Err(ConsolidatorError::UngroundedExtractions(_))
+            ),
+            "a hallucinated id must fail closed"
+        );
+        // Empty grounding / empty title / out-of-range confidence are all
+        // refused (each also leaves id-2 unaccounted — the first violation
+        // still fails closed).
+        assert!(
+            validate_extraction_result(
+                &with(
+                    vec![extraction_with(&[], "fact", "t", 0.9)],
+                    &["id-1", "id-2"]
+                ),
+                &allowed
+            )
+            .is_err()
+        );
+        assert!(
+            validate_extraction_result(
+                &with(
+                    vec![extraction_with(&["id-1"], "fact", "  ", 0.9)],
+                    &["id-2"]
+                ),
+                &allowed
+            )
+            .is_err()
+        );
+        assert!(
+            validate_extraction_result(
+                &with(
+                    vec![extraction_with(&["id-1"], "fact", "t", 1.5)],
+                    &["id-2"]
+                ),
+                &allowed
+            )
+            .is_err()
+        );
+        assert!(
+            validate_extraction_result(
+                &with(
+                    vec![extraction_with(&["id-1"], "fact", "t", f64::NAN)],
+                    &["id-2"]
+                ),
+                &allowed
+            )
+            .is_err()
+        );
+
+        // Coverage: an input id neither extracted nor marked is a silent
+        // drop — refused.
+        let missing = with(vec![extraction_with(&["id-1"], "fact", "t", 0.9)], &[]);
+        assert!(
+            matches!(
+                validate_extraction_result(&missing, &allowed),
+                Err(ConsolidatorError::IncompleteCoverage(_))
+            ),
+            "unaccounted input ids must fail closed"
+        );
+        // A foreign id in no_durable_fact_ids is a hallucination too.
+        assert!(
+            validate_extraction_result(
+                &with(
+                    vec![extraction_with(&["id-1"], "fact", "t", 0.9)],
+                    &["id-9"]
+                ),
+                &allowed
+            )
+            .is_err()
+        );
+        // An id both extracted and marked is double-accounted — refused.
+        assert!(
+            validate_extraction_result(
+                &with(
+                    vec![extraction_with(&["id-1"], "fact", "t", 0.9)],
+                    &["id-1", "id-2"]
+                ),
+                &allowed
+            )
+            .is_err()
+        );
+        // Marked-without-durable covers the remainder — accepted.
+        assert!(
+            validate_extraction_result(
+                &with(
+                    vec![extraction_with(&["id-1"], "fact", "t", 0.9)],
+                    &["id-2"]
+                ),
+                &allowed
+            )
+            .is_ok()
+        );
+        // A genuinely routine block: zero extractions, every id marked.
+        assert!(validate_extraction_result(&with(Vec::new(), &["id-1", "id-2"]), &allowed).is_ok());
+        // The valid shape passes, including a multi-id grounding.
+        let result = with(
+            vec![extraction_with(&["id-1", "id-2"], "decision", "t", 0.5)],
+            &[],
+        );
+        assert!(validate_extraction_result(&result, &allowed).is_ok());
+    }
+
+    #[test]
+    fn reduce_grouping_fits_target_and_keeps_order() {
+        let tmp = TempDir::new().unwrap();
+        let path = word_tokenizer_file(&tmp);
+        let counter = ChatTokenCounter::load(&path).unwrap();
+        let base = counter
+            .count_request(
+                &build_reduce_request(SessionId::new(), 1, 1, 1, &[]),
+                schema_value::<ExtractionResult>().as_ref(),
+            )
+            .unwrap();
+        let cfg = ChunkingConfig {
+            target_tokens: base + 200,
+            ceiling_tokens: base + 800,
+            counter,
+            model: "m1".into(),
+        };
+        let sid = SessionId::new();
+        // 10 extractions × 300 words of body ≈ 300 tokens each → more than
+        // the target, so the list must group; every group must fit the
+        // ceiling, and the grouping must be a partition in order.
+        let mut extractions = Vec::new();
+        for i in 0..10 {
+            let mut ex = extraction_with(&[format!("id-{i}").as_str()], "fact", "t", 0.9);
+            ex.body_markdown = "w1 ".repeat(300);
+            extractions.push(ex);
+        }
+        let groups = plan_reduce_groups(sid, &extractions, &cfg).unwrap();
+        assert!(groups.len() > 1, "an over-target list must group");
+        let mut seen = Vec::new();
+        for group in &groups {
+            let members: Vec<EvidenceExtraction> =
+                group.iter().map(|i| extractions[*i].clone()).collect();
+            let tokens =
+                count_reduce_request(&cfg, sid, usize::MAX, usize::MAX, usize::MAX, &members)
+                    .unwrap();
+            assert!(
+                tokens <= cfg.ceiling_tokens,
+                "group of {} fits the ceiling ({} ≤ {})",
+                group.len(),
+                tokens,
+                cfg.ceiling_tokens
+            );
+            seen.extend_from_slice(group);
+        }
+        let ordered = (0..10).collect::<Vec<_>>();
+        seen.sort();
+        assert_eq!(seen, ordered, "the groups partition all indices");
+        // A list that fits is a single group (the skip-reduce case).
+        let small: Vec<EvidenceExtraction> = extractions[..2].to_vec();
+        let groups_small = plan_reduce_groups(sid, &small, &cfg).unwrap();
+        assert_eq!(groups_small.len(), 1);
+    }
+    #[test]
+    fn final_requests_carry_the_evidence_digest_not_the_raw_dump() {
+        let sid = SessionId::new();
+        let extractions = vec![extraction_with(&["obs-id-1"], "decision", "Chose X", 0.9)];
+
+        let single = build_final_request_single(
+            sid,
+            &extractions,
+            "old heuristic body",
+            Some("project instructions"),
+            PromptBudgets::default(),
+            &[],
+        );
+        let user = single.messages[0].content.clone();
+        assert!(
+            user.contains("obs-id-1"),
+            "the digest cites observation ids"
+        );
+        assert!(
+            !user.contains("--- observation"),
+            "no raw observation dump in the final single prompt"
+        );
+        assert!(user.contains("old heuristic body"));
+        assert!(user.contains("project instructions"));
+        assert_eq!(single.system.as_deref(), Some(SYSTEM_PROMPT));
+
+        let batch = build_final_request_batch(
+            sid,
+            &extractions,
+            &[],
+            Some("project instructions"),
+            PromptBudgets::default(),
+            &["Existing Title".to_string()],
+        );
+        let user = batch.messages[0].content.clone();
+        assert!(user.contains("obs-id-1"));
+        assert!(!user.contains("--- observation"));
+        assert!(user.contains("Existing Title"));
+        assert_eq!(batch.system.as_deref(), Some(BATCH_SYSTEM_PROMPT));
+    }
+
+    /// An observation body sized so it forms its own map block under the
+    /// fixture's target: 800 words × 3 chars = 2400 chars of content.
+    fn big_body() -> String {
+        "w1 ".repeat(800)
+    }
+
+    /// End-to-end through the PUBLIC entry: one session, one operation id
+    /// across every call, the page written with the session-origin stamp,
+    /// and the checkpoints pruned after publish.
+    #[tokio::test]
+    async fn chunked_end_to_end_writes_session_page_and_prunes_checkpoints() {
+        let t = ChunkedTest::fresh().await;
+        let llm = Arc::new(StagedLlm::new("m1"));
+        let consolidator = t.consolidator(Arc::clone(&llm));
+        let session = SessionId::new();
+        t.seed_session(session, &[big_body(), big_body()]).await;
+
+        let outcome = consolidator
+            .consolidate_session(
+                session,
+                false,
+                ai_memory_core::ActorContext::anonymous(),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+
+        assert!(!outcome.dry_run);
+        assert!(outcome.page_id.is_some(), "a real write produced a page id");
+        assert_eq!(outcome.new_title, "Session page");
+        // Two 800-word bodies → two map blocks (one per block), one final
+        // call, no reduce (the merged list fits the target).
+        assert_eq!(llm.calls(), (2, 0, 1));
+        // One operation id across every attempt of the whole run.
+        let ids = llm.operation_ids();
+        assert_eq!(ids.len(), 3);
+        assert!(
+            ids.iter().all(|id| *id == ids[0]),
+            "every call of one run carries one operation id: {ids:?}"
+        );
+        // The published page carries the session-origin stamp (the durable
+        // identity the publish reconcile looks for).
+        let anchor = PagePath::new(format!("sessions/{session}.md")).unwrap();
+        let wiki = Wiki::new(t.tmp.path(), t.store.writer.clone()).unwrap();
+        let md = wiki.read_page(t.ws, t.proj, &anchor).unwrap();
+        assert_eq!(
+            md.frontmatter.get("session_id").and_then(|v| v.as_str()),
+            Some(session.to_string().as_str()),
+            "the durable publication identity is the session-origin stamp"
+        );
+        // Checkpoints are pruned after a successful publish.
+        assert!(
+            t.checkpoints(session).await.is_empty(),
+            "published runs leave no checkpoint rows behind"
+        );
+    }
+
+    /// Crash matrix row 1: the process dies after the map checkpoints and
+    /// before the wiki write. The resume reuses every map block (zero map
+    /// LLM calls) and the final result is not lost.
+    #[tokio::test]
+    async fn chunked_crash_between_checkpoint_and_apply_reuses_map_on_resume() {
+        let t = ChunkedTest::fresh().await;
+        let llm1 = Arc::new(StagedLlm::new("m1"));
+        let consolidator = t.consolidator(Arc::clone(&llm1));
+        let session = SessionId::new();
+        t.seed_session(session, &[big_body(), big_body()]).await;
+
+        // Run 1: the map phase succeeds and checkpoints, then the process
+        // dies — no reduce, no final, no apply, no prune.
+        let run1 = t.chunked_run(session, t.observations(session).await);
+        let _ = consolidator.chunked_map_extractions(&run1).await.unwrap();
+        assert_eq!(llm1.calls(), (2, 0, 0), "run 1 paid for the two map blocks");
+        assert_eq!(
+            t.checkpoints(session).await.len(),
+            2,
+            "the map checkpoints survived the crash"
+        );
+
+        // Run 2 (a "fresh process": new LLM, new consolidator, same
+        // on-disk store): the reconcile finds no publication, and the map
+        // phase reuses both checkpoints without a single LLM call.
+        let llm2 = Arc::new(StagedLlm::new("m1"));
+        let consolidator2 = t.consolidator(Arc::clone(&llm2));
+        let run2 = t.chunked_run(session, t.observations(session).await);
+        assert!(
+            consolidator2
+                .chunked_reconcile_published(&run2)
+                .await
+                .unwrap()
+                .is_none(),
+            "an unpublished session page is not a publication"
+        );
+        let _ = consolidator2.chunked_map_extractions(&run2).await.unwrap();
+        assert_eq!(
+            llm2.calls(),
+            (0, 0, 0),
+            "the resume reused every map checkpoint — no map LLM call"
+        );
+    }
+
+    /// Crash matrix row 2: the process dies after the wiki publish and
+    /// before the checkpoint prune. The next run reconciles the publication
+    /// from the wiki's own session-origin stamp — no LLM call, no new
+    /// revision — and prunes the leftover checkpoints.
+    #[tokio::test]
+    async fn chunked_crash_after_publish_before_prune_reconciles_without_llm() {
+        let t = ChunkedTest::fresh().await;
+        let llm1 = Arc::new(StagedLlm::new("m1"));
+        let consolidator = t.consolidator(Arc::clone(&llm1));
+        let session = SessionId::new();
+        t.seed_session(session, &[big_body()]).await;
+
+        // Run 1: drive the phases through the publish, then crash before the
+        // prune.
+        let run1 = t.chunked_run(session, t.observations(session).await);
+        let extractions = consolidator.chunked_map_extractions(&run1).await.unwrap();
+        let ctx = ReduceFinalContext::Single {
+            current_body: "",
+            instructions: None,
+            titles: &[],
+        };
+        let extractions = consolidator
+            .chunked_reduce_extractions(&run1, extractions, &ctx)
+            .await
+            .unwrap();
+        let page = consolidator
+            .chunked_final_single(&run1, &extractions, "", None, &[])
+            .await
+            .unwrap();
+        consolidator
+            .apply_single_page(
+                t.ws,
+                t.proj,
+                session,
+                ai_memory_core::AgentKind::OpenCode,
+                &PagePath::new(format!("sessions/{session}.md")).unwrap(),
+                ai_memory_core::ActorContext::anonymous(),
+                None,
+                page,
+                &[],
+            )
+            .await
+            .unwrap();
+        assert!(
+            !t.checkpoints(session).await.is_empty(),
+            "the crash left checkpoint rows behind"
+        );
+
+        // Run 2 (fresh LLM, zero calls allowed): the public entry reconciles
+        // the publication and prunes — without a new revision or a commit.
+        let llm2 = Arc::new(StagedLlm::new("m1"));
+        let consolidator2 = t.consolidator(Arc::clone(&llm2));
+        let outcome = consolidator2
+            .consolidate_session(
+                session,
+                false,
+                ai_memory_core::ActorContext::anonymous(),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        assert!(
+            llm2.calls() == (0, 0, 0),
+            "the reconcile made no LLM call: {:?}",
+            llm2.calls()
+        );
+        assert!(
+            outcome.page_id.is_none(),
+            "a reconciled publication writes no new page revision"
+        );
+        assert!(
+            t.checkpoints(session).await.is_empty(),
+            "the reconcile pruned the leftover checkpoints"
+        );
+    }
+
+    /// Retry row: a transient capacity error on the first map attempt does
+    /// not change the plan — the retry (and every later stage) keeps the
+    /// same operation id.
+    #[tokio::test]
+    async fn chunked_retry_keeps_one_operation_id_across_attempts() {
+        let t = ChunkedTest::fresh().await;
+        let llm = Arc::new(StagedLlm::new("m1"));
+        let consolidator = t.consolidator(Arc::clone(&llm));
+        let session = SessionId::new();
+        t.seed_session(session, &[big_body()]).await;
+
+        // One transient capacity failure on the first attempt: the bounded
+        // retry of `complete_structured_with_retry` re-runs the same call.
+        llm.fail_next(LlmError::Capacity {
+            body: "over capacity".into(),
+            retry_after_secs: 0,
+        });
+
+        let run = t.chunked_run(session, t.observations(session).await);
+        let extractions = consolidator.chunked_map_extractions(&run).await.unwrap();
+        assert_eq!(llm.calls(), (1, 0, 0), "the retried call succeeded");
+        assert_eq!(
+            extractions.len(),
+            1,
+            "the retried block produced its extraction"
+        );
+        let ids = llm.operation_ids();
+        assert_eq!(ids.len(), 2, "two attempts were recorded");
+        assert_eq!(ids[0], ids[1], "retry keeps the operation id");
+        assert_eq!(
+            ids[0],
+            session.into(),
+            "the run id derives from the session"
+        );
+    }
+
+    /// A model change between runs invalidates every checkpoint: the
+    /// fingerprints carry the model, so the resume re-runs the map instead
+    /// of reusing outputs produced by another model.
+    #[tokio::test]
+    async fn chunked_model_change_invalidates_checkpoint_reuse() {
+        let t = ChunkedTest::fresh().await;
+        let llm1 = Arc::new(StagedLlm::new("m1"));
+        let consolidator = t.consolidator(Arc::clone(&llm1));
+        let session = SessionId::new();
+        t.seed_session(session, &[big_body()]).await;
+        let run1 = t.chunked_run(session, t.observations(session).await);
+        consolidator.chunked_map_extractions(&run1).await.unwrap();
+        assert_eq!(llm1.calls(), (1, 0, 0));
+
+        // Same store, same session, a different model: the fingerprint
+        // changes, so the map re-runs.
+        let llm2 = Arc::new(StagedLlm::new("m2"));
+        let consolidator2 = t.consolidator(Arc::clone(&llm2));
+        let run2 = t.chunked_run(session, t.observations(session).await);
+        consolidator2.chunked_map_extractions(&run2).await.unwrap();
+        assert_eq!(
+            llm2.calls(),
+            (1, 0, 0),
+            "a model change must not reuse another model's checkpoints"
+        );
+    }
+
+    /// Observation-change row: when a new observation lands between a
+    /// crashed run and its resume, only the blocks whose content changed
+    /// re-run; the unchanged block's checkpoint is still reused.
+    #[tokio::test]
+    async fn chunked_new_observation_reruns_only_the_changed_block() {
+        let t = ChunkedTest::fresh().await;
+        let llm1 = Arc::new(StagedLlm::new("m1"));
+        let consolidator = t.consolidator(Arc::clone(&llm1));
+        let session = SessionId::new();
+        t.seed_session(session, &[big_body(), big_body()]).await;
+
+        // Run 1: two map blocks succeed, then the final call fails
+        // (non-retryable) — the run aborts with the map checkpoints intact.
+        llm1.fail_final_once(LlmError::Auth("final stage denied".into()));
+        let outcome = consolidator
+            .consolidate_session(
+                session,
+                false,
+                ai_memory_core::ActorContext::anonymous(),
+                None,
+                None,
+            )
+            .await;
+        assert!(matches!(
+            outcome,
+            Err(ConsolidatorError::Llm(LlmError::Auth(_)))
+        ));
+        assert_eq!(llm1.calls(), (2, 0, 1));
+
+        // A new observation lands. Its block is new; the other blocks'
+        // content is byte-identical, so their fingerprints still match.
+        seed_observations(&t.store.writer, t.ws, t.proj, session, &[big_body()]).await;
+
+        // Run 2: the public entry resumes — one map call (the new block
+        // only), one final call.
+        let llm2 = Arc::new(StagedLlm::new("m1"));
+        let consolidator2 = t.consolidator(Arc::clone(&llm2));
+        let outcome = consolidator2
+            .consolidate_session(
+                session,
+                false,
+                ai_memory_core::ActorContext::anonymous(),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        assert!(outcome.page_id.is_some());
+        let (maps, reduces, finals) = llm2.calls();
+        assert_eq!(
+            (maps, reduces, finals),
+            (1, 0, 1),
+            "only the new block re-ran; the unchanged blocks were reused"
+        );
+    }
+
+    /// Clock row: checkpoints carry `created_at` only as bookkeeping. A row
+    /// stamped a day in the future (a rolled-back or jumped clock) is still
+    /// reused, because the decision is fingerprint-based, never
+    /// timestamp-based.
+    #[tokio::test]
+    async fn chunked_future_dated_checkpoint_still_reused() {
+        let t = ChunkedTest::fresh().await;
+        let llm1 = Arc::new(StagedLlm::new("m1"));
+        let consolidator = t.consolidator(Arc::clone(&llm1));
+        let session = SessionId::new();
+        t.seed_session(session, &[big_body()]).await;
+
+        // Run 1: map succeeds, final fails — checkpoints remain.
+        llm1.fail_final_once(LlmError::Auth("final stage denied".into()));
+        let _ = consolidator
+            .consolidate_session(
+                session,
+                false,
+                ai_memory_core::ActorContext::anonymous(),
+                None,
+                None,
+            )
+            .await;
+        assert_eq!(llm1.calls(), (1, 0, 1));
+
+        // Simulate a clock regression: stamp the checkpoint rows a day in
+        // the future.
+        let future = (jiff::Timestamp::now() + jiff::Span::new().hours(24)).as_microsecond();
+        let db_path = t.tmp.path().join("db/memory.sqlite");
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        conn.execute(
+            "UPDATE consolidation_chunk_progress SET created_at = ?1",
+            rusqlite::params![future],
+        )
+        .unwrap();
+        drop(conn);
+
+        // Run 2: the resume still reuses the checkpoint — zero map calls.
+        let llm2 = Arc::new(StagedLlm::new("m1"));
+        let consolidator2 = t.consolidator(Arc::clone(&llm2));
+        let outcome = consolidator2
+            .consolidate_session(
+                session,
+                false,
+                ai_memory_core::ActorContext::anonymous(),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        assert!(outcome.page_id.is_some());
+        assert_eq!(
+            llm2.calls(),
+            (0, 0, 1),
+            "a future-dated checkpoint is still reused: the decision is              fingerprint-based, not timestamp-based"
+        );
+    }
+
+    /// 300+ observations (plus one larger than a block): no sampling —
+    /// every observation id survives into the final evidence digest, the
+    /// reduce runs hierarchically until the final request fits, and every
+    /// request the fake provider receives was counted (shared counter,
+    /// stage schema) at or under the admission ceiling before the "POST".
+    #[tokio::test]
+    async fn chunked_300_observations_full_coverage_hierarchical_reduce_and_capped_requests() {
+        let t = ChunkedTest::fresh().await;
+        let session = SessionId::new();
+        // 300 small observations + one larger than a block (3400 words =
+        // 10200 chars > the target's char budget, its own map block).
+        let mut bodies: Vec<String> = (0..300)
+            .map(|i| format!("obs {i} {}", "w1 ".repeat(40)))
+            .collect();
+        bodies.push("w1 ".repeat(3_400));
+        t.seed_session(session, &bodies).await;
+        let obs = t.observations(session).await;
+        assert!(obs.len() >= 300, "the fixture seeds 300+ observations");
+        let all_ids: Vec<String> = obs.iter().map(|o| o.id.to_string()).collect();
+
+        // The ceiling admits exactly the IRREDUCIBLE final: the digest
+        // citing every id once. A second extraction in the digest adds more
+        // overhead than the margin, so the reduce must merge until the
+        // final request fits; the map block of the oversized observation
+        // also fits this ceiling by construction (measured in the fixture
+        // design, not by assumption).
+        let counter = ChatTokenCounter::load(&t.tokenizer_path).unwrap();
+        let id_refs: Vec<&str> = all_ids.iter().map(|s| s.as_str()).collect();
+        let synthetic = vec![extraction_with(&id_refs, "fact", "t", 0.9)];
+        let irreducible = t.consolidator_base_count(session, &synthetic).unwrap();
+        let ceiling = irreducible + 100;
+
+        let llm = Arc::new(StagedLlm::new("m1").with_counter(counter));
+        let consolidator = t.consolidator_with(Arc::clone(&llm), t.base + 300, ceiling);
+        let outcome = consolidator
+            .consolidate_session(
+                session,
+                false,
+                ai_memory_core::ActorContext::anonymous(),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        assert!(!outcome.dry_run);
+        assert!(outcome.page_id.is_some());
+
+        // Full coverage: every observation id (including the oversized one)
+        // reaches the final evidence digest — nothing sampled away.
+        let final_user = llm.final_user();
+        let ids_in_final = merged_ids_in(&final_user);
+        for id in &all_ids {
+            assert!(
+                ids_in_final.iter().any(|x| x == id),
+                "observation {id} is missing from the final digest"
+            );
+        }
+        // Every request the provider received fit the ceiling by the shared
+        // counter — sized before the "POST", not rejected at the guard.
+        let counts = llm.counts();
+        assert_eq!(
+            counts.len(),
+            llm.calls().0 + llm.calls().1 + llm.calls().2,
+            "every request was captured and counted"
+        );
+        assert!(
+            counts.iter().all(|&c| c <= ceiling),
+            "every captured request is within the ceiling: {counts:?} vs {ceiling}"
+        );
+        // The digest needed more than one reduce pass to fit: the map's
+        // extractions are grouped, merged per group, and the merged list is
+        // counted against the final request again.
+        let (m, r, f) = llm.calls();
+        assert!(m >= 2, "multiple map blocks: {m}");
+        assert!(
+            r >= 2,
+            "the reduce grouped and merged (≥ 2 reduce calls): {r}"
+        );
+        assert_eq!(f, 1, "exactly one final call");
+        // Published, and the checkpoints pruned after the publish.
+        assert!(t.checkpoints(session).await.is_empty());
+    }
+
+    /// The reduce loop runs multiple DEPTHS when one pass still leaves the
+    /// final request over the ceiling: eight map-shaped extractions merge
+    /// in two groups (depth 1), the merged pair still overflows the final
+    /// (two digests carry the same ids plus a second rendering's overhead),
+    /// and one more group merges them together (depth 2) until the final
+    /// fits.
+    #[tokio::test]
+    async fn chunked_reduce_runs_multiple_depths_until_the_final_fits() {
+        let t = ChunkedTest::fresh().await;
+        let session = SessionId::new();
+        // Eight extractions, five disjoint ids each, 150-word bodies: the
+        // whole list is one greedy group, but only four fit the ceiling —
+        // so depth 1 is exactly two groups.
+        let mut extractions = Vec::new();
+        for g in 0..8 {
+            let ids: Vec<String> = (0..5)
+                .map(|i| format!("{g:08x}-0000-4000-8000-{i:012x}"))
+                .collect();
+            let refs: Vec<&str> = ids.iter().map(|s| s.as_str()).collect();
+            let mut ex = extraction_with(&refs, "fact", "t", 0.9);
+            ex.body_markdown = "w1 ".repeat(150);
+            extractions.push(ex);
+        }
+        // Ceiling derived from the digest arithmetic, not a guess: one
+        // digest carrying all 40 ids is `count1`; two digests carrying the
+        // same ids cost `delta` more (the second extraction's rendering).
+        // The ceiling sits between them, so two merged digests cannot fit
+        // but one can — the reduce must merge across two depths.
+        let all: Vec<String> = extractions
+            .iter()
+            .flat_map(|e| e.observation_ids.iter().cloned())
+            .collect();
+        let refs: Vec<&str> = all.iter().map(|s| s.as_str()).collect();
+        let single = vec![extraction_with(&refs, "fact", "t", 0.9)];
+        let count1 = t.consolidator_base_count(session, &single).unwrap();
+        let half_refs: Vec<&str> = all[..20].iter().map(|s| s.as_str()).collect();
+        let second_refs: Vec<&str> = all[20..].iter().map(|s| s.as_str()).collect();
+        let pair = vec![
+            extraction_with(&half_refs, "fact", "t", 0.9),
+            extraction_with(&second_refs, "fact", "t", 0.9),
+        ];
+        let count2 = t.consolidator_base_count(session, &pair).unwrap();
+        let delta = count2 - count1;
+        assert!(delta > 0, "a second digest rendering must cost tokens");
+        let ceiling = count1 + delta / 2;
+
+        let llm = Arc::new(StagedLlm::new("m1"));
+        let consolidator = t.consolidator_with(Arc::clone(&llm), t.base + 800, ceiling);
+        let run = t.chunked_run(session, Vec::new());
+        let ctx = ReduceFinalContext::Single {
+            current_body: "",
+            instructions: None,
+            titles: &[],
+        };
+        let merged = consolidator
+            .chunked_reduce_extractions(&run, extractions, &ctx)
+            .await
+            .unwrap();
+        // Two depths: the two depth-1 group merges, then the depth-2 merge
+        // of the merges.
+        assert_eq!(llm.calls(), (0, 3, 0), "depth 1 groups + depth 2 merge");
+        assert_eq!(merged.len(), 1, "the reduce converges to one extraction");
+        // The merge lost no id: the union is preserved.
+        let merged_ids: Vec<String> = merged[0].observation_ids.clone();
+        assert_eq!(merged_ids.len(), 40);
+        for id in &all {
+            assert!(merged_ids.iter().any(|x| x == id), "missing {id}");
+        }
+        // Every captured request fit the ceiling.
+        assert!(llm.counts().iter().all(|&c| c <= ceiling));
     }
 }

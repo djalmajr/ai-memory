@@ -224,6 +224,102 @@ pub struct ConsolidatedBatch {
     pub rationale: String,
 }
 
+/// Semantic class of one typed evidence extraction from the map stage of
+/// map-reduce consolidation. Closed vocabulary so the reduce stage can merge
+/// like-with-like and the final stage can route `rule` extractions like
+/// [`PageKind::Rule`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ExtractionKind {
+    /// Project chose X over Y (ADR-shaped).
+    Decision,
+    /// A failure mode or surprise worth remembering.
+    Gotcha,
+    /// Durable project convention ("always X", "never Y").
+    Rule,
+    /// A reusable workflow or operating pattern.
+    Procedure,
+    /// An evergreen concept the session clarified.
+    Concept,
+    /// Episodic narrative or anything that fits no stronger category.
+    /// The default — every map chunk must still ground at least one of its
+    /// observations here so the session's story survives the reduction.
+    #[default]
+    Fact,
+}
+
+impl ExtractionKind {
+    /// Wire string for serialisation.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Decision => "decision",
+            Self::Gotcha => "gotcha",
+            Self::Rule => "rule",
+            Self::Procedure => "procedure",
+            Self::Concept => "concept",
+            Self::Fact => "fact",
+        }
+    }
+}
+
+/// One grounded evidence extraction produced by the map stage of
+/// map-reduce consolidation.
+///
+/// The load-bearing field is `observation_ids`: every extraction MUST cite
+/// the exact observation ids it is grounded in (the consolidator validates
+/// this against the block the chunk actually saw — a hallucinated id fails
+/// the whole run, fail-closed). The reduce stage unions ids when merging
+/// extractions; the final stage cites them in the page body.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct EvidenceExtraction {
+    /// The observation ids this extraction is grounded in. Non-empty; must
+    /// be a subset of the chunk's observation ids.
+    pub observation_ids: Vec<String>,
+    /// Semantic class of the extraction.
+    pub kind: ExtractionKind,
+    /// Short page-worthy title.
+    pub title: String,
+    /// One line of plain prose describing the evidence.
+    pub summary: String,
+    /// Short markdown note of what the evidence says. Grounded in the
+    /// cited observations only — no invented detail.
+    pub body_markdown: String,
+    /// Optional short tags.
+    #[serde(default)]
+    pub tags: Vec<String>,
+    /// Specific nouns this extraction names (retrieval stream).
+    #[serde(default)]
+    pub entities: Vec<String>,
+    /// Model confidence in the extraction, 0..=1. Validated at ingestion —
+    /// the schema alone cannot stop a model emitting 7.5.
+    #[schemars(range(min = 0.0, max = 1.0))]
+    pub confidence: f64,
+}
+
+/// Structured output of one map (per-block extraction) or reduce (merge)
+/// stage. Bounded at validation: at most `MAX_EXTRactions_PER_STAGE`
+/// extractions per stage (schemars in this workspace cannot express
+/// `maxItems`, so the runtime validation is the boundary — the prompt also
+/// states the cap).
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct ExtractionResult {
+    /// The stage's extractions. Zero is allowed only when
+    /// `no_durable_fact_ids` covers the stage's whole input (a genuinely
+    /// routine block); validated at ingestion.
+    pub extractions: Vec<EvidenceExtraction>,
+    /// Brief LLM-authored note about what the stage did.
+    #[serde(default)]
+    pub rationale: String,
+    /// Observation ids this stage inspected but judged to carry no durable
+    /// fact. Together with the extractions' `observation_ids` this must
+    /// cover the stage's entire input — `validate_extraction_result`
+    /// enforces the coverage, so a stage cannot silently drop an
+    /// observation.
+    #[serde(default)]
+    pub no_durable_fact_ids: Vec<String>,
+}
+
 /// Outcome of a single consolidation call.
 #[derive(Debug, Clone, Serialize)]
 pub struct ConsolidationOutcome {

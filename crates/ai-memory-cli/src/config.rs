@@ -929,6 +929,17 @@ pub struct ConsolidationSettings {
     /// Maximum tokens the provider may generate for a consolidation response.
     /// Small-context models must lower this together with `max_input_tokens`.
     pub max_output_tokens: u32,
+    /// Opt-in map-reduce consolidation: when above zero, a session's
+    /// observation log is consolidated through sequential, checkpointed
+    /// map/reduce stages (typed evidence extraction grounded in observation
+    /// ids, hierarchical reduction, then the normal final prompt) instead of
+    /// one large prompt. Each stage is sized with the model's own tokenizer
+    /// so every call fits `llm_max_input_tokens` before it reaches the
+    /// admission guard. `0` (the default) keeps the single-prompt pipeline
+    /// exactly as before. Requires `llm_max_input_tokens > 0` and a readable
+    /// `llm_tokenizer_path`, and must not exceed `llm_max_input_tokens`.
+    /// Env: `AI_MEMORY_CONSOLIDATION__CHUNK_INPUT_TOKENS`.
+    pub chunk_input_tokens: usize,
 }
 
 impl Default for ConsolidationSettings {
@@ -936,6 +947,7 @@ impl Default for ConsolidationSettings {
         Self {
             max_input_tokens: ai_memory_consolidate::DEFAULT_CONSOLIDATION_MAX_INPUT_TOKENS,
             max_output_tokens: ai_memory_consolidate::DEFAULT_CONSOLIDATION_MAX_OUTPUT_TOKENS,
+            chunk_input_tokens: 0,
         }
     }
 }
@@ -1455,6 +1467,42 @@ impl Config {
                  (got {}); below that a structured consolidation response is unlikely to fit",
                 config.consolidation.max_output_tokens
             );
+        }
+        // Map-reduce chunking depends on the tokenized ceiling: the planner
+        // sizes every stage with the model's own tokenizer so each call fits
+        // the admission guard's cap. Active without a ceiling (or without a
+        // readable tokenizer) would ship a pipeline the guard can reject —
+        // fail at startup, not on the first consolidation.
+        if config.consolidation.chunk_input_tokens > 0 {
+            match config.llm_max_input_tokens {
+                Some(ceiling) if ceiling > 0 => {
+                    let Some(tokenizer_path) = &config.llm_tokenizer_path else {
+                        anyhow::bail!(
+                            "consolidation.chunk_input_tokens requires llm_tokenizer_path"
+                        );
+                    };
+                    if !tokenizer_path.is_file() {
+                        anyhow::bail!(
+                            "consolidation.chunk_input_tokens requires a readable \
+                             llm_tokenizer_path ({tokenizer_path:?} is not a readable file)"
+                        );
+                    }
+                    if config.consolidation.chunk_input_tokens > ceiling {
+                        anyhow::bail!(
+                            "consolidation.chunk_input_tokens ({}) cannot exceed \
+                             llm_max_input_tokens ({ceiling})",
+                            config.consolidation.chunk_input_tokens
+                        );
+                    }
+                }
+                _ => {
+                    anyhow::bail!(
+                        "consolidation.chunk_input_tokens requires llm_max_input_tokens \
+                         (a positive tokenized ceiling); the chunk planner sizes requests \
+                         the way the admission guard enforces them"
+                    );
+                }
+            }
         }
         // Zero (or a sub-second remainder rounded down) would cut every
         // provider request off before it is sent.
@@ -2758,6 +2806,100 @@ mod tests {
         .unwrap();
         let error = Config::load(Some(&config_path), Some(tmp.path().to_path_buf())).unwrap_err();
         assert!(error.to_string().contains("fallback tokenizers may differ"));
+    }
+
+    /// Map-reduce chunking is active only when `chunk_input_tokens > 0`, and
+    /// an active mode must carry its tokenized dependencies: a positive
+    /// `llm_max_input_tokens` ceiling, a readable tokenizer, and a chunk
+    /// target that fits the ceiling. Each refusal is a startup error — the
+    /// server must never start with a chunk planner that cannot be sized by
+    /// the admission guard.
+    #[test]
+    fn map_reduce_chunking_requires_the_tokenized_ceiling() {
+        let tmp = TempDir::new().unwrap();
+        let config_path = tmp.path().join("config.toml");
+
+        // Active without any ceiling: refused.
+        std::fs::write(
+            &config_path,
+            "[consolidation]\nchunk_input_tokens = 14000\n",
+        )
+        .unwrap();
+        let error = Config::load(Some(&config_path), Some(tmp.path().to_path_buf())).unwrap_err();
+        assert!(
+            error.to_string().contains("llm_max_input_tokens"),
+            "unexpected error: {error:#}"
+        );
+
+        // Active with a ceiling but no readable tokenizer: refused.
+        std::fs::write(
+            &config_path,
+            "llm_max_input_tokens = 16000\n\n[consolidation]\nchunk_input_tokens = 14000\n",
+        )
+        .unwrap();
+        let error = Config::load(Some(&config_path), Some(tmp.path().to_path_buf())).unwrap_err();
+        assert!(
+            error.to_string().contains("llm_tokenizer_path"),
+            "unexpected error: {error:#}"
+        );
+
+        // A tokenizer path that does not exist: refused.
+        std::fs::write(
+            &config_path,
+            "llm_max_input_tokens = 16000\nllm_tokenizer_path = \"/definitely/not/here/tokenizer.json\"\n\n[consolidation]\nchunk_input_tokens = 14000\n",
+        )
+        .unwrap();
+        let error = Config::load(Some(&config_path), Some(tmp.path().to_path_buf())).unwrap_err();
+        assert!(
+            error.to_string().contains("readable"),
+            "unexpected error: {error:#}"
+        );
+
+        // A chunk target above the ceiling: refused.
+        let tokenizer = tmp.path().join("tokenizer.json");
+        std::fs::write(&tokenizer, b"{}{}").unwrap();
+        std::fs::write(
+            &config_path,
+            format!(
+                "llm_max_input_tokens = 16000\nllm_tokenizer_path = {:?}\n\n[consolidation]\nchunk_input_tokens = 17000\n",
+                tokenizer
+            ),
+        )
+        .unwrap();
+        let error = Config::load(Some(&config_path), Some(tmp.path().to_path_buf())).unwrap_err();
+        assert!(
+            error.to_string().contains("cannot exceed"),
+            "unexpected error: {error:#}"
+        );
+
+        // The valid combination: accepted, and the value round-trips.
+        std::fs::write(
+            &config_path,
+            format!(
+                "llm_max_input_tokens = 16000\nllm_tokenizer_path = {:?}\n\n[consolidation]\nchunk_input_tokens = 14000\n",
+                tokenizer
+            ),
+        )
+        .unwrap();
+        let cfg = Config::load(Some(&config_path), Some(tmp.path().to_path_buf())).unwrap();
+        assert_eq!(cfg.consolidation.chunk_input_tokens, 14_000);
+    }
+
+    /// The zero default is the contract: without an explicit
+    /// `chunk_input_tokens` the single-prompt pipeline is unchanged, and no
+    /// tokenized ceiling is required.
+    #[test]
+    fn map_reduce_chunking_is_off_by_default() {
+        let tmp = TempDir::new().unwrap();
+        let config_path = tmp.path().join("config.toml");
+        std::fs::write(
+            &config_path,
+            "[consolidation]\nmax_input_tokens = 100000\nmax_output_tokens = 32000\n",
+        )
+        .unwrap();
+        let cfg = Config::load(Some(&config_path), Some(tmp.path().to_path_buf())).unwrap();
+        assert_eq!(cfg.consolidation.chunk_input_tokens, 0);
+        assert!(cfg.llm_max_input_tokens.is_none());
     }
 
     /// `AI_MEMORY_LLM_TIMEOUT_SECS` (figment maps it to this field) exists so
