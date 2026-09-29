@@ -4,6 +4,13 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 /// Identifier shared by every HTTP attempt for one logical LLM operation.
+///
+/// Fresh per operation: the caller of one LLM operation (a consolidation
+/// invocation, an auto-improve review) generates one value with
+/// [`LlmOperationId::new`] and passes it to every attempt of that
+/// operation. It is never derived from an agent session id — two
+/// operations of the same session (or a crash-resumed or re-claimed run)
+/// must not look like one operation on the provider side.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct LlmOperationId(Uuid);
 
@@ -18,12 +25,6 @@ impl LlmOperationId {
 impl Default for LlmOperationId {
     fn default() -> Self {
         Self::new()
-    }
-}
-
-impl From<ai_memory_core::SessionId> for LlmOperationId {
-    fn from(value: ai_memory_core::SessionId) -> Self {
-        Self(value.0)
     }
 }
 

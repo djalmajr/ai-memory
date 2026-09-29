@@ -13,7 +13,8 @@ use std::time::Duration;
 
 use ai_memory_core::{Observation, PagePath, ProjectId, SessionId, WorkspaceId};
 use ai_memory_llm::{
-    ChatMessage, ChatRequest, LlmError, LlmProvider, Role, complete_structured_with_operation_id,
+    ChatMessage, ChatRequest, LlmError, LlmOperationId, LlmProvider, Role,
+    complete_structured_with_operation_id,
 };
 use ai_memory_store::{AutoImproveRejectionSummary, BriefingPage, ReaderPool, StoredPageBody};
 use schemars::JsonSchema;
@@ -559,8 +560,12 @@ pub async fn run_auto_improve_review(
         max_tokens: DEFAULT_REVIEW_MAX_TOKENS,
         temperature: Some(0.1),
     };
+    // One review call is one LLM operation: a fresh identity, never the
+    // agent's session id — two reviews of the same session must not look
+    // like one operation on the provider side.
+    let operation_id = LlmOperationId::new();
     let raw: AutoImproveLlmResponse =
-        complete_structured_with_operation_id(llm, request, session_id.into()).await?;
+        complete_structured_with_operation_id(llm, request, operation_id).await?;
     let (mut proposals, mut rejected_candidates, mut warnings) =
         validate_response(raw, &cfg, &existing_index);
     rejected_candidates.extend(prompt_input.rejected_candidates);
@@ -2069,6 +2074,66 @@ mod tests {
         }
     }
 
+    /// Records the operation id of every structured call (one review call
+    /// is one LLM operation) and returns an empty proposal set — the id is
+    /// the subject under test, not the proposals.
+    struct OpIdCapturingLlm {
+        ids: std::sync::Arc<std::sync::Mutex<Vec<LlmOperationId>>>,
+    }
+
+    impl OpIdCapturingLlm {
+        fn new() -> Self {
+            Self {
+                ids: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+            }
+        }
+
+        fn ids(&self) -> Vec<LlmOperationId> {
+            self.ids.lock().unwrap().clone()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl LlmProvider for OpIdCapturingLlm {
+        fn name(&self) -> &'static str {
+            "fake"
+        }
+
+        fn model(&self) -> &'static str {
+            "fake-model"
+        }
+
+        async fn complete(&self, _request: ChatRequest) -> LlmResult<ChatResponse> {
+            Ok(ChatResponse {
+                text: "unused".into(),
+                usage: None,
+                model: "fake-model".into(),
+            })
+        }
+
+        async fn complete_structured_raw(
+            &self,
+            _request: ChatRequest,
+            _schema: serde_json::Value,
+        ) -> LlmResult<serde_json::Value> {
+            Ok(serde_json::json!({
+                "summary": "no durable lesson",
+                "proposals": [],
+                "rejected_candidates": []
+            }))
+        }
+
+        async fn complete_structured_raw_with_operation_id(
+            &self,
+            request: ChatRequest,
+            schema: serde_json::Value,
+            operation_id: LlmOperationId,
+        ) -> LlmResult<serde_json::Value> {
+            self.ids.lock().unwrap().push(operation_id);
+            self.complete_structured_raw(request, schema).await
+        }
+    }
+
     fn cfg() -> AutoImproveReviewConfig {
         AutoImproveReviewConfig {
             min_observations: 3,
@@ -2482,6 +2547,102 @@ mod tests {
         assert_eq!(report.proposals.len(), 1);
         assert_eq!(report.proposals[0].path, "procedures/release.md");
         assert!(report.rejected_candidates.is_empty());
+    }
+
+    /// Operation identity: two auto-improve reviews of the SAME session are
+    /// two LLM operations — two distinct fresh UUID v7 ids (the
+    /// gateway-compatible 36-character form), never the session id — so a
+    /// gateway cannot confuse one session's two reviews with one operation.
+    #[tokio::test]
+    async fn two_reviews_of_one_session_get_distinct_operation_ids() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let ws = store
+            .writer
+            .get_or_create_workspace("default")
+            .await
+            .unwrap();
+        let proj = store
+            .writer
+            .get_or_create_project(ws, "proj", None)
+            .await
+            .unwrap();
+        let session_id = ai_memory_core::SessionId::new();
+        store
+            .writer
+            .begin_session(NewSession {
+                occurred_at: None,
+                id: session_id,
+                workspace_id: ws,
+                project_id: proj,
+                agent_kind: AgentKind::Other,
+                cwd: None,
+                actor_user: None,
+            })
+            .await
+            .unwrap();
+        for i in 0..3 {
+            store
+                .writer
+                .insert_observation(Sanitized::new(
+                    NewObservation {
+                        occurred_at: None,
+                        session_id,
+                        workspace_id: ws,
+                        project_id: proj,
+                        kind: if i == 0 {
+                            ObservationKind::SessionStart
+                        } else {
+                            ObservationKind::UserPrompt
+                        },
+                        extension: None,
+                        source_event: None,
+                        title: format!("event {i}"),
+                        body: "run the full gate before release".into(),
+                        importance: 5,
+                    },
+                    &Sanitizer::builtin(),
+                ))
+                .await
+                .unwrap();
+        }
+
+        // Two reviews of the same session, one LLM operation each.
+        let llm = OpIdCapturingLlm::new();
+        for _ in 0..2 {
+            let report = run_auto_improve_review(
+                &store.reader,
+                &llm,
+                ws,
+                proj,
+                session_id,
+                AutoImproveReviewConfig {
+                    min_session_duration_secs: 0,
+                    ..cfg()
+                },
+            )
+            .await
+            .unwrap();
+            assert!(report.proposals.is_empty());
+        }
+
+        let ids = llm.ids();
+        assert_eq!(ids.len(), 2, "one structured LLM call per review");
+        assert_ne!(
+            ids[0], ids[1],
+            "two reviews of one session get distinct operation ids"
+        );
+        for id in &ids {
+            let s = id.to_string();
+            assert_eq!(s.len(), 36, "the hyphenated wire form is 36 chars: {s}");
+            let parsed = uuid::Uuid::parse_str(&s).expect("parses as a UUID");
+            assert_eq!(parsed.get_version_num(), 7, "fresh UUID v7: {s}");
+            assert_ne!(
+                s,
+                session_id.to_string(),
+                "the operation id is never the session id"
+            );
+        }
     }
 
     /// The reviewer's recent-page context must surface durable pages and drop

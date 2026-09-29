@@ -180,8 +180,16 @@ also set `COPILOT_GITHUB_TOKEN`, `GH_TOKEN`, or `GITHUB_TOKEN` on the server.
 > every attempt of the same operation and forward it to the engine (vLLM).
 > One operation is the invocation that enters the server's LLM admission:
 > a fresh durable queue execution of the same session is a new operation
-> and a new id. The official `openai` provider and `opencode` do not send
-> this header — `opencode` keeps its own `x-opencode-session` contract. Because
+> and a new id. The id is generated fresh by the caller of the operation —
+> the consolidation invocation or the auto-improve review — and is never
+> the agent's session id, so a gateway never sees two operations of one
+> session, or a crash-resumed run, as one. Crash re-entry is exactly one
+> new operation: a process restart or a queue re-claim mints a new id for
+> the calls it makes, while map-reduce checkpoint reuse and the publication
+> reconcile never read the id — a resumed run still reuses completed stages
+> and reconciles an already-published page without an LLM call. The official
+> `openai` provider and `opencode` do not send this header — `opencode`
+> keeps its own `x-opencode-session` contract. Because
 > ai-memory owns the header on the `openai-compat` path, a static
 > `x-request-id` entry in `AI_MEMORY_LLM_HEADERS` is refused at startup for
 > that provider; the dynamic value must not be shadowed or duplicated.
@@ -245,7 +253,11 @@ heuristic SessionEnd page (origin stamp only, no marker) is not a publication,
 so the pipeline runs and overwrites it. One consolidation run uses one logical
 operation id across every stage, retry, and replay (carried as `X-Request-Id`
 on the `openai-compat` path), so the whole run is one correlated stream on
-the provider side. Map and reduce output is validated at ingestion: any
+the provider side. The run's id is generated fresh at the public entry and
+is never the session id; a crash re-entry or a queue re-claim is a new
+operation with a new id, while the checkpoints and the publication marker
+never read it — a resumed run keeps reusing completed stages and
+reconciling without an LLM call. Map and reduce output is validated at ingestion: any
 hallucinated observation id, empty grounding, or out-of-range confidence
 fails the run closed rather than being written.
 

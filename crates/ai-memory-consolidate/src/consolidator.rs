@@ -342,6 +342,13 @@ impl Consolidator {
         let existing_titles = self
             .existing_page_titles(ws, proj, &actor, session_id)
             .await;
+        // One LLM operation, one identity: this fresh id (never the agent's
+        // session id) is shared by every attempt of this invocation, in the
+        // default path or every chunked stage. A re-entry after a crash or a
+        // new queue claim is a NEW operation with a new id; checkpoint reuse
+        // and the publication reconcile never read it, so a resumed run still
+        // reuses completed stages and reconciles without an LLM call.
+        let operation_id = LlmOperationId::new();
         // Opt-in map-reduce pipeline (see `ChunkedRun`): the observation log
         // is reduced through sequential, checkpointed map/reduce stages
         // before the final single-page prompt. The single-prompt pipeline
@@ -360,6 +367,7 @@ impl Consolidator {
                     &current_body,
                     instructions.as_deref(),
                     &existing_titles,
+                    operation_id,
                 )
                 .await;
         }
@@ -380,7 +388,7 @@ impl Consolidator {
         let page: ConsolidatedPage = complete_structured_with_retry(
             &*self.llm,
             request,
-            session_id.into(),
+            operation_id,
             CONSOLIDATION_LLM_RETRY_DELAY,
         )
         .await?;
@@ -804,6 +812,12 @@ impl Consolidator {
         // except that it now ALSO drops any batch update to the reserved
         // `_prompts/consolidation.md` page (input, not output) — the shared
         // `apply_batch_pages` enforces that for both pipelines.
+        //
+        // One LLM operation, one identity (see `consolidate_session`): the
+        // fresh id is shared by every attempt of this invocation; a re-entry
+        // after a crash or a new queue claim is a new operation with a new
+        // id, and checkpoint reuse / the publication reconcile never read it.
+        let operation_id = LlmOperationId::new();
         if self.chunking.is_some() {
             return self
                 .consolidate_session_multi_chunked(
@@ -815,6 +829,7 @@ impl Consolidator {
                     author_id,
                     instructions,
                     observations,
+                    operation_id,
                 )
                 .await;
         }
@@ -843,7 +858,7 @@ impl Consolidator {
         let batch: ConsolidatedBatch = complete_structured_with_retry(
             &*self.llm,
             request,
-            session_id.into(),
+            operation_id,
             CONSOLIDATION_LLM_RETRY_DELAY,
         )
         .await?;
@@ -1539,6 +1554,7 @@ impl Consolidator {
         current_body: &str,
         instructions: Option<&str>,
         existing_titles: &[String],
+        operation_id: LlmOperationId,
     ) -> ConsolidatorResult<ConsolidationOutcome> {
         let run = ChunkedRun {
             ws,
@@ -1546,7 +1562,7 @@ impl Consolidator {
             session: session_id,
             actor,
             observations,
-            operation_id: session_id.into(),
+            operation_id,
         };
         // The single entry receives the RESOLVED instructions (the public
         // `consolidate_session` resolves them before dispatching). The marker
@@ -1617,6 +1633,7 @@ impl Consolidator {
         author_id: Option<ai_memory_core::UserId>,
         instructions: Option<&str>,
         observations: Vec<Observation>,
+        operation_id: LlmOperationId,
     ) -> ConsolidatorResult<Vec<ConsolidationOutcome>> {
         let run = ChunkedRun {
             ws,
@@ -1624,7 +1641,7 @@ impl Consolidator {
             session: session_id,
             actor,
             observations,
-            operation_id: session_id.into(),
+            operation_id,
         };
         // Resolve the consolidation instructions BEFORE the reconcile so the
         // publication marker (which embeds them) is computed from the same
@@ -6714,6 +6731,21 @@ mod tests {
             .unwrap()
         }
 
+        /// The production DEFAULT pipeline: no chunking configured, exactly
+        /// what `chunk_input_tokens = 0` (the default) builds in serve.rs.
+        fn plain_consolidator(&self, llm: Arc<StagedLlm>) -> Consolidator {
+            let wiki = Wiki::new(self.tmp.path(), self.store.writer.clone()).unwrap();
+            let llm: Arc<dyn LlmProvider> = llm;
+            Consolidator::new(
+                self.store.reader.clone(),
+                self.store.writer.clone(),
+                wiki,
+                llm,
+                self.ws,
+                self.proj,
+            )
+        }
+
         async fn seed_session(&self, session: SessionId, bodies: &[String]) {
             self.store
                 .writer
@@ -6738,7 +6770,9 @@ mod tests {
                 session,
                 actor: ai_memory_core::ActorContext::anonymous(),
                 observations,
-                operation_id: session.into(),
+                // One fresh operation per run: never derived from the
+                // session id (the public entries generate it the same way).
+                operation_id: LlmOperationId::new(),
             }
         }
 
@@ -8243,6 +8277,7 @@ mod tests {
         });
 
         let run = t.chunked_run(session, t.observations(session).await);
+        let run_operation_id = run.operation_id;
         let extractions = consolidator.chunked_map_extractions(&run).await.unwrap();
         assert_eq!(llm.calls(), (1, 0, 0), "the retried call succeeded");
         assert_eq!(
@@ -8254,9 +8289,27 @@ mod tests {
         assert_eq!(ids.len(), 2, "two attempts were recorded");
         assert_eq!(ids[0], ids[1], "retry keeps the operation id");
         assert_eq!(
-            ids[0],
-            session.into(),
-            "the run id derives from the session"
+            ids[0], run_operation_id,
+            "the attempts carry the run's operation id"
+        );
+        assert_fresh_gateway_form(run_operation_id);
+        assert_ne!(
+            ids[0].to_string(),
+            session.to_string(),
+            "the operation id is fresh per operation, never the session id"
+        );
+    }
+
+    /// Gateway compatibility of a fresh operation id: the 36-character
+    /// hyphenated UUID v7 form a gateway records in `X-Request-Id`.
+    fn assert_fresh_gateway_form(id: LlmOperationId) {
+        let s = id.to_string();
+        assert_eq!(s.len(), 36, "the hyphenated wire form is 36 chars: {s}");
+        let parsed = uuid::Uuid::parse_str(&s).expect("parses as a UUID");
+        assert_eq!(
+            parsed.get_version_num(),
+            7,
+            "a fresh operation id is UUID v7: {s}"
         );
     }
 
@@ -8399,6 +8452,124 @@ mod tests {
             (0, 0, 1),
             "a future-dated checkpoint is still reused: the decision is              fingerprint-based, not timestamp-based"
         );
+    }
+
+    /// Operation-identity row: the DEFAULT (single-prompt, production) path
+    /// mints a fresh UUID v7 per public invocation — never the agent's
+    /// session id — so two invocations of one session (single and multi)
+    /// look like distinct operations on the provider side. Controls use a
+    /// v7 session (the `SessionId::new` form) and a v4-style session (the
+    /// random form agents commonly carry), so no derivation from the
+    /// session's own bytes can sneak back in.
+    #[tokio::test]
+    async fn each_invocation_gets_a_fresh_operation_id_independent_of_the_session() {
+        let t = ChunkedTest::fresh().await;
+        let actor = ai_memory_core::ActorContext::anonymous();
+        // v7 (time-ordered) and v4 (random, agent-style) sessions.
+        let sessions = [SessionId::new(), SessionId(uuid::Uuid::new_v4())];
+        for session in sessions {
+            t.seed_session(session, &[big_body()]).await;
+
+            // Two single invocations of the SAME session: two distinct
+            // fresh v7 ids, neither one the session id.
+            let llm1 = Arc::new(StagedLlm::new("m1"));
+            t.plain_consolidator(Arc::clone(&llm1))
+                .consolidate_session(session, false, actor.clone(), None, None)
+                .await
+                .unwrap();
+            let llm2 = Arc::new(StagedLlm::new("m1"));
+            t.plain_consolidator(Arc::clone(&llm2))
+                .consolidate_session(session, false, actor.clone(), None, None)
+                .await
+                .unwrap();
+            let single1 = llm1.operation_ids();
+            let single2 = llm2.operation_ids();
+            assert_eq!(single1.len(), 1, "one default single call per invocation");
+            assert_eq!(single2.len(), 1, "one default single call per invocation");
+            assert_ne!(
+                single1[0], single2[0],
+                "two single invocations of one session get distinct operation ids"
+            );
+            assert_fresh_gateway_form(single1[0]);
+            assert_fresh_gateway_form(single2[0]);
+            assert_ne!(
+                single1[0].to_string(),
+                session.to_string(),
+                "the operation id is never the session id"
+            );
+
+            // Same for the multi default path: two invocations, two ids.
+            let llm3 = Arc::new(StagedLlm::new("m1"));
+            t.plain_consolidator(Arc::clone(&llm3))
+                .consolidate_session_multi(session, false, actor.clone(), None, None)
+                .await
+                .unwrap();
+            let llm4 = Arc::new(StagedLlm::new("m1"));
+            t.plain_consolidator(Arc::clone(&llm4))
+                .consolidate_session_multi(session, false, actor.clone(), None, None)
+                .await
+                .unwrap();
+            let multi1 = llm3.operation_ids();
+            let multi2 = llm4.operation_ids();
+            assert_eq!(multi1.len(), 1, "one default multi call per invocation");
+            assert_eq!(multi2.len(), 1, "one default multi call per invocation");
+            assert_ne!(
+                multi1[0], multi2[0],
+                "two multi invocations of one session get distinct operation ids"
+            );
+            assert_fresh_gateway_form(multi1[0]);
+            assert_fresh_gateway_form(multi2[0]);
+            assert_ne!(
+                multi1[0].to_string(),
+                session.to_string(),
+                "the operation id is never the session id"
+            );
+        }
+    }
+
+    /// Re-entry row: a resumed (crashed) run is a NEW LLM operation — a new
+    /// operation id for its calls — while checkpoint reuse never reads that
+    /// id, so the completed stages are still reused (and a reconcile of an
+    /// already-published page still runs without any LLM call at all).
+    #[tokio::test]
+    async fn a_resumed_run_is_a_new_operation_but_reuses_checkpoints() {
+        let t = ChunkedTest::fresh().await;
+        let actor = ai_memory_core::ActorContext::anonymous();
+        let llm1 = Arc::new(StagedLlm::new("m1"));
+        let consolidator = t.consolidator(Arc::clone(&llm1));
+        let session = SessionId::new();
+        t.seed_session(session, &[big_body()]).await;
+
+        // Run 1: the map succeeds (checkpoint recorded), then the final
+        // call fails — the run aborts with the map checkpoint intact.
+        llm1.fail_final_once(LlmError::Auth("final stage denied".into()));
+        let _ = consolidator
+            .consolidate_session(session, false, actor.clone(), None, None)
+            .await;
+        assert_eq!(llm1.calls(), (1, 0, 1));
+        let ids1 = llm1.operation_ids();
+        assert!(
+            ids1.iter().all(|id| *id == ids1[0]),
+            "run 1 carried one operation id across its calls"
+        );
+
+        // Run 2 (a new process over the same store): the map checkpoint is
+        // reused (zero map calls) and the final stage re-runs.
+        let llm2 = Arc::new(StagedLlm::new("m1"));
+        let consolidator2 = t.consolidator(Arc::clone(&llm2));
+        let outcome = consolidator2
+            .consolidate_session(session, false, actor.clone(), None, None)
+            .await
+            .unwrap();
+        assert!(outcome.page_id.is_some());
+        assert_eq!(llm2.calls(), (0, 0, 1), "map reused; only the final re-ran");
+        let ids2 = llm2.operation_ids();
+        assert_eq!(ids2.len(), 1);
+        assert_ne!(
+            ids2[0], ids1[0],
+            "the re-entry is a new operation with a new id — checkpoint reuse did not depend on the id"
+        );
+        assert_fresh_gateway_form(ids2[0]);
     }
 
     /// 300+ observations (plus one larger than a block): no sampling —
