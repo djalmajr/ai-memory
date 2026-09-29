@@ -57,6 +57,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   separate static class). A provider response body, prompt, token, URL, or
   header no longer reaches those logs or the MCP response; fallback
   behavior, search ordering, and retry policy are unchanged. (#2)
+- Scheduled auto-improve failures no longer persist the full error text: the
+  claim's `last_error` and the tick/experience warnings ("scheduled
+  auto-improve failed", "experience pass failed", and the terminal LLM
+  failure that anchors the experience cadence) now carry only the redacted
+  `auto-improve failed: class=... status=...` summary, with a generic class
+  for unrecognized causes. A provider response body no longer reaches the
+  `auto_improve_scheduler_claims` table or the scheduler logs; attempt
+  counts, parking, and terminal decisions are unchanged. (#2)
 - Timeout and ambiguous 499/5xx LLM failures now receive at most one replay
   after a 60-second cooldown plus jitter. Fast retries remain for connection
   failures, 429 with Retry-After, and 503 explicitly marked as capacity;

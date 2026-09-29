@@ -6327,6 +6327,10 @@ mod tests {
             !logged.contains("SENTINEL_PRIVATE_BODY"),
             "no provider body may reach the log: {logged}"
         );
+        assert!(
+            !logged.contains("stub reranker task failure"),
+            "the panic payload must not reach the task-failure warning: {logged}"
+        );
     }
 
     #[tokio::test]
