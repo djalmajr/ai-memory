@@ -8572,6 +8572,84 @@ mod tests {
         assert_fresh_gateway_form(ids2[0]);
     }
 
+    /// Multi + chunking identity row — the path the MCP `memory_consolidate`
+    /// takes (public `consolidate_session_multi` with chunking enabled):
+    /// two public invocations of the same session, each of which actually
+    /// runs the staged pipeline, carry a fresh operation id across every
+    /// stage call (map, reduce, final) — distinct between the invocations,
+    /// v7, and never the session id.
+    ///
+    /// The second invocation must RE-RUN the pipeline rather than reconcile
+    /// the already-published page (reconciling would be zero LLM calls and
+    /// leave nothing to assert on): a new observation lands between the two,
+    /// changing the publication marker's observation digest.
+    ///
+    /// The ceiling is derived from the batch final request (the batch prompt
+    /// is much larger than the single one — the same pattern the other
+    /// public multi + chunked tests use), so both runs' final fits.
+    #[tokio::test]
+    async fn each_multi_chunked_invocation_gets_a_fresh_operation_id() {
+        let t = ChunkedTest::fresh().await;
+        let actor = ai_memory_core::ActorContext::anonymous();
+        let session = SessionId::new();
+        t.seed_session(session, &[big_body(), big_body()]).await;
+        // No instructions in this test → derive with an empty instruction
+        // string; three map blocks (after the new observation) → three
+        // extractions in the batch final digest.
+        let ceiling = t.consolidator_batch_base_count(session, 3, "").unwrap() + 100;
+
+        // Invocation 1: the staged pipeline runs to completion and publishes.
+        let llm1 = Arc::new(StagedLlm::new("m1"));
+        t.consolidator_with(Arc::clone(&llm1), t.base + 700, ceiling)
+            .consolidate_session_multi(session, false, actor.clone(), None, None)
+            .await
+            .unwrap();
+
+        // A new observation lands: the publication marker no longer matches,
+        // so invocation 2 re-runs the pipeline instead of reconciling without
+        // any LLM call.
+        seed_observations(&t.store.writer, t.ws, t.proj, session, &[big_body()]).await;
+
+        // Invocation 2: a fresh public call for the same session.
+        let llm2 = Arc::new(StagedLlm::new("m1"));
+        t.consolidator_with(Arc::clone(&llm2), t.base + 700, ceiling)
+            .consolidate_session_multi(session, false, actor.clone(), None, None)
+            .await
+            .unwrap();
+
+        let ids1 = llm1.operation_ids();
+        let ids2 = llm2.operation_ids();
+        assert!(
+            ids1.len() >= 2,
+            "invocation 1 ran the staged pipeline (map blocks + final): {} calls",
+            ids1.len()
+        );
+        assert!(
+            ids2.len() >= 2,
+            "invocation 2 re-ran the pipeline instead of reconciling: {} calls",
+            ids2.len()
+        );
+        assert!(
+            ids1.iter().all(|id| *id == ids1[0]),
+            "invocation 1 carries one operation id across map, reduce, and final: {ids1:?}"
+        );
+        assert!(
+            ids2.iter().all(|id| *id == ids2[0]),
+            "invocation 2 carries one operation id across map, reduce, and final: {ids2:?}"
+        );
+        assert_ne!(
+            ids1[0], ids2[0],
+            "two public invocations of one session get distinct operation ids"
+        );
+        assert_fresh_gateway_form(ids1[0]);
+        assert_fresh_gateway_form(ids2[0]);
+        assert_ne!(
+            ids1[0].to_string(),
+            session.to_string(),
+            "the operation id is never the session id"
+        );
+    }
+
     /// 300+ observations (plus one larger than a block): no sampling —
     /// every observation id survives into the final evidence digest, the
     /// reduce runs hierarchically until the final request fits, and every
