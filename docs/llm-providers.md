@@ -230,10 +230,14 @@ timestamps). A crashed or restarted run resumes from the checkpoints: stages
 whose fingerprint still matches are reused, only stale or missing blocks are
 re-run, and a new observation re-runs only the block that contains it —
 including a clock rollback, because no reuse decision reads `created_at`.
-A map checkpoint alone never proves publication: when the session's wiki
-page already exists and carries this session's id, the run reconciles the
-already-published state without a new commit, revision, supersession, or LLM
-call, then prunes its checkpoints. One consolidation run uses one logical
+A map checkpoint alone never proves publication: the pipeline stamps its own
+content marker (prompt versions, model, mode, and a digest of the sanitized
+observations) on the session anchor when it publishes, and a later run
+reconciles the already-published state — without a new commit, revision,
+supersession, or LLM call, then pruning its checkpoints — only when that
+marker matches the current inputs. The heuristic SessionEnd page (origin
+stamp only, no marker) is not a publication, so the pipeline runs and
+overwrites it. One consolidation run uses one logical
 operation id across every stage, retry, and replay (carried as `X-Request-Id`
 on the `openai-compat` path), so the whole run is one correlated stream on
 the provider side. Map and reduce output is validated at ingestion: any

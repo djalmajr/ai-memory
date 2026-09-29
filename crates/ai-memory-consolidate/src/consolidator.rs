@@ -354,6 +354,7 @@ impl Consolidator {
             author_id,
             page,
             &existing_titles,
+            None,
         )
         .await
     }
@@ -374,6 +375,7 @@ impl Consolidator {
         author_id: Option<ai_memory_core::UserId>,
         mut page: ConsolidatedPage,
         existing_titles: &[String],
+        marker: Option<&str>,
     ) -> ConsolidatorResult<ConsolidationOutcome> {
         // Deterministic backstop for the title-uniqueness prompt rule:
         // identical harness runs produce near-identical observations, and
@@ -390,7 +392,18 @@ impl Consolidator {
             page.title = new_title;
         }
 
-        let frontmatter = build_frontmatter(&page, session_id, agent_kind);
+        let mut frontmatter = build_frontmatter(&page, session_id, agent_kind);
+        // The map-reduce pipeline stamps its own publication marker so a
+        // later run can distinguish its own publication from the heuristic
+        // synthesizer's page. The single-prompt pipeline passes `None`.
+        if let Some(marker) = marker
+            && let Some(map) = frontmatter.as_object_mut()
+        {
+            map.insert(
+                CONSOLIDATION_MARKER_KEY.into(),
+                serde_json::Value::String(marker.to_string()),
+            );
+        }
         let id = self
             .wiki
             .write_page(WritePageRequest {
@@ -801,6 +814,7 @@ impl Consolidator {
             author_id,
             batch,
             &existing_titles,
+            None,
         )
         .await
     }
@@ -820,6 +834,7 @@ impl Consolidator {
         author_id: Option<ai_memory_core::UserId>,
         batch: ConsolidatedBatch,
         existing_titles: &[String],
+        marker: Option<&str>,
     ) -> ConsolidatorResult<Vec<ConsolidationOutcome>> {
         let anchor = PagePath::new(format!("sessions/{session_id}.md"))?;
         // `dry_run` is always false past the early return above, so every
@@ -830,6 +845,18 @@ impl Consolidator {
             let (mut req, mut outcome) = build_update(ws, proj, upd, false, &actor, author_id)?;
             if req.path == anchor {
                 stamp_session_origin(&mut req.frontmatter, session_id, agent_kind);
+                // The map-reduce pipeline stamps its own publication marker
+                // on the anchor so a later run can distinguish its own
+                // publication from the heuristic synthesizer's page. The
+                // single-prompt pipeline passes `None`.
+                if let Some(marker) = marker
+                    && let Some(map) = req.frontmatter.as_object_mut()
+                {
+                    map.insert(
+                        CONSOLIDATION_MARKER_KEY.into(),
+                        serde_json::Value::String(marker.to_string()),
+                    );
+                }
                 // Deterministic backstop for the title-uniqueness prompt
                 // rule — see the matching block in `consolidate_session`.
                 disambiguate_anchor_title(&mut req, &mut outcome, existing_titles, session_id);
@@ -961,15 +988,32 @@ impl Consolidator {
     // guard's own tokenizer, and carries one operation id per run.
     // ────────────────────────────────────────────────────────────────────
 
+    /// The anchor's publication marker for one run (see
+    /// [`publication_marker`]): prompt versions, model, pipeline mode, and a
+    /// digest of the sanitized observations. Stable across a crash+resume of
+    /// the same run, invalidated by any change of inputs.
+    fn run_publication_marker(&self, mode: &str, run: &ChunkedRun) -> ConsolidatorResult<String> {
+        let Some(cfg) = &self.chunking else {
+            return Err(ConsolidatorError::Llm(LlmError::NotConfigured(
+                "map-reduce phase called without chunking configured".into(),
+            )));
+        };
+        Ok(publication_marker(mode, &cfg.model, &run.observations))
+    }
+
     /// Reconcile an already-published wiki before touching checkpoints: if
-    /// the session's anchor page exists and carries this session's origin
-    /// stamp, the publication is proven by the wiki itself (a checkpoint
+    /// the session's anchor page exists AND carries this run's publication
+    /// marker, the publication is proven by the wiki itself (a checkpoint
     /// row alone never is) — prune the checkpoints (the crash-after-publish
     /// case) and report the existing page. Returns `None` when the session
-    /// page is not yet published.
+    /// page is not yet published, when it was written by the heuristic
+    /// synthesizer (no marker), or when a stale marker no longer matches the
+    /// current inputs — all of which must fall through to the normal
+    /// pipeline.
     async fn chunked_reconcile_published(
         &self,
         run: &ChunkedRun,
+        marker: &str,
     ) -> ConsolidatorResult<Option<(String, String)>> {
         let anchor = PagePath::new(format!("sessions/{}.md", run.session))?;
         let md = match self.wiki.read_page(run.ws, run.proj, &anchor) {
@@ -981,11 +1025,17 @@ impl Consolidator {
             }
             Err(err) => return Err(err.into()),
         };
+        // Only a matching publication marker proves THIS run already
+        // published the anchor. The SessionEnd synthesizer writes the anchor
+        // with only an origin stamp (session_id/agent/tier) — no marker — so
+        // it is not a map-reduce publication and the pipeline must run. A
+        // stale marker (changed observations, model, prompt, or mode)
+        // likewise falls through rather than silently skipping.
         let stamped = md
             .frontmatter
-            .get("session_id")
+            .get(CONSOLIDATION_MARKER_KEY)
             .and_then(|v| v.as_str())
-            .is_some_and(|s| s == run.session.to_string().as_str());
+            .is_some_and(|m| m == marker);
         if !stamped {
             return Ok(None);
         }
@@ -1425,7 +1475,8 @@ impl Consolidator {
             observations,
             operation_id: session_id.into(),
         };
-        if let Some((title, body)) = self.chunked_reconcile_published(&run).await? {
+        let marker = self.run_publication_marker("single", &run)?;
+        if let Some((title, body)) = self.chunked_reconcile_published(&run, &marker).await? {
             info!(
                 session = %session_id,
                 "map-reduce reconcile: the session page is already published; skipping the pipeline and pruning its checkpoints"
@@ -1468,6 +1519,7 @@ impl Consolidator {
                 author_id,
                 page,
                 existing_titles,
+                Some(marker.as_str()),
             )
             .await?;
         self.chunked_prune(&run).await;
@@ -1496,7 +1548,12 @@ impl Consolidator {
             observations,
             operation_id: session_id.into(),
         };
-        if self.chunked_reconcile_published(&run).await?.is_some() {
+        let marker = self.run_publication_marker("multi", &run)?;
+        if self
+            .chunked_reconcile_published(&run, &marker)
+            .await?
+            .is_some()
+        {
             info!(
                 session = %session_id,
                 "map-reduce reconcile: the session page is already published; skipping the pipeline and pruning its checkpoints"
@@ -1542,6 +1599,7 @@ impl Consolidator {
                 author_id,
                 batch,
                 &existing_titles,
+                Some(marker.as_str()),
             )
             .await?;
         self.chunked_prune(&run).await;
@@ -1638,6 +1696,12 @@ const FINAL_PROMPT_VERSION: u32 = 1;
 /// each repeating the observation header so a part alone still names its
 /// origin. Sized so a handful of parts fit one small map block.
 const MAX_CHUNK_PART_CHARS: usize = 12_000;
+/// The frontmatter key carrying one map-reduce run's publication marker on
+/// the session anchor. A page without it is NOT a map-reduce publication
+/// (the heuristic SessionEnd synthesizer writes the anchor with only an
+/// origin stamp), so reconciling without the LLM is safe only when this
+/// marker matches the current run's inputs.
+const CONSOLIDATION_MARKER_KEY: &str = "consolidation_marker";
 /// Ceiling on extractions per stage — matches the `max_items` on
 /// [`ExtractionResult::extractions`]; enforced again at validation because
 /// the schema alone is not the boundary.
@@ -1680,6 +1744,26 @@ fn schema_value<T: schemars::JsonSchema>() -> Option<serde_json::Value> {
     serde_json::to_value(schemars::schema_for!(T)).ok()
 }
 
+/// One map-reduce run's publication identity. The anchor page carries this
+/// in its frontmatter when this pipeline publishes it: the prompt versions,
+/// the model, the pipeline mode, and a digest of the sanitized observations
+/// it was built from. It is stable across a crash+resume of the same run
+/// (no clock input) and invalidated by any change of observations, model,
+/// prompt, or mode — so a page written by the heuristic synthesizer (no
+/// marker) or by an earlier run over different inputs (stale marker) is
+/// never mistaken for this run's publication.
+fn publication_marker(mode: &str, model: &str, observations: &[Observation]) -> String {
+    let mut payload = String::new();
+    payload.push_str("mapreduce|");
+    payload.push_str(&format!(
+        "map-v{MAP_PROMPT_VERSION}|reduce-v{REDUCE_PROMPT_VERSION}|final-v{FINAL_PROMPT_VERSION}|{model}|{mode}|"
+    ));
+    for obs in observations {
+        payload.push_str(&format!("{}|{}|{}\n", obs.id, obs.kind.as_str(), obs.body));
+    }
+    sha256_hex(&payload)
+}
+
 /// Split the session's observations into ordered map parts. The full
 /// sanitized body is preserved: every part repeats the observation header
 /// (id, kind, title, importance, created_at), and bodies longer than
@@ -1690,9 +1774,16 @@ fn plan_map_parts(observations: &[Observation]) -> Vec<ChunkPart> {
     for obs in observations {
         let chars: Vec<char> = obs.body.chars().collect();
         let body_chars = chars.len();
-        let part_total = body_chars.div_ceil(MAX_CHUNK_PART_CHARS).max(1) as u32;
-        for index in 1..=part_total {
-            let start = (index - 1) as usize * MAX_CHUNK_PART_CHARS;
+        // Slice boundaries first, then number the parts: each part starts
+        // exactly where the previous part's cut ENDED (never a fixed grid),
+        // so no character of the sanitized body is ever dropped — a word or
+        // line boundary that pulls a cut short of the cap must not strand
+        // the tail between two parts. `end` is always > `start` (the cap is
+        // positive and the boundary is at least `start + 1`), so the walk
+        // advances and terminates.
+        let mut spans: Vec<(usize, usize)> = Vec::new();
+        let mut start = 0usize;
+        while start < body_chars {
             let end_cap = (start + MAX_CHUNK_PART_CHARS).min(body_chars);
             // Prefer cutting on a line or word boundary in the last 400
             // chars (the LAST one, so the part fills its budget); a hard
@@ -1710,11 +1801,22 @@ fn plan_map_parts(observations: &[Observation]) -> Vec<ChunkPart> {
                     end = b;
                 }
             }
-            let slice: String = chars[start..end].iter().collect();
+            spans.push((start, end));
+            start = end;
+        }
+        if spans.is_empty() {
+            // An empty body still names its observation id in a single
+            // (empty) part, so the id keeps a place in the map — and in the
+            // per-stage coverage check.
+            spans.push((0, 0));
+        }
+        let part_total = spans.len() as u32;
+        for (index, (start, end)) in spans.iter().enumerate() {
+            let slice: String = chars[*start..*end].iter().collect();
             let header = format!(
                 "--- observation {} (part {}/{} of this observation) ---\nkind: {}\ntitle: {}\nimportance: {}\ncreated_at: {}\nbody:\n",
                 obs.id,
-                index,
+                index + 1,
                 part_total,
                 obs.kind.as_str(),
                 obs.title,
@@ -1726,13 +1828,10 @@ fn plan_map_parts(observations: &[Observation]) -> Vec<ChunkPart> {
             text.push('\n');
             parts.push(ChunkPart {
                 observation_id: obs.id.to_string(),
-                part_index: index,
+                part_index: (index + 1) as u32,
                 part_total,
                 text,
             });
-            if end >= body_chars {
-                break;
-            }
         }
     }
     parts
@@ -6175,6 +6274,55 @@ mod tests {
         ids
     }
 
+    fn session_id_in(user: &str) -> Option<String> {
+        let re = regex::Regex::new(r"Session id: ([0-9a-fA-F-]{36})").unwrap();
+        re.captures(user).map(|c| c[1].to_string())
+    }
+
+    /// The multi-page final reply: the session anchor (its path parsed from
+    /// the request so it matches THIS session — that is what lets the
+    /// pipeline stamp its publication marker on the anchor) plus a concept
+    /// and a decision, the shapes the batch path must publish.
+    fn batch_reply(user: &str) -> serde_json::Value {
+        let anchor = session_id_in(user)
+            .map(|sid| format!("sessions/{sid}.md"))
+            .unwrap_or_else(|| "sessions/unknown.md".to_string());
+        serde_json::json!({
+            "updates": [
+                {
+                    "path": anchor,
+                    "title": "Session page",
+                    "body_markdown": "# Session page\n\nbody citing obs ids",
+                    "tier": "episodic",
+                    "kind": "fact",
+                    "tags": [],
+                    "entities": [],
+                    "relations": {"causes": [], "fixes": [], "contradicts": []},
+                    "summary": "s"
+                },
+                {
+                    "path": "concepts/example-concept.md",
+                    "title": "Example concept",
+                    "body_markdown": "Concept body.",
+                    "tier": "semantic",
+                    "kind": "fact",
+                    "tags": [],
+                    "entities": []
+                },
+                {
+                    "path": "decisions/choose-x.md",
+                    "title": "Chose X over Y",
+                    "body_markdown": "Decision body.",
+                    "tier": "semantic",
+                    "kind": "decision",
+                    "tags": [],
+                    "entities": []
+                }
+            ],
+            "rationale": "multi-page"
+        })
+    }
+
     fn extraction_reply(ids: &[String]) -> serde_json::Value {
         serde_json::json!({
             "extractions": [{
@@ -6222,11 +6370,16 @@ mod tests {
                 .first()
                 .map(|m| m.content.as_str())
                 .unwrap_or("");
-            let is_final = system != MAP_SYSTEM_PROMPT && system != REDUCE_SYSTEM_PROMPT;
+            let is_map = system == MAP_SYSTEM_PROMPT;
+            let is_reduce = system == REDUCE_SYSTEM_PROMPT;
+            let is_batch = system == BATCH_SYSTEM_PROMPT;
+            let is_final = !is_map && !is_reduce;
             // Capture the request size the way the guard counts it: same
             // tokenizer, same reserves, the stage's own schema.
             if let Some(counter) = &self.counter {
-                let schema: serde_json::Value = if is_final {
+                let schema: serde_json::Value = if is_batch {
+                    serde_json::to_value(schemars::schema_for!(ConsolidatedBatch)).unwrap()
+                } else if is_final {
                     serde_json::to_value(schemars::schema_for!(ConsolidatedPage)).unwrap()
                 } else {
                     serde_json::to_value(schemars::schema_for!(ExtractionResult)).unwrap()
@@ -6238,11 +6391,11 @@ mod tests {
             if is_final {
                 *self.final_user.lock().unwrap() = user.to_string();
             }
-            if system == MAP_SYSTEM_PROMPT {
+            if is_map {
                 self.map_calls
                     .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 Ok(extraction_reply(&observation_ids_in(user)))
-            } else if system == REDUCE_SYSTEM_PROMPT {
+            } else if is_reduce {
                 self.reduce_calls
                     .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 Ok(extraction_reply(&merged_ids_in(user)))
@@ -6252,7 +6405,11 @@ mod tests {
                 if let Some(error) = self.final_fail_once.lock().unwrap().take() {
                     return Err(error);
                 }
-                Ok(serde_json::from_str(FINAL_SINGLE_REPLY).unwrap())
+                if is_batch {
+                    Ok(batch_reply(user))
+                } else {
+                    Ok(serde_json::from_str(FINAL_SINGLE_REPLY).unwrap())
+                }
             }
         }
         async fn complete_structured_raw_with_operation_id(
@@ -6377,6 +6534,36 @@ mod tests {
                 .unwrap()
         }
 
+        /// Write the heuristic SessionEnd page for this session: the SAME
+        /// frontmatter set the synthesizer writes (title/session_id/agent/
+        /// tier) and a body — but NO map-reduce publication marker. This is
+        /// the page that must NOT be mistaken for a map-reduce publication.
+        async fn write_heuristic_anchor(&self, session: SessionId) {
+            let wiki = Wiki::new(self.tmp.path(), self.store.writer.clone()).unwrap();
+            let anchor = PagePath::new(format!("sessions/{session}.md")).unwrap();
+            wiki.write_page(WritePageRequest {
+                workspace_id: self.ws,
+                project_id: self.proj,
+                path: anchor,
+                frontmatter: serde_json::json!({
+                    "title": "Heuristic",
+                    "session_id": session.to_string(),
+                    "agent": "opencode",
+                    "tier": "episodic",
+                }),
+                body: "HEURISTIC_PAGE_BODY".into(),
+                tier: Tier::Episodic,
+                pinned: false,
+                title: Some("Heuristic".into()),
+                admission_ctx: None,
+                author_id: None,
+                actor: ai_memory_core::ActorContext::anonymous(),
+                evidence: Vec::new(),
+            })
+            .await
+            .unwrap();
+        }
+
         /// Count the final single-page request for a digest, exactly as the
         /// final call builds it (default budgets, like `Consolidator::new`).
         /// The coverage test derives its ceiling from the irreducible case:
@@ -6397,6 +6584,35 @@ mod tests {
             ChatTokenCounter::load(&self.tokenizer_path)
                 .map_err(ConsolidatorError::Llm)?
                 .count_request(&request, schema_value::<ConsolidatedPage>().as_ref())
+                .map_err(ConsolidatorError::Llm)
+        }
+
+        /// Count the final BATCH request for a representative digest, exactly
+        /// as the final batch call builds it (default budgets). The batch
+        /// prompt is far larger than the single one, so the multi tests
+        /// derive their ceiling from this — the batch final must fit for the
+        /// reduce stop condition to hold.
+        fn consolidator_batch_base_count(
+            &self,
+            session: SessionId,
+            n_extractions: usize,
+        ) -> ConsolidatorResult<usize> {
+            // Ids sized like real observation uuids (36 chars) so the probe
+            // matches the evidence the fake map stage actually produces.
+            let extractions: Vec<EvidenceExtraction> = (0..n_extractions)
+                .map(|i| extraction_with(&[&format!("obs-{i:032}")], "fact", "Session event", 0.9))
+                .collect();
+            let request = build_final_request_batch(
+                session,
+                &extractions,
+                &[],
+                None,
+                PromptBudgets::default(),
+                &[],
+            );
+            ChatTokenCounter::load(&self.tokenizer_path)
+                .map_err(ConsolidatorError::Llm)?
+                .count_request(&request, schema_value::<ConsolidatedBatch>().as_ref())
                 .map_err(ConsolidatorError::Llm)
         }
 
@@ -6925,15 +7141,29 @@ mod tests {
             ids.iter().all(|id| *id == ids[0]),
             "every call of one run carries one operation id: {ids:?}"
         );
-        // The published page carries the session-origin stamp (the durable
-        // identity the publish reconcile looks for).
+        // The published page carries BOTH the session-origin stamp and this
+        // run's publication marker. The marker is the durable identity the
+        // publish reconcile matches on (the origin stamp alone is shared with
+        // the heuristic synthesizer's page).
         let anchor = PagePath::new(format!("sessions/{session}.md")).unwrap();
         let wiki = Wiki::new(t.tmp.path(), t.store.writer.clone()).unwrap();
         let md = wiki.read_page(t.ws, t.proj, &anchor).unwrap();
         assert_eq!(
             md.frontmatter.get("session_id").and_then(|v| v.as_str()),
             Some(session.to_string().as_str()),
-            "the durable publication identity is the session-origin stamp"
+        );
+        let run = t.chunked_run(session, t.observations(session).await);
+        assert_eq!(
+            md.frontmatter
+                .get(CONSOLIDATION_MARKER_KEY)
+                .and_then(|v| v.as_str()),
+            Some(
+                consolidator
+                    .run_publication_marker("single", &run)
+                    .unwrap()
+                    .as_str()
+            ),
+            "the durable publication identity is this run's content marker"
         );
         // Checkpoints are pruned after a successful publish.
         assert!(
@@ -6970,9 +7200,12 @@ mod tests {
         let llm2 = Arc::new(StagedLlm::new("m1"));
         let consolidator2 = t.consolidator(Arc::clone(&llm2));
         let run2 = t.chunked_run(session, t.observations(session).await);
+        let marker2 = consolidator2
+            .run_publication_marker("single", &run2)
+            .unwrap();
         assert!(
             consolidator2
-                .chunked_reconcile_published(&run2)
+                .chunked_reconcile_published(&run2, &marker2)
                 .await
                 .unwrap()
                 .is_none(),
@@ -7015,6 +7248,12 @@ mod tests {
             .chunked_final_single(&run1, &extractions, "", None, &[])
             .await
             .unwrap();
+        // The pipeline stamps its own publication marker on the anchor — the
+        // resume's reconcile matches exactly this marker (not the origin
+        // stamp) to prove this run already published.
+        let marker = consolidator
+            .run_publication_marker("single", &run1)
+            .unwrap();
         consolidator
             .apply_single_page(
                 t.ws,
@@ -7026,6 +7265,7 @@ mod tests {
                 None,
                 page,
                 &[],
+                Some(marker.as_str()),
             )
             .await
             .unwrap();
@@ -7061,6 +7301,404 @@ mod tests {
             t.checkpoints(session).await.is_empty(),
             "the reconcile pruned the leftover checkpoints"
         );
+    }
+
+    /// A heuristic SessionEnd page (title/session_id/agent/tier, no marker)
+    /// is NOT a map-reduce publication: with chunking on, the pipeline runs
+    /// the LLM (map + final) and publishes the LLM's result — not the
+    /// heuristic body — and stamps its own marker.
+    #[tokio::test]
+    async fn heuristic_session_page_must_not_skip_map_reduce() {
+        let t = ChunkedTest::fresh().await;
+        let llm = Arc::new(StagedLlm::new("m1"));
+        let consolidator = t.consolidator(Arc::clone(&llm));
+        let session = SessionId::new();
+        t.seed_session(session, &[big_body(), big_body()]).await;
+        t.write_heuristic_anchor(session).await;
+
+        let outcome = consolidator
+            .consolidate_session(
+                session,
+                false,
+                ai_memory_core::ActorContext::anonymous(),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+
+        // The heuristic page is not a publication: the LLM ran (map + final)
+        // and the page was published from the LLM's result.
+        let (maps, _, finals) = llm.calls();
+        assert!(
+            maps >= 1 && finals == 1,
+            "a pre-existing heuristic page is not a map-reduce publication; calls={:?}",
+            llm.calls()
+        );
+        assert!(outcome.page_id.is_some(), "the LLM result was published");
+
+        // The published body is the LLM's, not the heuristic body, and it
+        // carries this run's marker.
+        let wiki = Wiki::new(t.tmp.path(), t.store.writer.clone()).unwrap();
+        let anchor = PagePath::new(format!("sessions/{session}.md")).unwrap();
+        let md = wiki.read_page(t.ws, t.proj, &anchor).unwrap();
+        assert_ne!(
+            md.body, "HEURISTIC_PAGE_BODY",
+            "the heuristic body was superseded by the LLM's"
+        );
+        let run = t.chunked_run(session, t.observations(session).await);
+        assert_eq!(
+            md.frontmatter
+                .get(CONSOLIDATION_MARKER_KEY)
+                .and_then(|v| v.as_str()),
+            Some(
+                consolidator
+                    .run_publication_marker("single", &run)
+                    .unwrap()
+                    .as_str()
+            ),
+            "the real publication carries this run's content marker"
+        );
+    }
+
+    /// Multi variant: a heuristic anchor must not turn the batch into an
+    /// empty success — concepts and decisions are written.
+    #[tokio::test]
+    async fn heuristic_session_page_must_not_skip_map_reduce_multi() {
+        let t = ChunkedTest::fresh().await;
+        let llm = Arc::new(StagedLlm::new("m1"));
+        let session = SessionId::new();
+        t.seed_session(session, &[big_body(), big_body()]).await;
+        t.write_heuristic_anchor(session).await;
+        // The batch final prompt is far larger than the single one: derive
+        // the ceiling from the batch final (2 map extractions) so the reduce
+        // stop condition holds and the batch is not refused.
+        let ceiling = t.consolidator_batch_base_count(session, 2).unwrap() + 100;
+        let consolidator = t.consolidator_with(Arc::clone(&llm), t.base + 700, ceiling);
+
+        let outcomes = consolidator
+            .consolidate_session_multi(
+                session,
+                false,
+                ai_memory_core::ActorContext::anonymous(),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+
+        // The heuristic anchor is not a publication: the batch ran and wrote
+        // its pages (not an empty `Ok(vec![])`).
+        let (maps, _, finals) = llm.calls();
+        assert!(maps >= 1 && finals == 1, "the batch ran: {:?}", llm.calls());
+        assert!(
+            !outcomes.is_empty(),
+            "the batch wrote pages, not an empty success"
+        );
+        let paths: Vec<String> = outcomes
+            .iter()
+            .map(|o| o.path.as_str().to_string())
+            .collect();
+        assert!(
+            paths.iter().any(|p| p.starts_with("concepts/")),
+            "a concept page was written: {paths:?}"
+        );
+        assert!(
+            paths.iter().any(|p| p.starts_with("decisions/")),
+            "a decision page was written: {paths:?}"
+        );
+    }
+
+    /// Crash-after-publish, multi page: the anchor (and the concept/decision
+    /// pages) were written but the checkpoint prune did not run. The resume
+    /// reconciles the publication from the anchor's marker — zero LLM call,
+    /// no second revision — and prunes.
+    #[tokio::test]
+    async fn chunked_crash_after_publish_before_prune_reconciles_without_llm_multi() {
+        let t = ChunkedTest::fresh().await;
+        let llm1 = Arc::new(StagedLlm::new("m1"));
+        let session = SessionId::new();
+        t.seed_session(session, &[big_body()]).await;
+        // One map block → one extraction; the ceiling must fit the batch
+        // final for that digest (the batch prompt is much larger than the
+        // single one).
+        let ceiling = t.consolidator_batch_base_count(session, 1).unwrap() + 100;
+        let consolidator = t.consolidator_with(Arc::clone(&llm1), t.base + 700, ceiling);
+
+        // Run 1: drive the phases through the batch publish, then crash
+        // before the prune.
+        let run1 = t.chunked_run(session, t.observations(session).await);
+        let extractions = consolidator.chunked_map_extractions(&run1).await.unwrap();
+        let slots = consolidator
+            .slot_snapshots(t.ws, t.proj, &run1.actor)
+            .await
+            .unwrap();
+        let instructions = consolidator.resolve_instructions(t.ws, t.proj, None).await;
+        let existing_titles = consolidator
+            .existing_page_titles(t.ws, t.proj, &run1.actor, session)
+            .await;
+        let ctx = ReduceFinalContext::Batch {
+            slots: &slots,
+            instructions: instructions.as_deref(),
+            titles: &existing_titles,
+        };
+        let extractions = consolidator
+            .chunked_reduce_extractions(&run1, extractions, &ctx)
+            .await
+            .unwrap();
+        let batch = consolidator
+            .chunked_final_batch(
+                &run1,
+                &extractions,
+                &slots,
+                instructions.as_deref(),
+                &existing_titles,
+            )
+            .await
+            .unwrap();
+        let marker = consolidator.run_publication_marker("multi", &run1).unwrap();
+        consolidator
+            .apply_batch_pages(
+                t.ws,
+                t.proj,
+                session,
+                ai_memory_core::AgentKind::OpenCode,
+                run1.actor.clone(),
+                None,
+                batch,
+                &existing_titles,
+                Some(marker.as_str()),
+            )
+            .await
+            .unwrap();
+        assert!(
+            !t.checkpoints(session).await.is_empty(),
+            "the crash left checkpoint rows behind"
+        );
+
+        // Run 2 (fresh LLM, zero calls allowed): the public entry reconciles
+        // the publication and prunes — without a new revision or a commit.
+        let llm2 = Arc::new(StagedLlm::new("m1"));
+        let consolidator2 = t.consolidator_with(Arc::clone(&llm2), t.base + 700, ceiling);
+        let outcomes = consolidator2
+            .consolidate_session_multi(
+                session,
+                false,
+                ai_memory_core::ActorContext::anonymous(),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        assert!(
+            llm2.calls() == (0, 0, 0),
+            "the reconcile made no LLM call: {:?}",
+            llm2.calls()
+        );
+        assert!(
+            outcomes.is_empty(),
+            "a reconciled multi publication writes no new pages: {:?}",
+            outcomes.iter().map(|o| o.path.as_str()).collect::<Vec<_>>()
+        );
+        assert!(
+            t.checkpoints(session).await.is_empty(),
+            "the reconcile pruned the leftover checkpoints"
+        );
+    }
+
+    /// New observation after a REAL publication: the marker no longer
+    /// matches (the input changed), so the run is not skipped; only the
+    /// block whose content changed re-runs, the unchanged blocks reuse
+    /// their checkpoints (which survived because the crash landed between
+    /// publish and prune).
+    #[tokio::test]
+    async fn chunked_new_observation_after_publication_reprocesses_only_changed_block() {
+        let t = ChunkedTest::fresh().await;
+        let llm1 = Arc::new(StagedLlm::new("m1"));
+        let consolidator = t.consolidator(Arc::clone(&llm1));
+        let session = SessionId::new();
+        t.seed_session(session, &[big_body(), big_body()]).await;
+
+        // Run 1: publish for real, then crash before the prune — so the
+        // checkpoints survive (a successful prune would have removed them).
+        let run1 = t.chunked_run(session, t.observations(session).await);
+        let extractions = consolidator.chunked_map_extractions(&run1).await.unwrap();
+        let ctx = ReduceFinalContext::Single {
+            current_body: "",
+            instructions: None,
+            titles: &[],
+        };
+        let extractions = consolidator
+            .chunked_reduce_extractions(&run1, extractions, &ctx)
+            .await
+            .unwrap();
+        let page = consolidator
+            .chunked_final_single(&run1, &extractions, "", None, &[])
+            .await
+            .unwrap();
+        let marker1 = consolidator
+            .run_publication_marker("single", &run1)
+            .unwrap();
+        consolidator
+            .apply_single_page(
+                t.ws,
+                t.proj,
+                session,
+                ai_memory_core::AgentKind::OpenCode,
+                &PagePath::new(format!("sessions/{session}.md")).unwrap(),
+                ai_memory_core::ActorContext::anonymous(),
+                None,
+                page,
+                &[],
+                Some(marker1.as_str()),
+            )
+            .await
+            .unwrap();
+        assert!(!t.checkpoints(session).await.is_empty());
+
+        // A new observation lands. Its block is new; the other blocks are
+        // byte-identical (each big_body is its own block), so their
+        // fingerprints still match.
+        seed_observations(&t.store.writer, t.ws, t.proj, session, &[big_body()]).await;
+
+        // Run 2: the marker no longer matches the (now larger) input, so
+        // the run is NOT skipped — but only the new block re-runs; the
+        // unchanged blocks reuse their checkpoints.
+        let llm2 = Arc::new(StagedLlm::new("m1"));
+        let consolidator2 = t.consolidator(Arc::clone(&llm2));
+        let outcome = consolidator2
+            .consolidate_session(
+                session,
+                false,
+                ai_memory_core::ActorContext::anonymous(),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        assert!(outcome.page_id.is_some());
+        let (maps, _, finals) = llm2.calls();
+        assert_eq!(
+            (maps, finals),
+            (1, 1),
+            "only the new block re-ran; the unchanged blocks were reused: {:?}",
+            llm2.calls()
+        );
+    }
+
+    /// Part splitting must never drop a character of the sanitized body.
+    /// The fixture body is 11950 `a` + 1 space + 200 `B` + 500 `z` =
+    /// 12651 chars: the first part cuts on the word boundary inside the last
+    /// 400-char window (not at the 12000 cap), and the next part must resume
+    /// at that cut — not on the fixed grid — or the tail is stranded.
+    #[test]
+    fn map_parts_do_not_drop_characters_before_a_word_boundary() {
+        let body = format!(
+            "{} {}{}",
+            "a".repeat(11_950),
+            "B".repeat(200),
+            "z".repeat(500)
+        );
+        assert_eq!(body.len(), 12_651, "fixture size is what the test proves");
+        let obs = test_observation(&body);
+        let parts = plan_map_parts(std::slice::from_ref(&obs));
+        assert_eq!(parts.len(), 2, "12651 chars spans two parts");
+        // Concatenate the part bodies (everything after the "body:\n" header
+        // line and the trailing newline) and require the WHOLE body back.
+        let mut recovered = String::new();
+        for part in &parts {
+            let after_header = part.text.split_once("body:\n").unwrap().1;
+            recovered.push_str(after_header.trim_end_matches('\n'));
+        }
+        assert_eq!(
+            recovered,
+            body,
+            "the parts must reconstruct the full sanitized body (got {} of {} chars)",
+            recovered.len(),
+            body.len()
+        );
+        // The split boundary is preserved: the single space sits at the end
+        // of part 1, so no `B`/`z` tail is lost between the parts.
+        assert!(recovered.contains(" "), "the boundary space survived");
+        assert_eq!(recovered.matches('B').count(), 200);
+        assert_eq!(recovered.matches('z').count(), 500);
+    }
+
+    /// Multiple short word-boundary cuts in a row must each resume at the
+    /// previous cut: no character is stranded between parts. A space every
+    /// 3 chars guarantees every 12000-char window ends on a boundary cut
+    /// (not a hard cap), so each part's next part must resume at that cut.
+    #[test]
+    fn map_parts_resume_at_every_cut_without_stranding() {
+        let body: String = (0..12_000).map(|_| "ab ").collect();
+        let obs = test_observation(&body);
+        let parts = plan_map_parts(std::slice::from_ref(&obs));
+        assert!(
+            parts.len() >= 3,
+            "the body spans several boundary cuts: {} parts",
+            parts.len()
+        );
+        let mut recovered = String::new();
+        for part in &parts {
+            let after_header = part.text.split_once("body:\n").unwrap().1;
+            recovered.push_str(after_header.trim_end_matches('\n'));
+        }
+        assert_eq!(
+            recovered,
+            body,
+            "multiple boundary cuts must not strand any character ({} parts)",
+            parts.len()
+        );
+    }
+
+    /// A hard cut (no line/word boundary in the last 400 chars) keeps every
+    /// character and still resumes at the cut.
+    #[test]
+    fn map_parts_hard_cut_without_boundary_preserves_the_body() {
+        // 13000 chars with NO space/newline anywhere: every cut is a hard
+        // cut at the 12000 cap (the boundary search finds nothing).
+        let body = "x".repeat(13_000);
+        let obs = test_observation(&body);
+        let parts = plan_map_parts(std::slice::from_ref(&obs));
+        assert_eq!(parts.len(), 2);
+        let mut recovered = String::new();
+        for part in &parts {
+            let after_header = part.text.split_once("body:\n").unwrap().1;
+            recovered.push_str(after_header.trim_end_matches('\n'));
+        }
+        assert_eq!(recovered, body, "a hard cut drops no character");
+    }
+
+    /// A tiny observation (well under one part) is a single part that carries
+    /// the whole body verbatim.
+    #[test]
+    fn map_parts_single_small_body_is_one_part() {
+        let obs = test_observation("hello world");
+        let parts = plan_map_parts(std::slice::from_ref(&obs));
+        assert_eq!(parts.len(), 1);
+        assert_eq!(parts[0].part_index, 1);
+        assert_eq!(parts[0].part_total, 1);
+        assert!(parts[0].text.contains("hello world"));
+    }
+
+    /// Build one `Observation` with the given body for the part-splitting
+    /// unit tests (the splitter only reads id/kind/title/body/importance/
+    /// created_at, all deterministic here).
+    fn test_observation(body: &str) -> Observation {
+        use ai_memory_core::{ObservationId, ObservationKind};
+        Observation {
+            id: ObservationId::new(),
+            session_id: SessionId::new(),
+            workspace_id: WorkspaceId::new(),
+            project_id: ProjectId::new(),
+            kind: ObservationKind::Other,
+            extension: None,
+            source_event: None,
+            title: "t".into(),
+            body: body.to_string(),
+            importance: 5,
+            created_at: Timestamp::now(),
+        }
     }
 
     /// Retry row: a transient capacity error on the first map attempt does

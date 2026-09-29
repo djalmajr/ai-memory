@@ -11,7 +11,12 @@
 -- No foreign key: the fingerprint is content-derived, not a row. A
 -- successful publish prunes the session's rows; a run that crashes after
 -- publishing but before pruning is reconciled on the next run by the
--- wiki's own session-origin stamp, which is the only proof of publication.
+-- anchor page's map-reduce publication marker (`consolidation_marker`:
+-- prompt versions, model, mode, and a digest of the sanitized
+-- observations), NOT by the bare session-origin stamp — the heuristic
+-- SessionEnd synthesizer writes the anchor with only the origin stamp (no
+-- marker), so that page is not a map-reduce publication and the pipeline
+-- runs. The marker is the only proof of publication.
 CREATE TABLE consolidation_chunk_progress (
     workspace_id      TEXT    NOT NULL,
     project_id        TEXT    NOT NULL,
