@@ -8,6 +8,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- Added opt-in map-reduce consolidation: with `[consolidation]
+  chunk_input_tokens > 0` (env `AI_MEMORY_CONSOLIDATION__CHUNK_INPUT_TOKENS`),
+  a session's observation log is consolidated through sequential,
+  checkpointed stages — a typed-evidence map grounded in observation ids,
+  a hierarchical reduce, then the normal final prompt fed the merged
+  evidence digest — instead of one large prompt. Every stage request is
+  sized with the model's own tokenizer (the same counter and reserves the
+  admission guard enforces) so each call fits `llm_max_input_tokens` before
+  reaching the guard, and the whole run uses one logical operation id
+  across every stage, retry, and replay. Stage results checkpoint durably
+  under content-derived fingerprints (prompt version, model, exact stage
+  input — never timestamps), so a crashed run resumes without repeating
+  successful calls, a model or prompt change invalidates only the stale
+  stages, and a new observation re-runs only the block that contains it.
+  When the session's anchor page was already published by this pipeline
+  (it carries this run's content marker — prompt versions, model, mode, the
+  RESOLVED consolidation instructions, and a digest of the sanitized
+  observations, every field length-prefixed so distinct inputs can never
+  alias), the run reconciles without a new commit, revision, supersession, or
+  LLM call, then prunes its checkpoints. Changing the consolidation
+  instructions re-runs the pipeline (a different operation) and updates the
+  page, and the multi batch drops any update to the reserved
+  `_prompts/consolidation.md` page — decided on the sanitized path the write
+  actually uses, so the drop holds in any form the model returns (e.g. the
+  extension-less `_prompts/consolidation`) — input, not output. The heuristic
+  SessionEnd page (origin stamp only, no marker) is not a
+  publication, so the pipeline runs and overwrites it. The opt-in is fail-closed at config load (requires
+  `llm_max_input_tokens` and a readable `llm_tokenizer_path`; the target
+  must not exceed the ceiling) and ungrounded or out-of-range stage output
+  fails the run closed. Off by default; `chunk_input_tokens = 0` keeps the
+  single-prompt pipeline unchanged (#2).
 - The `openai-compat` provider now sends `X-Request-Id` with every chat
   attempt, carrying the logical operation id shared by all attempts of one
   operation — including the strict-to-tolerant fallback and the single

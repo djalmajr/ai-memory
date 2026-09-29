@@ -24,6 +24,87 @@ const MAX_RETRY_AFTER_SECS: u64 = 300;
 const CHAT_OVERHEAD_TOKENS: usize = 1_024;
 const MESSAGE_OVERHEAD_TOKENS: usize = 16;
 
+/// Count one chat request's input tokens with the exact formula the
+/// admission guard applies before every POST: a chat-framing reserve plus a
+/// per-message reserve, then the tokenizer's own count of the system prompt,
+/// every message body, and the serialized structured-output schema.
+///
+/// Extracted from [`AdmittedLlmProvider::count_input_tokens`] so off-guard
+/// consumers (the map-reduce consolidation planner) count requests with the
+/// same tokenizer and the same reserves the guard enforces — the planner
+/// must never under-count, or it would size a request the guard rejects.
+fn count_chat_tokens(
+    tokenizer: &Tokenizer,
+    request: &ChatRequest,
+    schema: Option<&serde_json::Value>,
+) -> LlmResult<usize> {
+    let mut total = CHAT_OVERHEAD_TOKENS
+        .saturating_add(MESSAGE_OVERHEAD_TOKENS.saturating_mul(request.messages.len() + 1));
+    if let Some(system) = &request.system {
+        total = total.saturating_add(
+            tokenizer
+                .encode(system.as_str(), false)
+                .map_err(|_| LlmError::NotConfigured("LLM input tokenization failed".into()))?
+                .len(),
+        );
+    }
+    for message in &request.messages {
+        total = total.saturating_add(
+            tokenizer
+                .encode(message.content.as_str(), false)
+                .map_err(|_| LlmError::NotConfigured("LLM input tokenization failed".into()))?
+                .len(),
+        );
+    }
+    if let Some(schema) = schema {
+        total = total.saturating_add(
+            tokenizer
+                .encode(schema.to_string(), false)
+                .map_err(|_| LlmError::NotConfigured("LLM schema tokenization failed".into()))?
+                .len(),
+        );
+    }
+    Ok(total)
+}
+
+/// Tokenizer-backed request counter built from a model's
+/// `tokenizer.json` file.
+///
+/// This is the same tokenizer and the same counting formula the
+/// [`AdmittedLlmProvider`] guard uses before every POST. The map-reduce
+/// consolidation planner builds requests with it so that every map,
+/// reduction, and final call it schedules is already within the configured
+/// `llm_max_input_tokens` ceiling before it reaches the guard — sizing and
+/// enforcement cannot drift apart.
+pub struct ChatTokenCounter {
+    tokenizer: Tokenizer,
+}
+
+impl ChatTokenCounter {
+    /// Load the model tokenizer from a Hugging Face `tokenizer.json` path.
+    ///
+    /// # Errors
+    /// Returns a configuration error if the file is missing or unreadable.
+    pub fn load(path: &Path) -> LlmResult<Self> {
+        let tokenizer = Tokenizer::from_file(path)
+            .map_err(|_| LlmError::NotConfigured("cannot load llm_tokenizer_path".into()))?;
+        Ok(Self { tokenizer })
+    }
+
+    /// Count one request with the admission formula (see
+    /// [`count_chat_tokens`]).
+    ///
+    /// # Errors
+    /// Returns a configuration error if tokenization fails.
+    pub fn count_request(
+        &self,
+        request: &ChatRequest,
+        schema: Option<&serde_json::Value>,
+    ) -> LlmResult<usize> {
+        count_chat_tokens(&self.tokenizer, request, schema)
+    }
+}
+
 /// Process-local admission and tokenized input limit for one LLM chain.
 ///
 /// Construct once around the *entire* primary/fallback chain, then clone the
@@ -96,33 +177,7 @@ impl AdmittedLlmProvider {
         let Some(tokenizer) = &self.tokenizer else {
             return Ok(0);
         };
-        let mut total = CHAT_OVERHEAD_TOKENS
-            .saturating_add(MESSAGE_OVERHEAD_TOKENS.saturating_mul(request.messages.len() + 1));
-        if let Some(system) = &request.system {
-            total = total.saturating_add(
-                tokenizer
-                    .encode(system.as_str(), false)
-                    .map_err(|_| LlmError::NotConfigured("LLM input tokenization failed".into()))?
-                    .len(),
-            );
-        }
-        for message in &request.messages {
-            total = total.saturating_add(
-                tokenizer
-                    .encode(message.content.as_str(), false)
-                    .map_err(|_| LlmError::NotConfigured("LLM input tokenization failed".into()))?
-                    .len(),
-            );
-        }
-        if let Some(schema) = schema {
-            total = total.saturating_add(
-                tokenizer
-                    .encode(schema.to_string(), false)
-                    .map_err(|_| LlmError::NotConfigured("LLM schema tokenization failed".into()))?
-                    .len(),
-            );
-        }
-        Ok(total)
+        count_chat_tokens(tokenizer, request, schema)
     }
 
     fn enforce_input_limit(
@@ -737,5 +792,81 @@ mod tests {
                 "every attempt of one operation carries the same id on the wire"
             );
         }
+    }
+
+    /// The shared counter and the admission guard must count the same
+    /// request identically: the map-reduce planner sizes blocks with
+    /// `ChatTokenCounter`, and the guard enforces the ceiling with the
+    /// extracted formula. If the two diverge, a planner-sized request could
+    /// sail past the planner's ceiling and be rejected (or worse, accepted
+    /// under-counted) at the guard. Pinned by the exact reserve math and by
+    /// a guard acceptance boundary at the counter's own count.
+    #[tokio::test]
+    async fn chat_token_counter_matches_the_guard_formula() {
+        use tokenizers::models::wordlevel::WordLevel;
+        use tokenizers::pre_tokenizers::whitespace::Whitespace;
+
+        let model = WordLevel::builder()
+            .vocab(
+                [
+                    ("a".to_string(), 0),
+                    ("b".to_string(), 1),
+                    ("[UNK]".to_string(), 2),
+                ]
+                .into_iter()
+                .collect(),
+            )
+            .unk_token("[UNK]".to_string())
+            .build()
+            .unwrap();
+        let mut tokenizer = Tokenizer::new(model);
+        tokenizer.with_pre_tokenizer(Some(Whitespace));
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("tokenizer.json");
+        std::fs::write(&path, tokenizer.to_string(true).unwrap()).unwrap();
+        let counter = ChatTokenCounter::load(&path).unwrap();
+
+        let request = ChatRequest {
+            system: Some("sys a b".into()),
+            messages: vec![ChatMessage::user(["a"; 10].join(" "))],
+            max_tokens: 1,
+            temperature: None,
+        };
+        let schema = serde_json::json!({"type":"object"});
+        // Expected value straight from the admission formula: framing +
+        // per-message reserves, then one encode per content field and the
+        // schema string. Pinned against the tokenizer directly so the test
+        // does not depend on word-level vocab quirks — only on the formula.
+        let expected = CHAT_OVERHEAD_TOKENS
+            + MESSAGE_OVERHEAD_TOKENS * (request.messages.len() + 1)
+            + tokenizer.encode("sys a b", false).unwrap().len()
+            + tokenizer
+                .encode(request.messages[0].content.as_str(), false)
+                .unwrap()
+                .len()
+            + tokenizer.encode(schema.to_string(), false).unwrap().len();
+        let counted = counter.count_request(&request, Some(&schema)).unwrap();
+        assert_eq!(
+            counted, expected,
+            "shared counter applies the admission reserve + per-field counts"
+        );
+
+        // The guard built around the same tokenizer accepts exactly at the
+        // counter's count and rejects one below it: identical formula.
+        let inner = Arc::new(ScriptedProvider::new(vec![response(), response()]));
+        let at_ceiling =
+            AdmittedLlmProvider::new(inner.clone(), Some(counted), Some(&path)).unwrap();
+        at_ceiling
+            .complete_structured_raw(request.clone(), schema.clone())
+            .await
+            .expect("at the counter's count the guard accepts");
+        let under = AdmittedLlmProvider::new(inner, Some(counted - 1), Some(&path)).unwrap();
+        assert!(
+            matches!(
+                under.complete_structured_raw(request, schema).await,
+                Err(LlmError::InputLimit { .. })
+            ),
+            "one token below the counter's count the guard rejects"
+        );
     }
 }

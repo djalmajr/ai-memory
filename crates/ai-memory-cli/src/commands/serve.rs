@@ -2628,21 +2628,31 @@ fn configure_consolidator(
         max_output_tokens = config.consolidation.max_output_tokens,
         "memory_consolidate + PreCompact LLM checkpointing enabled",
     );
-    let consolidator = Arc::new(
-        Consolidator::new(
-            store.reader.clone(),
-            store.writer.clone(),
-            wiki.clone(),
-            llm.clone(),
-            workspace_id,
-            project_id,
-        )
-        .with_per_user_slots(config.slots.per_user)
-        .with_prompt_limits(
-            config.consolidation.max_input_tokens,
-            config.consolidation.max_output_tokens,
-        ),
+    let mut consolidator = Consolidator::new(
+        store.reader.clone(),
+        store.writer.clone(),
+        wiki.clone(),
+        llm.clone(),
+        workspace_id,
+        project_id,
+    )
+    .with_per_user_slots(config.slots.per_user)
+    .with_prompt_limits(
+        config.consolidation.max_input_tokens,
+        config.consolidation.max_output_tokens,
     );
+    // Opt-in map-reduce chunking (`[consolidation] chunk_input_tokens > 0`).
+    // Config validation already guarantees the readable tokenizer behind a
+    // positive `llm_max_input_tokens` when the mode is active; the builder
+    // re-checks the same preconditions for off-tree misuse.
+    consolidator = consolidator
+        .with_chunking(
+            config.consolidation.chunk_input_tokens,
+            config.llm_max_input_tokens,
+            config.llm_tokenizer_path.as_deref(),
+        )
+        .context("enabling consolidation map-reduce chunking")?;
+    let consolidator = Arc::new(consolidator);
     server = server.with_consolidator_arc(wiki.clone(), llm.clone(), consolidator.clone());
     // Optional post-RRF reranking rides on the same provider, so it is
     // only reachable once an LLM is configured at all. Off unless the
