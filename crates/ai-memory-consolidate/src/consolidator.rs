@@ -760,8 +760,10 @@ impl Consolidator {
 
         // Opt-in map-reduce pipeline (see `ChunkedRun`): reconcile an
         // already-published wiki first, then run the checkpointed stages.
-        // The single-prompt pipeline below is byte-for-byte unchanged when
-        // chunking is off.
+        // When chunking is off the single-prompt pipeline below is unchanged
+        // except that it now ALSO drops any batch update to the reserved
+        // `_prompts/consolidation.md` page (input, not output) — the shared
+        // `apply_batch_pages` enforces that for both pipelines.
         if self.chunking.is_some() {
             return self
                 .consolidate_session_multi_chunked(
@@ -842,14 +844,19 @@ impl Consolidator {
         let mut requests = Vec::with_capacity(batch.updates.len());
         let mut outcomes_preview = Vec::with_capacity(batch.updates.len());
         for upd in &batch.updates {
+            let (mut req, mut outcome) = build_update(ws, proj, upd, false, &actor, author_id)?;
             // The project's standing consolidation instructions are INPUT to
             // this run (resolved into the final prompt), not an output the
             // batch may overwrite — writing them here would corrupt the very
             // instructions that steer the next consolidation, and would make
             // the crash-resume see a different instructions string than the
-            // one that was published. Drop any update targeting the reserved
-            // path.
-            if upd.path == PROJECT_INSTRUCTIONS_PATH {
+            // one that was published. Drop any update whose SANITIZED path is
+            // the reserved page, in whatever form the model returned it
+            // (e.g. `_prompts/consolidation` without the `.md` that
+            // `build_update`/`slugify_page_path` appends). The comparison must
+            // happen on the path the write actually uses — not the raw string
+            // the model emitted — or the extension-less form slips through.
+            if req.path.as_str() == PROJECT_INSTRUCTIONS_PATH {
                 warn!(
                     session = %session_id,
                     path = PROJECT_INSTRUCTIONS_PATH,
@@ -857,7 +864,6 @@ impl Consolidator {
                 );
                 continue;
             }
-            let (mut req, mut outcome) = build_update(ws, proj, upd, false, &actor, author_id)?;
             if req.path == anchor {
                 stamp_session_origin(&mut req.frontmatter, session_id, agent_kind);
                 // The map-reduce pipeline stamps its own publication marker
@@ -3533,7 +3539,7 @@ const SYSTEM_PROMPT: &str = include_str!("../prompts/single_consolidate_system.m
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::ExtractionKind;
+    use crate::types::{ConsolidatedPageUpdate, ExtractionKind};
     use ai_memory_core::{ObservationId, ObservationKind, ProjectId, SessionId, WorkspaceId};
     use jiff::Timestamp;
     use std::collections::VecDeque;
@@ -7942,6 +7948,120 @@ mod tests {
         assert_ne!(
             marker_a, marker_b,
             "the length-prefixed marker must not alias across distinct observation lists"
+        );
+    }
+
+    /// The batch must never write the reserved consolidation-instructions
+    /// page, in whatever form the model returned the path. The drop is
+    /// decided on the SANITIZED path — the one `build_update`/`slugify_page_path`
+    /// will actually write — not the raw string the model emitted. The
+    /// extension-less form gains the `.md` the helper appends, so a raw
+    /// (pre-slugify) comparison would let it through and overwrite the very
+    /// instructions that steer the next consolidation. Runs with
+    /// `marker: None` (the default / single-prompt form, which shares the
+    /// same writer).
+    #[tokio::test]
+    async fn batch_never_writes_the_instructions_page_in_any_path_form() {
+        let t = ChunkedTest::fresh().await;
+        let llm = Arc::new(StagedLlm::new("m1"));
+        let consolidator = t.consolidator(llm);
+        let session = SessionId::new();
+        t.seed_session(session, &[big_body()]).await;
+
+        // Precondition: the extension-less form is exactly what
+        // `slugify_page_path` normalizes to the reserved destination — the
+        // form a raw (pre-slugify) comparison misses.
+        assert_eq!(
+            slugify_page_path("_prompts/consolidation"),
+            PROJECT_INSTRUCTIONS_PATH,
+            "the extension-less path slugifies to the reserved page"
+        );
+
+        let batch = ConsolidatedBatch {
+            updates: vec![
+                // Reserved page, the EXACT form (control: dropped even by a
+                // raw comparison).
+                ConsolidatedPageUpdate {
+                    path: PROJECT_INSTRUCTIONS_PATH.to_string(),
+                    tier: Tier::Semantic,
+                    kind: crate::types::PageKind::Fact,
+                    title: "Reserved exact".into(),
+                    body_markdown: "EXACT_BODY".into(),
+                    summary: None,
+                    tags: Vec::new(),
+                    slot_kind: SlotKind::default(),
+                    entities: Vec::new(),
+                    relations: Relations::default(),
+                },
+                // Reserved page, the EXTENSION-LESS form — `slugify_page_path`
+                // appends `.md`, so the sanitized path IS the reserved page.
+                ConsolidatedPageUpdate {
+                    path: "_prompts/consolidation".into(),
+                    tier: Tier::Semantic,
+                    kind: crate::types::PageKind::Fact,
+                    title: "Reserved omitted .md".into(),
+                    body_markdown: "OMITTED_MD_BODY".into(),
+                    summary: None,
+                    tags: Vec::new(),
+                    slot_kind: SlotKind::default(),
+                    entities: Vec::new(),
+                    relations: Relations::default(),
+                },
+                // Legitimate control: a normal page that must still be
+                // written — proves the drop is path-specific, not a blanket
+                // skip of the whole batch.
+                ConsolidatedPageUpdate {
+                    path: "concepts/kept-page".into(),
+                    tier: Tier::Semantic,
+                    kind: crate::types::PageKind::Fact,
+                    title: "Kept page".into(),
+                    body_markdown: "KEPT_BODY".into(),
+                    summary: None,
+                    tags: Vec::new(),
+                    slot_kind: SlotKind::default(),
+                    entities: Vec::new(),
+                    relations: Relations::default(),
+                },
+            ],
+            rationale: "test batch".into(),
+        };
+
+        let outcomes = consolidator
+            .apply_batch_pages(
+                t.ws,
+                t.proj,
+                session,
+                ai_memory_core::AgentKind::OpenCode,
+                ai_memory_core::ActorContext::anonymous(),
+                None,
+                batch,
+                &[],
+                None, // marker: None — the default (single-prompt) form
+            )
+            .await
+            .unwrap();
+
+        let written: Vec<String> = outcomes
+            .iter()
+            .map(|o| o.path.as_str().to_string())
+            .collect();
+        assert!(
+            !written.iter().any(|p| p == PROJECT_INSTRUCTIONS_PATH),
+            "the reserved instructions page must not be written in any path form: {written:?}"
+        );
+        assert!(
+            !outcomes.iter().any(|o| o.new_body_markdown == "EXACT_BODY"),
+            "the exact-form reserved update must be dropped: {written:?}"
+        );
+        assert!(
+            !outcomes
+                .iter()
+                .any(|o| o.new_body_markdown == "OMITTED_MD_BODY"),
+            "the extension-less reserved update (slugified to the reserved page) must be dropped: {written:?}"
+        );
+        assert!(
+            written.iter().any(|p| p == "concepts/kept-page.md"),
+            "the legitimate control page was written (slugified): {written:?}"
         );
     }
 

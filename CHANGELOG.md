@@ -30,7 +30,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   LLM call, then prunes its checkpoints. Changing the consolidation
   instructions re-runs the pipeline (a different operation) and updates the
   page, and the multi batch drops any update to the reserved
-  `_prompts/consolidation.md` page (input, not output). The heuristic
+  `_prompts/consolidation.md` page — decided on the sanitized path the write
+  actually uses, so the drop holds in any form the model returns (e.g. the
+  extension-less `_prompts/consolidation`) — input, not output. The heuristic
   SessionEnd page (origin stamp only, no marker) is not a
   publication, so the pipeline runs and overwrites it. The opt-in is fail-closed at config load (requires
   `llm_max_input_tokens` and a readable `llm_tokenizer_path`; the target
