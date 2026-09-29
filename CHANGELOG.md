@@ -23,10 +23,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   successful calls, a model or prompt change invalidates only the stale
   stages, and a new observation re-runs only the block that contains it.
   When the session's anchor page was already published by this pipeline
-  (it carries this run's content marker — prompt versions, model, mode, and
-  a digest of the sanitized observations), the run reconciles without a new
-  commit, revision, supersession, or LLM call, then prunes its checkpoints.
-  The heuristic SessionEnd page (origin stamp only, no marker) is not a
+  (it carries this run's content marker — prompt versions, model, mode, the
+  RESOLVED consolidation instructions, and a digest of the sanitized
+  observations, every field length-prefixed so distinct inputs can never
+  alias), the run reconciles without a new commit, revision, supersession, or
+  LLM call, then prunes its checkpoints. Changing the consolidation
+  instructions re-runs the pipeline (a different operation) and updates the
+  page, and the multi batch drops any update to the reserved
+  `_prompts/consolidation.md` page (input, not output). The heuristic
+  SessionEnd page (origin stamp only, no marker) is not a
   publication, so the pipeline runs and overwrites it. The opt-in is fail-closed at config load (requires
   `llm_max_input_tokens` and a readable `llm_tokenizer_path`; the target
   must not exceed the ceiling) and ungrounded or out-of-range stage output

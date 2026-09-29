@@ -231,13 +231,18 @@ whose fingerprint still matches are reused, only stale or missing blocks are
 re-run, and a new observation re-runs only the block that contains it —
 including a clock rollback, because no reuse decision reads `created_at`.
 A map checkpoint alone never proves publication: the pipeline stamps its own
-content marker (prompt versions, model, mode, and a digest of the sanitized
-observations) on the session anchor when it publishes, and a later run
-reconciles the already-published state — without a new commit, revision,
-supersession, or LLM call, then pruning its checkpoints — only when that
-marker matches the current inputs. The heuristic SessionEnd page (origin
-stamp only, no marker) is not a publication, so the pipeline runs and
-overwrites it. One consolidation run uses one logical
+content marker (prompt versions, model, mode, the RESOLVED consolidation
+instructions, and a digest of the sanitized observations — every field
+length-prefixed so distinct inputs can never alias) on the session anchor when
+it publishes, and a later run reconciles the already-published state — without
+a new commit, revision, supersession, or LLM call, then pruning its
+checkpoints — only when that marker matches the current inputs. Changing the
+consolidation instructions (`_prompts/consolidation.md` or the per-call
+override) is a different operation, so the pipeline re-runs and updates the
+page instead of reconciling away; the multi batch drops any update to the
+reserved `_prompts/consolidation.md` page (it is input, not output). The
+heuristic SessionEnd page (origin stamp only, no marker) is not a publication,
+so the pipeline runs and overwrites it. One consolidation run uses one logical
 operation id across every stage, retry, and replay (carried as `X-Request-Id`
 on the `openai-compat` path), so the whole run is one correlated stream on
 the provider side. Map and reduce output is validated at ingestion: any

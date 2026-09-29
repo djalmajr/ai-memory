@@ -842,6 +842,21 @@ impl Consolidator {
         let mut requests = Vec::with_capacity(batch.updates.len());
         let mut outcomes_preview = Vec::with_capacity(batch.updates.len());
         for upd in &batch.updates {
+            // The project's standing consolidation instructions are INPUT to
+            // this run (resolved into the final prompt), not an output the
+            // batch may overwrite — writing them here would corrupt the very
+            // instructions that steer the next consolidation, and would make
+            // the crash-resume see a different instructions string than the
+            // one that was published. Drop any update targeting the reserved
+            // path.
+            if upd.path == PROJECT_INSTRUCTIONS_PATH {
+                warn!(
+                    session = %session_id,
+                    path = PROJECT_INSTRUCTIONS_PATH,
+                    "batch returned an update for the reserved consolidation instructions page; dropping it"
+                );
+                continue;
+            }
             let (mut req, mut outcome) = build_update(ws, proj, upd, false, &actor, author_id)?;
             if req.path == anchor {
                 stamp_session_origin(&mut req.frontmatter, session_id, agent_kind);
@@ -989,16 +1004,28 @@ impl Consolidator {
     // ────────────────────────────────────────────────────────────────────
 
     /// The anchor's publication marker for one run (see
-    /// [`publication_marker`]): prompt versions, model, pipeline mode, and a
-    /// digest of the sanitized observations. Stable across a crash+resume of
-    /// the same run, invalidated by any change of inputs.
-    fn run_publication_marker(&self, mode: &str, run: &ChunkedRun) -> ConsolidatorResult<String> {
+    /// [`publication_marker`]): prompt versions, model, pipeline mode, the
+    /// RESOLVED consolidation instructions, and a digest of the sanitized
+    /// observations. Stable across a crash+resume of the same run,
+    /// invalidated by any change of inputs — including the instructions
+    /// page, which this pipeline treats as input.
+    fn run_publication_marker(
+        &self,
+        mode: &str,
+        instructions: &str,
+        run: &ChunkedRun,
+    ) -> ConsolidatorResult<String> {
         let Some(cfg) = &self.chunking else {
             return Err(ConsolidatorError::Llm(LlmError::NotConfigured(
                 "map-reduce phase called without chunking configured".into(),
             )));
         };
-        Ok(publication_marker(mode, &cfg.model, &run.observations))
+        Ok(publication_marker(
+            mode,
+            &cfg.model,
+            instructions,
+            &run.observations,
+        ))
     }
 
     /// Reconcile an already-published wiki before touching checkpoints: if
@@ -1475,7 +1502,12 @@ impl Consolidator {
             observations,
             operation_id: session_id.into(),
         };
-        let marker = self.run_publication_marker("single", &run)?;
+        // The single entry receives the RESOLVED instructions (the public
+        // `consolidate_session` resolves them before dispatching). The marker
+        // embeds them so a changed instructions page is a different operation
+        // and is never reconciled away.
+        let marker =
+            self.run_publication_marker("single", instructions.unwrap_or_default(), &run)?;
         if let Some((title, body)) = self.chunked_reconcile_published(&run, &marker).await? {
             info!(
                 session = %session_id,
@@ -1548,7 +1580,19 @@ impl Consolidator {
             observations,
             operation_id: session_id.into(),
         };
-        let marker = self.run_publication_marker("multi", &run)?;
+        // Resolve the consolidation instructions BEFORE the reconcile so the
+        // publication marker (which embeds them) is computed from the same
+        // string the final stage renders: a changed instructions page/override
+        // is a different operation and must not be reconciled away. The crash
+        // resume re-resolves the same string (the anchor write does not touch
+        // the reserved instructions page — the batch drops that path), so the
+        // marker still matches and there is no second publication.
+        let instructions = self.resolve_instructions(ws, proj, instructions).await;
+        let marker = self.run_publication_marker(
+            "multi",
+            instructions.as_deref().unwrap_or_default(),
+            &run,
+        )?;
         if self
             .chunked_reconcile_published(&run, &marker)
             .await?
@@ -1568,7 +1612,6 @@ impl Consolidator {
         // the final-fit stop condition counts the same request the final
         // call will send.
         let slots = self.slot_snapshots(ws, proj, &run.actor).await?;
-        let instructions = self.resolve_instructions(ws, proj, instructions).await;
         let existing_titles = self
             .existing_page_titles(ws, proj, &run.actor, session_id)
             .await;
@@ -1746,22 +1789,56 @@ fn schema_value<T: schemars::JsonSchema>() -> Option<serde_json::Value> {
 
 /// One map-reduce run's publication identity. The anchor page carries this
 /// in its frontmatter when this pipeline publishes it: the prompt versions,
-/// the model, the pipeline mode, and a digest of the sanitized observations
-/// it was built from. It is stable across a crash+resume of the same run
-/// (no clock input) and invalidated by any change of observations, model,
-/// prompt, or mode — so a page written by the heuristic synthesizer (no
-/// marker) or by an earlier run over different inputs (stale marker) is
-/// never mistaken for this run's publication.
-fn publication_marker(mode: &str, model: &str, observations: &[Observation]) -> String {
+/// the model, the pipeline mode, the RESOLVED consolidation instructions
+/// (the same string the final stage renders), and a digest of the sanitized
+/// observations it was built from. Every field is length-prefixed so two
+/// different field assignments can never collapse to the same preimage (the
+/// alias the bare `id|kind|body` join allowed). It is stable across a
+/// crash+resume of the same run (no clock input) and invalidated by any
+/// change of observations, model, prompt, mode, or instructions — so a page
+/// written by the heuristic synthesizer (no marker) or by an earlier run
+/// over different inputs (stale marker) is never mistaken for this run's
+/// publication.
+fn publication_marker(
+    mode: &str,
+    model: &str,
+    instructions: &str,
+    observations: &[Observation],
+) -> String {
     let mut payload = String::new();
     payload.push_str("mapreduce|");
-    payload.push_str(&format!(
-        "map-v{MAP_PROMPT_VERSION}|reduce-v{REDUCE_PROMPT_VERSION}|final-v{FINAL_PROMPT_VERSION}|{model}|{mode}|"
-    ));
+    for field in [
+        format!("map-v{MAP_PROMPT_VERSION}"),
+        format!("reduce-v{REDUCE_PROMPT_VERSION}"),
+        format!("final-v{FINAL_PROMPT_VERSION}"),
+        model.to_string(),
+        mode.to_string(),
+        instructions.to_string(),
+    ] {
+        push_prefixed_field(&mut payload, &field);
+    }
     for obs in observations {
-        payload.push_str(&format!("{}|{}|{}\n", obs.id, obs.kind.as_str(), obs.body));
+        for field in [
+            obs.id.to_string(),
+            obs.kind.as_str().to_string(),
+            obs.body.clone(),
+        ] {
+            push_prefixed_field(&mut payload, &field);
+        }
     }
     sha256_hex(&payload)
+}
+
+/// Append one marker field with its byte length prefixed (`<len>:<field>|`),
+/// so the encoding is injective: a field boundary can never be absorbed into
+/// a neighbouring field's value. Without the prefix, one observation whose
+/// body embeds another observation's `id|kind|body` line would collide with
+/// two real observations.
+fn push_prefixed_field(payload: &mut String, field: &str) {
+    payload.push_str(&field.len().to_string());
+    payload.push(':');
+    payload.push_str(field);
+    payload.push('|');
 }
 
 /// Split the session's observations into ordered map parts. The full
@@ -6591,11 +6668,14 @@ mod tests {
         /// as the final batch call builds it (default budgets). The batch
         /// prompt is far larger than the single one, so the multi tests
         /// derive their ceiling from this — the batch final must fit for the
-        /// reduce stop condition to hold.
+        /// reduce stop condition to hold. `instructions` is counted too, so a
+        /// test that feeds the batch a (sentinel) instruction derives a
+        /// ceiling that fits it.
         fn consolidator_batch_base_count(
             &self,
             session: SessionId,
             n_extractions: usize,
+            instructions: &str,
         ) -> ConsolidatorResult<usize> {
             // Ids sized like real observation uuids (36 chars) so the probe
             // matches the evidence the fake map stage actually produces.
@@ -6606,7 +6686,11 @@ mod tests {
                 session,
                 &extractions,
                 &[],
-                None,
+                if instructions.is_empty() {
+                    None
+                } else {
+                    Some(instructions)
+                },
                 PromptBudgets::default(),
                 &[],
             );
@@ -7159,7 +7243,7 @@ mod tests {
                 .and_then(|v| v.as_str()),
             Some(
                 consolidator
-                    .run_publication_marker("single", &run)
+                    .run_publication_marker("single", "", &run)
                     .unwrap()
                     .as_str()
             ),
@@ -7201,7 +7285,7 @@ mod tests {
         let consolidator2 = t.consolidator(Arc::clone(&llm2));
         let run2 = t.chunked_run(session, t.observations(session).await);
         let marker2 = consolidator2
-            .run_publication_marker("single", &run2)
+            .run_publication_marker("single", "", &run2)
             .unwrap();
         assert!(
             consolidator2
@@ -7252,7 +7336,7 @@ mod tests {
         // resume's reconcile matches exactly this marker (not the origin
         // stamp) to prove this run already published.
         let marker = consolidator
-            .run_publication_marker("single", &run1)
+            .run_publication_marker("single", "", &run1)
             .unwrap();
         consolidator
             .apply_single_page(
@@ -7353,7 +7437,7 @@ mod tests {
                 .and_then(|v| v.as_str()),
             Some(
                 consolidator
-                    .run_publication_marker("single", &run)
+                    .run_publication_marker("single", "", &run)
                     .unwrap()
                     .as_str()
             ),
@@ -7373,7 +7457,7 @@ mod tests {
         // The batch final prompt is far larger than the single one: derive
         // the ceiling from the batch final (2 map extractions) so the reduce
         // stop condition holds and the batch is not refused.
-        let ceiling = t.consolidator_batch_base_count(session, 2).unwrap() + 100;
+        let ceiling = t.consolidator_batch_base_count(session, 2, "").unwrap() + 100;
         let consolidator = t.consolidator_with(Arc::clone(&llm), t.base + 700, ceiling);
 
         let outcomes = consolidator
@@ -7421,8 +7505,9 @@ mod tests {
         t.seed_session(session, &[big_body()]).await;
         // One map block → one extraction; the ceiling must fit the batch
         // final for that digest (the batch prompt is much larger than the
-        // single one).
-        let ceiling = t.consolidator_batch_base_count(session, 1).unwrap() + 100;
+        // single one). No instructions in this test → derive with an empty
+        // instruction string.
+        let ceiling = t.consolidator_batch_base_count(session, 1, "").unwrap() + 100;
         let consolidator = t.consolidator_with(Arc::clone(&llm1), t.base + 700, ceiling);
 
         // Run 1: drive the phases through the batch publish, then crash
@@ -7456,7 +7541,9 @@ mod tests {
             )
             .await
             .unwrap();
-        let marker = consolidator.run_publication_marker("multi", &run1).unwrap();
+        let marker = consolidator
+            .run_publication_marker("multi", "", &run1)
+            .unwrap();
         consolidator
             .apply_batch_pages(
                 t.ws,
@@ -7537,7 +7624,7 @@ mod tests {
             .await
             .unwrap();
         let marker1 = consolidator
-            .run_publication_marker("single", &run1)
+            .run_publication_marker("single", "", &run1)
             .unwrap();
         consolidator
             .apply_single_page(
@@ -7681,13 +7768,196 @@ mod tests {
         assert!(parts[0].text.contains("hello world"));
     }
 
+    /// Re-consolidating the same session after the consolidation instructions
+    /// changed must re-run the pipeline (the marker embeds the resolved
+    /// instructions), publish the new result, and carry the NEW instructions
+    /// (sentinel) to the final prompt — not reconcile to the old page.
+    #[tokio::test]
+    async fn changed_instructions_single_must_rerun() {
+        let t = ChunkedTest::fresh().await;
+        let llm1 = Arc::new(StagedLlm::new("m1"));
+        let consolidator = t.consolidator(Arc::clone(&llm1));
+        let session = SessionId::new();
+        t.seed_session(session, &[big_body()]).await;
+
+        // Run 1: publish under instructions A (a per-call override).
+        consolidator
+            .consolidate_session(
+                session,
+                false,
+                ai_memory_core::ActorContext::anonymous(),
+                None,
+                Some("instructions SENTINEL_A first run"),
+            )
+            .await
+            .unwrap();
+        assert_eq!(llm1.calls().2, 1, "run 1 ran the final stage");
+
+        // Run 2: same observations, but the instructions changed (sentinel B).
+        // A different instruction string is a different operation: the marker
+        // no longer matches, so the pipeline runs again and carries sentinel B
+        // to the final prompt.
+        let llm2 = Arc::new(StagedLlm::new("m1"));
+        let consolidator2 = t.consolidator(Arc::clone(&llm2));
+        let outcome = consolidator2
+            .consolidate_session(
+                session,
+                false,
+                ai_memory_core::ActorContext::anonymous(),
+                None,
+                Some("instructions SENTINEL_B second run"),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            llm2.calls().2,
+            1,
+            "changed instructions must re-run the final stage, not reconcile: {:?}",
+            llm2.calls()
+        );
+        assert!(outcome.page_id.is_some(), "the new result is published");
+        assert!(
+            llm2.final_user().contains("SENTINEL_B"),
+            "the NEW instructions reach the final prompt; final_user lacks SENTINEL_B"
+        );
+        assert!(
+            !llm2.final_user().contains("SENTINEL_A"),
+            "the old instructions are gone from the final prompt"
+        );
+    }
+
+    /// Multi variant: changing the instructions after a real multi publication
+    /// must re-run the batch (not return an empty `Ok(vec![])`) and carry the
+    /// new instructions to the batch final prompt.
+    #[tokio::test]
+    async fn changed_instructions_multi_must_rerun() {
+        let t = ChunkedTest::fresh().await;
+        let llm1 = Arc::new(StagedLlm::new("m1"));
+        let session = SessionId::new();
+        t.seed_session(session, &[big_body()]).await;
+        // The batch final prompt is much larger than the single one: derive
+        // the ceiling from it so the reduce stop condition holds. Count the
+        // (sentinel) instruction too, since both runs feed it to the batch
+        // final.
+        let ceiling = t
+            .consolidator_batch_base_count(session, 1, "instructions SENTINEL_A first run")
+            .unwrap()
+            + 100;
+        let consolidator = t.consolidator_with(Arc::clone(&llm1), t.base + 700, ceiling);
+
+        // Run 1: publish the batch under instructions A.
+        let out1 = consolidator
+            .consolidate_session_multi(
+                session,
+                false,
+                ai_memory_core::ActorContext::anonymous(),
+                None,
+                Some("instructions SENTINEL_A first run"),
+            )
+            .await
+            .unwrap();
+        assert!(!out1.is_empty(), "run 1 wrote the batch");
+        assert_eq!(llm1.calls().2, 1, "run 1 ran the batch final");
+
+        // Run 2: same observations, changed instructions (sentinel B). The
+        // marker embeds the resolved instructions, so the multi pipeline
+        // re-runs (not an empty success) and carries sentinel B.
+        let llm2 = Arc::new(StagedLlm::new("m1"));
+        let consolidator2 = t.consolidator_with(Arc::clone(&llm2), t.base + 700, ceiling);
+        let out2 = consolidator2
+            .consolidate_session_multi(
+                session,
+                false,
+                ai_memory_core::ActorContext::anonymous(),
+                None,
+                Some("instructions SENTINEL_B second run"),
+            )
+            .await
+            .unwrap();
+        assert!(
+            !out2.is_empty(),
+            "changed instructions must re-run the multi pipeline, not return empty: {:?}",
+            out2.iter().map(|o| o.path.as_str()).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            llm2.calls().2,
+            1,
+            "the batch final re-ran: {:?}",
+            llm2.calls()
+        );
+        assert!(
+            llm2.final_user().contains("SENTINEL_B"),
+            "the NEW instructions reach the batch final prompt"
+        );
+    }
+
+    /// The length-prefixed marker encoding is injective: two observation
+    /// lists whose un-prefixed `id|kind|body` preimage COLLIDES (one
+    /// observation whose body embeds another's line vs two real observations)
+    /// still yield DISTINCT markers. This is the alias the Grok re-check
+    /// registered as a limit of the bare join.
+    #[test]
+    fn publication_marker_length_prefixes_prevent_alias() {
+        let u1 = ai_memory_core::ObservationId::new();
+        let u2 = ai_memory_core::ObservationId::new();
+        assert_ne!(u1, u2);
+        let u2s = u2.to_string();
+        // List A: ONE observation whose body embeds a second observation's
+        // `id|kind|body` line (a newline + the other id's line). The embedded
+        // kind uses the REAL wire string (`other`), so the un-prefixed join
+        // collides with list B.
+        let list_a = vec![test_observation_with(
+            u1,
+            &format!(
+                "x\n{u2s}|{}|y",
+                ai_memory_core::ObservationKind::Other.as_str()
+            ),
+        )];
+        // List B: TWO real observations — the same two "lines" as records.
+        let list_b = vec![
+            test_observation_with(u1, "x"),
+            test_observation_with(u2, "y"),
+        ];
+
+        // Precondition: the OLD un-prefixed preimage collides — that is the
+        // alias. (Reproduce the pre-fix encoding: bare `id|kind|body` join.)
+        let naive = |list: &[Observation]| {
+            let mut s = String::new();
+            for obs in list {
+                s.push_str(&format!("{}|{}|{}\n", obs.id, obs.kind.as_str(), obs.body));
+            }
+            s
+        };
+        assert_eq!(
+            naive(&list_a),
+            naive(&list_b),
+            "precondition: the un-prefixed preimage collides (the alias)"
+        );
+
+        // With the length-prefixed encoding the two lists yield distinct
+        // markers, so a foreign/stale publication can never be confused with
+        // this one.
+        let marker_a = publication_marker("single", "m1", "", &list_a);
+        let marker_b = publication_marker("single", "m1", "", &list_b);
+        assert_ne!(
+            marker_a, marker_b,
+            "the length-prefixed marker must not alias across distinct observation lists"
+        );
+    }
+
     /// Build one `Observation` with the given body for the part-splitting
     /// unit tests (the splitter only reads id/kind/title/body/importance/
     /// created_at, all deterministic here).
     fn test_observation(body: &str) -> Observation {
-        use ai_memory_core::{ObservationId, ObservationKind};
+        test_observation_with(ai_memory_core::ObservationId::new(), body)
+    }
+
+    /// Like [`test_observation`] but with a controlled observation id — the
+    /// marker alias test needs specific ids to build a colliding preimage.
+    fn test_observation_with(id: ai_memory_core::ObservationId, body: &str) -> Observation {
+        use ai_memory_core::ObservationKind;
         Observation {
-            id: ObservationId::new(),
+            id,
             session_id: SessionId::new(),
             workspace_id: WorkspaceId::new(),
             project_id: ProjectId::new(),
