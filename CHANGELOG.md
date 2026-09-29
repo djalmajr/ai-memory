@@ -37,8 +37,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   publication, so the pipeline runs and overwrites it. The opt-in is fail-closed at config load (requires
   `llm_max_input_tokens` and a readable `llm_tokenizer_path`; the target
   must not exceed the ceiling) and ungrounded or out-of-range stage output
-  fails the run closed. Off by default; `chunk_input_tokens = 0` keeps the
-  single-prompt pipeline unchanged (#2).
+  fails the run closed; those deterministic failures (ungrounded output,
+  incomplete coverage, a block that cannot fit) end the SessionEnd queue
+  terminal — no re-send of the same prompt — and their persisted and
+  returned error summary is redacted to a fixed class (no body). Off by
+  default; `chunk_input_tokens = 0` keeps the single-prompt pipeline
+  unchanged (#2).
 - The `openai-compat` provider now sends `X-Request-Id` with every chat
   attempt, carrying the logical operation id shared by all attempts of one
   operation — including the strict-to-tolerant fallback and the single

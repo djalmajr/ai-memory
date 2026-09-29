@@ -771,6 +771,14 @@ fn is_terminal_session_consolidation_error(
     matches!(
         error,
         ai_memory_consolidate::ConsolidatorError::Serde(_)
+            // The map-reduce validation failures are deterministic on the
+            // same input (ungrounded stage output, an unaccounted observation
+            // id, a block that cannot fit the ceiling): re-sending the same
+            // prompt reproduces them, so the job ends terminal on the first
+            // failure and the heuristic page the hook already wrote remains.
+            | ai_memory_consolidate::ConsolidatorError::UngroundedExtractions(_)
+            | ai_memory_consolidate::ConsolidatorError::IncompleteCoverage(_)
+            | ai_memory_consolidate::ConsolidatorError::ChunkDoesNotFit
             | ai_memory_consolidate::ConsolidatorError::Llm(
                 ai_memory_llm::LlmError::AmbiguousRetryExhausted { .. }
                     | ai_memory_llm::LlmError::InputLimit { .. }
@@ -992,6 +1000,12 @@ fn consolidation_error_class(error: &ai_memory_consolidate::ConsolidatorError) -
         ai_memory_consolidate::ConsolidatorError::Serde(_) => "serde",
         ai_memory_consolidate::ConsolidatorError::SessionNotFound(_) => "session-not-found",
         ai_memory_consolidate::ConsolidatorError::EmptySession(_) => "empty-session",
+        // The map-reduce validation failures: fixed labels, no arbitrary text.
+        ai_memory_consolidate::ConsolidatorError::UngroundedExtractions(_) => {
+            "ungrounded-extractions"
+        }
+        ai_memory_consolidate::ConsolidatorError::IncompleteCoverage(_) => "incomplete-coverage",
+        ai_memory_consolidate::ConsolidatorError::ChunkDoesNotFit => "chunk-does-not-fit",
         // `ConsolidatorError` is non-exhaustive: a future variant must not
         // leak an unredacted Display into the structured fields.
         _ => "other",
@@ -4133,6 +4147,150 @@ mod tests {
                     "a deterministic structured-response failure must be terminal at queue attempt {attempts}"
                 );
             }
+        }
+    }
+
+    // The map-reduce validation failures (ungrounded stage output, an
+    // unaccounted observation id, a block that cannot fit the ceiling) are
+    // deterministic on the same input: the SessionEnd queue must end
+    // terminal on the FIRST failure — `session_consolidation_retry_at(1, …)
+    // == None` — so the identical prompt is never re-sent and the heuristic
+    // page the hook already wrote is preserved. [retry]/[clock]: the terminal
+    // decision is independent of any timestamp (it returns before the backoff
+    // delay is computed), so a rolled-back clock cannot turn it into a retry.
+    #[test]
+    fn mapreduce_validation_failures_are_terminal_on_first_attempt() {
+        let failures = [
+            ai_memory_consolidate::ConsolidatorError::UngroundedExtractions(
+                "obs 1234 ungrounded".into(),
+            ),
+            ai_memory_consolidate::ConsolidatorError::IncompleteCoverage(
+                "obs 5678 unaccounted".into(),
+            ),
+            ai_memory_consolidate::ConsolidatorError::ChunkDoesNotFit,
+        ];
+        for error in &failures {
+            // The brief's acceptance: terminal on the FIRST attempt.
+            assert!(
+                session_consolidation_retry_at(1, error).is_none(),
+                "a map-reduce validation failure must be terminal on the first attempt: {error:?}"
+            );
+            // …and on every later attempt (no retry at any step).
+            for attempts in 1..=ai_memory_store::SESSION_CONSOLIDATION_MAX_ATTEMPTS {
+                assert!(
+                    session_consolidation_retry_at(attempts, error).is_none(),
+                    "a map-reduce validation failure must be terminal at queue attempt {attempts}: {error:?}"
+                );
+            }
+        }
+    }
+
+    // [crash] failure matrix: after a terminal map-reduce failure is persisted
+    // (`retry_at = None` → the queue row goes to state `failed`), resuming the
+    // queue must NOT re-claim the job — the terminal classification persists
+    // and the identical prompt is never re-sent. Proven through the durable
+    // queue (claim → fail → re-claim at a later clock) with the redacted
+    // summary as the persisted `last_error`.
+    #[tokio::test]
+    async fn terminal_mapreduce_failure_persists_and_never_retriggers() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let workspace_id = store
+            .writer
+            .get_or_create_workspace("default")
+            .await
+            .unwrap();
+        let project_id = store
+            .writer
+            .get_or_create_project(workspace_id, "project", None)
+            .await
+            .unwrap();
+
+        let failures = [
+            ai_memory_consolidate::ConsolidatorError::UngroundedExtractions(
+                "obs 1234 ungrounded".into(),
+            ),
+            ai_memory_consolidate::ConsolidatorError::IncompleteCoverage(
+                "obs 5678 unaccounted".into(),
+            ),
+            ai_memory_consolidate::ConsolidatorError::ChunkDoesNotFit,
+        ];
+        for error in &failures {
+            let session_id = SessionId::new();
+            store
+                .writer
+                .begin_session(NewSession {
+                    occurred_at: None,
+                    id: session_id,
+                    workspace_id,
+                    project_id,
+                    agent_kind: AgentKind::Codex,
+                    cwd: None,
+                    actor_user: None,
+                })
+                .await
+                .unwrap();
+            store
+                .writer
+                .insert_observation(Sanitized::new(
+                    NewObservation {
+                        occurred_at: None,
+                        session_id,
+                        workspace_id,
+                        project_id,
+                        kind: ObservationKind::UserPrompt,
+                        extension: None,
+                        source_event: None,
+                        title: "finish".into(),
+                        body: "end the session".into(),
+                        importance: 8,
+                    },
+                    &Sanitizer::default(),
+                ))
+                .await
+                .unwrap();
+            store.writer.end_session(session_id, None).await.unwrap();
+            store
+                .writer
+                .enqueue_session_consolidation(workspace_id, project_id, session_id)
+                .await
+                .unwrap();
+
+            let now = jiff::Timestamp::now().as_microsecond();
+            let job = store
+                .writer
+                .claim_session_consolidation(now, now - 10 * 60 * 1_000_000)
+                .await
+                .unwrap()
+                .expect("the enqueued job must be claimable");
+            let retry_at = session_consolidation_retry_at(job.attempts(), error);
+            assert!(
+                retry_at.is_none(),
+                "the map-reduce validation failure must be terminal: {error:?}"
+            );
+            // Persist exactly as the worker does: the redacted summary and no
+            // retry time.
+            store
+                .writer
+                .fail_session_consolidation(
+                    job,
+                    ai_memory_consolidate::redacted_error_summary(error),
+                    retry_at,
+                )
+                .await
+                .unwrap();
+            // Resume the queue far in the future: a terminal row (`failed`) is
+            // never re-claimed, so the same prompt is not re-sent.
+            let probe_now = now + 10 * 60 * 1_000_000;
+            assert!(
+                store
+                    .writer
+                    .claim_session_consolidation(probe_now, probe_now - 10 * 60 * 1_000_000)
+                    .await
+                    .unwrap()
+                    .is_none(),
+                "a terminal map-reduce failure must not be re-claimed: {error:?}"
+            );
         }
     }
 

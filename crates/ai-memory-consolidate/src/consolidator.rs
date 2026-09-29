@@ -108,6 +108,12 @@ pub fn redacted_error_summary(error: &ConsolidatorError) -> String {
         ConsolidatorError::Serde(_) => ("serde", None),
         ConsolidatorError::SessionNotFound(_) => ("session-not-found", None),
         ConsolidatorError::EmptySession(_) => ("empty-session", None),
+        // The map-reduce validation failures are deterministic on the same
+        // input: a fixed class and `status=none`, never the detail `String`
+        // (which can name an observation body) or the variant's `Display`.
+        ConsolidatorError::UngroundedExtractions(_) => ("ungrounded-extractions", None),
+        ConsolidatorError::IncompleteCoverage(_) => ("incomplete-coverage", None),
+        ConsolidatorError::ChunkDoesNotFit => ("chunk-does-not-fit", None),
     };
     format!(
         "consolidation failed: class={class} status={}",
@@ -3636,6 +3642,41 @@ mod tests {
             "consolidation failed: class=not-configured status=none"
         );
         assert!(!summary.contains(REDACTION_SENTINEL));
+    }
+
+    /// The map-reduce validation failures carry a detail `String` (the two
+    /// that name an observation body) and a no-payload variant. Their
+    /// summary must expose ONLY a fixed class and `status=none` — never the
+    /// detail `String`, never the variant's `Display`. Adversarial: the
+    /// detail is a sentinel that must not leak into the summary.
+    #[test]
+    fn redacted_summary_for_mapreduce_validation_errors_carries_no_detail_text() {
+        let ungrounded = ConsolidatorError::UngroundedExtractions(REDACTION_SENTINEL.into());
+        let incomplete = ConsolidatorError::IncompleteCoverage(REDACTION_SENTINEL.into());
+        let does_not_fit = ConsolidatorError::ChunkDoesNotFit;
+
+        let ungrounded_summary = redacted_error_summary(&ungrounded);
+        let incomplete_summary = redacted_error_summary(&incomplete);
+        let fit_summary = redacted_error_summary(&does_not_fit);
+
+        assert_eq!(
+            ungrounded_summary,
+            "consolidation failed: class=ungrounded-extractions status=none"
+        );
+        assert_eq!(
+            incomplete_summary,
+            "consolidation failed: class=incomplete-coverage status=none"
+        );
+        assert_eq!(
+            fit_summary,
+            "consolidation failed: class=chunk-does-not-fit status=none"
+        );
+
+        for summary in [&ungrounded_summary, &incomplete_summary, &fit_summary] {
+            assert!(summary.starts_with("consolidation failed: class="));
+            assert!(summary.ends_with("status=none"));
+            assert!(!summary.contains(REDACTION_SENTINEL));
+        }
     }
 
     /// Helper for prompt construction tests.
