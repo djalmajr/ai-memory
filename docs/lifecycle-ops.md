@@ -19,7 +19,7 @@ on a homelab box where mistakes are harder to undo.
 | `backup --to` | ✅ yes | no | n/a | Streams a gzipped tarball from the server's online `sqlite3 .backup` plus the wiki tree. Safe alongside the live writer. |
 | `checkpoints` | ✅ yes | no | n/a | Lists recent wiki git checkpoints. Read-only. |
 | `restore-page --path --from` | ✅ yes | overwrites one markdown page version | yes (restore another checkpoint) | Restores one page from wiki git history, reindexes it into SQLite, and writes a post-restore checkpoint. Does not restore DB-only state. |
-| `restore --from <tarball>` | ❌ **stop the server first** | overwrites the data dir | no (without prior backup) | Refuses if any sibling `ai-memory` process is alive (sysinfo guard). |
+| `restore --from <tarball>` | ❌ **stop the server first** | overwrites the data dir | no (without prior backup) | Refuses if any sibling `ai-memory` process is alive (sysinfo guard). Stages and verifies the archive before swapping it in, so a failed restore leaves `wiki/` and `db/` as they were. |
 | `reset --confirm` | ❌ **stop the server first** | yes, all data | no | Refuses if any sibling `ai-memory` process is alive (sysinfo guard). |
 | `reindex` | ❌ **stop the server first** | no wiki wipe; requires a clean DB | only with prior DB backup | Rebuilds pages/links/FTS from `wiki/` using `_meta.md` manifests. Refuses if SQLite already has rows so stale DB-only state cannot survive silently. |
 
@@ -33,6 +33,9 @@ fundamentally cannot run while another process holds the SQLite WAL writer. See
 
 `purge-session` answers *"forget this conversation"*: after it runs, the
 session is gone from the API, from `status` counts and from search.
+It removes both earlier and later summary versions identified as belonging to
+that session; hand-written versions at the same path remain, including a later
+live wiki file.
 
 ```bash
 ai-memory purge-session \
@@ -712,17 +715,35 @@ alive (uses `sysinfo` to scan the process table).
 Order of operations:
 
 1. Check the data dir is empty (or the user passed `--force`).
-2. Extract the tarball into the data dir.
-3. Restore the SQLite snapshot in place.
-4. Print a one-line summary.
+2. Extract the tarball into a staging directory beside the live data
+   (`<data_dir>/.restore-staging-<stamp>/`), validating every entry.
+3. Open the staged store so pending migrations run and the SQLite
+   snapshot is verified — still without touching the live data.
+4. Swap: rename the live `wiki/` and `db/` (and `config.toml`, when the
+   archive carries one) aside, rename the staged copies into place, then
+   delete the previous data. Each move is a same-filesystem rename; if
+   one fails, the moves already made are reversed.
+5. Print a one-line summary.
+
+The live data is therefore untouched until the archive has proven usable.
+A restore that fails in steps 2–3 leaves `wiki/` and `db/` exactly as they
+were, which matters because a restore is usually attempted when no other
+copy exists.
 
 Failure modes:
 
 - **Server still running** → exits with "another ai-memory process is
   alive (pid X); stop it before restoring" - same wording as `reset`.
-- **`--confirm` omitted** → exits with usage hint.
 - **Data dir not empty + no `--force`** → exits with "data dir not
   empty; pass `--force` to overwrite".
+- **Truncated or corrupt tarball, an entry outside the allowed layout, or
+  a snapshot the current binary cannot open** (for example a backup taken
+  by a newer release) → exits with the error; the existing `wiki/` and
+  `db/` are left as they were.
+- **A rename in the swap fails and cannot be reversed** → exits with an
+  `INCONSISTENT STATE` message naming the
+  `<data_dir>/.restore-previous-<stamp>/` directory that still holds the
+  pre-restore `wiki/` and `db/`, to be moved back by hand.
 
 ### `reset`
 

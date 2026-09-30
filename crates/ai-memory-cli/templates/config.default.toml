@@ -177,6 +177,31 @@ per_user = false
 max_input_tokens = 100000
 max_output_tokens = 32000
 
+# Opt-in map-reduce consolidation. 0 (the default) keeps the single large
+# prompt. Above zero, a session's observation log is consolidated through
+# sequential, checkpointed stages: typed evidence extraction per token-sized
+# block (grounded in the observations' ids), hierarchical reduction, then the
+# normal final prompt. Every call is sized with the model's own tokenizer so
+# it fits llm_max_input_tokens before reaching the admission guard, and one
+# consolidation run carries one operation id across every call, retry and
+# replay. Durable checkpoints let a crashed or re-run consolidation reuse
+# already-succeeded stages; a published session page is reconciled without a
+# new revision, LLM call, or commit. Requires llm_max_input_tokens > 0 and a
+# readable llm_tokenizer_path, and must not exceed llm_max_input_tokens.
+# Env: AI_MEMORY_CONSOLIDATION__CHUNK_INPUT_TOKENS.
+# chunk_input_tokens = 0
+
+# Optional hard pre-send ceiling for every chat job, including consolidation,
+# review, bootstrap, lint, dream and LLM reranking. Requires the exact
+# tokenizer.json for the configured model and currently rejects LLM fallback
+# chains because they may use a different tokenizer. The provider counts tokens in
+# each message and the JSON schema, plus a conservative chat-framing reserve;
+# an oversized call fails locally before HTTP. The server also admits only
+# one chat call at a time and bounds its waiting queue to 32 requests.
+# Env: AI_MEMORY_LLM_MAX_INPUT_TOKENS and AI_MEMORY_LLM_TOKENIZER_PATH.
+# llm_max_input_tokens = 16000
+# llm_tokenizer_path = "/path/to/model/tokenizer.json"
+
 # Auto-improvement reviewer.
 #
 # The background scheduler reviews newly-completed sessions in every project

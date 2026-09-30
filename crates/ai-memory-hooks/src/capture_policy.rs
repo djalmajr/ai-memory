@@ -166,7 +166,14 @@ pub(crate) fn tool_observation_metadata(
         // camelCase — all captured live (engine v0.16.5, #512).
         // Native Codex 0.154 uses these same top-level fields, including
         // `tool_use_id` on both sides of a tool call.
-        AgentKind::ClaudeCode | AgentKind::CommandCode | AgentKind::Codex | AgentKind::Zcode => (
+        // Grok Build CLI posts Claude Code's snake_case aliases
+        // (`tool_name` / `tool_input` / `tool_use_id`) on its tool hooks
+        // alongside camelCase, so it shares this mapping (#931).
+        AgentKind::ClaudeCode
+        | AgentKind::CommandCode
+        | AgentKind::Codex
+        | AgentKind::Grok
+        | AgentKind::Zcode => (
             object.get("tool_name")?.as_str()?,
             object.get("tool_use_id").and_then(Value::as_str),
         ),
@@ -174,7 +181,9 @@ pub(crate) fn tool_observation_metadata(
             object.get("tool")?.as_str()?,
             object.get("callID").and_then(Value::as_str),
         ),
-        AgentKind::Pi => (
+        // The Pi extension is generated from the OMP one (`build_pi_extension`),
+        // so both post the same `tool` / `callID` / `args` payload.
+        AgentKind::Pi | AgentKind::Omp => (
             object.get("tool")?.as_str()?,
             object.get("callID").and_then(Value::as_str),
         ),
@@ -209,6 +218,7 @@ pub(crate) fn tool_observation_metadata(
                         AgentKind::ClaudeCode
                             | AgentKind::CommandCode
                             | AgentKind::Codex
+                            | AgentKind::Grok
                             | AgentKind::Hermes
                             | AgentKind::KiroCli
                             | AgentKind::Pool
@@ -230,7 +240,7 @@ pub(crate) fn tool_observation_metadata(
 /// Extracts an outcome only where the adapter protocol proves its meaning.
 pub(crate) fn tool_observation_outcome(agent: AgentKind, raw: &Value) -> ToolOutcome {
     match agent {
-        AgentKind::Pi => match raw.get("isError").and_then(Value::as_bool) {
+        AgentKind::Pi | AgentKind::Omp => match raw.get("isError").and_then(Value::as_bool) {
             Some(true) => ToolOutcome::Error,
             Some(false) => ToolOutcome::Success,
             None => ToolOutcome::Unknown,

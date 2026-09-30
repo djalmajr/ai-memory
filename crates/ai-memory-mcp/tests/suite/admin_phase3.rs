@@ -316,6 +316,7 @@ async fn seed_sessions_for_reorg(store: &Store) -> (SessionId, SessionId) {
     store
         .writer
         .begin_session(NewSession {
+            occurred_at: None,
             id: sid_a,
             workspace_id: ws,
             project_id: scratch,
@@ -329,6 +330,7 @@ async fn seed_sessions_for_reorg(store: &Store) -> (SessionId, SessionId) {
         .writer
         .insert_observation(Sanitized::new(
             NewObservation {
+                occurred_at: None,
                 session_id: sid_a,
                 workspace_id: ws,
                 project_id: scratch,
@@ -348,6 +350,7 @@ async fn seed_sessions_for_reorg(store: &Store) -> (SessionId, SessionId) {
     store
         .writer
         .begin_session(NewSession {
+            occurred_at: None,
             id: sid_b,
             workspace_id: ws,
             project_id: scratch,
@@ -361,6 +364,7 @@ async fn seed_sessions_for_reorg(store: &Store) -> (SessionId, SessionId) {
         .writer
         .insert_observation(Sanitized::new(
             NewObservation {
+                occurred_at: None,
                 session_id: sid_b,
                 workspace_id: ws,
                 project_id: scratch,

@@ -404,6 +404,7 @@ mod tests {
         crate::ops::insert_observation(
             &mut conn,
             &NewObservation {
+                occurred_at: None,
                 session_id,
                 workspace_id,
                 project_id,
@@ -597,6 +598,7 @@ mod tests {
         crate::ops::begin_session(
             &mut conn,
             &NewSession {
+                occurred_at: None,
                 id: SessionId::new(),
                 workspace_id,
                 project_id,
@@ -655,6 +657,7 @@ mod tests {
         crate::ops::begin_session(
             &mut conn,
             &NewSession {
+                occurred_at: None,
                 id: SessionId::new(),
                 workspace_id,
                 project_id,
@@ -727,6 +730,7 @@ mod tests {
         crate::ops::begin_session(
             &mut conn,
             &NewSession {
+                occurred_at: None,
                 id: SessionId::new(),
                 workspace_id,
                 project_id,
@@ -799,6 +803,7 @@ mod tests {
         crate::ops::begin_session(
             &mut conn,
             &NewSession {
+                occurred_at: None,
                 id: SessionId::new(),
                 workspace_id,
                 project_id,
@@ -866,6 +871,7 @@ mod tests {
         crate::ops::begin_session(
             &mut conn,
             &NewSession {
+                occurred_at: None,
                 id: SessionId::new(),
                 workspace_id,
                 project_id,

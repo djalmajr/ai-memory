@@ -186,6 +186,7 @@ async fn ownership_writes_reject_malformed_identity_keys() {
         store
             .writer
             .begin_session(ai_memory_core::NewSession {
+                occurred_at: None,
                 id: invalid_session,
                 workspace_id: ws,
                 project_id: proj,
@@ -760,6 +761,7 @@ async fn automatic_supersession_does_not_reach_across_operators() {
         store
             .writer
             .begin_session(NewSession {
+                occurred_at: None,
                 id: session_id,
                 workspace_id: ws,
                 project_id: proj,
@@ -887,6 +889,7 @@ async fn open_session_lookup_is_owner_scoped() {
         store
             .writer
             .begin_session(NewSession {
+                occurred_at: None,
                 id,
                 workspace_id: ws,
                 project_id: proj,

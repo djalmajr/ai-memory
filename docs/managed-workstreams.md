@@ -331,7 +331,12 @@ resume, continue, session, or fork selector.
    Direct launches continue to use the same handoff path without a managed
    packet.
 4. When the child exits, ai-memory reads the native transcript store without
-   modifying it. Visible user/assistant messages, completed tool calls/results,
+   modifying it. A session named on the command line (or chosen before the
+   spawn) is the one it reads. Otherwise a session linked during the run under
+   its `AI_MEMORY_RUN_ID`, even the workstream's current one, is read when the
+   native store holds it for this checkout; only without such a link does it
+   look for the newest session in the checkout, which a concurrent launch
+   there could own. Visible user/assistant messages, completed tool calls/results,
    compaction summaries, and a non-mutating Git checkpoint enter an append-only
    workstream ledger. Hidden reasoning and unsupported/private records are
    excluded and recorded as extraction-loss annotations. Each delivered
@@ -399,6 +404,14 @@ environment overrides are also honored:
 `CLAUDE_CONFIG_DIR`, `CODEX_HOME`, `XDG_DATA_HOME`,
 `PI_CODING_AGENT_SESSION_DIR`, `PI_CODING_AGENT_DIR`, `KIMI_CODE_HOME`,
 `KIRO_HOME`, and `GROK_HOME`.
+Export these in the environment `ai-memory run` itself sees — not only inside a
+harness wrapper script. `ai-memory run` resolves the native session directory
+(and installs hooks) from its own environment; if the harness writes its
+transcript under a custom `CLAUDE_CONFIG_DIR` that `ai-memory run` cannot see,
+the two disagree and the native transcript import fails. When you use per-account
+config directories, set the variable before invoking `ai-memory run` (or in the
+same wrapper that also runs it), so hook installation and native-session
+resolution agree.
 The Pi-family adapter
 also recognizes a complete `.jsonl.<nonce>.tmp` atomic-write file when a native
 process exits before renaming it; incomplete final JSONL records are never
@@ -553,8 +566,16 @@ the launched Crush process continues its normal native session writes.
 The Linux/macOS Docker shell wrapper cannot inspect host projects or execute a
 host agent from inside its helper container. For `run`, `show`, `continue`,
 `resume`, and `workstreams`, it downloads the matching native release into
-`~/.cache/ai-memory/native-runner`, verifies the published SHA-256 checksum, and
-executes that host client. Set `AI_MEMORY_NATIVE_BIN=/path/to/ai-memory` to use a
+`${XDG_DATA_HOME:-~/.local/share}/ai-memory/native-runner`, verifies the
+published SHA-256 checksum, and executes that host client. The release's
+`hooks/` bundle is kept beside it so auto-wire can stage hook scripts on a host
+where `install-hooks` never ran. The client lives with the host's ai-memory data
+rather than under `~/.cache` because auto-wired hook configuration runs it
+directly: a cache flush must not break capture. A client downloaded by an older
+wrapper stays in `~/.cache/ai-memory/native-runner`, and hooks auto-wired from it
+keep that path until a newer client version auto-wires again. To move them now,
+re-run `ai-memory install-hooks --agent <agent> --apply`, then delete the old
+directory. Set `AI_MEMORY_NATIVE_BIN=/path/to/ai-memory` to use a
 specific native build. Native package, release, and source installs need no
 shim. On native Windows, use the published `ai-memory.exe` or a source build.
 

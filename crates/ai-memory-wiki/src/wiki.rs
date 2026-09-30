@@ -1818,6 +1818,43 @@ impl Wiki {
         Ok(written)
     }
 
+    /// Repair the OKF `stale_after` that builds before this one copied
+    /// verbatim from a date-only `expires_at` (docs/okf.md): the index rows
+    /// in place through the writer, then each page's file, body and
+    /// `generated.at` untouched, in one git commit. Idempotent and cheap on
+    /// a repaired store (only pages with a date-only TTL are read); safe to
+    /// run on every startup. Returns `(rows, files)` repaired.
+    ///
+    /// # Errors
+    /// Returns [`WikiError`] for store, filesystem or git errors.
+    pub async fn repair_date_only_stale_after(&self) -> WikiResult<(u64, usize)> {
+        let _guard = self.mutation_lock.write().await;
+        let repair = self.writer.repair_date_only_stale_after().await?;
+        let mut files = 0;
+        for page in &repair.date_only_pages {
+            let abs = self
+                .project_root(page.workspace_id, page.project_id)
+                .join(&page.path);
+            let raw = match std::fs::read_to_string(&abs) {
+                Ok(raw) => raw,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(e) => return Err(e.into()),
+            };
+            let Ok(mut markdown) = parse(&raw) else {
+                continue;
+            };
+            if ai_memory_core::okf::repair_date_only_stale_after(&mut markdown.frontmatter) {
+                self.git.write_atomic(&abs, emit(&markdown)?.as_bytes())?;
+                files += 1;
+            }
+        }
+        if files > 0 {
+            self.git
+                .commit_all("okf: repair date-only stale_after on existing pages")?;
+        }
+        Ok((repair.rows_repaired, files))
+    }
+
     /// Atomically apply a batch of page writes. Either all pages land
     /// (one SQL transaction) and their files are renamed into place.
     /// Files are installed before the SQL batch so markdown remains the source
@@ -2454,20 +2491,7 @@ pub(crate) fn parse_expires_at(
     if raw.is_empty() {
         return Ok(None);
     }
-    if let Ok(ts) = raw.parse::<jiff::Timestamp>() {
-        return Ok(Some(ts));
-    }
-    if let Ok(date) = raw.parse::<jiff::civil::Date>() {
-        let ts = date
-            .at(23, 59, 59, 999_999_000)
-            .to_zoned(jiff::tz::TimeZone::UTC)
-            .map_err(|e| {
-                ai_memory_wiki_error(&format!(
-                    "invalid expires_at date in frontmatter for {}: {e}",
-                    path.as_str()
-                ))
-            })?
-            .timestamp();
+    if let Some(ts) = ai_memory_core::parse_expires_at_instant(raw) {
         return Ok(Some(ts));
     }
     Err(ai_memory_wiki_error(&format!(
@@ -2882,6 +2906,198 @@ mod tests {
                 .ends_with('Z')
         );
         assert!(ai_memory_core::okf::is_conformant(&parsed.frontmatter));
+    }
+
+    /// OKF requires every timestamp to carry an explicit UTC offset, while
+    /// the TTL key also accepts a bare date. The file on disk must name the
+    /// instant the TTL machinery hides the page, not the date as typed.
+    #[tokio::test]
+    async fn a_date_only_ttl_lands_on_disk_as_an_okf_stale_after_instant() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let ws = store.writer.get_or_create_workspace("w").await.unwrap();
+        let proj = store
+            .writer
+            .get_or_create_project(ws, "p", None)
+            .await
+            .unwrap();
+        let wiki = Wiki::new(tmp.path(), store.writer.clone()).unwrap();
+
+        let frontmatter = serde_json::json!({"title": "Freeze", "expires_at": "2099-08-01"});
+        wiki.write_page(req(
+            ws,
+            proj,
+            "notes/freeze.md",
+            "release freeze",
+            frontmatter.clone(),
+        ))
+        .await
+        .unwrap();
+
+        let raw =
+            std::fs::read_to_string(wiki.project_root(ws, proj).join("notes/freeze.md")).unwrap();
+        let parsed = crate::markdown::parse(&raw).unwrap();
+        assert_eq!(parsed.frontmatter["expires_at"], "2099-08-01");
+        assert_eq!(
+            parsed.frontmatter["stale_after"],
+            "2099-08-01T23:59:59.999999Z"
+        );
+        let path = PagePath::new("notes/freeze.md").unwrap();
+        let ttl = parse_expires_at(&path, &frontmatter).unwrap().unwrap();
+        assert_eq!(
+            parsed.frontmatter["stale_after"]
+                .as_str()
+                .unwrap()
+                .parse::<jiff::Timestamp>()
+                .unwrap(),
+            ttl
+        );
+    }
+
+    /// Put `notes/<name>.md` back in the state a pre-fix build left it:
+    /// `stale_after` copied verbatim from the date-only `expires_at`, in both
+    /// the index row and the file. Returns the row's `(id, updated_at)`.
+    fn regress_to_date_only_stale_after(
+        tmp: &TempDir,
+        wiki: &Wiki,
+        ws: WorkspaceId,
+        proj: ProjectId,
+        rel: &str,
+        row: bool,
+        file: bool,
+    ) -> (Vec<u8>, i64) {
+        let db = rusqlite::Connection::open(tmp.path().join("db").join("memory.sqlite")).unwrap();
+        let (id, updated_at, fm_str): (Vec<u8>, i64, String) = db
+            .query_row(
+                "SELECT id, updated_at, frontmatter_json FROM pages \
+                 WHERE path = ?1 AND is_latest = 1",
+                [rel],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        let regress = |fm: &mut serde_json::Value| {
+            let expires = fm["expires_at"].clone();
+            fm["stale_after"] = expires;
+        };
+        if row {
+            let mut fm: serde_json::Value = serde_json::from_str(&fm_str).unwrap();
+            regress(&mut fm);
+            db.execute(
+                "UPDATE pages SET frontmatter_json = ?1 WHERE id = ?2",
+                rusqlite::params![serde_json::to_string(&fm).unwrap(), id],
+            )
+            .unwrap();
+        }
+        if file {
+            let abs = wiki.project_root(ws, proj).join(rel);
+            let mut md = crate::markdown::parse(&std::fs::read_to_string(&abs).unwrap()).unwrap();
+            regress(&mut md.frontmatter);
+            std::fs::write(&abs, crate::markdown::emit(&md).unwrap()).unwrap();
+        }
+        (id, updated_at)
+    }
+
+    fn latest_row(tmp: &TempDir, rel: &str) -> (Vec<u8>, i64, serde_json::Value) {
+        let db = rusqlite::Connection::open(tmp.path().join("db").join("memory.sqlite")).unwrap();
+        let (id, updated_at, fm_str): (Vec<u8>, i64, String) = db
+            .query_row(
+                "SELECT id, updated_at, frontmatter_json FROM pages \
+                 WHERE path = ?1 AND is_latest = 1",
+                [rel],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        (id, updated_at, serde_json::from_str(&fm_str).unwrap())
+    }
+
+    /// Stores written before the `stale_after` fix hold the bare date the old
+    /// derivation copied. The startup repair rewrites row and file in place
+    /// (same version row, same `updated_at`, same `generated.at`, same body),
+    /// leaves a `stale_after` that is not that copy alone, finishes a file
+    /// whose row an interrupted run already repaired, and then does nothing.
+    #[tokio::test]
+    async fn startup_repair_fixes_a_date_only_stale_after_in_place() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let ws = store.writer.get_or_create_workspace("w").await.unwrap();
+        let proj = store
+            .writer
+            .get_or_create_project(ws, "p", None)
+            .await
+            .unwrap();
+        let wiki = Wiki::new(tmp.path(), store.writer.clone()).unwrap();
+        for (rel, fm) in [
+            (
+                "notes/freeze.md",
+                serde_json::json!({"title": "Freeze", "expires_at": "2099-08-01"}),
+            ),
+            (
+                "notes/interrupted.md",
+                serde_json::json!({"title": "Interrupted", "expires_at": "2099-09-01"}),
+            ),
+            (
+                "notes/authored.md",
+                serde_json::json!({
+                    "title": "Authored",
+                    "expires_at": "2099-10-01",
+                    "stale_after": "2099-07-01",
+                }),
+            ),
+        ] {
+            wiki.write_page(req(ws, proj, rel, "body stays", fm))
+                .await
+                .unwrap();
+        }
+        let (freeze_id, freeze_updated) =
+            regress_to_date_only_stale_after(&tmp, &wiki, ws, proj, "notes/freeze.md", true, true);
+        regress_to_date_only_stale_after(
+            &tmp,
+            &wiki,
+            ws,
+            proj,
+            "notes/interrupted.md",
+            false,
+            true,
+        );
+        let freeze_path = wiki.project_root(ws, proj).join("notes/freeze.md");
+        let before =
+            crate::markdown::parse(&std::fs::read_to_string(&freeze_path).unwrap()).unwrap();
+        assert_eq!(before.frontmatter["stale_after"], "2099-08-01");
+        let commits = wiki.git.commit_count();
+
+        assert_eq!(wiki.repair_date_only_stale_after().await.unwrap(), (1, 2));
+
+        let after =
+            crate::markdown::parse(&std::fs::read_to_string(&freeze_path).unwrap()).unwrap();
+        assert_eq!(
+            after.frontmatter["stale_after"],
+            "2099-08-01T23:59:59.999999Z"
+        );
+        assert_eq!(
+            after.frontmatter["generated"],
+            before.frontmatter["generated"]
+        );
+        assert_eq!(after.body, before.body);
+        let (id, updated_at, row_fm) = latest_row(&tmp, "notes/freeze.md");
+        assert_eq!(id, freeze_id, "the repair must not mint a new version");
+        assert_eq!(updated_at, freeze_updated);
+        assert_eq!(row_fm["stale_after"], "2099-08-01T23:59:59.999999Z");
+
+        let interrupted = crate::markdown::parse(
+            &std::fs::read_to_string(wiki.project_root(ws, proj).join("notes/interrupted.md"))
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            interrupted.frontmatter["stale_after"],
+            "2099-09-01T23:59:59.999999Z"
+        );
+        let (_, _, authored) = latest_row(&tmp, "notes/authored.md");
+        assert_eq!(authored["stale_after"], "2099-07-01");
+        assert_eq!(wiki.git.commit_count(), commits + 1);
+
+        assert_eq!(wiki.repair_date_only_stale_after().await.unwrap(), (0, 0));
+        assert_eq!(wiki.git.commit_count(), commits + 1);
     }
 
     /// Refused on every platform, not only the case-insensitive ones: the
@@ -3462,6 +3678,36 @@ mod tests {
             wiki.reindex_page(ws, proj, non_string).await.is_err(),
             "non-string tier frontmatter must fail closed"
         );
+    }
+
+    /// The same page saved with CRLF line endings (a Windows editor, or a
+    /// wiki checked out with `core.autocrlf=true`) must index the same way:
+    /// its frontmatter is still the source of truth for tier/pinned/title,
+    /// not body text ahead of the H1.
+    #[tokio::test]
+    async fn reindex_page_reads_crlf_frontmatter() {
+        let tmp = TempDir::new().unwrap();
+        let (store, wiki, ws, proj) = scoped(&tmp).await;
+
+        let path = PagePath::new("sessions/crlf.md").unwrap();
+        let abs = wiki.abs_path(ws, proj, &path);
+        std::fs::create_dir_all(abs.parent().unwrap()).unwrap();
+        std::fs::write(
+            &abs,
+            "---\r\ntitle: S\r\ntier: episodic\r\npinned: true\r\n---\r\nbody\r\n",
+        )
+        .unwrap();
+
+        wiki.reindex_page(ws, proj, path.clone()).await.unwrap();
+        let meta = store
+            .reader
+            .page_meta("default", "scratch", path.as_str())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(meta.title, "S", "the frontmatter title must win");
+        assert_eq!(meta.tier, "episodic");
+        assert!(meta.pinned, "a CRLF `pinned: true` must still pin the page");
     }
 
     #[tokio::test]
@@ -5126,6 +5372,7 @@ mod tests {
                 0,
                 5,
                 None,
+                false,
             )
             .await
             .unwrap();
@@ -5491,6 +5738,7 @@ mod tests {
         store
             .writer
             .begin_session(ai_memory_core::NewSession {
+                occurred_at: None,
                 id: sid,
                 workspace_id: ws,
                 project_id: src,

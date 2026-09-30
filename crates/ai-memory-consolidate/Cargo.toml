@@ -16,12 +16,18 @@ ai-memory-core.workspace = true
 ai-memory-store.workspace = true
 ai-memory-wiki.workspace = true
 ai-memory-llm.workspace = true
+# NFD diacritic folding for rule slugs (#886); the same crate/version
+# ai-memory-core already uses for `portable_page_key`, no new dependency.
+icu_normalizer.workspace = true
 git2.workspace = true
 anyhow.workspace = true
 thiserror.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 schemars.workspace = true
+# A2 keep-token miner: file paths / URLs / code spans / error codes, compiled
+# once via `LazyLock`. Same crate + version the core sanitizer already uses.
+regex.workspace = true
 sha2.workspace = true
 tokio.workspace = true
 tracing.workspace = true
@@ -33,6 +39,14 @@ async-trait.workspace = true
 tempfile.workspace = true
 rusqlite.workspace = true
 tracing-subscriber.workspace = true
+# Test-only: builds a small word-level tokenizer file so the map-reduce
+# planner tests can size blocks with a real tokenizer (same crate +
+# version the llm crate already uses for the admission guard).
+tokenizers.workspace = true
+# Test-only: asserts the fresh operation ids are UUID v7 in the
+# gateway-compatible 36-character form (same crate + features the
+# llm crate already uses to mint them).
+uuid.workspace = true
 
 [lints]
 workspace = true

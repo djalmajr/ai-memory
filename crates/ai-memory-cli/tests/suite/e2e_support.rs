@@ -20,17 +20,37 @@ use serde_json::Value;
 
 const BIN: &str = env!("CARGO_BIN_EXE_ai-memory");
 
+/// Harness store relocations the child would otherwise honor over the test's
+/// `$HOME` — the variables `environment_session_dir_with` in
+/// `ai-memory-workstream/src/harness.rs` reads. A developer running Claude Code
+/// with a relocated profile exports `CLAUDE_CONFIG_DIR`, and then `backfill`
+/// and `doctor` look there instead of at the transcripts the test planted.
+const HARNESS_STORE_OVERRIDES: &[&str] = &[
+    "CLAUDE_CONFIG_DIR",
+    "CODEX_HOME",
+    "GROK_HOME",
+    "KIMI_CODE_HOME",
+    "KIRO_HOME",
+    "PI_CODING_AGENT_DIR",
+    "PI_CODING_AGENT_SESSION_DIR",
+    "XDG_DATA_HOME",
+];
+
 /// Start from a clean, hermetic environment: drop every ambient `AI_MEMORY_*`
 /// var (a developer box or this project's own MCP config may export
-/// `AI_MEMORY_AUTH_TOKEN`, `AI_MEMORY_SERVER_URL`, scope names, …) so the child
-/// sees only what the test sets. Without this the spawned server would inherit
-/// an auth token and reject the test's own requests.
+/// `AI_MEMORY_AUTH_TOKEN`, `AI_MEMORY_SERVER_URL`, scope names, …) and every
+/// harness store relocation, so the child sees only what the test sets.
+/// Without this the spawned server would inherit an auth token and reject the
+/// test's own requests.
 pub fn hermetic(program: &str) -> Command {
     let mut cmd = Command::new(program);
     for (key, _) in std::env::vars_os() {
         if key.to_string_lossy().starts_with("AI_MEMORY_") {
             cmd.env_remove(key);
         }
+    }
+    for key in HARNESS_STORE_OVERRIDES {
+        cmd.env_remove(key);
     }
     cmd
 }

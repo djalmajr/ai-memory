@@ -103,6 +103,26 @@ pub(crate) enum WriteCmd {
         fingerprint: String,
         reply: oneshot::Sender<StoreResult<()>>,
     },
+    RecordConsolidationChunk {
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+        session_id: SessionId,
+        chunk_fingerprint: String,
+        extraction_json: String,
+        reply: oneshot::Sender<StoreResult<()>>,
+    },
+    LoadConsolidationChunks {
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+        session_id: SessionId,
+        reply: oneshot::Sender<StoreResult<Vec<ops::ConsolidationChunkRecord>>>,
+    },
+    ClearConsolidationChunks {
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+        session_id: SessionId,
+        reply: oneshot::Sender<StoreResult<()>>,
+    },
     UpsertPage {
         page: NewPage,
         reply: oneshot::Sender<StoreResult<PageId>>,
@@ -169,16 +189,19 @@ pub(crate) enum WriteCmd {
     EndAdmittedSession {
         admitted: AdmittedSession,
         summary_page_id: Option<PageId>,
+        occurred_at: Option<i64>,
         reply: oneshot::Sender<StoreResult<()>>,
     },
     EndAdmittedSessionWithHandoff {
         admitted: AdmittedSession,
         summary_page_id: Option<PageId>,
         handoff: NewHandoff,
+        occurred_at: Option<i64>,
         reply: oneshot::Sender<StoreResult<HandoffId>>,
     },
     EndAdmittedLifecycleOnlySession {
         admitted: AdmittedSession,
+        occurred_at: Option<i64>,
         reply: oneshot::Sender<StoreResult<LifecycleOnlyEndOutcome>>,
     },
     CompleteObservationIngest {
@@ -215,6 +238,10 @@ pub(crate) enum WriteCmd {
     ReleaseSessionConsolidation {
         job: SessionConsolidationJob,
         reply: oneshot::Sender<StoreResult<()>>,
+    },
+    ReconcileSessionConsolidationCompleted {
+        session_id: SessionId,
+        reply: oneshot::Sender<StoreResult<usize>>,
     },
     InsertHandoff {
         handoff: NewHandoff,
@@ -442,6 +469,10 @@ pub(crate) enum WriteCmd {
     OkfMigrateLatestPages {
         reply: oneshot::Sender<StoreResult<Vec<ops::OkfMigratedPage>>>,
     },
+    /// Idempotent in-place repair of date-only OKF `stale_after` values.
+    RepairDateOnlyStaleAfter {
+        reply: oneshot::Sender<StoreResult<ops::StaleAfterRepair>>,
+    },
     /// Read-only count of latest rows still lacking OKF conformance.
     OkfNonconformantCount {
         reply: oneshot::Sender<StoreResult<u64>>,
@@ -601,6 +632,20 @@ pub(crate) enum WriteCmd {
         session_id: SessionId,
         ended_at: i64,
         reply: oneshot::Sender<StoreResult<bool>>,
+    },
+    RecordAutoImproveClaimFailure {
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+        session_id: SessionId,
+        error: String,
+        reply: oneshot::Sender<StoreResult<u32>>,
+    },
+    ParkAutoImproveClaimFailure {
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+        session_id: SessionId,
+        error: String,
+        reply: oneshot::Sender<StoreResult<u32>>,
     },
     RecordMaintenanceJobSuccess {
         job: crate::maintenance::MaintenanceJob,
@@ -881,6 +926,79 @@ impl WriterHandle {
         rx.await.map_err(|_| StoreError::WriterClosed)?
     }
 
+    /// Durably record one validated map-reduce consolidation stage, keyed by
+    /// the full typed scope plus a content-derived fingerprint. See
+    /// [`crate::ops::record_consolidation_chunk`].
+    ///
+    /// # Errors
+    /// Returns [`StoreError::WriterClosed`] or propagates SQL errors.
+    pub async fn record_consolidation_chunk(
+        &self,
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+        session_id: SessionId,
+        chunk_fingerprint: String,
+        extraction_json: String,
+    ) -> StoreResult<()> {
+        let (tx, rx) = oneshot::channel();
+        self.send(WriteCmd::RecordConsolidationChunk {
+            workspace_id,
+            project_id,
+            session_id,
+            chunk_fingerprint,
+            extraction_json,
+            reply: tx,
+        })
+        .await?;
+        rx.await.map_err(|_| StoreError::WriterClosed)?
+    }
+
+    /// Load every recorded map-reduce stage for one session's scope,
+    /// ordered by fingerprint (never by timestamp). See
+    /// [`crate::ops::load_consolidation_chunks`].
+    ///
+    /// # Errors
+    /// Returns [`StoreError::WriterClosed`] or propagates SQL errors.
+    pub async fn load_consolidation_chunks(
+        &self,
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+        session_id: SessionId,
+    ) -> StoreResult<Vec<ops::ConsolidationChunkRecord>> {
+        let (tx, rx) = oneshot::channel();
+        self.send(WriteCmd::LoadConsolidationChunks {
+            workspace_id,
+            project_id,
+            session_id,
+            reply: tx,
+        })
+        .await?;
+        rx.await.map_err(|_| StoreError::WriterClosed)?
+    }
+
+    /// Delete every recorded map-reduce stage for one session's scope. Call
+    /// once a consolidation publishes successfully. See
+    /// [`crate::ops::clear_consolidation_chunks`].
+    ///
+    /// # Errors
+    /// Returns [`StoreError::WriterClosed`] or propagates SQL errors.
+    pub async fn clear_consolidation_chunks(
+        &self,
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+        session_id: SessionId,
+    ) -> StoreResult<()> {
+        let (tx, rx) = oneshot::channel();
+        self.send(WriteCmd::ClearConsolidationChunks {
+            workspace_id,
+            project_id,
+            session_id,
+            reply: tx,
+        })
+        .await?;
+        rx.await.map_err(|_| StoreError::WriterClosed)?
+    }
+
     /// Begin a session (idempotent on the supplied id).
     ///
     /// # Errors
@@ -1034,15 +1152,20 @@ impl WriterHandle {
     }
 
     /// Guarded hook end.
+    ///
+    /// `occurred_at` is the SessionEnd event's own original time (microseconds),
+    /// when known; `None` falls back to "now" at the store boundary.
     pub async fn end_admitted_session(
         &self,
         admitted: AdmittedSession,
         summary_page_id: Option<PageId>,
+        occurred_at: Option<i64>,
     ) -> StoreResult<()> {
         let (tx, rx) = oneshot::channel();
         self.send(WriteCmd::EndAdmittedSession {
             admitted,
             summary_page_id,
+            occurred_at,
             reply: tx,
         })
         .await?;
@@ -1050,17 +1173,22 @@ impl WriterHandle {
     }
 
     /// Guarded hook end plus automatic handoff.
+    ///
+    /// `occurred_at` is the SessionEnd event's own original time (microseconds),
+    /// when known; `None` falls back to "now" at the store boundary.
     pub async fn end_admitted_session_with_handoff(
         &self,
         admitted: AdmittedSession,
         summary_page_id: Option<PageId>,
         handoff: NewHandoff,
+        occurred_at: Option<i64>,
     ) -> StoreResult<HandoffId> {
         let (tx, rx) = oneshot::channel();
         self.send(WriteCmd::EndAdmittedSessionWithHandoff {
             admitted,
             summary_page_id,
             handoff,
+            occurred_at,
             reply: tx,
         })
         .await?;
@@ -1068,13 +1196,18 @@ impl WriterHandle {
     }
 
     /// Guarded hook lifecycle-only end.
+    ///
+    /// `occurred_at` is the SessionEnd event's own original time (microseconds),
+    /// when known; `None` falls back to "now" at the store boundary.
     pub async fn end_admitted_lifecycle_only_session(
         &self,
         admitted: AdmittedSession,
+        occurred_at: Option<i64>,
     ) -> StoreResult<LifecycleOnlyEndOutcome> {
         let (tx, rx) = oneshot::channel();
         self.send(WriteCmd::EndAdmittedLifecycleOnlySession {
             admitted,
+            occurred_at,
             reply: tx,
         })
         .await?;
@@ -1190,6 +1323,22 @@ impl WriterHandle {
         let (tx, rx) = oneshot::channel();
         self.send(WriteCmd::ReleaseSessionConsolidation { job, reply: tx })
             .await?;
+        rx.await.map_err(|_| StoreError::WriterClosed)?
+    }
+
+    /// Reconcile a session's durable consolidation job row to `completed` after
+    /// a manual `memory_consolidate` produced the page out-of-band. Never
+    /// touches a `running` lease. Returns the number of rows updated.
+    pub async fn reconcile_session_consolidation_completed(
+        &self,
+        session_id: SessionId,
+    ) -> StoreResult<usize> {
+        let (tx, rx) = oneshot::channel();
+        self.send(WriteCmd::ReconcileSessionConsolidationCompleted {
+            session_id,
+            reply: tx,
+        })
+        .await?;
         rx.await.map_err(|_| StoreError::WriterClosed)?
     }
 
@@ -1908,6 +2057,20 @@ impl WriterHandle {
         rx.await.map_err(|_| StoreError::WriterClosed)?
     }
 
+    /// Repair, in place, the OKF `stale_after` that older builds copied
+    /// verbatim from a date-only `expires_at`; returns every date-only page
+    /// so the wiki layer can align the files.
+    ///
+    /// # Errors
+    /// Returns [`StoreError::WriterClosed`] if the actor has shut down, or
+    /// propagates the SQL error.
+    pub async fn repair_date_only_stale_after(&self) -> StoreResult<ops::StaleAfterRepair> {
+        let (tx, rx) = oneshot::channel();
+        self.send(WriteCmd::RepairDateOnlyStaleAfter { reply: tx })
+            .await?;
+        rx.await.map_err(|_| StoreError::WriterClosed)?
+    }
+
     /// Count latest page rows still lacking OKF conformance (read-only).
     ///
     /// # Errors
@@ -2503,6 +2666,55 @@ impl WriterHandle {
         rx.await.map_err(|_| StoreError::WriterClosed)?
     }
 
+    /// Record a failed scheduled review, releasing the session's claim for
+    /// another attempt and returning the new attempt count. Returns `0` when the
+    /// session holds no claim, which is the manual path.
+    ///
+    /// # Errors
+    /// Returns an error when the writer is closed or the statement fails.
+    pub async fn record_auto_improve_claim_failure(
+        &self,
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+        session_id: SessionId,
+        error: &str,
+    ) -> StoreResult<u32> {
+        let (tx, rx) = oneshot::channel();
+        self.send(WriteCmd::RecordAutoImproveClaimFailure {
+            workspace_id,
+            project_id,
+            session_id,
+            error: error.to_owned(),
+            reply: tx,
+        })
+        .await?;
+        rx.await.map_err(|_| StoreError::WriterClosed)?
+    }
+
+    /// Record a terminal scheduled review failure and park its claim so the
+    /// session cannot be replayed on a later scheduler tick.
+    ///
+    /// # Errors
+    /// Returns an error when the writer is closed or the statement fails.
+    pub async fn park_auto_improve_claim_failure(
+        &self,
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+        session_id: SessionId,
+        error: &str,
+    ) -> StoreResult<u32> {
+        let (tx, rx) = oneshot::channel();
+        self.send(WriteCmd::ParkAutoImproveClaimFailure {
+            workspace_id,
+            project_id,
+            session_id,
+            error: error.to_owned(),
+            reply: tx,
+        })
+        .await?;
+        rx.await.map_err(|_| StoreError::WriterClosed)?
+    }
+
     /// Persist a global maintenance job's successful completion time.
     pub async fn record_maintenance_job_success(
         &self,
@@ -2735,6 +2947,44 @@ fn worker_loop(mut conn: Connection, mut rx: mpsc::Receiver<WriteCmd>) {
                 let result = ops::clear_bootstrap_progress(&conn, &fingerprint);
                 send_or_warn(reply, result, "clear_bootstrap_progress");
             }
+            WriteCmd::RecordConsolidationChunk {
+                workspace_id,
+                project_id,
+                session_id,
+                chunk_fingerprint,
+                extraction_json,
+                reply,
+            } => {
+                let result = ops::record_consolidation_chunk(
+                    &conn,
+                    &workspace_id,
+                    &project_id,
+                    &session_id,
+                    &chunk_fingerprint,
+                    &extraction_json,
+                );
+                send_or_warn(reply, result, "record_consolidation_chunk");
+            }
+            WriteCmd::LoadConsolidationChunks {
+                workspace_id,
+                project_id,
+                session_id,
+                reply,
+            } => {
+                let result =
+                    ops::load_consolidation_chunks(&conn, &workspace_id, &project_id, &session_id);
+                send_or_warn(reply, result, "load_consolidation_chunks");
+            }
+            WriteCmd::ClearConsolidationChunks {
+                workspace_id,
+                project_id,
+                session_id,
+                reply,
+            } => {
+                let result =
+                    ops::clear_consolidation_chunks(&conn, &workspace_id, &project_id, &session_id);
+                send_or_warn(reply, result, "clear_consolidation_chunks");
+            }
             WriteCmd::UpsertPage { page, reply } => {
                 let result = ops::upsert_page(&mut conn, &page);
                 send_or_warn(reply, result, "upsert_page");
@@ -2839,16 +3089,22 @@ fn worker_loop(mut conn: Connection, mut rx: mpsc::Receiver<WriteCmd>) {
             WriteCmd::EndAdmittedSession {
                 admitted,
                 summary_page_id,
+                occurred_at,
                 reply,
             } => {
-                let result =
-                    ops::end_admitted_session(&mut conn, &admitted, summary_page_id.as_ref());
+                let result = ops::end_admitted_session(
+                    &mut conn,
+                    &admitted,
+                    summary_page_id.as_ref(),
+                    occurred_at,
+                );
                 send_or_warn(reply, result, "end_admitted_session");
             }
             WriteCmd::EndAdmittedSessionWithHandoff {
                 admitted,
                 summary_page_id,
                 handoff,
+                occurred_at,
                 reply,
             } => {
                 let result = ops::end_admitted_session_with_handoff(
@@ -2856,11 +3112,17 @@ fn worker_loop(mut conn: Connection, mut rx: mpsc::Receiver<WriteCmd>) {
                     &admitted,
                     summary_page_id.as_ref(),
                     &handoff,
+                    occurred_at,
                 );
                 send_or_warn(reply, result, "end_admitted_session_with_handoff");
             }
-            WriteCmd::EndAdmittedLifecycleOnlySession { admitted, reply } => {
-                let result = ops::end_admitted_lifecycle_only_session(&mut conn, &admitted);
+            WriteCmd::EndAdmittedLifecycleOnlySession {
+                admitted,
+                occurred_at,
+                reply,
+            } => {
+                let result =
+                    ops::end_admitted_lifecycle_only_session(&mut conn, &admitted, occurred_at);
                 send_or_warn(reply, result, "end_admitted_lifecycle_only_session");
             }
             WriteCmd::CompleteObservationIngest {
@@ -2921,6 +3183,13 @@ fn worker_loop(mut conn: Connection, mut rx: mpsc::Receiver<WriteCmd>) {
             WriteCmd::ReleaseSessionConsolidation { job, reply } => {
                 let result = crate::session_consolidation::release(&mut conn, &job);
                 send_or_warn(reply, result, "release_session_consolidation");
+            }
+            WriteCmd::ReconcileSessionConsolidationCompleted { session_id, reply } => {
+                let result =
+                    crate::session_consolidation::reconcile_session_consolidation_completed(
+                        &mut conn, session_id,
+                    );
+                send_or_warn(reply, result, "reconcile_session_consolidation_completed");
             }
             WriteCmd::InsertHandoff { handoff, reply } => {
                 let result = ops::insert_handoff(&mut conn, &handoff);
@@ -3259,6 +3528,10 @@ fn worker_loop(mut conn: Connection, mut rx: mpsc::Receiver<WriteCmd>) {
                 let result = ops::okf_migrate_latest_pages(&mut conn);
                 send_or_warn(reply, result, "okf_migrate_latest_pages");
             }
+            WriteCmd::RepairDateOnlyStaleAfter { reply } => {
+                let result = ops::repair_date_only_stale_after(&mut conn);
+                send_or_warn(reply, result, "repair_date_only_stale_after");
+            }
             WriteCmd::OkfNonconformantCount { reply } => {
                 let result = ops::okf_nonconformant_latest_pages(&conn);
                 send_or_warn(reply, result, "okf_nonconformant_count");
@@ -3538,6 +3811,38 @@ fn worker_loop(mut conn: Connection, mut rx: mpsc::Receiver<WriteCmd>) {
                     ended_at,
                 );
                 send_or_warn(reply, result, "claim_auto_improve_scheduler_session");
+            }
+            WriteCmd::RecordAutoImproveClaimFailure {
+                workspace_id,
+                project_id,
+                session_id,
+                error,
+                reply,
+            } => {
+                let result = crate::auto_improve::record_claim_failure(
+                    &conn,
+                    workspace_id,
+                    project_id,
+                    session_id,
+                    &error,
+                );
+                send_or_warn(reply, result, "record_auto_improve_claim_failure");
+            }
+            WriteCmd::ParkAutoImproveClaimFailure {
+                workspace_id,
+                project_id,
+                session_id,
+                error,
+                reply,
+            } => {
+                let result = crate::auto_improve::park_claim_failure(
+                    &conn,
+                    workspace_id,
+                    project_id,
+                    session_id,
+                    &error,
+                );
+                send_or_warn(reply, result, "park_auto_improve_claim_failure");
             }
             WriteCmd::RecordMaintenanceJobSuccess { job, reply } => {
                 let result = crate::maintenance::record_success(&conn, job);
@@ -3853,6 +4158,7 @@ mod tests {
         store
             .writer
             .begin_session(NewSession {
+                occurred_at: None,
                 id: sid,
                 workspace_id: ws,
                 project_id: src,

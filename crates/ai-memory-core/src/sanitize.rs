@@ -808,6 +808,7 @@ mod tests {
     #[test]
     fn observation_round_trip() {
         let raw = NewObservation {
+            occurred_at: None,
             session_id: SessionId::new(),
             workspace_id: WorkspaceId::new(),
             project_id: ProjectId::new(),
@@ -826,6 +827,7 @@ mod tests {
     #[test]
     fn observation_boundary_caps_after_sanitizing_without_splitting_utf8() {
         let raw = NewObservation {
+            occurred_at: None,
             session_id: SessionId::new(),
             workspace_id: WorkspaceId::new(),
             project_id: ProjectId::new(),

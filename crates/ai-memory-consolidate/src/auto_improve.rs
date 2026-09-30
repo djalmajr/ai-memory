@@ -13,7 +13,8 @@ use std::time::Duration;
 
 use ai_memory_core::{Observation, PagePath, ProjectId, SessionId, WorkspaceId};
 use ai_memory_llm::{
-    ChatMessage, ChatRequest, LlmError, LlmProvider, Role, complete_structured_with_operation_id,
+    ChatMessage, ChatRequest, LlmError, LlmOperationId, LlmProvider, Role,
+    complete_structured_with_operation_id,
 };
 use ai_memory_store::{AutoImproveRejectionSummary, BriefingPage, ReaderPool, StoredPageBody};
 use schemars::JsonSchema;
@@ -21,6 +22,7 @@ use serde::{Deserialize, Serialize, de};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
+use crate::path_sanitize::slugify_page_path;
 use crate::projection::{ObservationProjectionConfig, cap_text_with_marker, project_observations};
 
 const CHARS_PER_TOKEN: usize = 4;
@@ -211,6 +213,34 @@ pub enum AutoImproveError {
     /// Optional external eval command failed unexpectedly.
     #[error("auto-improve eval gate failed: {0}")]
     Eval(String),
+}
+
+/// Redacted one-line summary of an auto-improve review failure:
+/// `auto-improve failed: class=<class> status=<status-or-none>`.
+///
+/// For the MCP boundary where the full `Display` of [`AutoImproveError`]
+/// would leak a provider response body to the tool caller
+/// (`AutoImproveError::Llm` is transparent to [`LlmError`]). `class` is a
+/// fixed label per variant (or [`LlmError::class`] for LLM failures) and
+/// `status` is the HTTP status captured by the failure
+/// ([`LlmError::http_status`]), or `none`. It never carries the cause's
+/// `Display`, a response body, URL, prompt, token, or headers.
+#[must_use]
+pub fn redacted_auto_improve_summary(error: &AutoImproveError) -> String {
+    let (class, status) = match error {
+        AutoImproveError::Store(_) => ("store", None),
+        AutoImproveError::Llm(llm) => (llm.class(), llm.http_status()),
+        AutoImproveError::Memory(_) => ("memory", None),
+        AutoImproveError::SessionNotFound(_) => ("session-not-found", None),
+        AutoImproveError::SessionOutOfScope { .. } => ("session-out-of-scope", None),
+        AutoImproveError::Eval(_) => ("eval", None),
+    };
+    format!(
+        "auto-improve failed: class={class} status={}",
+        status
+            .map(|status| status.to_string())
+            .unwrap_or_else(|| "none".into())
+    )
 }
 
 /// Result alias for auto-improvement review.
@@ -476,6 +506,20 @@ pub async fn run_auto_improve_review(
             false,
         )
         .await?;
+    // The reviewer's recent-page context exists to surface durable knowledge
+    // (`decisions/`, `gotchas/`, `_rules/`, …) so it is not re-proposed. The
+    // shared briefing is recency-ordered and dominated by `sessions/` pages,
+    // which the reviewer must never target (session pages come from session-end
+    // consolidation). Drop them here — auto-improve only — so those slots go to
+    // durable pages. This does NOT touch the shared `briefing_for_project`
+    // reader, so the SessionStart briefing and `memory_briefing`, where session
+    // pages legitimately belong, are unaffected.
+    let reviewer_recent_pages: Vec<_> = briefing
+        .recent_pages
+        .iter()
+        .filter(|page| !page.path.starts_with("sessions/"))
+        .cloned()
+        .collect();
     let session_page_path = format!("sessions/{session_id}.md");
     let session_page = reader
         .page_body_by_ids(workspace_id, project_id, &session_page_path)
@@ -484,7 +528,7 @@ pub async fn run_auto_improve_review(
         reader,
         workspace_id,
         project_id,
-        &briefing.recent_pages,
+        &reviewer_recent_pages,
         &cfg,
     )
     .await?;
@@ -494,7 +538,7 @@ pub async fn run_auto_improve_review(
         &observations,
         duration,
         session_page.as_ref(),
-        &briefing.recent_pages,
+        &reviewer_recent_pages,
         &patchable_pages,
         &rejection_context,
         &cfg,
@@ -505,7 +549,7 @@ pub async fn run_auto_improve_review(
         .cloned()
         .collect();
     let existing_index =
-        ExistingPageIndex::from_pages(&briefing.recent_pages, &prompt_patchable_pages);
+        ExistingPageIndex::from_pages(&reviewer_recent_pages, &prompt_patchable_pages);
     let estimated_input_tokens = estimate_tokens(&prompt_input.prompt);
     let request = ChatRequest {
         system: Some(AUTO_IMPROVE_SYSTEM_PROMPT.to_string()),
@@ -516,8 +560,12 @@ pub async fn run_auto_improve_review(
         max_tokens: DEFAULT_REVIEW_MAX_TOKENS,
         temperature: Some(0.1),
     };
+    // One review call is one LLM operation: a fresh identity, never the
+    // agent's session id — two reviews of the same session must not look
+    // like one operation on the provider side.
+    let operation_id = LlmOperationId::new();
     let raw: AutoImproveLlmResponse =
-        complete_structured_with_operation_id(llm, request, session_id.into()).await?;
+        complete_structured_with_operation_id(llm, request, operation_id).await?;
     let (mut proposals, mut rejected_candidates, mut warnings) =
         validate_response(raw, &cfg, &existing_index);
     rejected_candidates.extend(prompt_input.rejected_candidates);
@@ -1576,7 +1624,18 @@ fn validate_proposal(
     {
         return Err("missing_evidence".into());
     }
-    let path = PagePath::new(proposal.path.clone()).map_err(|_| "invalid_path".to_string())?;
+    // Same class as bootstrap #847 / consolidation #848: a model-produced
+    // path with a Windows-illegal character (e.g. `:`) passes `PagePath::new`
+    // and would be staged, then fail `ensure_portable` at approve time.
+    // Sanitize before constructing the path so the staged proposal is
+    // applyable; a path that is still unportable after slugify is rejected
+    // rather than queued.
+    let cleaned = slugify_page_path(&proposal.path);
+    let path = PagePath::new(&cleaned).map_err(|_| "invalid_path".to_string())?;
+    if path.ensure_portable().is_err() {
+        return Err("invalid_path".into());
+    }
+    proposal.path = path.as_str().to_string();
     match proposal.edit_mode.as_str() {
         "" | "full_page" => {
             validate_full_page_proposal(proposal, cfg, existing_index, path.as_str())
@@ -1867,10 +1926,63 @@ mod tests {
     use ai_memory_core::{
         AgentKind, NewObservation, NewSession, ObservationId, ObservationKind, Sanitized, Sanitizer,
     };
-    use ai_memory_llm::{ChatResponse, LlmResult};
+    use ai_memory_llm::{ChatResponse, LlmError, LlmResult};
     use ai_memory_store::Store;
     use jiff::Timestamp;
     use tempfile::TempDir;
+
+    /// Body a fake provider returns in the redaction tests; the summary must
+    /// never contain it.
+    const AUTO_IMPROVE_REDACTION_SENTINEL: &str = "SENTINEL_PRIVATE_BODY";
+
+    /// The summary is the only failure text the `memory_auto_improve` MCP
+    /// call returns, so it must expose class/status and drop the provider
+    /// body.
+    #[test]
+    fn auto_improve_redacted_summary_exposes_class_and_status_without_body() {
+        let error = AutoImproveError::Llm(LlmError::Provider {
+            status: 400,
+            body: AUTO_IMPROVE_REDACTION_SENTINEL.into(),
+        });
+        let summary = redacted_auto_improve_summary(&error);
+        assert_eq!(summary, "auto-improve failed: class=provider status=400");
+        assert!(!summary.contains(AUTO_IMPROVE_REDACTION_SENTINEL));
+    }
+
+    /// Non-LLM variants take a static label with `status=none`; the shape
+    /// stays stable and the cause's `Display` never enters the summary.
+    #[test]
+    fn auto_improve_redacted_summary_non_llm_variants_report_none_status() {
+        for (error, class) in [
+            (
+                AutoImproveError::SessionNotFound(ai_memory_core::SessionId::new()),
+                "session-not-found",
+            ),
+            (
+                AutoImproveError::SessionOutOfScope {
+                    session_id: ai_memory_core::SessionId::new(),
+                },
+                "session-out-of-scope",
+            ),
+            (
+                AutoImproveError::Eval(AUTO_IMPROVE_REDACTION_SENTINEL.into()),
+                "eval",
+            ),
+            (
+                AutoImproveError::Llm(LlmError::NotConfigured(
+                    AUTO_IMPROVE_REDACTION_SENTINEL.into(),
+                )),
+                "not-configured",
+            ),
+        ] {
+            let summary = redacted_auto_improve_summary(&error);
+            assert_eq!(
+                summary,
+                format!("auto-improve failed: class={class} status=none")
+            );
+            assert!(!summary.contains(AUTO_IMPROVE_REDACTION_SENTINEL));
+        }
+    }
 
     struct FakeLlm;
 
@@ -1918,6 +2030,107 @@ mod tests {
                 }],
                 "rejected_candidates": []
             }))
+        }
+    }
+
+    /// Records the reviewer prompt so a test can assert what context it saw,
+    /// then returns an empty proposal set (the prompt is the subject under test).
+    #[derive(Clone, Default)]
+    struct CapturingLlm {
+        prompt: std::sync::Arc<std::sync::Mutex<Option<String>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl LlmProvider for CapturingLlm {
+        fn name(&self) -> &'static str {
+            "fake"
+        }
+
+        fn model(&self) -> &str {
+            "fake-model"
+        }
+
+        async fn complete(&self, _request: ChatRequest) -> LlmResult<ChatResponse> {
+            Ok(ChatResponse {
+                text: "unused".into(),
+                usage: None,
+                model: "fake-model".into(),
+            })
+        }
+
+        async fn complete_structured_raw(
+            &self,
+            request: ChatRequest,
+            _schema: serde_json::Value,
+        ) -> LlmResult<serde_json::Value> {
+            if let Some(message) = request.messages.first() {
+                *self.prompt.lock().unwrap() = Some(message.content.clone());
+            }
+            Ok(serde_json::json!({
+                "summary": "no durable lesson",
+                "proposals": [],
+                "rejected_candidates": []
+            }))
+        }
+    }
+
+    /// Records the operation id of every structured call (one review call
+    /// is one LLM operation) and returns an empty proposal set — the id is
+    /// the subject under test, not the proposals.
+    struct OpIdCapturingLlm {
+        ids: std::sync::Arc<std::sync::Mutex<Vec<LlmOperationId>>>,
+    }
+
+    impl OpIdCapturingLlm {
+        fn new() -> Self {
+            Self {
+                ids: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+            }
+        }
+
+        fn ids(&self) -> Vec<LlmOperationId> {
+            self.ids.lock().unwrap().clone()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl LlmProvider for OpIdCapturingLlm {
+        fn name(&self) -> &'static str {
+            "fake"
+        }
+
+        fn model(&self) -> &'static str {
+            "fake-model"
+        }
+
+        async fn complete(&self, _request: ChatRequest) -> LlmResult<ChatResponse> {
+            Ok(ChatResponse {
+                text: "unused".into(),
+                usage: None,
+                model: "fake-model".into(),
+            })
+        }
+
+        async fn complete_structured_raw(
+            &self,
+            _request: ChatRequest,
+            _schema: serde_json::Value,
+        ) -> LlmResult<serde_json::Value> {
+            Ok(serde_json::json!({
+                "summary": "no durable lesson",
+                "proposals": [],
+                "rejected_candidates": []
+            }))
+        }
+
+        async fn complete_structured_raw_with_operation_id(
+            &self,
+            request: ChatRequest,
+            schema: serde_json::Value,
+            operation_id: LlmOperationId,
+        ) -> LlmResult<serde_json::Value> {
+            self.ids.lock().unwrap().push(operation_id);
+            self.complete_structured_raw(request, schema).await
         }
     }
 
@@ -1969,7 +2182,10 @@ mod tests {
         AutoImproveEvalConfig {
             enabled: true,
             command,
-            timeout_secs: 2,
+            // Windows PowerShell cold-start is slower than 2s, and these gate
+            // tests run in parallel — timeouts here are for the eval command
+            // itself, not for interpreter startup.
+            timeout_secs: if cfg!(windows) { 8 } else { 2 },
             targets: default_auto_improve_eval_targets(),
             min_delta: 0.01,
         }
@@ -2012,7 +2228,9 @@ mod tests {
                 "$null = [Console]::In.ReadToEnd()\n[Console]::Out.Write('not-json')\n".into()
             }
             "#!/bin/sh\ncat >/dev/null\nsleep 3\n" => {
-                "$null = [Console]::In.ReadToEnd()\nStart-Sleep -Seconds 3\n".into()
+                // Must exceed the Windows eval timeout (8s, see `eval_cfg`)
+                // so the timeout case still times out instead of completing.
+                "$null = [Console]::In.ReadToEnd()\nStart-Sleep -Seconds 12\n".into()
             }
             "#!/bin/sh\nsleep 5\n" => "Start-Sleep -Seconds 20\n".into(),
             "#!/bin/sh\ni=0\nwhile [ $i -lt 70000 ]; do printf x; i=$((i + 1)); done\n" => {
@@ -2116,7 +2334,7 @@ mod tests {
         ];
         for (command, expected_reason) in cases {
             let mut cfg = eval_cfg(command);
-            cfg.timeout_secs = 1;
+            cfg.timeout_secs = if cfg!(windows) { 8 } else { 1 };
             let mut proposals = vec![proposal("_rules/test.md", "rule", 0.9)];
             let mut rejected = Vec::new();
             let mut warnings = Vec::new();
@@ -2274,6 +2492,7 @@ mod tests {
         store
             .writer
             .begin_session(NewSession {
+                occurred_at: None,
                 id: session_id,
                 workspace_id: ws,
                 project_id: proj,
@@ -2288,6 +2507,7 @@ mod tests {
                 .writer
                 .insert_observation(Sanitized::new(
                     NewObservation {
+                        occurred_at: None,
                         session_id,
                         workspace_id: ws,
                         project_id: proj,
@@ -2327,6 +2547,218 @@ mod tests {
         assert_eq!(report.proposals.len(), 1);
         assert_eq!(report.proposals[0].path, "procedures/release.md");
         assert!(report.rejected_candidates.is_empty());
+    }
+
+    /// Operation identity: two auto-improve reviews of the SAME session are
+    /// two LLM operations — two distinct fresh UUID v7 ids (the
+    /// gateway-compatible 36-character form), never the session id — so a
+    /// gateway cannot confuse one session's two reviews with one operation.
+    #[tokio::test]
+    async fn two_reviews_of_one_session_get_distinct_operation_ids() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let ws = store
+            .writer
+            .get_or_create_workspace("default")
+            .await
+            .unwrap();
+        let proj = store
+            .writer
+            .get_or_create_project(ws, "proj", None)
+            .await
+            .unwrap();
+        let session_id = ai_memory_core::SessionId::new();
+        store
+            .writer
+            .begin_session(NewSession {
+                occurred_at: None,
+                id: session_id,
+                workspace_id: ws,
+                project_id: proj,
+                agent_kind: AgentKind::Other,
+                cwd: None,
+                actor_user: None,
+            })
+            .await
+            .unwrap();
+        for i in 0..3 {
+            store
+                .writer
+                .insert_observation(Sanitized::new(
+                    NewObservation {
+                        occurred_at: None,
+                        session_id,
+                        workspace_id: ws,
+                        project_id: proj,
+                        kind: if i == 0 {
+                            ObservationKind::SessionStart
+                        } else {
+                            ObservationKind::UserPrompt
+                        },
+                        extension: None,
+                        source_event: None,
+                        title: format!("event {i}"),
+                        body: "run the full gate before release".into(),
+                        importance: 5,
+                    },
+                    &Sanitizer::builtin(),
+                ))
+                .await
+                .unwrap();
+        }
+
+        // Two reviews of the same session, one LLM operation each.
+        let llm = OpIdCapturingLlm::new();
+        for _ in 0..2 {
+            let report = run_auto_improve_review(
+                &store.reader,
+                &llm,
+                ws,
+                proj,
+                session_id,
+                AutoImproveReviewConfig {
+                    min_session_duration_secs: 0,
+                    ..cfg()
+                },
+            )
+            .await
+            .unwrap();
+            assert!(report.proposals.is_empty());
+        }
+
+        let ids = llm.ids();
+        assert_eq!(ids.len(), 2, "one structured LLM call per review");
+        assert_ne!(
+            ids[0], ids[1],
+            "two reviews of one session get distinct operation ids"
+        );
+        for id in &ids {
+            let s = id.to_string();
+            assert_eq!(s.len(), 36, "the hyphenated wire form is 36 chars: {s}");
+            let parsed = uuid::Uuid::parse_str(&s).expect("parses as a UUID");
+            assert_eq!(parsed.get_version_num(), 7, "fresh UUID v7: {s}");
+            assert_ne!(
+                s,
+                session_id.to_string(),
+                "the operation id is never the session id"
+            );
+        }
+    }
+
+    /// The reviewer's recent-page context must surface durable pages and drop
+    /// `sessions/` pages, so those slots go to knowledge the reviewer might
+    /// re-propose (#834). Both pages are seeded at the same tier, so exclusion
+    /// is by path family, not by tier.
+    #[tokio::test]
+    async fn reviewer_recent_context_excludes_session_pages() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let ws = store
+            .writer
+            .get_or_create_workspace("default")
+            .await
+            .unwrap();
+        let proj = store
+            .writer
+            .get_or_create_project(ws, "proj", None)
+            .await
+            .unwrap();
+
+        let seed_page = |path: &str| ai_memory_core::NewPage {
+            workspace_id: ws,
+            project_id: proj,
+            path: PagePath::new(path).unwrap(),
+            title: path.to_string(),
+            body: format!("# {path}\n\nbody"),
+            tier: ai_memory_core::Tier::Semantic,
+            frontmatter_json: serde_json::json!({}),
+            pinned: false,
+            links: Vec::new(),
+            author_id: None,
+            expires_at: None,
+            entities: Vec::new(),
+            evidence: Vec::new(),
+        };
+        store
+            .writer
+            .upsert_page(seed_page("decisions/durable.md"))
+            .await
+            .unwrap();
+        store
+            .writer
+            .upsert_page(seed_page("sessions/old-session.md"))
+            .await
+            .unwrap();
+
+        let session_id = ai_memory_core::SessionId::new();
+        store
+            .writer
+            .begin_session(NewSession {
+                occurred_at: None,
+                id: session_id,
+                workspace_id: ws,
+                project_id: proj,
+                agent_kind: AgentKind::Other,
+                cwd: None,
+                actor_user: None,
+            })
+            .await
+            .unwrap();
+        for i in 0..3 {
+            store
+                .writer
+                .insert_observation(Sanitized::new(
+                    NewObservation {
+                        occurred_at: None,
+                        session_id,
+                        workspace_id: ws,
+                        project_id: proj,
+                        kind: if i == 0 {
+                            ObservationKind::SessionStart
+                        } else {
+                            ObservationKind::UserPrompt
+                        },
+                        extension: None,
+                        source_event: None,
+                        title: format!("event {i}"),
+                        body: "run the full gate before release".into(),
+                        importance: 5,
+                    },
+                    &Sanitizer::builtin(),
+                ))
+                .await
+                .unwrap();
+        }
+
+        let llm = CapturingLlm::default();
+        run_auto_improve_review(
+            &store.reader,
+            &llm,
+            ws,
+            proj,
+            session_id,
+            AutoImproveReviewConfig {
+                min_session_duration_secs: 0,
+                ..cfg()
+            },
+        )
+        .await
+        .unwrap();
+
+        let prompt = llm
+            .prompt
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("the reviewer must have called the LLM");
+        assert!(
+            prompt.contains("decisions/durable.md"),
+            "the durable decisions page must reach the reviewer's recent context"
+        );
+        assert!(
+            !prompt.contains("sessions/old-session.md"),
+            "session pages must be excluded from the reviewer's recent context"
+        );
     }
 
     #[test]
@@ -2428,6 +2860,53 @@ mod tests {
         assert_eq!(rejected.len(), 1);
         assert_eq!(rejected[0].reason, "invalid_path");
         assert!(warnings.is_empty());
+    }
+
+    /// Same class as bootstrap #847 / consolidation #848: the reviewer LLM
+    /// echoes a conventional-commit subject into the page path. That passes
+    /// `PagePath::new` (deliberately tolerant) but fails `ensure_portable`,
+    /// so the proposal is staged and then cannot be applied.
+    #[test]
+    fn windows_illegal_model_path_is_sanitized_before_staging() {
+        let raw_path = "concepts/build(sandbox): orchestrate.md";
+        assert!(
+            PagePath::new(raw_path).is_ok(),
+            "precondition: PagePath::new is deliberately tolerant of ':'"
+        );
+        assert!(
+            PagePath::new(raw_path).unwrap().ensure_portable().is_err(),
+            "precondition: the raw model path is not portable"
+        );
+
+        let raw: AutoImproveLlmResponse = serde_json::from_value(serde_json::json!({
+            "summary": "ok",
+            "proposals": [{
+                "path": raw_path,
+                "title": "Orchestrate the run",
+                "kind": "concept",
+                "confidence": 0.91,
+                "rationale": "The session recorded a durable conventional-commit workflow.",
+                "evidence": [{"quote": "build(sandbox): orchestrate the run"}],
+                "body_markdown": "# Orchestrate the run\n\nKeep the sandbox build orchestrated."
+            }],
+            "rejected_candidates": []
+        }))
+        .unwrap();
+
+        let (accepted, rejected, warnings) =
+            validate_response(raw, &cfg(), &ExistingPageIndex::default());
+        assert!(
+            rejected.is_empty(),
+            "sanitized path should be accepted: {rejected:?}"
+        );
+        assert!(warnings.is_empty());
+        assert_eq!(accepted.len(), 1);
+        assert_eq!(accepted[0].path, "concepts/build(sandbox)- orchestrate.md");
+        let path = PagePath::new(&accepted[0].path).unwrap();
+        assert!(
+            path.ensure_portable().is_ok(),
+            "staged path must be applyable"
+        );
     }
 
     #[test]

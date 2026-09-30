@@ -33,7 +33,7 @@ sha2.workspace = true
 candle-core = { workspace = true, optional = true }
 candle-nn = { workspace = true, optional = true }
 candle-transformers = { workspace = true, optional = true }
-tokenizers = { workspace = true, optional = true }
+tokenizers.workspace = true
 
 [features]
 default = ["local-embeddings"]
@@ -41,7 +41,6 @@ local-embeddings = [
     "dep:candle-core",
     "dep:candle-nn",
     "dep:candle-transformers",
-    "dep:tokenizers",
 ]
 
 [dev-dependencies]
@@ -51,6 +50,8 @@ rstest.workspace = true
 # In-process HTTP mock for the openai-compat strict-fallback tests.
 # Scoped to dev-dependencies so production binaries don't pull it in.
 wiremock = "0.6"
+# Test-only capture subscriber for the per-attempt log assertions.
+tracing-subscriber.workspace = true
 
 [lints]
 workspace = true

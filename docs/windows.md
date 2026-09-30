@@ -414,9 +414,51 @@ ai-memory status
 
 `stop`, `restart`, and `uninstall` are the remaining commands. Because
 the bind is loopback, the service account does not affect reachability:
-agents running as your user still reach `127.0.0.1:49374`. Only the data
-directory is account-sensitive, which is what the absolute path above
-settles.
+agents running as your user still reach `127.0.0.1:49374`.
+
+### ⚠️ Run the service as the owning user when the data dir is in a profile
+
+The absolute `--data-dir` above stops the *empty-directory* trap, but it
+does **not** make a `LocalSystem` service safe over a data directory that
+lives under your user profile (`C:\Users\you\AppData\Local\ai-memory`).
+The data directory is account-sensitive, and so is the **wiki's git
+repository inside it**. libgit2 enforces the same dubious-ownership guard
+as Git itself (CVE-2022-24765): when the process account is not the owner
+of the repository, every commit fails with `code=Owner (-36)`. The server
+still starts, capture still works, and search still answers — but the
+wiki git history silently stops advancing, because a wiki commit failure
+is not fatal. As of ai-memory 2.4.x the server logs this at **ERROR** on
+startup with the same remedy below; on older builds it was a WARN that was
+easy to miss.
+
+**Whenever the data directory lives under a user profile, run the service
+as that user** rather than as `LocalSystem`. In the WinSW XML add a
+`<serviceaccount>` block:
+
+```xml
+  <serviceaccount>
+    <username>.\you</username>
+    <password>your-account-password</password>
+  </serviceaccount>
+```
+
+(or set it from the service's **Log On** tab in `services.msc` after
+install, then `restart`). Use `.\you` for a local account or
+`DOMAIN\you` for a domain account. `LocalSystem` is only appropriate when
+the data directory is in a location that account owns outright (e.g. a
+dedicated `C:\ProgramData\ai-memory` created and owned by the service
+account).
+
+> **WinSW error 1069 / stale password.** If `start` fails with *"The
+> service did not start due to a logon failure"* (error 1069), the
+> `<serviceaccount>` credentials are wrong or stale. This bites
+> **Microsoft-account, PIN, and Windows Hello** users especially: the
+> WinSW `<password>` must be your *account password*, which for a
+> Microsoft account is your online Microsoft password (not your PIN or
+> Hello gesture), and it must be updated in the service config whenever
+> that password changes — Windows does not roll it forward. Consider a
+> local account, or a dedicated service account with a non-expiring
+> password, for an unattended service.
 
 Keep running `install-mcp` and `install-hooks` **as your own user**, not
 as the service — they write per-user agent config, and the rule at the
@@ -535,6 +577,62 @@ On Windows, a contended drain lock can be reported as the native
 ai-memory treats both as normal lock-busy states, so concurrent drains wait,
 skip, or expire according to the same spool timing rules instead of failing the
 hook.
+
+<!-- BEGIN: windows-tier-exit-criteria -->
+## Support Tier: Experimental → Supported Exit Criteria
+
+Native Windows is currently an **Experimental** tier. This is the checklist a
+maintainer uses to decide whether it can be promoted to **Supported** — it is a
+status inventory, not a promotion. Nothing here claims the tier has changed.
+Each item is marked **done**, **in-progress**, or **deferred-pending-policy**,
+from what the repository actually ships today.
+
+- **CI trigger coverage — done.** `.github/workflows/windows.yml` runs on a
+  nightly `schedule`, on `workflow_dispatch`, and on pull requests. A pull
+  request that touches platform-sensitive code (path handling, file locking,
+  git plumbing, the hook bundle — `crates/ai-memory-{wiki,store,hooks}/**`,
+  `crates/ai-memory-cli/src/commands/install_hooks.rs`, `hooks/**`,
+  `tests/hooks/**`, and the workflow itself) now opts in automatically via the
+  workflow's leading `changes` job (`dorny/paths-filter`, SHA-pinned); the
+  `windows` label remains a manual override for PRs outside those paths. The
+  tier promise no longer depends on a human remembering the label.
+
+- **Hook-bundle Windows job — done.** The `hooks` job in `windows.yml` runs
+  `tests/hooks/test_lib.sh` on `windows-latest`. That suite drives
+  `hooks/lib/ai-memory-hook.ps1`, whose PowerShell branch only ever executes
+  natively on Windows — so the one platform its PowerShell code is written for
+  is now exercised in CI rather than only on a contributor's box.
+
+- **`#[cfg(windows)]` regression coverage — in-progress.** The Windows-only
+  regression tests that no Linux/macOS leg can compile run here: the drain-lock
+  `ERROR_LOCK_VIOLATION` busy-state handling, the libgit2 path-resolution
+  fallback to the Git CLI when opening a freshly initialized wiki repository,
+  and verbatim (`\\?\`) path handling (see the header of `windows.yml` and
+  Scenario D above). This coverage exists for the platform code that has hit a
+  documented bug; it stays **in-progress** because each new Windows path-,
+  lock-, or git-touching change is expected to add its own `#[cfg(windows)]`
+  regression before promotion, not because the current tests are absent.
+
+- **`.exe` code-signing — deferred-pending-policy.** Release binaries and the
+  `build.rs` helper executables Cargo emits are unsigned. On machines enforcing
+  **App Control for Business** or **Smart App Control**, unsigned binaries run
+  from user-writable directories are blocked — this is the `os error 4551`
+  build failure documented in Scenario D, and it can equally block an unsigned
+  released `ai-memory.exe`. Signing needs a code-signing certificate and a
+  decision on how its private material is held as a CI secret (and rotated).
+  Both are maintainer/policy calls, so this item is deferred until that
+  decision is made; it is a blocker for a frictionless Supported experience on
+  Application-Control-enforced fleets.
+
+- **Native `ai-memory upgrade` path — in-progress.** A first-class in-place
+  upgrade for native Windows installs (release-binary and wrapper flows) is
+  tracked in #801/#802. Until it lands, upgrading is the manual
+  download/extract/re-`install-hooks` sequence in Scenarios B and C.
+
+Promotion to Supported is the maintainer's decision once the in-progress items
+are closed and the deferred code-signing policy is resolved (or explicitly
+accepted as out of scope for the tier).
+<!-- END: windows-tier-exit-criteria -->
 
 ## Current Harness Caveats
 

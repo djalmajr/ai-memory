@@ -133,12 +133,19 @@ uses the Copilot Chat endpoint with `vscode-chat` integration headers. You can
 also set `COPILOT_GITHUB_TOKEN`, `GH_TOKEN`, or `GITHUB_TOKEN` on the server.
 
 > [!TIP]
-> **For the OAuth/subscription backends (`anthropic-oauth`, `openai-oauth`, `codex`,
-> `copilot`), pick a small, fast model** via `AI_MEMORY_LLM_MODEL` — e.g.
-> `claude-haiku-4-5` or `gpt-5-mini`. ai-memory's LLM work (consolidation,
-> lint, explore) is summarisation, not hard reasoning, so a Haiku/mini-class
-> model is plenty and is much easier on subscription rate limits. Save the
-> high-effort thinking models for your coding agent.
+> **For the OAuth/subscription backends, prefer a small, fast model** via
+> `AI_MEMORY_LLM_MODEL` where the backend lets you choose one. ai-memory's LLM
+> work (consolidation, lint, explore) is summarisation, not hard reasoning, so a
+> Haiku/mini-class model is plenty and is much easier on subscription rate
+> limits. Save the high-effort thinking models for your coding agent. Per backend:
+> - `anthropic-oauth`: set `claude-haiku-4-5`.
+> - `openai-oauth` / `codex`: leave the provider default (`gpt-5.5`). The
+>   Codex/ChatGPT backend only accepts a small server-defined set of model ids
+>   and rejects others (e.g. `gpt-5-mini`) with a deterministic 400, so do not
+>   override the model here.
+> - `copilot`: a mini-class id such as `gpt-5-mini` may work, but Copilot's
+>   accepted model set is unverified — check before relying on it, and fall back
+>   to the default if the endpoint rejects your choice.
 
 > [!TIP]
 > **OpenAI-compatible structured output is schema-constrained by default.**
@@ -147,6 +154,45 @@ also set `COPILOT_GITHUB_TOKEN`, `GH_TOKEN`, or `GITHUB_TOKEN` on the server.
 > llama.cpp releases honour. It falls back to the tolerant parser when an
 > endpoint explicitly rejects that field or returns a malformed shape. Set
 > `AI_MEMORY_LLM_COMPAT_STRICT=false` only for an incompatible endpoint.
+
+> [!TIP]
+> **Thinking-capable local engines (vLLM / SGLang serving Qwen3-class
+> models).** Such engines spend the output budget on a reasoning pass before
+> the structured payload and can truncate the JSON mid-object
+> (`finish_reason = "length"`). Set
+> `AI_MEMORY_LLM_COMPAT_DISABLE_THINKING=true` to send
+> `chat_template_kwargs: {"enable_thinking": false}` on every openai-compat
+> request so the engine spends the budget on the payload instead. The knob is
+> opt-in, openai-compat only, and off by default — existing vLLM / Ollama /
+> LM Studio setups are unchanged unless it is set, and every other provider
+> ignores it. When the engine still truncates a structured response, or
+> returns HTTP 2xx with an empty `message.content`, the call now fails fast
+> with the terminal errors `truncated-response` / `empty-content` — no
+> retry, no second HTTP call, and the error text carries no response
+> content.
+
+> [!TIP]
+> **`openai-compat` sends `X-Request-Id` on every chat attempt.** Each HTTP
+> attempt of one logical operation — including the strict-to-tolerant
+> fallback and the single replay after an ambiguous delivery — carries the
+> same operation id (a 36-character UUID v7) in the `X-Request-Id` header,
+> so a gateway that records it (for example as `req=<id>`) can correlate
+> every attempt of the same operation and forward it to the engine (vLLM).
+> One operation is the invocation that enters the server's LLM admission:
+> a fresh durable queue execution of the same session is a new operation
+> and a new id. The id is generated fresh by the caller of the operation —
+> the consolidation invocation or the auto-improve review — and is never
+> the agent's session id, so a gateway never sees two operations of one
+> session, or a crash-resumed run, as one. Crash re-entry is exactly one
+> new operation: a process restart or a queue re-claim mints a new id for
+> the calls it makes, while map-reduce checkpoint reuse and the publication
+> reconcile never read the id — a resumed run still reuses completed stages
+> and reconciles an already-published page without an LLM call. The official
+> `openai` provider and `opencode` do not send this header — `opencode`
+> keeps its own `x-opencode-session` contract. Because
+> ai-memory owns the header on the `openai-compat` path, a static
+> `x-request-id` entry in `AI_MEMORY_LLM_HEADERS` is refused at startup for
+> that provider; the dynamic value must not be shadowed or duplicated.
 
 For small-context local models, configure both consolidation limits. The input
 target accounts for the complete rendered prompt, including bounded slot and
@@ -166,6 +212,54 @@ The equivalent environment variables are
 automatic PreCompact/PostCompaction checkpoint fall back to the deterministic
 rule-based page; admission, storage, and scope errors still fail closed. The
 validated minimums are 6,000 input and 1,000 output tokens.
+
+**Map-reduce consolidation (opt-in).** For sessions whose observation log no
+longer fits one prompt — or engines whose context is simply small — set
+`chunk_input_tokens` above zero (config key, or
+`AI_MEMORY_CONSOLIDATION__CHUNK_INPUT_TOKENS`). The session log is then
+consolidated through sequential, checkpointed stages instead of one large
+prompt: a **map** stage extracts typed evidence per block, grounded in the
+observation ids the block shows; a hierarchical **reduce** merges the
+extractions until the final request itself fits the ceiling; and the
+**final** stage is the normal single-page or multi-page prompt, fed the
+merged evidence digest. Every stage's request is sized with the model's own tokenizer — the
+same counter and reserves the admission guard enforces — so each call fits
+`llm_max_input_tokens` before it reaches the guard, and the stages run
+sequentially through the same admitted provider.
+
+The opt-in is fail-closed at config load: it requires `llm_max_input_tokens`
+(a positive tokenized ceiling) and a readable `llm_tokenizer_path`, and the
+target must not exceed the ceiling. With `chunk_input_tokens = 0` (the
+default) the single-prompt pipeline is unchanged.
+
+Each stage result is checkpointed durably, keyed by a content-derived
+fingerprint (prompt version, model, and the stage's exact input — never
+timestamps). A crashed or restarted run resumes from the checkpoints: stages
+whose fingerprint still matches are reused, only stale or missing blocks are
+re-run, and a new observation re-runs only the block that contains it —
+including a clock rollback, because no reuse decision reads `created_at`.
+A map checkpoint alone never proves publication: the pipeline stamps its own
+content marker (prompt versions, model, mode, the RESOLVED consolidation
+instructions, and a digest of the sanitized observations — every field
+length-prefixed so distinct inputs can never alias) on the session anchor when
+it publishes, and a later run reconciles the already-published state — without
+a new commit, revision, supersession, or LLM call, then pruning its
+checkpoints — only when that marker matches the current inputs. Changing the
+consolidation instructions (`_prompts/consolidation.md` or the per-call
+override) is a different operation, so the pipeline re-runs and updates the
+page instead of reconciling away; the multi batch drops any update to the
+reserved `_prompts/consolidation.md` page (it is input, not output). The
+heuristic SessionEnd page (origin stamp only, no marker) is not a publication,
+so the pipeline runs and overwrites it. One consolidation run uses one logical
+operation id across every stage, retry, and replay (carried as `X-Request-Id`
+on the `openai-compat` path), so the whole run is one correlated stream on
+the provider side. The run's id is generated fresh at the public entry and
+is never the session id; a crash re-entry or a queue re-claim is a new
+operation with a new id, while the checkpoints and the publication marker
+never read it — a resumed run keeps reusing completed stages and
+reconciling without an LLM call. Map and reduce output is validated at ingestion: any
+hallucinated observation id, empty grounding, or out-of-range confidence
+fails the run closed rather than being written.
 
 Every chat provider bounds each completion request at 300 seconds
 (`AI_MEMORY_LLM_TIMEOUT_SECS` to override, or `llm_timeout_secs = 900` in
@@ -195,7 +289,10 @@ engines (Ollama, LM Studio, vLLM): it needs no API key and requires explicit
 `AI_MEMORY_EMBEDDING_BASE_URL`, `AI_MEMORY_EMBEDDING_MODEL`, and
 `AI_MEMORY_EMBEDDING_DIM`. The optional `EMBEDDING_API_KEY` credentials the
 embedder alone and is checked before `OPENAI_API_KEY` and `LLM_API_KEY`, so
-embeddings can run on a different provider than the LLM. Both the FTS-only and
+embeddings can run on a different provider than the LLM. Because the two
+endpoints are independent, `AI_MEMORY_LLM_BASE_URL` redirects only the LLM;
+set `AI_MEMORY_EMBEDDING_BASE_URL` as well or embedding traffic still goes to
+the embedding provider's default endpoint. Both the FTS-only and
 hybrid paths apply the same bounded page-authority adjustment after candidate
 generation; embeddings improve relevance recall but do not decide which source
 is canonical.

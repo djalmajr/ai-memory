@@ -273,7 +273,7 @@ printf '%s\n' '{"session_id":"demo","cwd":"/example/workspace","tool_name":"Edit
 ```
 
 The normal capture contract is intentionally narrow: supported Claude Code,
-OpenCode, Pi, and Antigravity tool events retain only canonical tool family,
+OpenCode, Pi, OMP, and Antigravity tool events retain only canonical tool family,
 an agent-provided validated call ID when their documented schema proves one,
 and a PostToolUse outcome class. `PreToolUse` never retains commands,
 arguments, paths, input bodies, or arbitrary tool names. `PostToolUse` appends

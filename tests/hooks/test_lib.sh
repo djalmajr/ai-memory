@@ -31,6 +31,18 @@ assert_eq() {
     fi
 }
 
+# Git Bash reports $PWD and mktemp's directory as MSYS paths (/h/..., /tmp/...).
+# powershell.exe resolves neither, so a path handed to it has to be converted
+# first. cygpath ships with Git for Windows and exists nowhere else, where the
+# path is already native.
+host_path() {
+    if command -v cygpath >/dev/null 2>&1; then
+        cygpath -w "$1"
+    else
+        printf '%s' "$1"
+    fi
+}
+
 # --- parse_toml_key ---------------------------------------------------
 cat >"$TMP/sample.toml" <<EOF
 # Comment line
@@ -96,6 +108,20 @@ assert_eq "extract cwd from cursor workspace_roots" "/home/u/cur" \
 PAYLOAD_CURSOR_TOOL='{"session_id":"x","cwd":"","hook_event_name":"postToolUse","workspace_roots":["/home/u/cur"]}'
 assert_eq "extract cwd falls through cursor empty cwd" "/home/u/cur" \
     "$(ai_memory_extract_cwd "$PAYLOAD_CURSOR_TOOL")"
+# A large tool result must not make extraction quadratic in the payload
+# size: `${payload#*"key"}` pinned a CPU for minutes at a few hundred KB (#870).
+BIG=$(awk 'BEGIN { for (i = 0; i < 262144; i++) printf "x" }')
+PAYLOAD_CURSOR_BIG="{\"tool_output\":\"$BIG\",\"cwd\":\"\",\"workspace_roots\":[\"/home/u/big\"]}"
+assert_eq "extract cwd from a 256 KB cursor tool payload" "/home/u/big" \
+    "$(ai_memory_extract_cwd "$PAYLOAD_CURSOR_BIG")"
+# Only the first occurrence of a key is read, so a non-string top-level value
+# never lets a nested field of the same name take its place.
+PAYLOAD_NULL_CWD='{"cwd":null,"tool_input":{"cwd":"/tmp/nested"},"workspace_roots":["/home/u/top"]}'
+assert_eq "extract cwd ignores nested cwd after a null one" "/home/u/top" \
+    "$(ai_memory_extract_cwd "$PAYLOAD_NULL_CWD")"
+PAYLOAD_EMPTY_ROOTS='{"cwd":"","workspace_roots":[],"tool_input":{"workspace_roots":["/tmp/nested"]}}'
+assert_eq "extract cwd ignores nested roots after an empty array" "" \
+    "$(ai_memory_extract_cwd "$PAYLOAD_EMPTY_ROOTS")"
 
 antigravity_initial() {
     if ai_memory_antigravity_is_initial_invocation "$1"; then
@@ -116,6 +142,11 @@ assert_eq "antigravity fractional invocation fails closed" "no" \
     "$(antigravity_initial '{"invocationNum":0.5,"conversationId":"agy"}')"
 assert_eq "extract antigravity conversation id" "agy" \
     "$(ai_memory_extract_session_id '{"conversationId":"agy"}')"
+PAYLOAD_AGY_BIG="{\"prompt\":\"$BIG\",\"invocationNum\":0,\"conversationId\":\"agy\"}"
+assert_eq "antigravity initial invocation after a 256 KB field" "yes" \
+    "$(antigravity_initial "$PAYLOAD_AGY_BIG")"
+assert_eq "extract session id after a 256 KB field" "agy" \
+    "$(ai_memory_extract_session_id "$PAYLOAD_AGY_BIG")"
 
 FAKE_CURL_BIN="$TMP/fake-curl-bin"
 FAKE_CURL_LOG="$TMP/fake-curl.log"
@@ -299,8 +330,10 @@ if command -v git >/dev/null 2>&1; then
         PSH=$(command -v powershell)
     fi
     if [ -n "$PSH" ]; then
-        PS_REPO=$($PSH -NoProfile -ExecutionPolicy Bypass -Command \
-            ". '$PWD/hooks/lib/ai-memory-hook.ps1'; Get-AiMemoryRepoRootProject -Cwd '$REPO/crates/cli'")
+        PS_LIB=$(host_path "$PWD/hooks/lib/ai-memory-hook.ps1")
+        PS_CWD=$(host_path "$REPO/crates/cli")
+        PS_REPO=$("$PSH" -NoProfile -ExecutionPolicy Bypass -Command \
+            ". '$PS_LIB'; Get-AiMemoryRepoRootProject -Cwd '$PS_CWD'")
         assert_eq "powershell repo-root helper resolves repo basename" "acme-api" "$PS_REPO"
     else
         PS_STATIC=$(grep -q 'function Get-AiMemoryRepoRootProject' hooks/lib/ai-memory-hook.ps1 \
@@ -319,6 +352,10 @@ assert_eq "url_encode escapes plus"       "a%2Bb"  "$(ai_memory_url_encode "a+b"
 assert_eq "url_encode escapes Windows cwd" "C%3A%5Cdev%5Cmyproject" \
     "$(ai_memory_url_encode 'C:\dev\myproject')"
 assert_eq "url_encode encodes UTF-8 per byte" "r%C3%A9po" "$(ai_memory_url_encode 'répo')"
+# macOS /bin/sh is bash 3.2, which sign-extends bytes >= 0x80 in `printf "'c"`.
+assert_eq "url_encode encodes an accented macOS path" \
+    "%2FUsers%2Fme%2F%C3%81rea%20de%20Trabalho" \
+    "$(ai_memory_url_encode '/Users/me/Área de Trabalho')"
 
 # --- offline spool ----------------------------------------------------
 # The spool dir follows the data dir, which the harness pins inside $TMP.

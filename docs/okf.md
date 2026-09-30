@@ -58,7 +58,7 @@ families. Summary of what conformance requires:
 | `generated.by` | actor convention: `process:ai-memory/<version>` for the zero-LLM consolidator and system writers; `<provider-model>` (e.g. `openai-compat/qwen3:32b`) for LLM-written pages; `human:<user>` for wiki edits attributed via the watcher |
 | `generated.at` | the page version's `updated_at` |
 | `sources` | session provenance: pages already stamped with `session_id`/`agent` get `[{resource: "ai-memory://session/<uuid>", author: "<agent>"}]` |
-| `stale_after` | existing `expires_at` (TTL), when present |
+| `stale_after` | existing `expires_at` (TTL), when present: an RFC 3339 value verbatim, a bare `YYYY-MM-DD` as the end of that day in UTC (`2026-10-01T23:59:59.999999Z`), since OKF timestamps carry an explicit offset |
 | `status` | `deprecated` when TTL-expired but retained; otherwise omitted (spec default `stable`) |
 
 Extension fields kept verbatim (unknown keys are conformant): `tier`,
@@ -122,6 +122,26 @@ Order is fixed; each step gates the next:
 
 Rollback: restore the archive (blunt, no git knowledge needed), or the
 pre-migration git checkpoint + `reindex` (surgical).
+
+### Repairs to already-migrated stores
+
+A conformance bug found after a store migrated is repaired by an
+idempotent startup pass, not by a new `WikiMigration`: a registered
+migration name makes every older binary refuse the wiki
+(`NewerWikiFormat`), a format-generation step a patch fix should not
+force. The pass follows the
+migration's no-churn rules (row in place, same version, `updated_at` and
+`generated.at` untouched, body untouched, one git commit) and is a no-op
+once the store is clean. `conform_frontmatter` applies the same repair,
+so any later rewrite of an affected page (a restore, a hand edit, a
+`reindex`) heals it too.
+
+- **Date-only `stale_after`.** Builds before the fix copied a bare
+  `expires_at` date into `stale_after` verbatim. `serve` rewrites a
+  `stale_after` that equals its date-only `expires_at` to the instant the
+  TTL names (`2026-10-01` → `2026-10-01T23:59:59.999999Z`); a
+  `stale_after` that differs from `expires_at` was not derived by
+  ai-memory and is left alone.
 
 ## Tests (each with a control that must fail on a broken build)
 

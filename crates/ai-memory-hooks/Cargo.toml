@@ -35,6 +35,9 @@ tempfile.workspace = true
 git2.workspace = true
 ai-memory-llm.workspace = true
 async-trait.workspace = true
+# Per-test log capture in the checkpoint redaction tests (thread-local
+# `set_default`); the same workspace dep the MCP crate's dev-deps use.
+tracing-subscriber.workspace = true
 
 [lints]
 workspace = true

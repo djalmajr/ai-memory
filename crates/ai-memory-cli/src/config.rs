@@ -10,9 +10,9 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use ai_memory_llm::{
-    AuthRequirement, Candidate, EmbedderChoice, EmbedderConfig, ExtraHeaders, FallbackLlmProvider,
-    LlmError, LlmProvider, LlmResult, OPENCODE_DEFAULT_MODEL, ProviderAuth, ProviderChoice,
-    ProviderConfig, ReasoningEffort, build_provider,
+    AdmittedLlmProvider, AuthRequirement, Candidate, EmbedderChoice, EmbedderConfig, ExtraHeaders,
+    FallbackLlmProvider, LlmError, LlmProvider, LlmResult, OPENCODE_DEFAULT_MODEL, ProviderAuth,
+    ProviderChoice, ProviderConfig, ReasoningEffort, build_provider,
 };
 use anyhow::{Context, Result};
 use figment::{
@@ -24,6 +24,12 @@ use serde::{Deserialize, Serialize};
 
 /// Default HTTP bind address for the local single-user server.
 pub const DEFAULT_BIND: &str = "127.0.0.1:49374";
+
+/// Default idle time (seconds) before TCP keepalive probes start on an
+/// accepted `serve` connection. Conservative: long enough to never fire on a
+/// live, merely-quiet MCP/hook connection, short enough that a dead peer's
+/// fd is reclaimed in minutes rather than the OS default of ~2 hours (#792).
+pub const DEFAULT_TCP_KEEPALIVE_SECS: u64 = 60;
 
 /// Default base URL used by thin-client CLI subcommands.
 pub const DEFAULT_SERVER_URL: &str = "http://127.0.0.1:49374";
@@ -45,6 +51,27 @@ pub const DEFAULT_WORKSPACE: &str = ai_memory_core::DEFAULT_WORKSPACE_NAME;
 
 /// Defensive project fallback used only when no cwd/project is available.
 pub const DEFAULT_PROJECT: &str = ai_memory_core::DEFAULT_PROJECT_NAME;
+
+/// Optional per-tier retention half-lives, expressed in **days**.
+///
+/// This is the operator-facing `[decay.half_life_days]` sub-table. Half-life in
+/// days is the intuitive knob ("episodic pages: a 180-day half-life"); it is
+/// converted to the internal per-day decay rate λ (`λ = ln(2) / days`) in
+/// [`DecaySettings::decay_params`]. Every key is optional: an omitted key falls
+/// back to the scalar `lambda`, so the default (all keys unset) reproduces
+/// today's single-λ behaviour byte-for-byte and no upgrade changes a score.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct DecayHalfLifeDays {
+    /// Half-life in days for `working`-tier pages; unset uses the scalar λ.
+    pub working: Option<f64>,
+    /// Half-life in days for `episodic`-tier pages; unset uses the scalar λ.
+    pub episodic: Option<f64>,
+    /// Half-life in days for `semantic`-tier pages; unset uses the scalar λ.
+    pub semantic: Option<f64>,
+    /// Half-life in days for `procedural`-tier pages; unset uses the scalar λ.
+    pub procedural: Option<f64>,
+}
 
 /// Config-file representation of retention settings.
 ///
@@ -73,6 +100,30 @@ pub struct DecaySettings {
     pub observation_retention_days: i64,
     /// Observation rows deleted per prune transaction.
     pub observation_prune_batch: usize,
+    /// A2 extractive tier-down (`[decay] compact_cold_episodic`). When `true`,
+    /// the forget sweep COMPACTS a cold episodic page — keeping its L0 abstract,
+    /// an L1 summary and the L2 keep-token set, dropping the prose — instead of
+    /// evicting it. Reversible (the full body stays in git + the supersession
+    /// chain) and non-destructive. Defaults to `false`, so an upgrade changes
+    /// nothing until an operator opts in.
+    pub compact_cold_episodic: bool,
+    /// A3 cold-cluster dedup (`[decay] dedup_cold_clusters`). When `true` AND an
+    /// embedder is configured, the forget sweep clusters near-duplicate cold
+    /// episodic pages by embedding (cosine DBSCAN, adaptive eps) and collapses
+    /// each cluster to one survivor via supersession + a merge note.
+    /// Non-destructive (merged-away members stay reachable) and zero generative
+    /// LLM. Defaults to `false`, and is a clean no-op with no embedder, so an
+    /// upgrade changes nothing until an operator opts in.
+    pub dedup_cold_clusters: bool,
+    /// DBSCAN density floor for A3. `0` ⇒ the conservative default (2).
+    pub dedup_min_pts: usize,
+    /// Conservative ceiling on the adaptive eps (cosine distance) for A3.
+    /// `0.0` ⇒ the conservative default. Lower errs harder toward NOT merging.
+    pub dedup_max_eps: f32,
+    /// Optional per-tier half-life overrides (`[decay.half_life_days]`). All
+    /// keys default to unset ⇒ the scalar `lambda` applies to every tier, which
+    /// is byte-identical to the historical single-λ behaviour.
+    pub half_life_days: DecayHalfLifeDays,
 }
 
 impl Default for DecaySettings {
@@ -88,6 +139,11 @@ impl Default for DecaySettings {
             breadth_weight: 0.0,
             observation_retention_days: 0,
             observation_prune_batch: ai_memory_consolidate::DEFAULT_OBSERVATION_PRUNE_BATCH,
+            compact_cold_episodic: false,
+            dedup_cold_clusters: false,
+            dedup_min_pts: 0,
+            dedup_max_eps: 0.0,
+            half_life_days: DecayHalfLifeDays::default(),
         }
     }
 }
@@ -103,6 +159,28 @@ impl DecaySettings {
             salience_default: self.salience_default,
             cold_threshold: self.cold_threshold,
             hard_delete_after_days: self.hard_delete_after_days,
+            // Half-life-in-days is the user surface; λ is the math. Convert here
+            // once. An unset key stays `None`, so `lambda_for` falls back to the
+            // scalar `lambda` unchanged — the identity default, no days↔λ
+            // round-trip that could perturb an unconfigured store's scores.
+            tier_lambda: ai_memory_store::TierLambdas {
+                working: self
+                    .half_life_days
+                    .working
+                    .map(ai_memory_store::lambda_from_half_life_days),
+                episodic: self
+                    .half_life_days
+                    .episodic
+                    .map(ai_memory_store::lambda_from_half_life_days),
+                semantic: self
+                    .half_life_days
+                    .semantic
+                    .map(ai_memory_store::lambda_from_half_life_days),
+                procedural: self
+                    .half_life_days
+                    .procedural
+                    .map(ai_memory_store::lambda_from_half_life_days),
+            },
         }
     }
 
@@ -118,11 +196,29 @@ impl DecaySettings {
             batch: self.observation_prune_batch,
         }
     }
+
+    /// A3 cold-cluster dedup options for the M8 sweep.
+    ///
+    /// `embedding` is the running server's configured embedder coordinate, or
+    /// `None` when no embedder is configured — in which case A3 is a clean no-op
+    /// even with the flag on (there are no stored vectors to cluster).
+    #[must_use]
+    pub fn cold_cluster_dedup(
+        self,
+        embedding: Option<ai_memory_consolidate::EmbeddingCoord>,
+    ) -> ai_memory_consolidate::ColdClusterDedup {
+        ai_memory_consolidate::ColdClusterDedup {
+            enabled: self.dedup_cold_clusters,
+            embedding,
+            min_pts: self.dedup_min_pts,
+            max_eps: self.dedup_max_eps,
+        }
+    }
 }
 
 /// One `[[llm_fallbacks]]` entry: an ordered LLM provider tried only after
-/// the primary (`llm_provider`) fails a transient call
-/// (`LlmError::is_transient()`). See `docs/llm-provider-fallback.md`.
+/// the primary (`llm_provider`) fails before delivery or reports explicit
+/// capacity (`LlmError::is_fast_retryable()`). See `docs/llm-provider-fallback.md`.
 ///
 /// `Config::load` validates every profile and resolves its credential once,
 /// at startup — a missing/empty provider or model, an unknown provider, or
@@ -159,6 +255,14 @@ pub struct Config {
     pub data_dir: PathBuf,
     /// HTTP bind address used by `ai-memory serve`.
     pub bind: String,
+    /// Idle-time (seconds) before the OS starts probing an accepted `serve`
+    /// connection with TCP keepalive. `0` disables keepalive entirely. A
+    /// hook client's peer can die without sending FIN (laptop sleep, a
+    /// VPN/Tailscale flap, an abrupt kill); without keepalive the socket
+    /// stays `ESTABLISHED` forever and leaks one fd per dead peer until
+    /// `accept()` fails with `EMFILE` and the healthcheck breaks (#792). Set
+    /// with `AI_MEMORY_TCP_KEEPALIVE_SECS`.
+    pub tcp_keepalive_secs: u64,
     /// Base URL used by thin-client CLI commands to contact the running server.
     pub server_url: String,
     /// URL subpath the server is mounted under (e.g. `/wiki`). Thin-client
@@ -194,6 +298,15 @@ pub struct Config {
     /// already supplies its own schema. Set
     /// `AI_MEMORY_LLM_COMPAT_STRICT=false` for an incompatible endpoint.
     pub llm_compat_strict: bool,
+    /// OpenAI-compat only: send
+    /// `chat_template_kwargs: {"enable_thinking": false}` with every chat
+    /// request, for thinking-capable local engines (vLLM / SGLang serving
+    /// Qwen3-class models): the engine otherwise spends the output budget
+    /// on a reasoning pass before the structured payload and can truncate
+    /// it mid-JSON. Ignored by every other provider; off by default. Set
+    /// with `AI_MEMORY_LLM_COMPAT_DISABLE_THINKING` (or
+    /// `llm_compat_disable_thinking = true` in `config.toml`).
+    pub llm_compat_disable_thinking: bool,
     /// Per-request timeout (seconds) applied to every chat
     /// completion request and to the Copilot token exchange; the
     /// openai-oauth token refresh keeps the built-in default ceiling
@@ -204,6 +317,13 @@ pub struct Config {
     /// ceiling (observed with free aggregator tiers). Set with
     /// `AI_MEMORY_LLM_TIMEOUT_SECS`.
     pub llm_timeout_secs: u64,
+    /// Optional tokenized input ceiling across all LLM jobs. Requires
+    /// `llm_tokenizer_path` for the configured model; no byte/character
+    /// heuristic is used. Env: `AI_MEMORY_LLM_MAX_INPUT_TOKENS`.
+    pub llm_max_input_tokens: Option<usize>,
+    /// Path to this model's Hugging Face tokenizer.json. Used only when
+    /// `llm_max_input_tokens` is set. Env: `AI_MEMORY_LLM_TOKENIZER_PATH`.
+    pub llm_tokenizer_path: Option<PathBuf>,
     /// Optional reasoning / thinking effort. Omitted when unset so the
     /// model default applies. Env: `AI_MEMORY_LLM_REASONING_EFFORT`.
     /// Values: `none`, `minimal`, `low`, `medium`, `high`, `xhigh`,
@@ -229,7 +349,7 @@ pub struct Config {
     /// overriding it. Values are never logged.
     pub llm_headers: Vec<String>,
     /// Ordered LLM fallback chain, tried after the primary provider only on
-    /// a transient failure (`LlmError::is_transient()`); empty by default
+    /// a safe fast failure (`LlmError::is_fast_retryable()`); empty by default
     /// (no behavior change). See [`FallbackProfile`] and
     /// `docs/llm-provider-fallback.md`. Configure via TOML:
     /// ```toml
@@ -345,6 +465,11 @@ pub struct Config {
     pub decay: DecaySettings,
     /// Server-side scheduled maintenance. Jobs run outside hook latency.
     pub maintenance: MaintenanceSettings,
+    /// Opt-in LLM "dream" pass (B2/B3/B4): rewrite/merge cold clusters with the
+    /// configured provider, scheduled on idle and cancelled the moment the
+    /// operator returns. OFF by default and gated on an R2 number before it may
+    /// default on; never deletes a source.
+    pub dream: DreamSettings,
     /// Opt-in post-fusion ranking signals for `memory_query` (hotness boost,
     /// lexical query-intent routing). All off by default.
     pub retrieval: RetrievalSettings,
@@ -740,6 +865,7 @@ impl Default for Config {
         Self {
             data_dir: default_data_dir(),
             bind: DEFAULT_BIND.into(),
+            tcp_keepalive_secs: DEFAULT_TCP_KEEPALIVE_SECS,
             server_url: DEFAULT_SERVER_URL.into(),
             base_path: String::new(),
             home_dir: None,
@@ -748,7 +874,10 @@ impl Default for Config {
             llm_model: None,
             llm_base_url: None,
             llm_compat_strict: true,
+            llm_compat_disable_thinking: false,
             llm_timeout_secs: ai_memory_llm::DEFAULT_REQUEST_TIMEOUT_SECS,
+            llm_max_input_tokens: None,
+            llm_tokenizer_path: None,
             llm_reasoning_effort: None,
             llm_headers: Vec::new(),
             llm_fallbacks: Vec::new(),
@@ -767,6 +896,7 @@ impl Default for Config {
             embedding_base_url: None,
             decay: DecaySettings::default(),
             maintenance: MaintenanceSettings::default(),
+            dream: DreamSettings::default(),
             retrieval: RetrievalSettings::default(),
             slots: SlotSettings::default(),
             consolidation: ConsolidationSettings::default(),
@@ -799,6 +929,17 @@ pub struct ConsolidationSettings {
     /// Maximum tokens the provider may generate for a consolidation response.
     /// Small-context models must lower this together with `max_input_tokens`.
     pub max_output_tokens: u32,
+    /// Opt-in map-reduce consolidation: when above zero, a session's
+    /// observation log is consolidated through sequential, checkpointed
+    /// map/reduce stages (typed evidence extraction grounded in observation
+    /// ids, hierarchical reduction, then the normal final prompt) instead of
+    /// one large prompt. Each stage is sized with the model's own tokenizer
+    /// so every call fits `llm_max_input_tokens` before it reaches the
+    /// admission guard. `0` (the default) keeps the single-prompt pipeline
+    /// exactly as before. Requires `llm_max_input_tokens > 0` and a readable
+    /// `llm_tokenizer_path`, and must not exceed `llm_max_input_tokens`.
+    /// Env: `AI_MEMORY_CONSOLIDATION__CHUNK_INPUT_TOKENS`.
+    pub chunk_input_tokens: usize,
 }
 
 impl Default for ConsolidationSettings {
@@ -806,6 +947,7 @@ impl Default for ConsolidationSettings {
         Self {
             max_input_tokens: ai_memory_consolidate::DEFAULT_CONSOLIDATION_MAX_INPUT_TOKENS,
             max_output_tokens: ai_memory_consolidate::DEFAULT_CONSOLIDATION_MAX_OUTPUT_TOKENS,
+            chunk_input_tokens: 0,
         }
     }
 }
@@ -912,6 +1054,11 @@ pub struct AutoImproveSchedulerSettings {
     pub experience_every_sessions: u64,
     /// How many recent session summary pages one experience pass reads.
     pub experience_sessions: usize,
+    /// A4 entropy / boilerplate pre-filter for the experience pass
+    /// (`[auto_improve.scheduler.experience_entropy_filter]`). Off by default:
+    /// low-information session pages are skipped from consolidation only when an
+    /// operator enables it. Advisory (skip, never delete).
+    pub experience_entropy_filter: ai_memory_consolidate::EntropyFilterConfig,
 }
 
 impl Default for AutoImproveSchedulerSettings {
@@ -923,6 +1070,7 @@ impl Default for AutoImproveSchedulerSettings {
             min_session_age_secs: 600,
             experience_every_sessions: 0,
             experience_sessions: 10,
+            experience_entropy_filter: ai_memory_consolidate::EntropyFilterConfig::default(),
         }
     }
 }
@@ -1034,6 +1182,90 @@ impl Default for MaintenanceSettings {
     }
 }
 
+/// `[dream]` — the opt-in LLM dream pass (docs/design-memory-aging.md §B2–B4).
+///
+/// OFF by default (`enabled = false`): the scheduled job is not started, and even
+/// a direct call is a clean no-op. It runs only when this flag is set AND a
+/// provider AND an embedder are configured; a provider-less store keeps the
+/// zero-LLM A3 path (invariant #13). Gated on an R2 number before default-on.
+///
+/// Env form: `AI_MEMORY_DREAM__ENABLED=true`,
+/// `AI_MEMORY_DREAM__IDLE_WINDOW_SECS=600`.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[serde(default)]
+pub struct DreamSettings {
+    /// Master switch. `false` (the default) means the job never starts.
+    pub enabled: bool,
+    /// How often the scheduler CONSIDERS a run (seconds). It still only runs when
+    /// the operator has been idle for `idle_window_secs`. `0` ⇒ a conservative
+    /// default cadence.
+    pub interval_secs: u64,
+    /// Idle window (seconds) the operator must be quiet for before a run starts,
+    /// and past which returning activity cancels an in-flight run (B3). `0` ⇒
+    /// [`ai_memory_consolidate::DEFAULT_DREAM_IDLE_WINDOW_SECS`].
+    pub idle_window_secs: u64,
+    /// DBSCAN density floor. `0` ⇒ the conservative default (2).
+    pub min_pts: usize,
+    /// Conservative eps ceiling (cosine distance). `0.0` ⇒ the conservative
+    /// default; lower errs harder toward NOT merging.
+    pub max_eps: f32,
+    /// Hard cap on clusters rewritten per run (bounded fan-out, invariant #5).
+    /// `0` ⇒ [`ai_memory_consolidate::DEFAULT_DREAM_MAX_CLUSTERS_PER_RUN`].
+    pub max_clusters_per_run: usize,
+    /// Minimum cold pages before a run does work (the events-accrued gate). `0` ⇒
+    /// [`ai_memory_consolidate::DEFAULT_DREAM_MIN_COLD_PAGES`].
+    pub min_cold_pages: usize,
+}
+
+impl Default for DreamSettings {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            // A conservative default cadence: the job wakes hourly to check
+            // whether the box has been idle long enough to run.
+            interval_secs: 3_600,
+            idle_window_secs: 0,
+            min_pts: 0,
+            max_eps: 0.0,
+            max_clusters_per_run: 0,
+            min_cold_pages: 0,
+        }
+    }
+}
+
+impl DreamSettings {
+    /// The effective scheduler interval in seconds (never zero).
+    #[must_use]
+    pub fn effective_interval_secs(self) -> u64 {
+        if self.interval_secs == 0 {
+            3_600
+        } else {
+            self.interval_secs
+        }
+    }
+
+    /// Build the [`ai_memory_consolidate::DreamConfig`] for the pass.
+    ///
+    /// `embedding` is the running server's configured embedder coordinate, or
+    /// `None` when no embedder is configured — in which case the dream pass is a
+    /// clean no-op even with the flag on (there are no stored vectors).
+    #[must_use]
+    pub fn dream_config(
+        self,
+        embedding: Option<ai_memory_consolidate::EmbeddingCoord>,
+    ) -> ai_memory_consolidate::DreamConfig {
+        ai_memory_consolidate::DreamConfig {
+            enabled: self.enabled,
+            embedding,
+            min_pts: self.min_pts,
+            max_eps: self.max_eps,
+            max_clusters_per_run: self.max_clusters_per_run,
+            min_cold_pages: self.min_cold_pages,
+            idle_window_secs: self.idle_window_secs,
+        }
+    }
+}
+
 /// `[retrieval]` opt-in ranking signals layered on the RRF fusion in
 /// `memory_query`. Every default leaves ranking byte-identical to a store
 /// that never heard of this section.
@@ -1055,6 +1287,12 @@ pub struct RetrievalSettings {
     /// the RRF fusion. Pages gain an abstract vector when their frontmatter
     /// carries `abstract:` and the embedding backfill runs.
     pub abstract_vectors: bool,
+    /// Weight of the belief-strength confidence factor folded into page
+    /// authority (P2). `0.0` (the default) is inert — ranking is byte-identical
+    /// and no belief query runs. Positive folds a page's evidence-derived
+    /// `confidence` into its authority factor, inside the existing bounds.
+    /// OFF by default: enabling it is gated on a positive R2 delta.
+    pub belief_authority_weight: f64,
 }
 
 impl Default for RetrievalSettings {
@@ -1064,6 +1302,7 @@ impl Default for RetrievalSettings {
             query_intent: base.session_recall_routing,
             session_recall_bonus: base.session_recall_bonus,
             abstract_vectors: base.abstract_vectors,
+            belief_authority_weight: base.belief_authority_weight,
         }
     }
 }
@@ -1076,6 +1315,10 @@ impl RetrievalSettings {
             session_recall_routing: self.query_intent,
             session_recall_bonus: self.session_recall_bonus.max(0.0),
             abstract_vectors: self.abstract_vectors,
+            // A negative weight would flip the boost into a penalty on
+            // supported pages; clamp it out so misconfiguration is inert, not
+            // inverted.
+            belief_authority_weight: self.belief_authority_weight.max(0.0),
         }
     }
 }
@@ -1160,6 +1403,27 @@ impl Config {
             );
         }
 
+        // A per-tier half-life must be a real, positive number of days: `0` (or
+        // negative/NaN) would convert to a nonsensical λ (+inf / negative /
+        // NaN) and silently mass-evict or never decay that tier. Reject it at
+        // load rather than at 3am inside the sweep. An unset key is fine — it
+        // falls back to the scalar `lambda`.
+        for (tier, value) in [
+            ("working", config.decay.half_life_days.working),
+            ("episodic", config.decay.half_life_days.episodic),
+            ("semantic", config.decay.half_life_days.semantic),
+            ("procedural", config.decay.half_life_days.procedural),
+        ] {
+            if let Some(days) = value
+                && (!days.is_finite() || days <= 0.0)
+            {
+                anyhow::bail!(
+                    "decay.half_life_days.{tier} must be a finite number greater than zero \
+                     (got {days}); omit the key to use the default decay rate"
+                );
+            }
+        }
+
         // Fail closed at load rather than at 3am inside a destructive pass: a
         // negative age would be a nonsensical cutoff, and a zero batch would
         // spin the prune loop forever without deleting anything.
@@ -1171,6 +1435,16 @@ impl Config {
         }
         if config.decay.observation_prune_batch == 0 {
             anyhow::bail!("decay.observation_prune_batch must be greater than zero");
+        }
+        // A4 entropy filter thresholds: reject an unusable threshold at startup
+        // rather than silently ignoring it on the first experience pass.
+        if let Err(message) = config
+            .auto_improve
+            .scheduler
+            .experience_entropy_filter
+            .validate()
+        {
+            anyhow::bail!("auto_improve.scheduler.experience_{message}");
         }
 
         // Fail at startup rather than shipping a prompt that is all scaffolding
@@ -1194,6 +1468,42 @@ impl Config {
                 config.consolidation.max_output_tokens
             );
         }
+        // Map-reduce chunking depends on the tokenized ceiling: the planner
+        // sizes every stage with the model's own tokenizer so each call fits
+        // the admission guard's cap. Active without a ceiling (or without a
+        // readable tokenizer) would ship a pipeline the guard can reject —
+        // fail at startup, not on the first consolidation.
+        if config.consolidation.chunk_input_tokens > 0 {
+            match config.llm_max_input_tokens {
+                Some(ceiling) if ceiling > 0 => {
+                    let Some(tokenizer_path) = &config.llm_tokenizer_path else {
+                        anyhow::bail!(
+                            "consolidation.chunk_input_tokens requires llm_tokenizer_path"
+                        );
+                    };
+                    if !tokenizer_path.is_file() {
+                        anyhow::bail!(
+                            "consolidation.chunk_input_tokens requires a readable \
+                             llm_tokenizer_path ({tokenizer_path:?} is not a readable file)"
+                        );
+                    }
+                    if config.consolidation.chunk_input_tokens > ceiling {
+                        anyhow::bail!(
+                            "consolidation.chunk_input_tokens ({}) cannot exceed \
+                             llm_max_input_tokens ({ceiling})",
+                            config.consolidation.chunk_input_tokens
+                        );
+                    }
+                }
+                _ => {
+                    anyhow::bail!(
+                        "consolidation.chunk_input_tokens requires llm_max_input_tokens \
+                         (a positive tokenized ceiling); the chunk planner sizes requests \
+                         the way the admission guard enforces them"
+                    );
+                }
+            }
+        }
         // Zero (or a sub-second remainder rounded down) would cut every
         // provider request off before it is sent.
         if config.llm_timeout_secs == 0 {
@@ -1201,6 +1511,17 @@ impl Config {
                 "llm_timeout_secs must be at least 1 second (got {}); \
                  AI_MEMORY_LLM_TIMEOUT_SECS is read in seconds",
                 config.llm_timeout_secs
+            );
+        }
+        if config.llm_max_input_tokens == Some(0) {
+            anyhow::bail!("llm_max_input_tokens must be greater than zero");
+        }
+        if config.llm_max_input_tokens.is_some() && config.llm_tokenizer_path.is_none() {
+            anyhow::bail!("llm_tokenizer_path is required with llm_max_input_tokens");
+        }
+        if config.llm_max_input_tokens.is_some() && !config.llm_fallbacks.is_empty() {
+            anyhow::bail!(
+                "llm_max_input_tokens requires one model; fallback tokenizers may differ"
             );
         }
         // Parsed (and discarded) here so a malformed header list is rejected
@@ -1320,6 +1641,7 @@ impl Config {
             auth: self.provider_auth(provider, None),
             base_url: self.resolve_base_url(provider),
             compat_strict: self.llm_compat_strict,
+            compat_disable_thinking: self.llm_compat_disable_thinking,
             request_timeout_secs: self.llm_timeout_secs,
             reasoning_effort: self.llm_reasoning_effort,
             extra_headers: self.llm_extra_headers()?,
@@ -1376,6 +1698,7 @@ impl Config {
             auth: self.fallback_provider_auth(provider, resolved_key),
             base_url: non_empty(profile.base_url.as_deref()).map(str::to_string),
             compat_strict: self.llm_compat_strict,
+            compat_disable_thinking: self.llm_compat_disable_thinking,
             request_timeout_secs: self.llm_timeout_secs,
             reasoning_effort: self.llm_reasoning_effort,
             extra_headers: self.llm_extra_headers()?,
@@ -1449,16 +1772,19 @@ impl Config {
     /// Build the configured LLM provider, including any ordered
     /// `llm_fallbacks` chain.
     ///
-    /// `None` when no LLM is configured; the plain provider when no
-    /// fallback is configured (existing single-provider callers are
-    /// unaffected); otherwise a [`FallbackLlmProvider`] wrapping the
-    /// primary and its fallbacks in declaration order. See
-    /// `docs/llm-provider-fallback.md`.
+    /// `None` when no LLM is configured; otherwise one shared admission
+    /// wrapper around the plain provider or an ordered
+    /// [`FallbackLlmProvider`] chain. See `docs/llm-provider-fallback.md`.
     ///
     /// # Errors
     /// Propagates any error from constructing the primary or a fallback
     /// provider (`build_provider` is the sole construction path for both).
     pub fn llm_provider_chain(&self) -> LlmResult<Option<Arc<dyn LlmProvider>>> {
+        if self.llm_max_input_tokens.is_some() && !self.llm_fallback_configs.is_empty() {
+            return Err(LlmError::NotConfigured(
+                "llm_max_input_tokens requires one model; fallback tokenizers may differ".into(),
+            ));
+        }
         // A chain with a profile silently dropped would look healthy until
         // the primary has an outage.
         if let Some(message) = self.llm_fallback_unresolved.first() {
@@ -1467,23 +1793,29 @@ impl Config {
         let Some(primary_cfg) = self.llm_provider_config()? else {
             return Ok(None);
         };
-        if self.llm_fallback_configs.is_empty() {
-            return Ok(Some(build_provider(primary_cfg)?));
-        }
-        let mut candidates = Vec::with_capacity(1 + self.llm_fallback_configs.len());
-        candidates.push(Candidate::new(
-            primary_cfg.provider.name(),
-            primary_cfg.model.clone(),
-            build_provider(primary_cfg)?,
-        ));
-        for cfg in &self.llm_fallback_configs {
+        let inner: Arc<dyn LlmProvider> = if self.llm_fallback_configs.is_empty() {
+            build_provider(primary_cfg)?
+        } else {
+            let mut candidates = Vec::with_capacity(1 + self.llm_fallback_configs.len());
             candidates.push(Candidate::new(
-                cfg.provider.name(),
-                cfg.model.clone(),
-                build_provider(cfg.clone())?,
+                primary_cfg.provider.name(),
+                primary_cfg.model.clone(),
+                build_provider(primary_cfg)?,
             ));
-        }
-        Ok(Some(Arc::new(FallbackLlmProvider::new(candidates))))
+            for cfg in &self.llm_fallback_configs {
+                candidates.push(Candidate::new(
+                    cfg.provider.name(),
+                    cfg.model.clone(),
+                    build_provider(cfg.clone())?,
+                ));
+            }
+            Arc::new(FallbackLlmProvider::new(candidates))
+        };
+        Ok(Some(Arc::new(AdmittedLlmProvider::new(
+            inner,
+            self.llm_max_input_tokens,
+            self.llm_tokenizer_path.as_deref(),
+        )?)))
     }
 
     /// OpenAI-compatible embedding key. `EMBEDDING_API_KEY` is checked first
@@ -2196,6 +2528,7 @@ mod tests {
         let cfg = Config::default();
         assert!(cfg.data_dir.ends_with("ai-memory"));
         assert_eq!(cfg.bind, DEFAULT_BIND);
+        assert_eq!(cfg.tcp_keepalive_secs, DEFAULT_TCP_KEEPALIVE_SECS);
         assert_eq!(cfg.server_url, DEFAULT_SERVER_URL);
         assert_eq!(cfg.log_level, "info");
         assert_eq!(
@@ -2281,6 +2614,97 @@ mod tests {
         }
     }
 
+    /// `[decay.half_life_days]` parses per-tier half-lives (in days) and
+    /// converts each to the internal λ; an omitted key falls back to the scalar
+    /// `lambda`, so the resulting `DecayParams` is a pure identity for every
+    /// unset tier.
+    #[test]
+    fn load_parses_per_tier_half_lives_and_falls_back_for_omitted_keys() {
+        let tmp = TempDir::new().unwrap();
+        let config_path = tmp.path().join("config.toml");
+        std::fs::write(
+            &config_path,
+            "[decay.half_life_days]\nepisodic = 365.0\nworking = 7.0\n",
+        )
+        .unwrap();
+        let cfg = Config::load(Some(&config_path), Some(tmp.path().to_path_buf())).unwrap();
+        let params = cfg.decay.decay_params();
+
+        // Configured tiers convert days -> λ = ln(2) / days.
+        let expect = |days: f64| std::f64::consts::LN_2 / days;
+        assert_eq!(
+            params.lambda_for(ai_memory_core::Tier::Episodic).to_bits(),
+            expect(365.0).to_bits(),
+        );
+        assert_eq!(
+            params.lambda_for(ai_memory_core::Tier::Working).to_bits(),
+            expect(7.0).to_bits(),
+        );
+        // Omitted tiers fall back to the scalar λ, byte-for-byte.
+        assert_eq!(
+            params.lambda_for(ai_memory_core::Tier::Semantic).to_bits(),
+            params.lambda.to_bits(),
+        );
+        assert_eq!(
+            params
+                .lambda_for(ai_memory_core::Tier::Procedural)
+                .to_bits(),
+            params.lambda.to_bits(),
+        );
+    }
+
+    /// With no `[decay.half_life_days]` table the resolved `DecayParams` is the
+    /// store default: every tier's λ is the scalar `lambda` (the identity
+    /// upgrade guarantee at the config layer).
+    #[test]
+    fn load_without_half_lives_is_identity_to_the_default_params() {
+        let tmp = TempDir::new().unwrap();
+        let cfg = Config::load(None, Some(tmp.path().to_path_buf())).unwrap();
+        let params = cfg.decay.decay_params();
+        let default = ai_memory_store::DecayParams::default();
+        for tier in [
+            ai_memory_core::Tier::Working,
+            ai_memory_core::Tier::Episodic,
+            ai_memory_core::Tier::Semantic,
+            ai_memory_core::Tier::Procedural,
+        ] {
+            assert_eq!(
+                params.lambda_for(tier).to_bits(),
+                default.lambda_for(tier).to_bits(),
+                "tier {tier:?} must decay at the default scalar λ",
+            );
+        }
+    }
+
+    /// A zero, negative, or non-finite half-life converts to a nonsensical λ,
+    /// so it is rejected at load rather than silently mass-evicting (or never
+    /// decaying) that tier.
+    #[test]
+    fn load_rejects_invalid_per_tier_half_lives() {
+        for (tier, value) in [
+            ("episodic", "0.0"),
+            ("working", "-5.0"),
+            ("semantic", "nan"),
+            ("procedural", "inf"),
+        ] {
+            let tmp = TempDir::new().unwrap();
+            let config_path = tmp.path().join("config.toml");
+            std::fs::write(
+                &config_path,
+                format!("[decay.half_life_days]\n{tier} = {value}\n"),
+            )
+            .unwrap();
+            let error = Config::load(Some(&config_path), Some(tmp.path().to_path_buf()))
+                .expect_err("an invalid per-tier half-life must fail closed");
+            assert!(
+                error
+                    .to_string()
+                    .contains(&format!("decay.half_life_days.{tier}")),
+                "unexpected error for {tier} = {value}: {error:#}"
+            );
+        }
+    }
+
     /// A negative retention age or a zero batch is rejected at load, beside
     /// the breadth-weight guard, so a destructive pass can never be configured
     /// into a nonsensical shape.
@@ -2362,6 +2786,120 @@ mod tests {
         let cfg = Config::load(Some(&config_path), Some(tmp.path().to_path_buf())).unwrap();
         assert_eq!(cfg.consolidation.max_input_tokens, 7_000);
         assert_eq!(cfg.consolidation.max_output_tokens, 1_000);
+    }
+
+    // Mutation captured: accepting a cap without its model tokenizer would
+    // silently fall back to the old character estimate at send time.
+    #[test]
+    fn tokenized_llm_cap_requires_a_tokenizer_and_one_model() {
+        let tmp = TempDir::new().unwrap();
+        let config_path = tmp.path().join("config.toml");
+        std::fs::write(&config_path, "llm_max_input_tokens = 16000\n").unwrap();
+        let error = Config::load(Some(&config_path), Some(tmp.path().to_path_buf())).unwrap_err();
+        assert!(error.to_string().contains("llm_tokenizer_path"));
+
+        std::fs::write(
+            &config_path,
+            "llm_max_input_tokens = 16000\nllm_tokenizer_path = \"/tmp/model/tokenizer.json\"\n\
+             [[llm_fallbacks]]\nprovider = \"openai-compat\"\nmodel = \"other\"\nbase_url = \"http://127.0.0.1:9\"\n",
+        )
+        .unwrap();
+        let error = Config::load(Some(&config_path), Some(tmp.path().to_path_buf())).unwrap_err();
+        assert!(error.to_string().contains("fallback tokenizers may differ"));
+    }
+
+    /// Map-reduce chunking is active only when `chunk_input_tokens > 0`, and
+    /// an active mode must carry its tokenized dependencies: a positive
+    /// `llm_max_input_tokens` ceiling, a readable tokenizer, and a chunk
+    /// target that fits the ceiling. Each refusal is a startup error — the
+    /// server must never start with a chunk planner that cannot be sized by
+    /// the admission guard.
+    #[test]
+    fn map_reduce_chunking_requires_the_tokenized_ceiling() {
+        let tmp = TempDir::new().unwrap();
+        let config_path = tmp.path().join("config.toml");
+
+        // Active without any ceiling: refused.
+        std::fs::write(
+            &config_path,
+            "[consolidation]\nchunk_input_tokens = 14000\n",
+        )
+        .unwrap();
+        let error = Config::load(Some(&config_path), Some(tmp.path().to_path_buf())).unwrap_err();
+        assert!(
+            error.to_string().contains("llm_max_input_tokens"),
+            "unexpected error: {error:#}"
+        );
+
+        // Active with a ceiling but no readable tokenizer: refused.
+        std::fs::write(
+            &config_path,
+            "llm_max_input_tokens = 16000\n\n[consolidation]\nchunk_input_tokens = 14000\n",
+        )
+        .unwrap();
+        let error = Config::load(Some(&config_path), Some(tmp.path().to_path_buf())).unwrap_err();
+        assert!(
+            error.to_string().contains("llm_tokenizer_path"),
+            "unexpected error: {error:#}"
+        );
+
+        // A tokenizer path that does not exist: refused.
+        std::fs::write(
+            &config_path,
+            "llm_max_input_tokens = 16000\nllm_tokenizer_path = \"/definitely/not/here/tokenizer.json\"\n\n[consolidation]\nchunk_input_tokens = 14000\n",
+        )
+        .unwrap();
+        let error = Config::load(Some(&config_path), Some(tmp.path().to_path_buf())).unwrap_err();
+        assert!(
+            error.to_string().contains("readable"),
+            "unexpected error: {error:#}"
+        );
+
+        // A chunk target above the ceiling: refused.
+        let tokenizer = tmp.path().join("tokenizer.json");
+        std::fs::write(&tokenizer, b"{}{}").unwrap();
+        std::fs::write(
+            &config_path,
+            format!(
+                "llm_max_input_tokens = 16000\nllm_tokenizer_path = {:?}\n\n[consolidation]\nchunk_input_tokens = 17000\n",
+                tokenizer
+            ),
+        )
+        .unwrap();
+        let error = Config::load(Some(&config_path), Some(tmp.path().to_path_buf())).unwrap_err();
+        assert!(
+            error.to_string().contains("cannot exceed"),
+            "unexpected error: {error:#}"
+        );
+
+        // The valid combination: accepted, and the value round-trips.
+        std::fs::write(
+            &config_path,
+            format!(
+                "llm_max_input_tokens = 16000\nllm_tokenizer_path = {:?}\n\n[consolidation]\nchunk_input_tokens = 14000\n",
+                tokenizer
+            ),
+        )
+        .unwrap();
+        let cfg = Config::load(Some(&config_path), Some(tmp.path().to_path_buf())).unwrap();
+        assert_eq!(cfg.consolidation.chunk_input_tokens, 14_000);
+    }
+
+    /// The zero default is the contract: without an explicit
+    /// `chunk_input_tokens` the single-prompt pipeline is unchanged, and no
+    /// tokenized ceiling is required.
+    #[test]
+    fn map_reduce_chunking_is_off_by_default() {
+        let tmp = TempDir::new().unwrap();
+        let config_path = tmp.path().join("config.toml");
+        std::fs::write(
+            &config_path,
+            "[consolidation]\nmax_input_tokens = 100000\nmax_output_tokens = 32000\n",
+        )
+        .unwrap();
+        let cfg = Config::load(Some(&config_path), Some(tmp.path().to_path_buf())).unwrap();
+        assert_eq!(cfg.consolidation.chunk_input_tokens, 0);
+        assert!(cfg.llm_max_input_tokens.is_none());
     }
 
     /// `AI_MEMORY_LLM_TIMEOUT_SECS` (figment maps it to this field) exists so
@@ -3090,6 +3628,45 @@ mod tests {
         cfg.llm_compat_strict = false;
         let provider = cfg.llm_provider_config().unwrap().unwrap();
         assert!(!provider.compat_strict);
+    }
+
+    /// The thinking switch is opt-in: off by default (existing vLLM /
+    /// Ollama / LM Studio setups are unchanged) and forwarded verbatim to
+    /// the provider config when the operator turns it on.
+    #[test]
+    fn openai_compat_disable_thinking_defaults_off_and_is_forwarded() {
+        let mut cfg = Config {
+            llm_provider: Some("openai-compat".into()),
+            llm_model: Some("qwen3.8-27b".into()),
+            llm_base_url: Some("http://localhost:8000/v1".into()),
+            ..Config::default()
+        };
+
+        let provider = cfg.llm_provider_config().unwrap().unwrap();
+        assert!(!provider.compat_disable_thinking);
+
+        cfg.llm_compat_disable_thinking = true;
+        let provider = cfg.llm_provider_config().unwrap().unwrap();
+        assert!(provider.compat_disable_thinking);
+    }
+
+    /// TOML key loads and stays independent from the strict-mode default.
+    #[test]
+    fn load_accepts_llm_compat_disable_thinking_from_toml() {
+        let tmp = TempDir::new().unwrap();
+        let config_path = tmp.path().join("config.toml");
+        std::fs::write(&config_path, "llm_compat_disable_thinking = true\n").unwrap();
+        let cfg = Config::load(Some(&config_path), Some(tmp.path().to_path_buf())).unwrap();
+        assert!(cfg.llm_compat_disable_thinking);
+        // The sibling strict knob keeps its own default — independent keys.
+        assert!(cfg.llm_compat_strict);
+    }
+
+    #[test]
+    fn load_defaults_llm_compat_disable_thinking_off() {
+        let tmp = TempDir::new().unwrap();
+        let cfg = Config::load(None, Some(tmp.path().to_path_buf())).unwrap();
+        assert!(!cfg.llm_compat_disable_thinking);
     }
 
     #[test]

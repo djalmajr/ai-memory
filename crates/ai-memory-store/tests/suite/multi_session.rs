@@ -18,9 +18,9 @@
 
 use ai_memory_core::{
     ActorContext, AgentKind, HandoffAcceptance, IdentityKey, NewHandoff, NewPage, NewSession,
-    OwnerFilter, PagePath, ProjectId, SessionId, Tier, WorkspaceId, owner_stamp,
+    NewUser, OwnerFilter, PagePath, ProjectId, SessionId, Tier, UserRole, WorkspaceId, owner_stamp,
 };
-use ai_memory_store::Store;
+use ai_memory_store::{PrepareWorkstreamRun, Store, WorkstreamSelection};
 
 fn operator(name: &str) -> String {
     IdentityKey::User(name.into()).storage_key()
@@ -52,6 +52,7 @@ async fn open_session(
     store
         .writer
         .begin_session(NewSession {
+            occurred_at: None,
             id,
             workspace_id: ws,
             project_id: proj,
@@ -128,6 +129,74 @@ async fn one_operators_page_is_readable_by_another_in_the_same_project() {
         .unwrap()
         .expect("the page resolves by path for any reader");
     assert!(body.body.contains("We picked SQLite"));
+}
+
+/// The stronger form of the collaboration guarantee: the existing sibling
+/// test writes with `author_id: None`, so it cannot tell an "authored pages
+/// are private" regression from a genuine bug — a filter keyed on the
+/// caller's identity would happily let a NULL-authored page through. This
+/// stamps a real, non-null `author_id` (operator A) and asserts operator B —
+/// a *different* identity, reading with no owner coordinate at all, exactly
+/// as `search_pages_for_project` and `page_body_by_ids` are shaped — still
+/// sees the page in full, through both the search path and the direct-body
+/// path. `pages.author_id` is attribution, never a read filter.
+#[tokio::test]
+async fn an_authored_page_is_readable_by_a_different_operator_via_search_and_body() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = Store::open(tmp.path()).unwrap();
+    let (ws, proj) = scope(&store).await;
+
+    let operator_a = store
+        .writer
+        .create_human_user(
+            NewUser {
+                username: "operator-a".into(),
+                name: Some("Operator A".into()),
+                email: Some("operator-a@example.com".into()),
+            },
+            UserRole::User,
+            None,
+            false,
+        )
+        .await
+        .unwrap();
+
+    store
+        .writer
+        .upsert_page(NewPage {
+            author_id: Some(operator_a),
+            ..page(
+                ws,
+                proj,
+                "decisions/0002.md",
+                "Chose SQLite Again",
+                "We picked SQLite for the derived index, authored by operator A.",
+            )
+        })
+        .await
+        .unwrap();
+
+    // Operator B's read: no owner coordinate passed anywhere, because none of
+    // these signatures accept one — that absence IS the invariant.
+    let hits = store
+        .reader
+        .search_pages_for_project(ws, proj, "SQLite Again".to_string(), 10, None)
+        .await
+        .unwrap();
+    assert!(
+        hits.iter().any(|h| h.path.as_str() == "decisions/0002.md"),
+        "an authored page must be visible to a different operator's search; \
+         got {:?}",
+        hits.iter().map(|h| h.path.as_str()).collect::<Vec<_>>()
+    );
+
+    let body = store
+        .reader
+        .page_body_by_ids(ws, proj, "decisions/0002.md")
+        .await
+        .unwrap()
+        .expect("a different operator can still resolve the page by path");
+    assert!(body.body.contains("authored by operator A"));
 }
 
 /// Two harnesses editing the same page keep both versions.
@@ -356,5 +425,73 @@ async fn an_owned_handoff_stays_with_its_owner_while_pages_stay_shared() {
         !stolen,
         "carol must not be able to accept a baton owned by {}",
         operator("alice")
+    );
+}
+
+/// Two workstreams launched at once in one checkout each get a managed run.
+/// A session one run's child links marks that run only: the other run's
+/// status must neither report it nor count as linked, or its launcher would
+/// import the other launch's transcript.
+#[tokio::test]
+async fn a_session_linked_by_one_managed_run_is_not_another_runs() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = Store::open(tmp.path()).unwrap();
+    let (ws, proj) = scope(&store).await;
+    let prepare = |name: &str| PrepareWorkstreamRun {
+        workspace_id: ws,
+        project_id: proj,
+        repo_fingerprint: "repo".into(),
+        worktree_fingerprint: "worktree".into(),
+        cwd: "/repo".into(),
+        agent: AgentKind::Codex,
+        automatic_harness: false,
+        available_agents: Vec::new(),
+        selection: WorkstreamSelection::New(name.into()),
+        lease_owner: format!("launcher-{name}"),
+    };
+    let alpha = store
+        .writer
+        .prepare_workstream_run(prepare("alpha"))
+        .await
+        .unwrap();
+    let beta = store
+        .writer
+        .prepare_workstream_run(prepare("beta"))
+        .await
+        .unwrap();
+    assert_ne!(alpha.workstream_id, beta.workstream_id);
+    let status = async |run| {
+        let status = store.reader.managed_run_status(run).await.unwrap().unwrap();
+        (status.native_session_id, status.native_session_linked)
+    };
+
+    assert!(
+        store
+            .writer
+            .link_managed_run_session(beta.run_id, AgentKind::Codex, "native-beta")
+            .await
+            .unwrap()
+    );
+    assert_eq!(status(alpha.run_id).await, (None, false));
+    assert_eq!(
+        status(beta.run_id).await,
+        (Some("native-beta".into()), true)
+    );
+
+    // Control: alpha's own link marks alpha, and leaves beta as it was.
+    assert!(
+        store
+            .writer
+            .link_managed_run_session(alpha.run_id, AgentKind::Codex, "native-alpha")
+            .await
+            .unwrap()
+    );
+    assert_eq!(
+        status(alpha.run_id).await,
+        (Some("native-alpha".into()), true)
+    );
+    assert_eq!(
+        status(beta.run_id).await,
+        (Some("native-beta".into()), true)
     );
 }

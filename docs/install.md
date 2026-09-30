@@ -1,13 +1,16 @@
 # Installation cookbook
 
 The [README quick-start](../README.md#quick-start) covers the happy
-path (docker + Claude Code). This page covers everything else:
+paths (Docker + Claude Code, Arch AUR, macOS menu bar app). This page
+covers everything else:
 
 - [Server on a different machine](#server-on-a-different-machine)
   (homelab, LAN box, remote server)
 - [Configuring the CLI URL and auth](#configuring-the-cli-url-and-auth)
 - [Arch Linux native packages (AUR)](#arch-linux-native-packages-aur)
   (systemd system service or user service)
+- [macOS menu bar app](#macos-menu-bar-app)
+  (self-contained `.app` + LaunchAgent)
 - [Configuring other agent CLIs](#configuring-other-agent-clis)
   (Codex, Command Code, Devin CLI, OpenCode, OMP, Pi, Cursor, Claude Desktop, Gemini CLI, Antigravity CLI, Grok Build CLI, Zero, ZCode, Kimi Code, Kiro CLI, Pool, OpenClaw, VS Code Copilot, Zed)
 - [Installing hooks without docker](#installing-hooks-without-docker)
@@ -711,6 +714,42 @@ AI_MEMORY_NATIVE_TEST_BOX=ai-memory-native-test scripts/test-native-arch-systemd
 AI_MEMORY_NATIVE_TEST_KEEP_BOX=1 scripts/test-native-arch-systemd-distrobox.sh
 AI_MEMORY_NATIVE_TEST_IMAGE=quay.io/toolbx/arch-toolbox:latest scripts/test-native-arch-systemd-distrobox.sh
 ```
+
+---
+
+## macOS menu bar app
+
+On a Mac, the self-contained menu bar app is the GUI install: it bundles the
+native `ai-memory` binary and `hooks/` tree, governs the existing LaunchAgent
+(`com.github.akitaonrails.ai-memory`), and opens `/web`, `ai-memory status`,
+`config.toml`, the data directory, and logs. It does not replace those tools
+with a second dashboard.
+
+Needs a Rust toolchain and Xcode / Swift 6 (the same as a source build):
+
+```bash
+git clone https://github.com/akitaonrails/ai-memory
+cd ai-memory
+./companions/ai-memory-macos/build.sh
+open "companions/ai-memory-macos/dist/AI Memory.app"
+```
+
+Drag **AI Memory.app** to `/Applications`, then **Install & Start Server**
+from the menu extra (no Dock icon). When the status item is green, wire an
+agent with the bundled binary so `install-hooks` finds the sibling `hooks/`
+tree:
+
+```bash
+BIN="/Applications/AI Memory.app/Contents/Resources/runtime/ai-memory"
+"$BIN" install-mcp --client claude-code --apply
+"$BIN" install-hooks --agent claude-code --apply
+```
+
+Durable memory stays in `~/Library/Application Support/ai-memory`. Replacing
+the `.app` is an update and does not rewrite that tree. Prebuilt tarball,
+source-build, Docker-wrapper, and hand-installed launchd paths remain in
+[`docs/macos.md`](macos.md). Companion source:
+[`companions/ai-memory-macos`](../companions/ai-memory-macos).
 
 ---
 
@@ -1543,7 +1582,9 @@ The `serve` subcommand also accepts:
 | _(config only)_ | `AI_MEMORY_HOOK_RATE_PER_SEC`, `AI_MEMORY_HOOK_RATE_BURST` | Optional per-actor/session hook ingest token bucket. Unset/`0` rate disables it; burst defaults to the rate (minimum one token when enabled). |
 
 On macOS, see [`docs/macos.md`](macos.md); use the archive matching your
-architecture: `aarch64` for Apple Silicon, `x86_64` for Intel. On Windows, see
+architecture: `aarch64` for Apple Silicon, `x86_64` for Intel. The
+[menu bar app](#macos-menu-bar-app) is the self-contained GUI path (bundles
+the binary, starts the LaunchAgent, opens `/web` and status). On Windows, see
 [`docs/windows.md`](windows.md).
 The short version: run the install commands from the same environment that
 launches the agent. WSL2-launched agents need WSL paths and POSIX `.sh` hooks.
@@ -1730,13 +1771,13 @@ Use `ai-memory auth status` to check whether a token is present and
 `ai-memory auth logout openai-oauth` to remove it.
 
 > [!TIP]
-> **Pick a small, fast model.** Consolidation / lint / explore are
-> summarisation tasks, not hard reasoning — a mini-class model is plenty and
-> is much easier on subscription rate limits. Set e.g.
-> `AI_MEMORY_LLM_MODEL=gpt-5-mini` (the `gpt-5.5` default works but is
-> overkill for this workload). If you stay on a reasoning model, set
-> `AI_MEMORY_LLM_REASONING_EFFORT=none` or `low` so hidden thought tokens
-> do not eat the JSON budget. Reserve high-effort reasoning for your
+> **Leave the model at the provider default (`gpt-5.5`).** The Codex/ChatGPT
+> backend behind `openai-oauth` only accepts a small server-defined set of model
+> ids and rejects others — including `gpt-5-mini` — with a deterministic 400, so
+> do not set `AI_MEMORY_LLM_MODEL` for this backend. Consolidation / lint /
+> explore are summarisation tasks, so if the default reasoning is too heavy set
+> `AI_MEMORY_LLM_REASONING_EFFORT=none` or `low` instead, so hidden thought
+> tokens do not eat the JSON budget. Reserve high-effort reasoning for your
 > coding agent.
 
 ### Codex credential reuse
@@ -1809,7 +1850,20 @@ docker run -d --name ai-memory \
 ```
 
 There is no safe default model for `openai-compat`; the env var is
-required. For OpenRouter (Kimi, DeepSeek, etc.):
+required.
+
+On a shared GPU, `serve` admits one chat request at a time per process and
+allows at most 32 waiting requests. To reject oversized input before it
+reaches the provider, set `AI_MEMORY_LLM_MAX_INPUT_TOKENS=16000` and mount
+the configured model's `tokenizer.json` at
+`AI_MEMORY_LLM_TOKENIZER_PATH=/models/tokenizer.json`. The cap counts each
+message and structured-output schema with that tokenizer, plus a conservative
+chat-framing reserve; it applies to all LLM jobs. A capped setup currently
+rejects fallback chains because their tokenizers may differ. An ambiguous timeout or 499/502
+waits at least 60 seconds plus jitter before its sole replay; a connection
+failure or explicit capacity 503 can retry quickly.
+
+For OpenRouter (Kimi, DeepSeek, etc.):
 
 ```bash
 -e AI_MEMORY_LLM_PROVIDER=openai-compat
@@ -2126,7 +2180,9 @@ remote or uses a custom host/port.
                             "scratch" only as a defensive fallback for
                             hook events with no usable cwd.)
 --max-input-tokens N       (default: 150000; total source budget after prune)
---chunk-input-tokens N     (default: 24000; per LLM call; 0 = single call)
+--chunk-input-tokens N     (default: 24000; per LLM call, each asking for up
+                            to 16K output tokens; 0 = single call asking for
+                            up to 64K, so input + 64K must fit the context)
 --since "30 days ago"      (git log filter; supports "N days/months/years ago" + YYYY-MM-DD)
 --exclude-git              (skip commit history)
 --exclude-readme           (skip README)
@@ -2135,6 +2191,12 @@ remote or uses a custom host/port.
 --dry-run                  (collect + estimate but don't call LLM or write)
 --force                    (re-bootstrap, overwrites the prior manifest)
 ```
+
+**Budgets and the estimate.** Bootstrap estimates tokens as bytes ÷ 4, which
+undercounts non-English text and code, so it fills only 80% of
+`--max-input-tokens` and of each `--chunk-input-tokens` by that estimate. The
+dry run still reports tokens by the same estimate; the sources it keeps and the
+chunks it plans reflect the margin.
 
 **Cost.** With Kimi 2.6 via OpenRouter ($0.73/$3.49 per M):
 - 50k input tokens cap → ~$0.04 worst case input
@@ -2369,6 +2431,11 @@ unrelated Compose project just because its file occupies a conventional path;
 the wrapper instead writes the inspected standalone recreation script for
 review, preserving the existing `/data` mount and other runtime options.
 
+The macOS menu bar app is not covered by `ai-memory upgrade`. Rebuild with
+`./companions/ai-memory-macos/build.sh` (or replace `/Applications/AI Memory.app`
+with a newer staged bundle). Wiki, SQLite, config, and models stay in
+`~/Library/Application Support/ai-memory`.
+
 Set `AI_MEMORY_NO_VERSION_CHECK=1` to silence the daily check. To pin wrapper
 self-upgrades to a fork or tagged release, set `AI_MEMORY_WRAPPER_URL=<url>`;
 the wrapper requires `<url>.sha256` unless
@@ -2412,6 +2479,8 @@ write to `~/.local/share/ai-memory/hooks/`.
 
 ## See also
 
+- [`docs/macos.md`](macos.md) - macOS install paths: menu bar app, native
+  release tarball, source build, Docker wrapper, and launchd
 - [`docs/deploy.md`](deploy.md) - homelab deploy walkthrough
   (`bin/deploy`, cloudflared TLS, env-file management)
 - [`docs/usage.md`](usage.md) - handoffs, proactive querying, web UI, slim

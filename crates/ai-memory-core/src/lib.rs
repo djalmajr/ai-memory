@@ -43,7 +43,7 @@ pub const GLOBAL_SCOPE_PROJECT: &str = "_global";
 
 pub use active_project::{
     ActiveProject, ActiveProjectLookup, ActiveProjectMode, ActorKey, DEFAULT_MAX_ENTRIES,
-    DEFAULT_PER_KEY_TTL, MidSessionRouting,
+    DEFAULT_PER_KEY_TTL, MidSessionRouting, ReadPointer,
 };
 pub use actor::{
     ActorContext, AuthLevel, AuthzError, Capability, IdentityKey, OwnerFilter,
@@ -68,7 +68,7 @@ pub use observation::{NewObservation, NewSession, Observation, ObservationKind};
 pub use page::{
     FeedbackKind, LinkTarget, MAX_ENTITIES_PER_PAGE, MAX_ENTITY_LEN, NewPage, Page, PageEvidence,
     PageEvidenceKind, Relation, Tier, frontmatter_entity_names, normalize_entities,
-    normalize_entity,
+    normalize_entity, parse_expires_at_instant,
 };
 pub use routing_snippet::{
     COMPACT_SNIPPET_BODY, MARKER_END, MARKER_START, SNIPPET_BODY, compact_block, find_marker_line,

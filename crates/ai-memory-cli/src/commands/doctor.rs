@@ -20,7 +20,7 @@
 //! for the captured side, and the local side is read-only.
 
 use std::collections::BTreeMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
 use anyhow::{Context, Result};
@@ -175,15 +175,35 @@ pub(crate) fn build_rows(
 /// Read-only. A harness whose store is unreadable, absent, or unsupported
 /// simply contributes nothing — the command never invents a gap it cannot see.
 pub(crate) async fn scan_local(home: &Path, cwd: &Path, since_days: u32) -> Vec<LocalScan> {
+    scan_local_with(home, cwd, since_days, relocated_session_dir).await
+}
+
+/// Where `harness` keeps its sessions when the environment relocates its home
+/// (`CLAUDE_CONFIG_DIR`, `CODEX_HOME`, `KIMI_CODE_HOME`, …), via the same
+/// launch-plan resolver `ai-memory run` uses. `None` means the default
+/// `$HOME`-relative store.
+pub(crate) fn relocated_session_dir(harness: ManagedHarness) -> Option<PathBuf> {
+    build_launch_plan(harness, None, Vec::new(), None)
+        .ok()
+        .and_then(|plan| plan.session_dir)
+}
+
+/// [`scan_local`] with the relocation lookup passed in. The lookup reads the
+/// process environment, so a test that plants a fixture under a temporary
+/// `$HOME` passes `|_| None`: otherwise a developer's `CLAUDE_CONFIG_DIR`
+/// wins over that `$HOME` and the fixture is never found.
+async fn scan_local_with(
+    home: &Path,
+    cwd: &Path,
+    since_days: u32,
+    session_dir_for: impl Fn(ManagedHarness) -> Option<PathBuf>,
+) -> Vec<LocalScan> {
     let recent_cutoff = recent_cutoff(SystemTime::now(), since_days);
     let mut scans = Vec::new();
     for &harness in SCANNED_HARNESSES {
-        // Honor harness home relocations (CODEX_HOME, KIMI_CODE_HOME, …) via the
-        // same launch-plan resolver `ai-memory run` uses; fall back to the
-        // default $HOME-relative store when a probe plan cannot be built.
-        let session_dir = build_launch_plan(harness, None, Vec::new(), None)
-            .ok()
-            .and_then(|plan| plan.session_dir);
+        // Honor harness home relocations (see `relocated_session_dir`); fall
+        // back to the default $HOME-relative store when there is none.
+        let session_dir = session_dir_for(harness);
         let Ok(sessions) =
             list_native_sessions(harness, home, cwd, session_dir.as_deref(), SCAN_LIMIT).await
         else {
@@ -478,7 +498,7 @@ mod tests {
         });
         std::fs::write(session_dir.join("foreign.jsonl"), format!("{foreign}\n")).unwrap();
 
-        let scans = scan_local(home.path(), cwd.path(), 0).await;
+        let scans = scan_local_with(home.path(), cwd.path(), 0, |_| None).await;
         let claude = scans
             .iter()
             .find(|s| s.agent == AgentKind::ClaudeCode)
@@ -488,7 +508,7 @@ mod tests {
 
         // And a project with no local stores yields no scans at all.
         let empty_home = tempfile::tempdir().unwrap();
-        let none = scan_local(empty_home.path(), cwd.path(), 0).await;
+        let none = scan_local_with(empty_home.path(), cwd.path(), 0, |_| None).await;
         assert!(none.is_empty(), "no stores should mean no scans: {none:?}");
     }
 }

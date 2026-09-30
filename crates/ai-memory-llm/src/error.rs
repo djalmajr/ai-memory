@@ -22,6 +22,46 @@ pub enum LlmError {
         body: String,
     },
 
+    /// Rate limit carrying the server's delta-seconds Retry-After value.
+    #[error("provider error 429: {body}")]
+    RateLimited {
+        /// Bounded response body.
+        body: String,
+        /// Delay requested by the provider, if it supplied delta seconds.
+        retry_after_secs: Option<u64>,
+    },
+
+    /// A 503 explicitly marked as admission/capacity by Retry-After.
+    #[error("provider error 503: {body}")]
+    Capacity {
+        /// Bounded response body.
+        body: String,
+        /// Retry-After delta seconds from the provider.
+        retry_after_secs: u64,
+    },
+
+    /// The request may have reached the model. One delayed replay also failed.
+    #[error("ambiguous LLM request failed after one delayed retry ({class}{status:?})")]
+    AmbiguousRetryExhausted {
+        /// Redacted class of the second failure.
+        class: &'static str,
+        /// HTTP status of the second failure, when available.
+        status: Option<u16>,
+    },
+
+    /// Bounded admission queue is full.
+    #[error("LLM admission queue is full")]
+    AdmissionFull,
+
+    /// Tokenized input exceeds the configured pre-send limit.
+    #[error("LLM input token limit exceeded: {tokens} > {max}")]
+    InputLimit {
+        /// Count made with the configured tokenizer and chat overhead reserve.
+        tokens: usize,
+        /// Configured limit.
+        max: usize,
+    },
+
     /// JSON (de)serialization failure.
     #[error("serde: {0}")]
     Serde(String),
@@ -30,6 +70,32 @@ pub enum LlmError {
     /// use block where structured output was requested).
     #[error("unexpected response shape: {0}")]
     UnexpectedShape(String),
+
+    /// Structured response stopped at the provider's token budget
+    /// (`finish_reason = "length"`): the engine ran out of output budget
+    /// before finishing the JSON. Terminal — a retry reproduces the same
+    /// truncation and doubles the spend. Carries only the configured
+    /// model label and the provider-reported completion token count —
+    /// never response content, prompt text, or secrets.
+    #[error(
+        "structured response truncated at token budget (finish_reason=length) for model {model}"
+    )]
+    TruncatedResponse {
+        /// Configured model label.
+        model: String,
+        /// `usage.completion_tokens` when the provider reported it.
+        completion_tokens: Option<u32>,
+    },
+
+    /// Structured request got HTTP 2xx but no usable message content
+    /// (`message.content` missing, empty, or whitespace-only). Terminal
+    /// and distinct from [`Self::TruncatedResponse`] and from a JSON
+    /// parse error: nothing was produced to parse.
+    #[error("provider returned no message content for model {model}")]
+    EmptyContent {
+        /// Configured model label.
+        model: String,
+    },
 
     /// Configured provider lacks the env var we need.
     #[error("provider not configured: {0}")]
@@ -59,22 +125,50 @@ pub enum LlmError {
 }
 
 impl LlmError {
-    /// Whether this failure is worth a short, bounded retry.
+    /// Whether this failure might clear on a later attempt.
     ///
-    /// True only for errors that a subsequent identical request could plausibly
-    /// succeed on: a server-side `Provider` status (`429` or any `5xx`,
-    /// including Cloudflare's `52x`), or an `Http` transport timeout / connect
-    /// failure. Everything else — auth, schema, a malformed-request `4xx`, a
-    /// deserialization or unexpected-shape error — is deterministic: retrying
-    /// only burns another expensive call. Callers must keep the retry *short
-    /// and bounded* (a few attempts, seconds apart); this is not a license for
-    /// tenacity-style 8–128s backoff (see the cognee #2840 lesson in `lib.rs`).
+    /// This remains useful for passive health classification. Callers that
+    /// actually send another request use [`Self::is_fast_retryable`] or the
+    /// admission wrapper's one delayed ambiguous-delivery retry.
     #[must_use]
     pub fn is_transient(&self) -> bool {
         match self {
             Self::Provider { status, .. } => *status == 429 || (500..=599).contains(status),
+            Self::RateLimited { .. } => true,
+            Self::Capacity { .. } => true,
             Self::Http(e) => e.is_timeout() || e.is_connect(),
             _ => false,
+        }
+    }
+
+    /// A retry that cannot duplicate an accepted model request.
+    #[must_use]
+    pub fn is_fast_retryable(&self) -> bool {
+        match self {
+            Self::Capacity { .. } => true,
+            Self::Http(error) => error.is_connect(),
+            _ => false,
+        }
+    }
+
+    /// The upstream may still have consumed the request after this error.
+    #[must_use]
+    pub fn is_ambiguous_delivery(&self) -> bool {
+        match self {
+            Self::Provider { status, .. } => *status == 499 || *status >= 500,
+            Self::Http(error) => error.is_timeout(),
+            _ => false,
+        }
+    }
+
+    /// Delta-seconds Retry-After for an explicit 429 response.
+    #[must_use]
+    pub fn retry_after_secs(&self) -> Option<u64> {
+        match self {
+            Self::RateLimited {
+                retry_after_secs, ..
+            } => *retry_after_secs,
+            _ => None,
         }
     }
 
@@ -84,6 +178,9 @@ impl LlmError {
         match self {
             Self::Http(e) => e.status().map(|status| status.as_u16()),
             Self::Provider { status, .. } => Some(*status),
+            Self::RateLimited { .. } => Some(429),
+            Self::Capacity { .. } => Some(503),
+            Self::AmbiguousRetryExhausted { status, .. } => *status,
             _ => None,
         }
     }
@@ -95,8 +192,15 @@ impl LlmError {
         match self {
             Self::Http(_) => "http",
             Self::Provider { .. } => "provider",
+            Self::RateLimited { .. } => "rate_limit",
+            Self::Capacity { .. } => "capacity",
+            Self::AmbiguousRetryExhausted { .. } => "ambiguous_retry_exhausted",
+            Self::AdmissionFull => "admission_full",
+            Self::InputLimit { .. } => "input_limit",
             Self::Serde(_) => "serde",
             Self::UnexpectedShape(_) => "unexpected-shape",
+            Self::TruncatedResponse { .. } => "truncated-response",
+            Self::EmptyContent { .. } => "empty-content",
             Self::NotConfigured(_) => "not-configured",
             Self::Auth(_) => "auth",
             Self::Schema(_) => "schema",
@@ -147,6 +251,34 @@ mod tests {
         }
     }
 
+    // Mutation captured: treating any 503 or 502 as pre-admission capacity
+    // would immediately duplicate a request the backend may have processed.
+    #[test]
+    fn fast_retry_requires_explicit_capacity_or_connection_failure() {
+        assert!(
+            LlmError::Capacity {
+                body: String::new(),
+                retry_after_secs: 1,
+            }
+            .is_fast_retryable()
+        );
+        for status in [499, 500, 502, 503, 504] {
+            let error = LlmError::Provider {
+                status,
+                body: String::new(),
+            };
+            assert!(!error.is_fast_retryable(), "status {status}");
+            assert!(error.is_ambiguous_delivery(), "status {status}");
+        }
+        assert!(
+            !LlmError::RateLimited {
+                body: String::new(),
+                retry_after_secs: None,
+            }
+            .is_fast_retryable()
+        );
+    }
+
     #[test]
     fn deterministic_errors_are_not_transient() {
         assert!(!LlmError::Auth("expired".into()).is_transient());
@@ -154,6 +286,48 @@ mod tests {
         assert!(!LlmError::Serde("nope".into()).is_transient());
         assert!(!LlmError::UnexpectedShape("no tool block".into()).is_transient());
         assert!(!LlmError::NotConfigured("no key".into()).is_transient());
+    }
+
+    // A `length` stop or an empty 2xx is a definitive answer about this
+    // response: none of the retry lanes (transient, fast retry, delayed
+    // ambiguous-delivery replay) may fire, and the error must carry no
+    // response content in its message.
+    #[test]
+    fn truncated_and_empty_content_are_terminal_and_content_free() {
+        let truncated = LlmError::TruncatedResponse {
+            model: "qwen3.8-27b".into(),
+            completion_tokens: Some(4096),
+        };
+        assert_eq!(truncated.class(), "truncated-response");
+        assert!(!truncated.is_transient());
+        assert!(!truncated.is_fast_retryable());
+        assert!(!truncated.is_ambiguous_delivery());
+        assert_eq!(truncated.http_status(), None);
+        let rendered = truncated.to_string();
+        assert!(rendered.contains("finish_reason=length"), "{rendered}");
+        assert!(rendered.contains("qwen3.8-27b"), "{rendered}");
+
+        let empty = LlmError::EmptyContent {
+            model: "qwen3.8-27b".into(),
+        };
+        assert_eq!(empty.class(), "empty-content");
+        assert!(!empty.is_transient());
+        assert!(!empty.is_fast_retryable());
+        assert!(!empty.is_ambiguous_delivery());
+        assert_eq!(empty.http_status(), None);
+    }
+
+    #[test]
+    fn truncated_response_message_carries_no_content() {
+        let err = LlmError::TruncatedResponse {
+            model: "qwen3.8-27b".into(),
+            completion_tokens: None,
+        };
+        let rendered = err.to_string();
+        // Only the class, the wire fact, and the operator's own model
+        // label may appear — never the (truncated) completion text.
+        assert!(!rendered.contains('{'), "{rendered}");
+        assert_eq!(rendered.matches('"').count(), 0, "{rendered}");
     }
 
     #[test]
@@ -195,6 +369,17 @@ mod tests {
             (
                 LlmError::UnexpectedShape("no tool block".into()),
                 "unexpected-shape",
+            ),
+            (
+                LlmError::TruncatedResponse {
+                    model: "qwen3.8-27b".into(),
+                    completion_tokens: Some(4096),
+                },
+                "truncated-response",
+            ),
+            (
+                LlmError::EmptyContent { model: "m".into() },
+                "empty-content",
             ),
             (LlmError::NotConfigured("no key".into()), "not-configured"),
             (LlmError::Auth("expired".into()), "auth"),
