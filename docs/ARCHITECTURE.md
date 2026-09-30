@@ -94,7 +94,17 @@ from hook paths.
    that summary into a richer durable page or fans out into a
    multi-page batch under `concepts/`, `decisions/`, `gotchas/`. Consolidation
    prompts preserve the source material's dominant natural language and ask
-   the model to connect related pages with path-based wikilinks.
+   the model to connect related pages with path-based wikilinks. The default
+   single-page and batch prompts lead the user content with their stable
+   blocks — the fixed batch text (header + field schema) and the project
+   instructions — followed by the current body / slot and title state, and
+   only then the session id and observation dump, so providers with prefix
+   caching can reuse the stable prefix. In the single-page prompt the current
+   body is the session's own page body (`sessions/<id>.md`), so it varies per
+   session: the prefix shared across sessions of one project is the system
+   prompt plus the instructions block when present, and the titles block
+   follows the variable body. The input budget remains an approximate
+   character estimate; cache eligibility is not a measured hit.
 5. When an LLM provider is configured, the auto-improvement scheduler reviews
    newly completed sessions across all projects outside hook latency. It records validated
    `concepts/`, `decisions/`, `gotchas/`, `procedures/`, and `_rules/` proposals
