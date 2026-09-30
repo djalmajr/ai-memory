@@ -6198,6 +6198,51 @@ mod tests {
         }
     }
 
+    /// Installs the per-thread capture subscriber and returns its guard,
+    /// a companion `Dispatch`, and the companion's own capture buffer.
+    /// Keep all three alive until the assertions read the capture.
+    ///
+    /// The companion exists because tracing-core caches each callsite's
+    /// interest process-wide: while exactly one dispatcher is registered,
+    /// the cache is computed from the *registering* thread's default
+    /// dispatcher, so a first registration by a subscriber-less thread —
+    /// a parallel test hitting the same production `warn!` — pins
+    /// `Interest::never` and later emissions are dropped before reaching
+    /// any subscriber. With a second live `Dispatch` the rebuilder reads
+    /// the registered dispatchers instead of the calling thread, so a
+    /// subscriber-less registration can no longer pin `never`; the
+    /// `rebuild_interest_cache()` call heals callsites that were
+    /// registered (and possibly poisoned) before the companion came
+    /// alive. The companion must be a distinct registered `Dispatch` — a
+    /// clone of the capture dispatch is the same entry and does not count
+    /// — and it must outlive the capture: dropping it early reopens the
+    /// single-dispatcher window. Both dispatchers drop with the test, so
+    /// no state outlives it.
+    fn install_capture(
+        captured: CapturedLog,
+    ) -> (
+        tracing::subscriber::DefaultGuard,
+        tracing::Dispatch,
+        CapturedLog,
+    ) {
+        let companion_capture = CapturedLog::default();
+        let companion = tracing::Dispatch::new(
+            tracing_subscriber::fmt()
+                .with_writer(companion_capture.clone())
+                .with_max_level(tracing::Level::WARN)
+                .with_ansi(false)
+                .finish(),
+        );
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(captured)
+            .with_max_level(tracing::Level::WARN)
+            .with_ansi(false)
+            .finish();
+        let guard = tracing::subscriber::set_default(subscriber);
+        tracing::callsite::rebuild_interest_cache();
+        (guard, companion, companion_capture)
+    }
+
     /// Mutation captured: formatting the `LlmError`'s `Display` into the
     /// degradation warning copies the provider body into the server log. The
     /// warning must carry class/status only, the hits keep the pre-rerank
@@ -6206,18 +6251,42 @@ mod tests {
     #[tokio::test]
     async fn reranker_provider_failure_warning_carries_class_status_not_body() {
         let captured = CapturedLog::default();
-        let subscriber = tracing_subscriber::fmt()
-            .with_writer(captured.clone())
-            .with_max_level(tracing::Level::WARN)
-            .with_ansi(false)
-            .finish();
-        let _guard = tracing::subscriber::set_default(subscriber);
+        let (_guard, _companion, companion_log) = install_capture(captured.clone());
 
         let (_tmp, _store, server, _ws, _proj) = setup_server().await;
         let hits = rerank_test_hits(4);
         let original_ids: Vec<PageId> = hits.iter().map(|(hit, _)| hit.id).collect();
         let (reranker, calls, _) = stub_reranker(StubRerankOutcome::ProviderFail, Duration::ZERO);
         let server = server.with_reranker(reranker);
+
+        // Adversarial schedule: the window this mechanism produces — a
+        // subscriber-less thread registering the production failure
+        // callsite first (the scheduling class behind the Windows CI
+        // failure; the exact runner order was not instrumented). This
+        // thread performs that first use before the emission below.
+        // `join` fixes the order without any timing dependency, and the
+        // thread runs its own server and reranker so the counters and
+        // assertions below stay exact.
+        let adversarial_hits = hits.clone();
+        std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("adversarial first-registration runtime");
+            runtime.block_on(async move {
+                let (_tmp, _store, poison_server, _ws, _proj) = setup_server().await;
+                let (poison_reranker, poison_calls, _) =
+                    stub_reranker(StubRerankOutcome::ProviderFail, Duration::ZERO);
+                let result = poison_server
+                    .with_reranker(poison_reranker)
+                    .rerank_hits("query", adversarial_hits, 2)
+                    .await;
+                assert_eq!(result.len(), 2);
+                assert_eq!(poison_calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+            });
+        })
+        .join()
+        .expect("adversarial first-registration thread");
 
         let result = server.rerank_hits("query", hits, 2).await;
 
@@ -6254,6 +6323,13 @@ mod tests {
             !logged.contains("SENTINEL_PRIVATE_BODY"),
             "provider body leaked into the reranker log: {logged}"
         );
+        // The companion dispatch only guards the process-wide interest
+        // cache: nothing may flow through it.
+        assert!(
+            companion_log.text().is_empty(),
+            "the companion dispatch must stay scoped out of the capture: {}",
+            companion_log.text()
+        );
     }
 
     /// A task failure (`JoinError`) and a timeout are different classes from
@@ -6262,12 +6338,7 @@ mod tests {
     #[tokio::test]
     async fn reranker_task_failure_and_timeout_stay_degraded_without_request_content() {
         let captured = CapturedLog::default();
-        let subscriber = tracing_subscriber::fmt()
-            .with_writer(captured.clone())
-            .with_max_level(tracing::Level::WARN)
-            .with_ansi(false)
-            .finish();
-        let _guard = tracing::subscriber::set_default(subscriber);
+        let (_guard, _companion, companion_log) = install_capture(captured.clone());
 
         let (_tmp, _store, server, _ws, _proj) = setup_server().await;
         let hits = rerank_test_hits(4);
@@ -6330,6 +6401,13 @@ mod tests {
         assert!(
             !logged.contains("stub reranker task failure"),
             "the panic payload must not reach the task-failure warning: {logged}"
+        );
+        // The companion dispatch only guards the process-wide interest
+        // cache: nothing may flow through it.
+        assert!(
+            companion_log.text().is_empty(),
+            "the companion dispatch must stay scoped out of the capture: {}",
+            companion_log.text()
         );
     }
 
