@@ -90,8 +90,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   system prompt, budget math, clipping, and
   observation selection are unchanged — blocks were only permuted — and the
   input budget remains an approximate character estimate (no tokenizer
-  ceiling promised, no cache hit guaranteed). (PR reference pending local
-  validation)
+  ceiling promised, no cache hit guaranteed). (#3)
 
 ### Fixed
 - Structured LLM responses stopped at the output budget
