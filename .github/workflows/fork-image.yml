@@ -1,0 +1,139 @@
+# Build + push the fork's production ai-memory bundle image (engine + UI in
+# ONE image) to the fork GHCR.
+#
+# Fork-exclusive: this workflow and deploy/ do not exist upstream
+# (akitaonrails/ai-memory), so upstream merges never conflict with them.
+# The deploy path and this workflow are the only build surface of the fork
+# image — there is no push/tag trigger and no other dispatcher.
+#
+# Dispatch-only (manual). Both inputs are REQUIRED and must be exactly
+# 40 hex chars (full SHA); branch names, release tags, latest and empty are
+# rejected BEFORE any checkout, login or build.
+#
+# Every candidate is tagged candidate-<run_id>-<run_attempt> (immutable per
+# run, never latest). The digest of the build step is validated as
+# sha256:64hex before the run summary claims success; the summary records
+# image, tag, digest, the validated refs and the workflow SHA (source of
+# deploy/Dockerfile).
+#
+# The engine is checked out at engine_ref (build context); deploy/Dockerfile
+# is read from the workflow commit (github.sha), so an old engine SHA that
+# predates deploy/ still builds with the current Dockerfile.
+#
+# Login uses github.actor + GITHUB_TOKEN. Single-arch (linux/amd64).
+
+name: fork-image
+
+on:
+  workflow_dispatch:
+    inputs:
+      engine_ref:
+        description: "ai-memory engine ref: exactly 40 hex chars (full SHA); branch names, release tags, latest and empty are rejected."
+        required: true
+        type: string
+      ui_ref:
+        description: "ai-memory-ui ref: exactly 40 hex chars (full SHA); branch names, release tags, latest and empty are rejected."
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  # One group for the whole workflow: a pending run is only ever replaced by
+  # another dispatch of the same workflow. The active run is never canceled.
+  group: fork-image
+  cancel-in-progress: false
+
+jobs:
+  build-image:
+    runs-on: ubuntu-latest
+    steps:
+      # Gate: reject invalid refs before any checkout, login or build.
+      # Exactly 40 lowercase hex chars — branch names, release tags, latest
+      # and empty are all rejected by the same regex.
+      - name: Validate refs
+        env:
+          ENGINE_REF: ${{ github.event.inputs.engine_ref }}
+          UI_REF: ${{ github.event.inputs.ui_ref }}
+        run: |
+          set -euo pipefail
+          fail() { echo "::error::$1" >&2; exit 1; }
+          if ! [[ "$ENGINE_REF" =~ ^[0-9a-f]{40}$ ]]; then
+            fail "engine_ref must be exactly 40 hex chars (full SHA); branch names, release tags, latest and empty are not allowed; got '$ENGINE_REF'"
+          fi
+          if ! [[ "$UI_REF" =~ ^[0-9a-f]{40}$ ]]; then
+            fail "ui_ref must be exactly 40 hex chars (full SHA); branch names, release tags, latest and empty are not allowed; got '$UI_REF'"
+          fi
+          echo "refs OK: engine_ref=$ENGINE_REF ui_ref=$UI_REF"
+
+      # The workflow commit (github.sha): source of deploy/Dockerfile.
+      - name: Checkout deploy source
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ github.sha }}
+          path: deploy-src
+
+      # The engine at the validated engine_ref: the docker build context.
+      # Full history so the exact SHA is always checkable out.
+      - name: Checkout engine
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ inputs.engine_ref }}
+          path: engine
+          fetch-depth: 0
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build + push candidate
+        id: build
+        uses: docker/build-push-action@v7
+        with:
+          context: engine/
+          file: deploy-src/deploy/Dockerfile
+          platforms: linux/amd64
+          push: true
+          build-args: |
+            AI_MEMORY_UI_REF=${{ inputs.ui_ref }}
+          tags: ghcr.io/djalmajr/ai-memory:candidate-${{ github.run_id }}-${{ github.run_attempt }}
+          labels: |
+            org.opencontainers.image.source=https://github.com/djalmajr/ai-memory
+            org.opencontainers.image.revision=${{ inputs.engine_ref }}
+            io.djalmajr.ai-memory.ui-ref=${{ inputs.ui_ref }}
+          cache-from: type=registry,ref=ghcr.io/djalmajr/ai-memory:buildcache
+          cache-to: type=registry,ref=ghcr.io/djalmajr/ai-memory:buildcache,mode=max
+
+      - name: Validate digest and write to run summary
+        env:
+          IMAGE: ghcr.io/djalmajr/ai-memory
+          TAG: candidate-${{ github.run_id }}-${{ github.run_attempt }}
+          ENGINE_REF: ${{ inputs.engine_ref }}
+          UI_REF: ${{ inputs.ui_ref }}
+          WORKFLOW_SHA: ${{ github.sha }}
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          set -euo pipefail
+          # Fail closed: an empty or malformed digest must not claim success.
+          if ! [[ "$DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+            echo "::error::pushed digest is empty or malformed; must be sha256: followed by 64 lowercase hex chars; got '$DIGEST'" >&2
+            exit 1
+          fi
+          {
+            echo "## ai-memory candidate (fork image)"
+            echo
+            echo "- image: \`$IMAGE\`"
+            echo "- tag: \`$TAG\`"
+            echo "- digest: \`$DIGEST\`"
+            echo "- engine_ref: \`$ENGINE_REF\`"
+            echo "- ui_ref: \`$UI_REF\`"
+            echo "- workflow SHA (deploy/Dockerfile source): \`$WORKFLOW_SHA\`"
+          } >> "$GITHUB_STEP_SUMMARY"
