@@ -89,6 +89,10 @@ fn run_wrapper_on_fake_macos(args: &[&str]) -> String {
         .args(args)
         .env("PATH", path)
         .env("AI_MEMORY_DOCKER", shell_path(&docker))
+        // This helper asserts container argv. `install-hooks` defaults to the
+        // native host client now; opt into the documented script fallback so
+        // that subcommand still exercises the container-routing contract.
+        .env("AI_MEMORY_HOOK_PLATFORM", "posix")
         .env("AI_MEMORY_NO_VERSION_CHECK", "1")
         .env("AI_MEMORY_DATA_VOLUME", "test-ai-memory-data")
         .env("HOME", shell_path(tmp.path()))
@@ -189,6 +193,103 @@ fn macos_release_tarball_ships_the_launchd_agent_plist() {
         release.contains(LAUNCHD_AGENT_PLIST),
         "the macOS tarball smoke test must prove the plist actually shipped"
     );
+}
+
+/// Source lock: Unix release packing must disable macOS AppleDouble sidecars
+/// (`._*`) so Linux runners and macOS producers emit the same archive layout
+/// upgrade's allowlist expects (see `extracts_archive_built_like_release_yml`).
+#[test]
+fn unix_release_tarball_packing_disables_appledouble_sidecars() {
+    let release = read_repo(".github/workflows/release.yml");
+    let pack = "COPYFILE_DISABLE=1 tar -C \"dist/$artifact\" -czf \"$artifact.tar.gz\" .";
+    assert!(
+        release.matches(pack).count() >= 2,
+        "Linux and macOS release pack steps must set COPYFILE_DISABLE=1"
+    );
+}
+
+/// Drift lock for #1025: every top-level name staged into a release archive
+/// by `release.yml` must be extractable or listed in upgrade's exact support
+/// consts (`RELEASE_SUPPORT_*`). Direction is release → allowlist (Windows
+/// correctly omits `packaging/`). Catching a new `dist/$artifact/share`
+/// without an allowlist update keeps CI red before a live tarball upgrade
+/// fails after checksum.
+#[test]
+fn release_yml_staged_top_levels_are_upgrade_allowlisted() {
+    let release = read_repo(".github/workflows/release.yml");
+    let staged = release_yml_staged_top_levels(&release);
+    assert!(
+        staged.contains("hooks") && staged.contains("docs") && staged.contains("crates"),
+        "sanity: release.yml must still stage shared top-levels; got {staged:?}"
+    );
+
+    let upgrade = read_repo("crates/ai-memory-cli/src/commands/upgrade.rs");
+    let dirs = const_str_slice_body(&upgrade, "RELEASE_SUPPORT_DIRS");
+    let files = const_str_slice_body(&upgrade, "RELEASE_SUPPORT_FILES");
+    for name in &staged {
+        // Runtime extract targets live outside the support consts.
+        if matches!(name.as_str(), "hooks" | "ai-memory" | "ai-memory.exe") {
+            continue;
+        }
+        let quoted = format!("\"{name}\"");
+        assert!(
+            dirs.contains(&quoted) || files.contains(&quoted),
+            "release.yml stages top-level `{name}` but it is missing from \
+             RELEASE_SUPPORT_DIRS/FILES in upgrade.rs"
+        );
+    }
+}
+
+/// First path components under `dist/$artifact/…` and `$stage/…`, plus
+/// README.md/LICENSE when the workflow copies them onto the stage root.
+fn release_yml_staged_top_levels(release: &str) -> std::collections::BTreeSet<String> {
+    let mut tops = std::collections::BTreeSet::new();
+    for prefix in ["dist/$artifact/", "$stage/"] {
+        let mut search = release;
+        while let Some(idx) = search.find(prefix) {
+            let after = &search[idx + prefix.len()..];
+            let end = after
+                .find(|c: char| c == '"' || c == '\'' || c == '`' || c == '\\' || c.is_whitespace())
+                .unwrap_or(after.len());
+            let rel = &after[..end];
+            if let Some(top) = rel
+                .split('/')
+                .next()
+                .filter(|s| is_release_top_level_name(s))
+            {
+                tops.insert(top.to_string());
+            }
+            // Always advance so an empty relative path cannot spin forever.
+            search = &search[idx + 1..];
+        }
+    }
+    if release.contains("cp README.md LICENSE \"dist/$artifact/\"")
+        || release.contains("Copy-Item README.md, LICENSE $stage")
+    {
+        tops.insert("README.md".to_string());
+        tops.insert("LICENSE".to_string());
+    }
+    tops
+}
+
+/// Reject globs / comment noise (e.g. `"$stage/*"` in release.yml prose).
+fn is_release_top_level_name(name: &str) -> bool {
+    !name.is_empty()
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+}
+
+fn const_str_slice_body<'a>(src: &'a str, name: &str) -> &'a str {
+    let marker = format!("const {name}:");
+    let start = src
+        .find(&marker)
+        .unwrap_or_else(|| panic!("upgrade.rs must declare {name}"));
+    let from = &src[start..];
+    let end = from
+        .find(';')
+        .unwrap_or_else(|| panic!("{name} const must end with ';'"));
+    &from[..end]
 }
 
 #[test]
@@ -294,7 +395,7 @@ fn docker_publish_jobs_use_prebuilt_binaries() {
     assert!(release.contains("artifact: ai-memory-linux-aarch64"));
     assert!(release.contains("artifact: ai-memory-macos-aarch64"));
     assert!(release.contains("artifact: ai-memory-macos-x86_64"));
-    assert!(release.contains("needs: [binary, macos, windows, validate-version]"));
+    assert!(release.contains("needs: [binary, macos, windows, rpm, validate-version]"));
     assert!(release.contains("target: runtime-prebuilt-amd64"));
     assert!(release.contains("target: runtime-prebuilt-arm64"));
 
@@ -1010,11 +1111,24 @@ fn run_wrapper_with_fake_docker_env(
         .args(args)
         .env("PATH", path)
         .env("AI_MEMORY_DOCKER", shell_path(&docker))
+        // Callers test Docker/Podman UID, SELinux, and env forwarding. Keep
+        // `install-hooks` on that explicit compatibility path; native hook
+        // routing has separate regression coverage below.
+        .env("AI_MEMORY_HOOK_PLATFORM", "posix")
         .env("AI_MEMORY_NO_VERSION_CHECK", "1")
         .env("AI_MEMORY_DATA_VOLUME", "test-ai-memory-data")
         .env("HOME", shell_path(tmp.path()))
         .env_remove("AI_MEMORY_SERVER_URL")
-        .env_remove("CLAUDE_CONFIG_DIR");
+        .env_remove("CLAUDE_CONFIG_DIR")
+        // Guarantees the "unset" case in
+        // `posix_wrapper_forwards_embedding_prefixes_by_presence_not_non_emptiness`
+        // is actually unset rather than silently inheriting whatever the
+        // test-runner's own ambient environment happens to hold; every
+        // other case re-adds one of these via `forwarded_env` below, so
+        // removing them unconditionally here is a no-op for every other
+        // caller of this helper.
+        .env_remove("AI_MEMORY_EMBEDDING_QUERY_PREFIX")
+        .env_remove("AI_MEMORY_EMBEDDING_DOCUMENT_PREFIX");
     if let Some(claude_config_dir) = claude_config_dir {
         command.env("CLAUDE_CONFIG_DIR", claude_config_dir);
     }
@@ -2292,6 +2406,7 @@ mod slow {
             .arg("upgrade")
             .env("PATH", path)
             .env("HOME", tmp.path())
+            .env("XDG_DATA_HOME", tmp.path().join("data"))
             .env("AI_MEMORY_DOCKER", &docker)
             .env(
                 "AI_MEMORY_WRAPPER_URL",
@@ -2717,6 +2832,7 @@ mod slow {
             .env("AI_MEMORY_SKIP_SELF_UPGRADE", "1")
             .env("AI_MEMORY_SERVER_URL", "http://192.168.0.90:49374")
             .env("HOME", tmp.path())
+            .env("XDG_DATA_HOME", tmp.path().join("data"))
             .output()
             .unwrap();
         assert!(
@@ -2999,6 +3115,83 @@ mod slow {
                 "wrapper must not put the value of {name} in Docker argv"
             );
         }
+    }
+
+    /// The two embedding-prefix env vars are forwarded on PRESENCE, not
+    /// non-emptiness, unlike every other var in the loop: an operator sets
+    /// one to the empty string to clear a `config.toml`-configured prefix
+    /// without editing the file (see `Config::load`'s figment overlay in
+    /// `ai-memory-cli/src/config.rs`), and that override only reaches the
+    /// server if the wrapper forwards the (empty) variable rather than
+    /// dropping it the way a plain `[ -n ]` check would.
+    #[cfg(unix)]
+    #[test]
+    fn posix_wrapper_forwards_embedding_prefixes_by_presence_not_non_emptiness() {
+        const QUERY: &str = "AI_MEMORY_EMBEDDING_QUERY_PREFIX";
+        const DOC: &str = "AI_MEMORY_EMBEDDING_DOCUMENT_PREFIX";
+        let has_e = |args: &[&str], name: &str| args.windows(2).any(|pair| pair == ["-e", name]);
+
+        // Unset: neither var forwarded (the loop must not invent a value).
+        let args =
+            run_wrapper_with_fake_docker_and_forwarded_env(&["llm-test"], "[name=seccomp]", &[]);
+        let lines: Vec<&str> = args.lines().collect();
+        assert!(
+            !has_e(&lines, QUERY),
+            "unset must not be forwarded; got {lines:?}"
+        );
+        assert!(
+            !has_e(&lines, DOC),
+            "unset must not be forwarded; got {lines:?}"
+        );
+
+        // Empty: forwarded anyway — this is the override case.
+        let args = run_wrapper_with_fake_docker_and_forwarded_env(
+            &["llm-test"],
+            "[name=seccomp]",
+            &[(QUERY, ""), (DOC, "")],
+        );
+        let lines: Vec<&str> = args.lines().collect();
+        assert!(
+            has_e(&lines, QUERY),
+            "an empty (but present) value must still be forwarded; got {lines:?}"
+        );
+        assert!(
+            has_e(&lines, DOC),
+            "an empty (but present) value must still be forwarded; got {lines:?}"
+        );
+
+        // Whitespace-only: also present, also forwarded — this loop must
+        // not apply any trimming/emptiness judgement of its own.
+        let args = run_wrapper_with_fake_docker_and_forwarded_env(
+            &["llm-test"],
+            "[name=seccomp]",
+            &[(QUERY, "   "), (DOC, "   ")],
+        );
+        let lines: Vec<&str> = args.lines().collect();
+        assert!(
+            has_e(&lines, QUERY),
+            "whitespace-only must still be forwarded; got {lines:?}"
+        );
+        assert!(
+            has_e(&lines, DOC),
+            "whitespace-only must still be forwarded; got {lines:?}"
+        );
+
+        // Non-empty: forwarded, same as every other var.
+        let args = run_wrapper_with_fake_docker_and_forwarded_env(
+            &["llm-test"],
+            "[name=seccomp]",
+            &[(QUERY, "query: "), (DOC, "passage: ")],
+        );
+        let lines: Vec<&str> = args.lines().collect();
+        assert!(
+            has_e(&lines, QUERY),
+            "a non-empty value must be forwarded; got {lines:?}"
+        );
+        assert!(
+            has_e(&lines, DOC),
+            "a non-empty value must be forwarded; got {lines:?}"
+        );
     }
 
     // The Windows mirror of macos_wrapper_routes_urls_by_real_subcommand: Docker

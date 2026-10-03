@@ -20,10 +20,12 @@ pub mod belief;
 pub mod decay;
 mod error;
 mod fts_query;
+mod grants;
 mod maintenance;
 mod migrations;
 mod ops;
 pub mod password;
+mod project_authz;
 mod reader;
 mod retrieval_tuning;
 mod scope;
@@ -33,7 +35,7 @@ pub mod web_sessions;
 mod workstream;
 mod writer;
 
-pub use fts_query::prepare_fts5_query;
+pub use fts_query::{FtsStopwords, prepare_fts5_query};
 
 pub use api_credentials::{AuthenticatedApiUser, generate_api_key, preview_for as api_key_preview};
 pub use auto_improve::{
@@ -41,9 +43,9 @@ pub use auto_improve::{
     AutoImproveProposalDetail, AutoImproveProposalEvent, AutoImproveProposalOperation,
     AutoImproveProposalStatus, AutoImproveProposalSummary, AutoImproveRejectionSummary,
     AutoImproveTelemetryAggregate, AutoImproveTelemetryCount, FailAutoImproveProposal,
-    NewAutoImproveProposal, OwnedAutoImproveProposalDetail, RejectAutoImproveProposal,
-    SkippedProposal, StageAutoImproveRun, StagedAutoImproveRun, StagedAutoImproveRunReport,
-    artifact_path_for,
+    NewAutoImproveProposal, OwnedAutoImproveProposalDetail, PendingAutoImproveReview,
+    PendingAutoImproveScope, RejectAutoImproveProposal, SkippedProposal, StageAutoImproveRun,
+    StagedAutoImproveRun, StagedAutoImproveRunReport, artifact_path_for,
 };
 pub use belief::{BeliefInputs, CONFIDENCE_CAP, confidence};
 pub use decay::{
@@ -52,15 +54,22 @@ pub use decay::{
     salience_after_feedback,
 };
 pub use error::{StoreError, StoreResult};
+pub use grants::{GrantFilter, GrantListing, GrantOutcome, ProjectGrant};
 pub use maintenance::MaintenanceJob;
 pub use ops::{
     AdmittedSession, BootstrapChunkRecord, CompactSummary, Compaction, ConsolidationChunkRecord,
     DateOnlyTtlPage, DeleteWorkspaceSummary, EmbedOutcome, EmbeddingWrite, EntityBackfillSummary,
-    HookSessionAdmission, IngestObservationOutcome, LifecycleOnlyEndOutcome,
+    HookSessionAdmission, IdentityResolution, IngestObservationOutcome, LifecycleOnlyEndOutcome,
     MAX_PENDING_INBOX_MESSAGES, MoveSessionSummary, MoveSummary, ObservationPruneOutcome,
-    OkfMigratedPage, PAGE_WINDOW_BACKFILL_BATCH, PageWindowBackfillSummary, PagesMode,
-    PurgeSessionSummary, PurgeSummary, ReorgSummary, StaleAfterRepair, backfill_entity_index,
-    backfill_page_windows, backfill_page_windows_in_batches, purge_session, record_embed_failure,
+    OkfMigratedPage, PAGE_WINDOW_BACKFILL_BATCH, PageWindowBackfillSummary, PagesMode, PurgeMode,
+    PurgeSessionSummary, PurgeSummary, ReorgSummary, RepairSessionTimesSummary,
+    RepairedSessionTimes, SessionTimesCandidate, SessionTimesSkipReason, SkippedSessionTimes,
+    StaleAfterRepair, backfill_entity_index, backfill_page_windows,
+    backfill_page_windows_in_batches, purge_session, record_embed_failure,
+};
+pub use project_authz::{
+    AccessMode, GrantLevel, ProjectAccess, ProjectAuthz, ProjectPrincipal,
+    RESTRICTED_PROJECT_FORBIDDEN, authorize_project, resolve_project_authz,
 };
 pub use reader::{
     ActivityWindow, AgentSessionCount, AuditEvent, AuditLogFilter, AutoImproveCandidateSession,
@@ -78,9 +87,10 @@ pub use reader::{
 pub use retrieval_tuning::{RetrievalTuning, is_session_recall_query};
 pub use scope::{
     ResolvedScope, ScopeName, ScopeResolutionError, ScopeResolver, ScopeSource,
-    WORKSPACE_PROJECT_PAIR_REQUIRED, create_explicit_scope, create_global_scope,
-    lookup_existing_scope, lookup_existing_workspace, lookup_global_scope,
-    resolve_many_existing_scopes,
+    WORKSPACE_PROJECT_PAIR_REQUIRED, authorize_scope_for, create_explicit_scope,
+    create_explicit_scope_guarded, create_global_scope, lookup_existing_scope,
+    lookup_existing_scope_guarded, lookup_existing_workspace, lookup_global_scope,
+    resolve_many_existing_scopes, resolve_many_existing_scopes_guarded,
 };
 pub use session_consolidation::{SESSION_CONSOLIDATION_MAX_ATTEMPTS, SessionConsolidationJob};
 pub use users::{
@@ -88,9 +98,10 @@ pub use users::{
 };
 pub use web_sessions::{LiveWebSession, WebSession, hash_session_secret};
 pub use workstream::{
-    FinishWorkstreamRun, FinishedWorkstreamRun, ManagedRunContext, PrepareWorkstreamRun,
-    PreparedWorkstreamRun, RenameWorkstream, RenamedWorkstream, StoredManagedRunStatus,
-    StoredWorkstreamSummary, WorkstreamSelection, WorkstreamSelector,
+    FinishWorkstreamRun, FinishedWorkstreamRun, LinkOrAdoptManagedRunSession, ManagedRunContext,
+    ManagedRunSessionLink, PrepareWorkstreamRun, PreparedWorkstreamRun, RenameWorkstream,
+    RenamedWorkstream, StoredManagedRunStatus, StoredWorkstreamSummary, WorkstreamSelection,
+    WorkstreamSelector,
 };
 pub use writer::{StartupContextAcceptance, WriterHandle};
 
@@ -1943,7 +1954,7 @@ mod tests {
         store.writer.upsert_page(dep).await.unwrap();
 
         // Graph: exactly one resolved cross-project edge, app -> infra.
-        let edges = store.reader.cross_project_edges(None).await.unwrap();
+        let edges = store.reader.cross_project_edges(None, None).await.unwrap();
         assert_eq!(edges.len(), 1, "one resolved cross-project edge");
         assert_eq!(edges[0].from_project, "app");
         assert_eq!(edges[0].to_project, "infra");
@@ -2240,7 +2251,11 @@ mod tests {
             .await
             .unwrap();
 
-        let hits = store.reader.search_pages("quick".into(), 10).await.unwrap();
+        let hits = store
+            .reader
+            .search_pages("quick".into(), 10, None)
+            .await
+            .unwrap();
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].path.as_str(), "alpha.md");
         assert!(hits[0].snippet.contains("<mark>quick</mark>"));
@@ -2262,7 +2277,11 @@ mod tests {
         assert_eq!(counts.pages_latest, 1);
         assert_eq!(counts.pages_all, 2);
 
-        let hits = store.reader.search_pages("quick".into(), 10).await.unwrap();
+        let hits = store
+            .reader
+            .search_pages("quick".into(), 10, None)
+            .await
+            .unwrap();
         assert_eq!(hits.len(), 1);
         assert!(
             hits[0].snippet.contains("different"),
@@ -2358,7 +2377,7 @@ mod tests {
 
         let global = store
             .reader
-            .search_pages_with_meta(query.into(), 10, None)
+            .search_pages_with_meta(query.into(), 10, None, None)
             .await
             .unwrap();
         assert_eq!(global[0].path.as_str(), "decisions/embedding-policy.md");
@@ -2419,7 +2438,7 @@ mod tests {
 
         let hits = store
             .reader
-            .search_pages("pick: handoff bootstrap".into(), 10)
+            .search_pages("pick: handoff bootstrap".into(), 10, None)
             .await
             .unwrap();
         assert!(
@@ -2456,7 +2475,7 @@ mod tests {
 
         let hits = store
             .reader
-            .search_pages("descricao sessao".into(), 10)
+            .search_pages("descricao sessao".into(), 10, None)
             .await
             .unwrap();
         assert!(
@@ -2487,7 +2506,7 @@ mod tests {
 
         let hits = store
             .reader
-            .search_pages("quick OR slow".into(), 10)
+            .search_pages("quick OR slow".into(), 10, None)
             .await
             .unwrap();
         assert!(!hits.is_empty(), "OR must remain an FTS5 operator");
@@ -4580,7 +4599,7 @@ mod tests {
             .await
             .unwrap();
 
-        let summaries = store.reader.list_projects_with_stats().await.unwrap();
+        let summaries = store.reader.list_projects_with_stats(None).await.unwrap();
         assert_eq!(summaries.len(), 1);
         let s = &summaries[0];
         assert_eq!(s.workspace_name, "default");
@@ -4716,7 +4735,7 @@ mod tests {
         assert_briefing_kinds(
             &store
                 .reader
-                .briefing_for_workspace(ws, 100, ai_memory_core::OwnerFilter::Any)
+                .briefing_for_workspace(ws, 100, ai_memory_core::OwnerFilter::Any, None)
                 .await
                 .unwrap()
                 .recent_pages,
@@ -4770,13 +4789,13 @@ mod tests {
 
         let source_links = store
             .reader
-            .page_links(ws, proj, "notes/source.md".into())
+            .page_links(ws, proj, "notes/source.md".into(), None)
             .await
             .unwrap();
         assert_eq!(source_links.links[0].kind, "session");
         let target_links = store
             .reader
-            .page_links(ws, proj, "sessions/session.md".into())
+            .page_links(ws, proj, "sessions/session.md".into(), None)
             .await
             .unwrap();
         assert_eq!(target_links.backlinks[0].kind, "note");
@@ -6173,6 +6192,7 @@ mod tests {
                 Some(acceptance(first_handoff, None)),
                 Some(run.run_id),
                 None,
+                jiff::Timestamp::now(),
             )
             .await
             .unwrap();
@@ -6199,6 +6219,7 @@ mod tests {
                 Some(acceptance(second_handoff, None)),
                 Some(run.run_id),
                 None,
+                jiff::Timestamp::now(),
             )
             .await
             .unwrap();
@@ -6266,6 +6287,7 @@ mod tests {
                 Some(acceptance(selected_auto, Some("/repo/api/src".into()))),
                 Some(run.run_id),
                 None,
+                jiff::Timestamp::now(),
             )
             .await
             .unwrap();

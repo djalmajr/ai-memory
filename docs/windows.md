@@ -181,8 +181,9 @@ Docker. Each tagged release publishes
 `ai-memory-windows-x86_64.zip` (see the repo's Releases page).
 
 ```powershell
-# Download + extract into your user data dir (any stable path works; the
-# native hook exec-form command is rendered from wherever ai-memory.exe lives).
+# First-time install: download + extract into your user data dir (any stable
+# path works; the native hook exec-form command is rendered from wherever
+# ai-memory.exe lives).
 $Dest = "$env:LOCALAPPDATA\ai-memory"
 New-Item -ItemType Directory -Force $Dest | Out-Null
 Invoke-WebRequest `
@@ -203,6 +204,24 @@ if (($UserPath -split ';') -notcontains $Dest) {
 & "$Dest\ai-memory.exe" install-hooks --agent claude-code --apply `
     --server-url "https://memory.example.com" --auth-token "<token>"
 ```
+
+Later updates for this install use the same command as Linux/macOS release
+binaries. From a writable prefix (for example `%LOCALAPPDATA%\ai-memory`),
+run:
+
+```powershell
+ai-memory upgrade
+# optional: pin a tag, or force a re-download of the current tag
+ai-memory upgrade --version v2.3.2
+ai-memory upgrade --force
+```
+
+That downloads `ai-memory-windows-x86_64.zip` + `.sha256`, verifies the
+checksum, replaces `ai-memory.exe` via rename-aside (Windows cannot overwrite
+a running image), refreshes a sibling `hooks/` tree when present, then
+re-stages hooks for agents already under the data-dir hooks tree. Keep the
+manual zip download above as a fallback if the install directory is not
+writable (for example under Program Files).
 
 The zip mirrors the Linux release tarball, minus the Linux-only service
 assets: it contains `ai-memory.exe`, the full `hooks/` bundle (`.ps1` +
@@ -522,15 +541,15 @@ native on an i7-6700HQ). Notes:
   - `windows-bash` — `bash -c` + `.sh` through Git Bash (the previous
     default; set this to opt back in, or as a fallback for older Claude Code
     builds that do not support exec form).
-  - `posix` — POSIX `.sh`. The Linux/macOS Docker-wrapper default (the host has
-    no local binary); set it explicitly to opt a native install back into the
-    scripts.
+  - `posix` — POSIX `.sh`. An explicit Linux/macOS Docker-wrapper compatibility
+    fallback; set it to opt a native install back into the scripts.
   - `posix-native` — direct binary call on macOS / Linux (`<exe> hook
     --event …`) instead of the `.sh` script, so the hook uses the local event
     spool + OIDC-token fallback. The **default for native macOS / Linux
     Claude Code installs** (cargo / release binary), mirroring
-    `windows-native`. The Linux/macOS Docker wrapper forces `posix`, so its
-    host-rendered config keeps the `.sh` scripts.
+    `windows-native`. The Linux/macOS Docker wrapper uses its
+    checksum-verified native host client by default; set `posix` explicitly to
+    keep the `.sh` scripts.
 
   Set the env var before running `install-hooks` so the chosen platform
   is baked into the rendered hook commands.
@@ -624,10 +643,12 @@ from what the repository actually ships today.
   decision is made; it is a blocker for a frictionless Supported experience on
   Application-Control-enforced fleets.
 
-- **Native `ai-memory upgrade` path — in-progress.** A first-class in-place
-  upgrade for native Windows installs (release-binary and wrapper flows) is
-  tracked in #801/#802. Until it lands, upgrading is the manual
-  download/extract/re-`install-hooks` sequence in Scenarios B and C.
+- **Native `ai-memory upgrade` path — done.** `ai-memory upgrade` upgrades a
+  writable native install in place (#801, #802): it verifies the
+  `ai-memory-windows-x86_64.zip` checksum, replaces `ai-memory.exe` by
+  rename-aside, refreshes a sibling `hooks/` tree, and re-stages installed
+  hooks — see Scenario B. A non-writable prefix (for example under Program
+  Files) still upgrades through the manual download/extract sequence.
 
 Promotion to Supported is the maintainer's decision once the in-progress items
 are closed and the deferred code-signing policy is resolved (or explicitly

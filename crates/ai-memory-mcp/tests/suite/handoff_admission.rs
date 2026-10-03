@@ -289,7 +289,7 @@ async fn accept_with_nothing_pending_tells_no_webhook() {
     .await;
     assert_eq!(
         result,
-        json!({ "handoff": null }),
+        json!({ "handoff": null, "status": "none_pending" }),
         "nothing was pending, so nothing is accepted",
     );
 

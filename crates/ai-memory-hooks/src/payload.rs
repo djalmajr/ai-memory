@@ -89,6 +89,14 @@ pub struct HookQuery {
     /// `.ai-memory.toml` named it, `repo-root` when the host hook derived it
     /// from the enclosing checkout. Absent on older clients (#394).
     pub project_src: Option<String>,
+    /// Repository identity the client resolved for this checkout (#708):
+    /// an explicit marker `identity`, or a normalised git remote. Paired
+    /// with `identity_src`. Absent on older clients and for checkouts that
+    /// declare a `project`, which keep routing by name.
+    pub identity: Option<String>,
+    /// Which rung produced `identity`: `explicit` or `git_remote`. Anything
+    /// else, or a malformed identity, is ignored and the event routes by name.
+    pub identity_src: Option<String>,
 }
 
 /// Coalesced view of an incoming hook event after light parsing of the
@@ -117,6 +125,10 @@ pub struct HookEnvelope {
     /// Where `project_override` came from. Always [`ProjectSource::Unspecified`]
     /// when there is no override, so the two can never disagree (#394).
     pub project_source: ProjectSource,
+    /// Repository identity from the client, already validated by
+    /// [`ai_memory_core::repository_identity::accept_wire_identity`]. `None`
+    /// routes by project name, as every event did before identities existed.
+    pub identity: Option<ai_memory_core::repository_identity::RepositoryIdentity>,
     /// Whether this project opted into `drop_subagent_captures` via its
     /// `.ai-memory.toml` (forwarded as the `drop_subagent` query flag). The
     /// ingest router consults this per-event so the drop is scoped to the
@@ -170,6 +182,7 @@ impl std::fmt::Debug for HookEnvelope {
             .field("workspace_override", &self.workspace_override)
             .field("project_override", &self.project_override)
             .field("project_strategy", &self.project_strategy)
+            .field("identity", &self.identity)
             .field("drop_subagent_requested", &self.drop_subagent_requested)
             .field(
                 "recall_default_global_requested",
@@ -208,11 +221,12 @@ impl std::fmt::Debug for HookEnvelope {
 
 /// Keys by which agent harnesses tag a hook event as belonging to a SUBAGENT
 /// (a nested/spawned agent session) rather than the top-level session. Grok
-/// sets `subagentType` (on its tool-use events); Claude Code sets `agent_type`
-/// and `agent_id` (on its `SubagentStart`/`SubagentStop` and subagent tool
-/// events). The set is a union so one check covers every harness that signals
-/// subagent-ness; a harness that does not signal it simply never matches.
-const SUBAGENT_MARKER_KEYS: &[&str] = &["subagentType", "agent_type", "agent_id"];
+/// sets `subagentType` (on its tool-use events); Claude Code sets `agent_id`
+/// on subagent events. `agent_type` alone is not a subagent marker: Claude
+/// Code also sets it on top-level sessions launched with `--agent`. The set
+/// is a union so one check covers every harness that signals subagent-ness;
+/// a harness that does not signal it simply never matches.
+const SUBAGENT_MARKER_KEYS: &[&str] = &["subagentType", "agent_id"];
 
 /// True when the raw hook payload carries a non-empty subagent marker — i.e.
 /// the event originates from a spawned subagent session. The ingest router
@@ -444,7 +458,7 @@ impl HookEnvelope {
     /// from common shapes used by Claude Code, Codex, and OpenCode hook
     /// payloads.
     #[must_use]
-    pub fn from_query_and_body(query: HookQuery, raw: serde_json::Value) -> Self {
+    pub fn from_query_and_body(query: HookQuery, mut raw: serde_json::Value) -> Self {
         let event = HookEvent::parse(&query.event);
         let agent = agent_from_payload(&raw)
             .unwrap_or_else(|| query.agent.as_deref().map_or(AgentKind::Other, parse_agent));
@@ -519,6 +533,12 @@ impl HookEnvelope {
         } else {
             ProjectSource::Unspecified
         };
+        let identity = match (query.identity.as_deref(), query.identity_src.as_deref()) {
+            (Some(identity), Some(source)) => {
+                ai_memory_core::repository_identity::accept_wire_identity(identity, source)
+            }
+            _ => None,
+        };
         let drop_subagent_requested = query_flag_truthy(query.drop_subagent.as_deref());
         let recall_default_global_requested = query_flag_truthy(query.default_global.as_deref());
         let all_owners_requested = query_flag_truthy(query.all_owners.as_deref());
@@ -537,6 +557,9 @@ impl HookEnvelope {
         } else {
             None
         };
+        if agent == AgentKind::AntigravityCli {
+            crate::antigravity::enrich_antigravity_step_output(&mut raw, event, None);
+        }
         let tool_metadata = tool_observation_metadata(agent, &raw, event == HookEvent::PreToolUse);
         let closed_tool_event = matches!(event, HookEvent::PreToolUse | HookEvent::PostToolUse)
             && closed_tool_agent(agent);
@@ -599,6 +622,7 @@ impl HookEnvelope {
             project_override,
             project_strategy,
             project_source,
+            identity,
             drop_subagent_requested,
             recall_default_global_requested,
             all_owners_requested,
@@ -916,7 +940,7 @@ fn best_title_hint(event: HookEvent, raw: &serde_json::Value) -> Option<String> 
             // Kimi Code sends `prompt` as content blocks
             // (`[{"type":"text","text":...}]`); `extract_content` flattens
             // them and returns identical values for plain-string agents.
-            extract_content(raw, &["prompt", "message", "text"]).map(|s| truncate_for_title(&s))
+            extract_content(raw, &["prompt", "message", "text"]).map(|s| first_line(&s))
         }
         HookEvent::PreToolUse | HookEvent::PostToolUse => {
             extract_string(raw, &["tool", "tool_name", "name"])
@@ -933,7 +957,7 @@ fn best_title_hint(event: HookEvent, raw: &serde_json::Value) -> Option<String> 
 
 fn extension_title_hint(raw: &serde_json::Value, source_event: &str) -> String {
     extract_string(raw, &["title", "summary", "subject", "name"])
-        .map(|s| truncate_for_title(&s))
+        .map(|s| first_line(&s))
         .unwrap_or_else(|| source_event.to_string())
 }
 
@@ -1026,16 +1050,18 @@ fn best_body_excerpt(event: HookEvent, raw: &serde_json::Value) -> Option<String
     }
 }
 
-pub(crate) fn truncate_for_title(s: &str) -> String {
-    const MAX: usize = 80;
-    let one_line: String = s.chars().take_while(|c| *c != '\n').collect();
-    if one_line.chars().count() <= MAX {
-        one_line
-    } else {
-        let mut buf: String = one_line.chars().take(MAX - 1).collect();
-        buf.push('…');
-        buf
-    }
+/// Reduce a hook-supplied string to its first line, discarding everything
+/// after the first `\n`.
+///
+/// This is the only shaping `title_hint` gets before it reaches the
+/// sanitizer: the 80-char display cap used to happen here too, but that ran
+/// *before* redaction and could cut a secret in half — the truncated prefix
+/// was then too short to match the sanitizer's pattern, so it was stored in
+/// clear text (#980). The length cap now lives in
+/// `ai_memory_core::sanitize::truncate_for_title`, applied by
+/// `Sanitized::new` *after* `Sanitizer::scrub`.
+fn first_line(s: &str) -> String {
+    s.chars().take_while(|c| *c != '\n').collect()
 }
 
 fn truncate_excerpt(s: &str) -> String {
@@ -1343,13 +1369,33 @@ mod tests {
         assert!(body_is_subagent(
             &serde_json::json!({ "sessionId": "s", "subagentType": "general-purpose" })
         ));
-        // Claude Code tags its subagent events with `agent_type` / `agent_id`.
+        // Claude Code identifies spawned agents with `agent_id`.
         assert!(body_is_subagent(
-            &serde_json::json!({ "session_id": "s", "agent_type": "workflow-subagent" })
+            &serde_json::json!({ "session_id": "s", "agent_type": "workflow-subagent", "agent_id": "agent-abc123" })
         ));
         assert!(body_is_subagent(
             &serde_json::json!({ "agent_id": "agent-abc123" })
         ));
+    }
+
+    #[test]
+    fn body_is_subagent_keeps_top_level_claude_agent_sessions() {
+        // `claude --agent <name>` also sets agent_type on the main session.
+        let mut raw = serde_json::json!({
+            "session_id": "main-session",
+            "agent_type": "regulus:regulus",
+        });
+        assert!(!body_is_subagent(&raw), "agent_id absent");
+        for agent_id in [
+            serde_json::Value::Null,
+            serde_json::json!(""),
+            serde_json::json!("   "),
+            serde_json::json!(42),
+            serde_json::json!(false),
+        ] {
+            raw["agent_id"] = agent_id;
+            assert!(!body_is_subagent(&raw), "{raw}");
+        }
     }
 
     #[test]
@@ -2125,10 +2171,13 @@ mod tests {
 
     /// Title-hint extraction must truncate at the first newline (the
     /// "first line" rule used everywhere in the wiki log + handoff
-    /// surfaces) and cap at 80 chars to keep observation titles
-    /// scannable in the log.md heading.
+    /// surfaces), but must NOT cap length here any more: the 80-char display
+    /// cap moved to `ai_memory_core::sanitize::truncate_for_title`, applied
+    /// by `Sanitized::new` after redaction (#980) — truncating a long
+    /// `title_hint` in `payload.rs`, before the sanitizer ever runs, could
+    /// cut a secret in half and leave the unmatched fragment unredacted.
     #[test]
-    fn user_prompt_title_truncates_at_newline_and_at_max_chars() {
+    fn user_prompt_title_keeps_first_line_full_length_untruncated() {
         let q = HookQuery {
             event: "user-prompt".into(),
             agent: Some("claude-code".into()),
@@ -2141,12 +2190,13 @@ mod tests {
         );
         assert_eq!(env.title_hint.as_deref(), Some("first line"));
 
-        // Very long single line → truncated with ellipsis.
+        // Very long single line → title_hint keeps every character; the
+        // 80-char cap now happens later, after sanitization.
         let long = "x".repeat(200);
         let env = HookEnvelope::from_query_and_body(q, serde_json::json!({ "prompt": long }));
         let title = env.title_hint.unwrap();
-        assert!(title.chars().count() <= 80);
-        assert!(title.ends_with('…'));
+        assert_eq!(title.chars().count(), 200);
+        assert!(!title.contains('…'));
     }
 
     #[test]
@@ -2926,6 +2976,69 @@ mod tests {
             }),
         );
         assert!(notification.body_excerpt.is_none());
+    }
+
+    #[test]
+    fn antigravity_post_tool_use_extracts_output_txt_content() {
+        let dir = tempfile::tempdir().unwrap();
+        let step_dir = dir
+            .path()
+            .join(".system_generated")
+            .join("steps")
+            .join("42");
+        std::fs::create_dir_all(&step_dir).unwrap();
+        std::fs::write(step_dir.join("output.txt"), "cargo test: 10 passed\n").unwrap();
+
+        let env = HookEnvelope::from_query_and_body(
+            HookQuery {
+                event: "post-tool-use".into(),
+                agent: Some("antigravity-cli".into()),
+                ..Default::default()
+            },
+            serde_json::json!({
+                "conversationId": "conv-1",
+                "toolCall": {
+                    "name": "run_command",
+                    "args": {"CommandLine": "cargo test"}
+                },
+                "stepIdx": 42,
+                "artifactDirectoryPath": dir.path().to_str().unwrap()
+            }),
+        );
+        let body = env.body_excerpt.expect("body excerpt should be present");
+        assert!(body.contains("tool_family: non-file"));
+        assert!(body.contains("cargo test: 10 passed"));
+    }
+
+    #[test]
+    fn antigravity_post_tool_use_preserves_edit_tool_code_content() {
+        let dir = tempfile::tempdir().unwrap();
+        let step_dir = dir.path().join(".system_generated").join("steps").join("1");
+        std::fs::create_dir_all(&step_dir).unwrap();
+        std::fs::write(step_dir.join("output.txt"), "Created file test.rs\n").unwrap();
+
+        let env = HookEnvelope::from_query_and_body(
+            HookQuery {
+                event: "post-tool-use".into(),
+                agent: Some("antigravity-cli".into()),
+                ..Default::default()
+            },
+            serde_json::json!({
+                "conversationId": "conv-1",
+                "toolCall": {
+                    "name": "write_to_file",
+                    "args": {
+                        "TargetFile": "/workspace/test.rs",
+                        "CodeContent": "fn preserved_code() {}"
+                    }
+                },
+                "stepIdx": 1,
+                "artifactDirectoryPath": dir.path().to_str().unwrap()
+            }),
+        );
+        let body = env.body_excerpt.expect("body excerpt should be present");
+        assert!(body.contains("fn preserved_code() {}"));
+        assert!(!body.contains("Created file test.rs"));
     }
 
     #[test]
