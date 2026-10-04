@@ -1,3 +1,11 @@
+-- Provenance and renumbering: this table was introduced in the fork as
+-- migration V68. Upstream 2.5.2 added its own V68–V71 (project_grants and
+-- successors), so the fork's migration was renumbered to V72, after them.
+-- The DDL is idempotent (IF NOT EXISTS) because stores that applied the old
+-- V68 already have the table; the deploy removes the old
+-- `68 consolidation_chunk_progress` row from `refinery_schema_history`
+-- before the first boot of the new binary.
+--
 -- Durable per-block progress for opt-in map-reduce consolidation so a
 -- crashed or re-run consolidation reuses LLM extractions that already
 -- succeeded instead of re-paying for every call.
@@ -21,7 +29,7 @@
 -- operation, so it re-runs instead of reconciling; the batch drops any
 -- update to the reserved `_prompts/consolidation.md` page (input, not
 -- output). The marker is the only proof of publication.
-CREATE TABLE consolidation_chunk_progress (
+CREATE TABLE IF NOT EXISTS consolidation_chunk_progress (
     workspace_id      TEXT    NOT NULL,
     project_id        TEXT    NOT NULL,
     session_id        TEXT    NOT NULL,
@@ -30,5 +38,5 @@ CREATE TABLE consolidation_chunk_progress (
     created_at        INTEGER NOT NULL,
     PRIMARY KEY (workspace_id, project_id, session_id, chunk_fingerprint)
 );
-CREATE INDEX idx_consolidation_chunk_progress_at
+CREATE INDEX IF NOT EXISTS idx_consolidation_chunk_progress_at
     ON consolidation_chunk_progress(created_at);

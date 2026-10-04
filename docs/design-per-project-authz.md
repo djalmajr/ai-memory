@@ -1,8 +1,42 @@
 # Design proposal: per-project authorization for multi-user servers (#708)
 
-**Status: proposal for review — not implemented.** This is the design pass promised
-on #708 before any code lands. It changes a security boundary, so it is deliberately
-separated from implementation.
+**Implementation status.** Slices 2 and 3 have landed. Slice 2 is the inert
+V68 schema (`project_grants` + `projects.access_mode`, default `open`) and the
+`authorize_project` choke point (`ai-memory-store/src/project_authz.rs`),
+wired into `ScopeResolver` read/write resolution and the writer actor. Slice 3
+makes `restricted` safe end-to-end:
+
+- **Creator.** V69 adds `projects.created_by`, set when a database user's call
+  creates the project; `resolve_project_authz` derives `is_creator` from it.
+  Projects that predate V69 have none, and admit only root and grants once
+  restricted.
+- **Every surface opts in.** MCP tools, `/api/v1`, the web pages, hook routes
+  and captures attach `ScopeResolver::with_project_authz` (or its free-function
+  form, `authorize_scope_for`) for every database user. Root and installs with
+  no database users attach nothing and behave as before.
+- **Read-shaped mutations need write.** Tools that take read-shaped arguments
+  but mutate (delete, feedback, sweep, lint, auto-improve, handoff accept and
+  cancel, message pop and cancel, a message's recipient) resolve at
+  `ProjectAccess::Write`.
+- **Unscoped reads** — search, listings, the graph and the workspace
+  overview — are filtered in SQL before `LIMIT` with the same rule the choke
+  point applies; the global preferences scope stays readable by everyone.
+- **Raw-id entry points** (managed runs, workstreams, session-scoped
+  consolidation) resolve the id to its project and authorize it.
+- **Management surface**, root-only: `ai-memory project access`,
+  `ai-memory user grant|revoke|grants`, `ai-memory project grants`, and the
+  matching `/admin` routes; every change is recorded in `audit_log`.
+  `[auth] new_projects_restricted` makes new projects start `restricted`.
+- **Captures** into a project the author may not write are dropped and counted
+  (`dropped_unauthorized`), never retried.
+
+Per-project administrators remain out of scope: granting, revoking and
+restricting are root's alone. Sections below are the original design pass,
+retained as the spec.
+
+**Original status: proposal for review — not implemented.** This was the design
+pass promised on #708 before any code lands. It changes a security boundary, so
+it is deliberately separated from implementation.
 
 ## Problem
 
@@ -155,3 +189,32 @@ for the two bypass classes above:
 - a **ship-inert test**: an empty grants table, and a `restricted` project with zero
   grants, both still admit root and the creator; a caller on an `open` project is
   unaffected.
+
+## Identity routing (slice 4, #925 — resolved: always-on)
+
+Authorization is only sound if two unrelated checkouts that happen to share a
+folder basename (`~/work/api` and `~/clients/acme/api`) resolve to **different**
+projects — otherwise one grant silently covers both. Slice 4 routes captures by
+**repository identity** (the normalized git remote) instead of folder name:
+
+- A new `V70` migration adds `projects.identity` / `identity_source`
+  (`NOT NULL DEFAULT ''`) with a **partial** unique index
+  `(workspace_id, identity) WHERE identity <> ''` and **no backfill** (a
+  backfill on `lower(name)` would fail a workspace holding both `API` and `api`).
+- Identity is derived by `git2::Repository::discover` (config read only) and
+  normalized **lexically** (scheme split, credential strip, `.git`/slash tidy) —
+  never `fs::canonicalize`. Credentials in a remote URL are stripped client-side
+  and never sent; the server re-validates any wire `identity` (`accept_wire_identity`).
+- Resolution order is **explicit scope > declared `project` > git-remote identity
+  > folder name**; a non-git directory falls back to the folder-name behavior
+  (fail-closed, no new collision).
+- The same normalization runs at all four capture front doors — native
+  `ai-memory hook`, the shell bundle, the PowerShell bundle, and the generated
+  TypeScript integrations — checked by a shared-fixture parity test so they
+  cannot drift.
+
+**Decision (resolved):** this is **always-on** in 2.5.0, not gated behind a
+flag. Opt-in would leave the same-basename grant hole open for anyone who did
+not opt in, defeating the authorization slices. The trade-off — that an upgrading
+install's captures re-bucket by repository identity (two same-name repos split; one
+repo opened from two folders converges) — is documented in the CHANGELOG.

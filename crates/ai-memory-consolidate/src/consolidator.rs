@@ -220,9 +220,23 @@ impl Consolidator {
     ///
     /// `max_input_tokens + max_output_tokens` must fit the provider's context
     /// window. Callers validate the supported minimums when resolving config.
+    ///
+    /// `safety_margin` shrinks the char-count input budget so the flat
+    /// chars-per-token heuristic does not over-admit on denser-than-English
+    /// corpora (pt-BR, code); it is validated to `0 < margin <= 1` at config
+    /// load. See [`DEFAULT_CONSOLIDATION_INPUT_TOKEN_SAFETY_MARGIN`] (#884).
     #[must_use]
-    pub fn with_prompt_limits(mut self, max_input_tokens: usize, max_output_tokens: u32) -> Self {
-        self.budgets = PromptBudgets::from_limits(max_input_tokens, max_output_tokens);
+    pub fn with_prompt_limits(
+        mut self,
+        max_input_tokens: usize,
+        max_output_tokens: u32,
+        safety_margin: f64,
+    ) -> Self {
+        self.budgets = PromptBudgets::from_limits_with_margin(
+            max_input_tokens,
+            max_output_tokens,
+            safety_margin,
+        );
         self
     }
 
@@ -531,18 +545,37 @@ impl Consolidator {
         &self,
         session_id: SessionId,
     ) -> ConsolidatorResult<(WorkspaceId, ProjectId)> {
+        Ok(self
+            .session_target(session_id)
+            .await?
+            .unwrap_or((self.workspace_id, self.project_id)))
+    }
+
+    /// The repository a consolidation of `session_id` would write into, or
+    /// `None` when the session has neither observations nor a row.
+    ///
+    /// Exactly [`Self::resolve_target`] without the startup fallback, so a
+    /// caller authorizing the write checks the repository the page will
+    /// actually land in (#708). `None` needs no authorization: with no
+    /// observations there is nothing to consolidate, and the consolidation
+    /// itself fails before writing anything — which also keeps an unknown
+    /// session reported as unknown rather than as a refusal on the server's
+    /// default project.
+    ///
+    /// # Errors
+    /// Propagates store errors.
+    pub async fn session_target(
+        &self,
+        session_id: SessionId,
+    ) -> ConsolidatorResult<Option<(WorkspaceId, ProjectId)>> {
         if let Some(scope) = self
             .reader
             .session_scope_from_observations(session_id)
             .await?
         {
-            return Ok(scope);
+            return Ok(Some(scope));
         }
-        Ok(self
-            .reader
-            .session_project_ids(session_id)
-            .await?
-            .unwrap_or((self.workspace_id, self.project_id)))
+        Ok(self.reader.session_project_ids(session_id).await?)
     }
 
     /// Resolve the session's creating harness from the persisted session row.
@@ -3101,6 +3134,17 @@ pub const DEFAULT_CONSOLIDATION_MAX_INPUT_TOKENS: usize = 100_000;
 /// Default maximum generated tokens for a consolidation response.
 pub const DEFAULT_CONSOLIDATION_MAX_OUTPUT_TOKENS: u32 = 32_000;
 
+/// Default multiplier applied to the char-count input budget (#884).
+///
+/// `max_input_tokens` is turned into a char budget with a flat
+/// [`CHARS_PER_TOKEN`] heuristic. That ratio holds for English prose but
+/// over-admits on denser corpora — pt-BR prose and source code tokenize at
+/// closer to ~2.1 chars/token, so a 3:1 estimate overshot the real token
+/// count by ~40% and tripped provider `max_input_tokens` limits. Shrinking
+/// the effective char budget to 80% of the nominal value buys that headroom
+/// back for the common case while leaving English budgets close to before.
+pub const DEFAULT_CONSOLIDATION_INPUT_TOKEN_SAFETY_MARGIN: f64 = 0.8;
+
 /// Conservative character-to-token estimate for provider-neutral budgeting.
 /// The exact tokenizer is provider/model-specific, so this is a target rather
 /// than a hard token count. Three characters per token plus the default
@@ -3154,8 +3198,26 @@ struct PromptBudgets {
 
 impl PromptBudgets {
     fn from_limits(max_input_tokens: usize, max_output_tokens: u32) -> Self {
+        // A bare limit applies no safety margin (margin 1.0), preserving the
+        // historical char budget; production tightens it via config (#884).
+        Self::from_limits_with_margin(max_input_tokens, max_output_tokens, 1.0)
+    }
+
+    /// Derive budgets from the token limits, shrinking the char-count input
+    /// budget by `safety_margin` (#884). The margin compensates for the flat
+    /// [`CHARS_PER_TOKEN`] heuristic over-admitting on denser-than-English
+    /// corpora (pt-BR, code). Callers pass a validated `0 < margin <= 1`.
+    fn from_limits_with_margin(
+        max_input_tokens: usize,
+        max_output_tokens: u32,
+        safety_margin: f64,
+    ) -> Self {
+        let nominal = max_input_tokens.saturating_mul(CHARS_PER_TOKEN);
+        // `safety_margin` is validated to `0 < margin <= 1` at config load, so
+        // the product never exceeds `nominal` and the cast cannot overflow.
+        let max_input_chars = (nominal as f64 * safety_margin) as usize;
         Self {
-            max_input_chars: max_input_tokens.saturating_mul(CHARS_PER_TOKEN),
+            max_input_chars,
             max_output_tokens,
         }
     }
@@ -4910,6 +4972,55 @@ mod tests {
         assert_eq!(
             budgets.remaining_input_chars::<ConsolidatedPage>(SYSTEM_PROMPT, usize::MAX),
             0
+        );
+    }
+
+    /// #884: the safety margin scales the char budget by exactly the factor,
+    /// and margin 1.0 reproduces the un-margined budget.
+    #[test]
+    fn safety_margin_scales_input_char_budget() {
+        let full = PromptBudgets::from_limits(10_000, 1_000);
+        assert_eq!(full.max_input_chars, 30_000);
+        assert_eq!(
+            PromptBudgets::from_limits_with_margin(10_000, 1_000, 1.0),
+            full,
+            "margin 1.0 must leave the budget unchanged"
+        );
+        let tightened = PromptBudgets::from_limits_with_margin(10_000, 1_000, 0.8);
+        assert_eq!(
+            tightened.max_input_chars, 24_000,
+            "margin 0.8 must shrink the char budget to 0.8x"
+        );
+        // Output allowance is independent of the input margin.
+        assert_eq!(tightened.max_output_tokens, 1_000);
+    }
+
+    /// #884: a large observation set is packed to the tightened budget, so a
+    /// margin actually reduces how much prompt content is admitted.
+    #[test]
+    fn safety_margin_trims_packed_observations() {
+        let tightened = PromptBudgets::from_limits_with_margin(
+            DEFAULT_CONSOLIDATION_MAX_INPUT_TOKENS,
+            DEFAULT_CONSOLIDATION_MAX_OUTPUT_TOKENS,
+            0.8,
+        );
+        let full = PromptBudgets::from_limits(
+            DEFAULT_CONSOLIDATION_MAX_INPUT_TOKENS,
+            DEFAULT_CONSOLIDATION_MAX_OUTPUT_TOKENS,
+        );
+        assert!(tightened.max_input_chars < full.max_input_chars);
+        let observations = (0..256).map(|_| obs_of_size(4_000)).collect::<Vec<_>>();
+        let request = build_request(
+            SessionId::new(),
+            &observations,
+            &"x".repeat(50_000),
+            Some(&"preference ".repeat(500)),
+            tightened,
+            &[],
+        );
+        assert!(
+            estimated_input_chars::<ConsolidatedPage>(&request) <= tightened.max_input_chars,
+            "packed request must respect the tightened budget"
         );
     }
 

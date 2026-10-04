@@ -10,6 +10,7 @@ use crate::cli::InstallHooksArgs;
 use crate::commands::apply_shared::{ApplyOutcome, apply_atomic};
 use crate::commands::render_shared::{
     ts_capture_policy_v1, ts_resolve_token_fn, ts_spool_runtime, ts_string_literal,
+    ts_timeout_signal,
 };
 
 pub(crate) const PLUGIN_ID: &str = "ai-memory";
@@ -340,12 +341,7 @@ const AGENT = "openclaw";
 {token_line}{resolve_fn}
 {capture_policy}
 
-function timeoutSignal(ms: number): AbortSignal | undefined {{
-  if (typeof AbortSignal === "undefined") return undefined;
-  const factory = (AbortSignal as unknown as {{ timeout?: (ms: number) => AbortSignal }}).timeout;
-  return factory ? factory(ms) : undefined;
-}}
-
+{timeout_signal}
 function authHeaders(): Record<string, string> {{
   const token = resolveToken();
   return token ? {{ Authorization: `Bearer ${{token}}` }} : {{}};
@@ -504,6 +500,7 @@ function postPreCompact(event: any, ctx: any): void {{
 async function fetchHandoff(event: any, ctx: any): Promise<string | undefined> {{
   const currentCwd = cwd(event, ctx);
   if (!currentCwd) return undefined;
+  if (captureServerRouted(currentCwd)) return undefined;
   const url = new URL(`${{SERVER}}/handoff`);
   url.searchParams.set("agent", AGENT);
   applyMarkerParams(url, currentCwd);
@@ -585,6 +582,7 @@ export default definePluginEntry({{
         server_literal = ts_string_literal(server_url),
         token_line = token_line,
         repo_root_project = super::install_hooks::TS_REPO_ROOT_PROJECT,
+        timeout_signal = ts_timeout_signal(),
         spool_runtime = ts_spool_runtime(),
     )
 }
@@ -606,6 +604,7 @@ mod tests {
                 .contains("if (!resp || resp.status >= 500) spoolFailedHook(url, policy.payload);")
         );
         assert!(plugin.contains("else requestSpoolDrain();"));
+        crate::commands::render_shared::assert_shared_ts_delivery_runtime("openclaw", &plugin);
         assert!(plugin.contains(r#"return join(env, "hook-spool");"#));
         for f in [
             "mkdirSync",
@@ -758,6 +757,24 @@ mod tests {
             ),
             "allowlist build must carry the marker-presence admit gate: {plugin}"
         );
+    }
+
+    /// #992: OpenClaw posts to `SERVER` directly and does not route `server`
+    /// profiles, so a routed repository must emit nothing and fetch no handoff.
+    #[test]
+    fn openclaw_plugin_fails_closed_on_a_server_profile_marker() {
+        let plugin = build_plugin("http://127.0.0.1:49374", None, None, "denylist");
+        assert!(
+            plugin.contains(
+                "if (captureServerRouted(cwd)) return { disposition: \"drop\", payload };"
+            ),
+            "{plugin}"
+        );
+        let handoff = plugin.split_once("async function fetchHandoff(").unwrap().1;
+        let guard = handoff
+            .find("if (captureServerRouted(currentCwd)) return undefined;")
+            .expect("handoff fetch must be gated");
+        assert!(guard < handoff.find("/handoff`").unwrap());
     }
 
     #[test]

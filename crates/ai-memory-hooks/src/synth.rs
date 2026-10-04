@@ -10,11 +10,11 @@ use std::collections::BTreeMap;
 
 use ai_memory_core::{
     AgentKind, NewPage, Observation, ObservationKind, PagePath, ProjectId, SessionId, Tier,
-    WorkspaceId, looks_like_scaffolding,
+    WorkspaceId, looks_like_scaffolding, truncate_for_title,
 };
 use jiff::tz::TimeZone;
 
-use crate::payload::{is_safe_tool_title, truncate_for_title};
+use crate::payload::is_safe_tool_title;
 
 const RAW_OBSERVATION_MAX_LINES: usize = 500;
 const RAW_OBSERVATION_HEAD_LINES: usize = 250;

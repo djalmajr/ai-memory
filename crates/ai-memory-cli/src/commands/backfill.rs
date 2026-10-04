@@ -40,8 +40,8 @@ use serde::{Deserialize, Serialize};
 
 use ai_memory_core::{NewWorkstreamEvent, WorkstreamEventKind};
 use ai_memory_workstream::{
-    ManagedHarness, build_launch_plan, export_transcript, list_native_sessions,
-    wait_for_transcript_flush,
+    LaunchRoots, ManagedHarness, build_launch_plan_with_env, export_transcript,
+    list_native_sessions, wait_for_transcript_flush,
 };
 
 use super::doctor::{SCANNED_HARNESSES, relocated_session_dir};
@@ -68,9 +68,9 @@ const BACKFILL_EXTENSION: &str = "ai-memory-backfill";
 /// A local native session eligible for import.
 #[derive(Debug, Clone)]
 pub(crate) struct SessionRef {
-    harness: ManagedHarness,
-    native_session_id: String,
-    updated_at: SystemTime,
+    pub(crate) harness: ManagedHarness,
+    pub(crate) native_session_id: String,
+    pub(crate) updated_at: SystemTime,
 }
 
 /// The outcome of a backfill run, and the JSON output shape.
@@ -145,6 +145,41 @@ fn write_sentinel(data_dir: &Path, cwd: &Path) {
     let _ = std::fs::write(&path, b"");
 }
 
+/// The server this backfill delivers to.
+///
+/// A SessionStart-spawned run names the hook's own target: a server profile
+/// (#992), whose stored token is the only credential it will present, or the
+/// install-time hook URL, authenticated exactly like the hook's own events to
+/// it: the persisted hook token, then OIDC. The config/env bearer is never
+/// used there, because it may belong to a different server than the one the
+/// hook is installed against. A manual run keeps resolving from config.
+async fn backfill_endpoint(
+    config: &Config,
+    args: &crate::cli::BackfillArgs,
+) -> Result<ServerEndpoint> {
+    if let Some(raw) = args.server_profile.as_deref() {
+        let name = crate::server_profiles::ProfileName::parse(raw)
+            .with_context(|| format!("`{raw}` is not a valid server profile name"))?;
+        let profile = crate::server_profiles::lookup(&config.data_dir, &name)
+            .map_err(|r| anyhow::anyhow!("server profile `{name}` was refused ({})", r.as_str()))?;
+        return Ok(ServerEndpoint::for_hook_target(
+            profile.url,
+            Some(profile.token),
+        ));
+    }
+    if let Some(url) = args.server_url.as_deref() {
+        let static_token = crate::config::read_hook_auth_token(&config.data_dir);
+        let token = super::hook_spool::resolve_bearer(
+            &reqwest::Client::new(),
+            &config.data_dir,
+            static_token.as_deref(),
+        )
+        .await;
+        return Ok(ServerEndpoint::for_hook_target(url.to_owned(), token));
+    }
+    Ok(ServerEndpoint::from_config_resolving_auth(config).await)
+}
+
 /// Run the backfill.
 ///
 /// # Errors
@@ -168,7 +203,7 @@ pub async fn run(config: &Config, args: crate::cli::BackfillArgs) -> Result<()> 
     let (workspace, project) =
         super::resolve_scope(config, args.workspace.as_deref(), args.project.as_deref())?;
     let home = run::native_home(config).context("locating the local harness session stores")?;
-    let endpoint = ServerEndpoint::from_config_resolving_auth(config).await;
+    let endpoint = backfill_endpoint(config, &args).await?;
 
     let mut report = BackfillReport {
         workspace: workspace.clone(),
@@ -192,7 +227,8 @@ pub async fn run(config: &Config, args: crate::cli::BackfillArgs) -> Result<()> 
     }
 
     // Enumerate local sessions for this cwd across every supported harness.
-    let candidates = collect_local_sessions(&home, &cwd, args.session.as_deref()).await;
+    let (candidates, _limit_hit) =
+        collect_local_sessions(&home, &cwd, args.session.as_deref()).await;
     let selected = select_sessions(candidates, args.max_sessions.max(1));
     report.selected = selected.len();
 
@@ -263,11 +299,16 @@ async fn project_is_empty(
 
 /// Enumerate local native sessions for `cwd` across every scanned harness.
 /// Read-only; a harness whose store is absent/unreadable contributes nothing.
-async fn collect_local_sessions(
+///
+/// Returns, alongside the sessions, the harnesses whose scan came back at
+/// exactly [`PER_HARNESS_SCAN_LIMIT`] — a caller that cares about missing
+/// older sessions (as opposed to `backfill`'s own newest-first + cap
+/// selection, which does not) can surface that.
+pub(crate) async fn collect_local_sessions(
     home: &Path,
     cwd: &Path,
     only_session: Option<&str>,
-) -> Vec<SessionRef> {
+) -> (Vec<SessionRef>, Vec<ManagedHarness>) {
     collect_local_sessions_with(home, cwd, only_session, relocated_session_dir).await
 }
 
@@ -275,13 +316,14 @@ async fn collect_local_sessions(
 /// same reason as `doctor::scan_local_with`: tests pass `|_| None` so a
 /// developer's `CLAUDE_CONFIG_DIR` cannot hide a fixture planted under a
 /// temporary `$HOME`.
-async fn collect_local_sessions_with(
+pub(crate) async fn collect_local_sessions_with(
     home: &Path,
     cwd: &Path,
     only_session: Option<&str>,
     session_dir_for: impl Fn(ManagedHarness) -> Option<PathBuf>,
-) -> Vec<SessionRef> {
+) -> (Vec<SessionRef>, Vec<ManagedHarness>) {
     let mut out = Vec::new();
+    let mut limit_hit = Vec::new();
     for &harness in SCANNED_HARNESSES {
         let session_dir = session_dir_for(harness);
         let Ok(sessions) = list_native_sessions(
@@ -295,6 +337,9 @@ async fn collect_local_sessions_with(
         else {
             continue;
         };
+        if sessions.len() >= PER_HARNESS_SCAN_LIMIT {
+            limit_hit.push(harness);
+        }
         for session in sessions {
             if only_session.is_some_and(|want| want != session.native_session_id) {
                 continue;
@@ -306,7 +351,7 @@ async fn collect_local_sessions_with(
             });
         }
     }
-    out
+    (out, limit_hit)
 }
 
 /// One item in a `POST /hook/batch` request: the full hook URL (whose query the
@@ -339,9 +384,11 @@ async fn import_one(
     cwd: &Path,
     session: &SessionRef,
 ) -> Result<usize> {
-    let session_dir = build_launch_plan(session.harness, None, Vec::new(), None)
-        .ok()
-        .and_then(|plan| plan.session_dir);
+    let roots = LaunchRoots { home, cwd };
+    let session_dir =
+        build_launch_plan_with_env(session.harness, None, Vec::new(), None, &[], Some(roots))
+            .ok()
+            .and_then(|plan| plan.session_dir);
     // These are historical sessions, so the flush wait is a quick no-op; ignore
     // its result and read whatever is on disk.
     let _ = wait_for_transcript_flush(
@@ -968,7 +1015,8 @@ mod tests {
         });
         std::fs::write(session_dir.join("foreign.jsonl"), format!("{foreign}\n")).unwrap();
 
-        let found = collect_local_sessions_with(home.path(), cwd.path(), None, |_| None).await;
+        let (found, _limit_hit) =
+            collect_local_sessions_with(home.path(), cwd.path(), None, |_| None).await;
         let claude: Vec<_> = found
             .iter()
             .filter(|s| s.harness == ManagedHarness::Claude)
@@ -980,9 +1028,73 @@ mod tests {
         );
 
         // `--session` narrows to one id.
-        let only =
+        let (only, _limit_hit) =
             collect_local_sessions_with(home.path(), cwd.path(), Some("nope"), |_| None).await;
         assert!(only.is_empty(), "no session matches the filter: {only:?}");
+    }
+
+    fn spawned_args(
+        server_url: Option<&str>,
+        server_profile: Option<&str>,
+    ) -> crate::cli::BackfillArgs {
+        crate::cli::BackfillArgs {
+            workspace: None,
+            project: None,
+            session: None,
+            force: false,
+            dry_run: false,
+            max_sessions: 25,
+            json: false,
+            quiet: true,
+            auto: true,
+            server_url: server_url.map(str::to_owned),
+            server_profile: server_profile.map(str::to_owned),
+        }
+    }
+
+    /// #992: a SessionStart-spawned backfill presents only the credential the
+    /// hook itself uses for that server — never the config/env bearer, which
+    /// may belong to another server entirely.
+    #[tokio::test]
+    async fn a_spawned_backfill_authenticates_like_the_hook_that_spawned_it() {
+        let home = tempfile::tempdir().unwrap();
+        let data_dir = tempfile::tempdir().unwrap();
+        let mut config =
+            crate::config::Config::load(None, Some(home.path().to_path_buf())).unwrap();
+        config.data_dir = data_dir.path().to_path_buf();
+        config.auth.bearer_token = Some("CONFIG-SERVER-TOKEN".into());
+
+        let url = "https://hook.example/wiki";
+        let endpoint = backfill_endpoint(&config, &spawned_args(Some(url), None))
+            .await
+            .unwrap();
+        assert_eq!(
+            endpoint.auth_token, None,
+            "no hook token: nothing, not config's"
+        );
+        assert_eq!(endpoint.url, "https://hook.example");
+        assert_eq!(endpoint.base_path, "/wiki");
+
+        crate::config::store_hook_auth_token(data_dir.path(), "HOOK-TOKEN").unwrap();
+        let endpoint = backfill_endpoint(&config, &spawned_args(Some(url), None))
+            .await
+            .unwrap();
+        assert_eq!(endpoint.auth_token.as_deref(), Some("HOOK-TOKEN"));
+
+        let name = crate::server_profiles::ProfileName::parse("team-b").unwrap();
+        crate::server_profiles::add(data_dir.path(), &name, "https://b.example", &[], Some("B"))
+            .unwrap();
+        let endpoint = backfill_endpoint(&config, &spawned_args(None, Some("team-b")))
+            .await
+            .unwrap();
+        assert_eq!(endpoint.url, "https://b.example");
+        assert_eq!(endpoint.auth_token.as_deref(), Some("B"));
+        assert!(
+            backfill_endpoint(&config, &spawned_args(None, Some("nobody")))
+                .await
+                .is_err(),
+            "an unregistered profile is refused, not replaced by config"
+        );
     }
 
     /// The automatic path must honor the `backfill_on_start` opt-out: it records
@@ -1000,18 +1112,7 @@ mod tests {
         // must return before we ever build the endpoint.
         config.server_url = "http://127.0.0.1:9".to_string();
 
-        let args = crate::cli::BackfillArgs {
-            workspace: None,
-            project: None,
-            session: None,
-            force: false,
-            dry_run: false,
-            max_sessions: 25,
-            json: false,
-            quiet: true,
-            auto: true,
-        };
-        run(&config, args)
+        run(&config, spawned_args(None, None))
             .await
             .expect("opted-out auto run must succeed without contacting the server");
 

@@ -967,4 +967,129 @@ mod tests {
         assert!(after.contains("superseded_at IS NOT NULL"), "{after}");
         assert!(!after.contains("supersedes IS NULL"), "{after}");
     }
+
+    /// Upstream's `UNIQUE (workspace_id, name)` is case-sensitive, so one
+    /// workspace may hold both `API` and `api`. The identity index is on
+    /// case-folded values, and backfilling `lower(name)` into it failed the
+    /// whole upgrade on such an install. Looked up by name, not number: this
+    /// migration is renumbered on every upstream sync that adds one of its own.
+    #[test]
+    fn project_identity_upgrades_a_workspace_with_names_differing_only_in_case() {
+        let identity_version = migrations::runner()
+            .get_migrations()
+            .iter()
+            .find(|m| m.name() == "project_identity")
+            .map(refinery::Migration::version)
+            .expect("the project_identity migration is embedded");
+
+        let mut conn = Connection::open_in_memory().unwrap();
+        run_to(&mut conn, identity_version - 1).unwrap();
+        let workspace_id = [7_u8; 16];
+        conn.execute(
+            "INSERT INTO workspaces (id, name, created_at) VALUES (?1, 'acme', 1)",
+            params![workspace_id.as_slice()],
+        )
+        .unwrap();
+        for (id, name) in [([1_u8; 16], "API"), ([2_u8; 16], "api")] {
+            conn.execute(
+                "INSERT INTO projects (id, workspace_id, name, created_at) VALUES (?1, ?2, ?3, 1)",
+                params![id.as_slice(), workspace_id.as_slice(), name],
+            )
+            .unwrap();
+        }
+
+        run(&mut conn).expect("names differing only in case must not fail the upgrade");
+
+        // Both projects survive, and neither is claimed: which one a future
+        // `api/` checkout resolves to is not the migration's decision.
+        let unclaimed: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM projects WHERE identity = '' AND identity_source = ''",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(unclaimed, 2);
+
+        // The index still does its job once the resolver claims an identity.
+        conn.execute(
+            "UPDATE projects SET identity = 'api', identity_source = 'folder_name' WHERE name = 'api'",
+            [],
+        )
+        .unwrap();
+        let duplicate = conn.execute(
+            "UPDATE projects SET identity = 'api', identity_source = 'folder_name' WHERE name = 'API'",
+            [],
+        );
+        assert!(
+            duplicate.is_err(),
+            "a claimed identity must stay unique per workspace"
+        );
+    }
+
+    /// The renumbered fork migration (V72, was V68) is idempotent: a store
+    /// that applied the OLD fork V68 already has the `consolidation_chunk_progress`
+    /// table and index, so `run()` must apply V72 over the existing objects
+    /// without failing on `table already exists`, and the schema it leaves is
+    /// the same one a fresh migration produces. This is the guarantee the
+    /// deploy relies on (remove the old `68 consolidation_chunk_progress`
+    /// history row, then let the new binary re-record it as V72).
+    #[test]
+    fn v72_renumbered_migration_is_idempotent_over_a_store_that_already_has_the_table() {
+        let mut conn = Connection::open_in_memory().unwrap();
+
+        // A store migrated to just before the fork's renumbered migration.
+        run_to(&mut conn, 71).unwrap();
+
+        // Simulate the old fork V68 already having run: the table and index
+        // exist, but there is no V72 history row. Use the exact same DDL the
+        // migration emits so the "already exists" paths are the real ones.
+        let (v72_name, v72_sql) = {
+            let runner = migrations::runner();
+            let m = runner
+                .get_migrations()
+                .iter()
+                .find(|m| m.version() == 72)
+                .expect("the renumbered V72 migration must be embedded");
+            (m.name().to_string(), m.sql().unwrap().to_string())
+        };
+        assert_eq!(v72_name, "consolidation_chunk_progress");
+        conn.execute_batch(&v72_sql).unwrap();
+
+        // A row written under the old shape survives.
+        conn.execute(
+            "INSERT INTO consolidation_chunk_progress \
+             (workspace_id, project_id, session_id, chunk_fingerprint, extraction_json, created_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![[1u8; 16].as_slice(), [2u8; 16].as_slice(), [3u8; 16].as_slice(), "fp", "{}", 1],
+        )
+        .unwrap();
+
+        // The new binary's `run()` applies V72 over the existing objects.
+        run(&mut conn)
+            .expect("V72 must apply idempotently over a store that already has the table");
+
+        // The version is now recorded and the pre-existing row + index survive.
+        assert_eq!(
+            schema_object_count(&conn, "table", "consolidation_chunk_progress"),
+            1
+        );
+        assert_eq!(
+            schema_object_count(&conn, "index", "idx_consolidation_chunk_progress_at"),
+            1
+        );
+        let rows: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM consolidation_chunk_progress",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            rows, 1,
+            "the pre-existing row must survive the idempotent re-apply"
+        );
+        let versions = applied_versions(&conn);
+        assert!(versions.contains(&72), "V72 must be recorded: {versions:?}");
+    }
 }

@@ -127,7 +127,13 @@ pub fn conform_frontmatter(path: &str, frontmatter: &mut Value) {
             Value::String(format!("ai-memory://session/{session}")),
         );
         if let Some(agent) = map.get("agent").and_then(Value::as_str) {
-            entry.insert("author".into(), Value::String(agent.to_string()));
+            // The OKF actor grammar (§5.1) requires `<producer>/<version>`
+            // for agents or `process:<id>` for automated processes; a bare
+            // `claude-code` matches neither. We don't track a per-harness
+            // semantic version, so `<producer>/<version>` isn't honestly
+            // derivable — `process:<id>` is the correct, non-fabricated
+            // choice.
+            entry.insert("author".into(), Value::String(format!("process:{agent}")));
         }
         map.insert("sources".into(), Value::Array(vec![Value::Object(entry)]));
     }
@@ -276,7 +282,7 @@ mod tests {
             fm["sources"][0]["resource"],
             "ai-memory://session/0192aaaa-0000-7000-8000-000000000000"
         );
-        assert_eq!(fm["sources"][0]["author"], "claude-code");
+        assert_eq!(fm["sources"][0]["author"], "process:claude-code");
         assert!(
             fm["generated"]["by"]
                 .as_str()
@@ -371,6 +377,21 @@ mod tests {
         let mut fm = json!({"generated_by_model": "openai-compat/qwen3:32b"});
         conform_frontmatter("sessions/x.md", &mut fm);
         assert_eq!(fm["generated"]["by"], "openai-compat/qwen3:32b");
+    }
+
+    #[test]
+    fn sources_author_uses_the_process_actor_form() {
+        // OKF §5.1's actor grammar requires `<producer>/<version>` for an
+        // agent or `process:<id>` for an automated process; a bare agent
+        // name like `claude-code` matches neither. We don't track a
+        // per-harness semantic version, so `process:<agent>` is the honest
+        // choice, not a fabricated version.
+        let mut fm = json!({
+            "session_id": "0192aaaa-0000-7000-8000-000000000000",
+            "agent": "codex",
+        });
+        conform_frontmatter("sessions/x.md", &mut fm);
+        assert_eq!(fm["sources"][0]["author"], "process:codex");
     }
 
     #[test]
