@@ -87,7 +87,10 @@ RUN cargo build --release -p ai-memory-cli \
 # 3) runtime — debian-slim, non-root, SPA em /web-ui
 # ---------------------------------------------------------------------------
 FROM debian:bookworm-slim
+# Pull the base image's published security fixes (e.g. libpcre2-8-0,
+# CVE-2026-103111) instead of waiting for a rebuilt bookworm-slim tag.
 RUN apt-get update \
+ && apt-get upgrade -y --no-install-recommends \
  && apt-get install -y --no-install-recommends ca-certificates \
  && rm -rf /var/lib/apt/lists/* \
  && useradd --system --uid 1000 --user-group --home-dir /data \
