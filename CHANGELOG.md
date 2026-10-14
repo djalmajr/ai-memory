@@ -12,7 +12,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   answered `202`) and a `GET /admin/compact` status route, so a compaction that
   outlasts a proxy timeout is followed instead of cut off with `524`. Both forms
   share one single-flight slot and answer `409` while a compaction runs.
-  (#PRNUM)
+  (#7)
 
 ### Changed
 - Documented FutureInfra as an endpoint for the existing `openai-compat`
