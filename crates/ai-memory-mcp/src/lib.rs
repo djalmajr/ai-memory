@@ -11,6 +11,7 @@
 pub mod actor;
 pub mod admin;
 pub mod auth;
+mod compact_job;
 pub mod human_auth;
 mod server;
 

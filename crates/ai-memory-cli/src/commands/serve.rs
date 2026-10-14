@@ -1463,6 +1463,7 @@ pub async fn run(config: &Config, args: ServeArgs) -> Result<()> {
             });
             let admin = admin_router_with_sweep_tuning(
                 AdminState {
+                    compact_jobs: Default::default(),
                     ingest_metrics: ingest_metrics.clone(),
                     writer: store.writer.clone(),
                     reader: store.reader.clone(),

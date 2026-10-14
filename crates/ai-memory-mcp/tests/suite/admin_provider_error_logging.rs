@@ -92,6 +92,7 @@ async fn make_admin_state(tmp: &TempDir, llm: Option<Arc<dyn LlmProvider>>) -> A
     let wiki = Wiki::new(tmp.path(), store.writer.clone()).unwrap();
     let db_path = store.db_path().to_path_buf();
     AdminState {
+        compact_jobs: Default::default(),
         ingest_metrics: Arc::new(ai_memory_core::IngestMetrics::default()),
         writer: store.writer.clone(),
         reader: store.reader.clone(),

@@ -31,7 +31,9 @@
 //!   repair-backfill-timestamps`).
 //! - `POST /admin/rename-project` — rename a project (column-only; no files move).
 //! - `POST /admin/rename-workspace` — rename a workspace and refresh scope manifests.
-//! - `POST /admin/compact`        — reclaim free pages; deletes nothing.
+//! - `POST /admin/compact`        — reclaim free pages; deletes nothing. With
+//!   `background: true` it answers 202 and runs on its own task.
+//! - `GET  /admin/compact`        — status of the latest compaction job.
 //! - `POST /admin/reclaim-ledger-versions` — drop the superseded ledger
 //!   versions the pre-#660 indexer left behind, and nothing else.
 //! - `POST /admin/delete-workspace` — delete a workspace and its projects
@@ -55,6 +57,7 @@ use std::io::Seek;
 use std::path::PathBuf;
 use std::pin::Pin;
 
+use crate::compact_job::CompactJobStatus;
 use ai_memory_consolidate::{
     AutoImproveReviewConfig, AutoImproveTelemetryParams, AutoImproveTelemetryReport, Bootstrap,
     BootstrapConfig, BootstrapOutcome, BootstrapSource, CuratorParams, CuratorReport,
@@ -188,6 +191,9 @@ pub struct AdminState {
     /// proxy secret, which is what keeps single-operator servers on their
     /// historical behaviour.
     pub trusted_proxy_identity: bool,
+    /// Single-flight slot and last-run status for `/admin/compact`. Process
+    /// memory only, so it answers while the writer is busy compacting.
+    pub compact_jobs: crate::compact_job::CompactJobs,
 }
 
 /// Async hook-router project-cache invalidator installed by the serve command.
@@ -693,7 +699,10 @@ pub fn admin_router_with_sweep_tuning(
             post(handle_repair_session_times),
         )
         .route("/admin/delete-workspace", post(handle_delete_workspace))
-        .route("/admin/compact", post(handle_compact))
+        .route(
+            "/admin/compact",
+            get(handle_compact_status).post(handle_compact),
+        )
         .route(
             "/admin/reclaim-ledger-versions",
             post(handle_reclaim_ledger_versions),
@@ -5169,9 +5178,6 @@ pub struct DeleteWorkspaceResult {
     pub dry_run: bool,
 }
 
-/// `POST /admin/delete-workspace` — remove a workspace and, via cascade, every
-/// project/page under it. Guarded: refuses a non-empty workspace unless
-/// `force` (a typo shouldn't wipe live data). Orphan-workspace cleanup.
 /// JSON request body for `POST /admin/compact`.
 #[derive(Deserialize)]
 struct CompactRequest {
@@ -5180,10 +5186,14 @@ struct CompactRequest {
     /// the whole database, so every write blocks until it finishes. That is an
     /// availability decision, and it should be deliberate.
     confirm: bool,
+    /// Answer `202` with the job's status at once instead of holding the
+    /// request until the `VACUUM` finishes. Poll `GET /admin/compact`.
+    #[serde(default)]
+    background: bool,
 }
 
 /// Wire-format summary returned by `POST /admin/compact`.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct CompactReport {
     /// Database size in bytes before the rebuild + `VACUUM`.
     pub bytes_before: u64,
@@ -5196,10 +5206,15 @@ pub struct CompactReport {
 /// `POST /admin/compact` — rebuild the FTS indexes and `VACUUM`, deleting
 /// nothing. The on-demand form of what the destructive commands offer as
 /// `--compact`.
+///
+/// Both forms take the single-flight slot, so a second `VACUUM` can never queue
+/// behind the first. The work runs on its own task and records its result in
+/// [`AdminState::compact_jobs`]: a client that disconnects does not cancel it,
+/// and neither does a proxy's timeout.
 async fn handle_compact(
     State(state): State<Arc<AdminState>>,
     Json(req): Json<CompactRequest>,
-) -> impl IntoResponse {
+) -> Response {
     if !req.confirm {
         return (
             StatusCode::BAD_REQUEST,
@@ -5207,25 +5222,90 @@ async fn handle_compact(
                 "error": "compact rewrites the whole database under an exclusive \
                           lock; pass confirm: true to proceed"
             })),
-        );
+        )
+            .into_response();
     }
-    match state.writer.compact().await {
-        Ok(summary) => {
-            let report = CompactReport {
+    // Read before claiming the slot, so the claim itself never awaits: a client
+    // that disconnects here leaves nothing marked running.
+    let (database_bytes, reclaimable_bytes) = match state.reader.storage_status().await {
+        Ok(storage) => (
+            Some(storage.database_bytes),
+            Some(storage.reclaimable_bytes),
+        ),
+        Err(error) => {
+            warn!(%error, "compact job starts without storage figures");
+            (None, None)
+        }
+    };
+    let (job_id, started) = match state
+        .compact_jobs
+        .try_start(database_bytes, reclaimable_bytes)
+    {
+        Ok(claimed) => claimed,
+        Err(job) => {
+            return (
+                StatusCode::CONFLICT,
+                Json(serde_json::json!({
+                    "error": "a compaction is already running",
+                    "job": job,
+                })),
+            )
+                .into_response();
+        }
+    };
+    let outcome = spawn_compaction(&state, job_id);
+    if req.background {
+        return (StatusCode::ACCEPTED, Json(started)).into_response();
+    }
+    match outcome.await {
+        Ok(Ok(report)) => (StatusCode::OK, Json(report)).into_response(),
+        Ok(Err(error)) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": error })),
+        )
+            .into_response(),
+        Err(_) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": "compaction stopped before it reported" })),
+        )
+            .into_response(),
+    }
+}
+
+/// Run one compaction for the job `job_id` already claimed. The returned
+/// receiver yields the outcome for a synchronous caller; a background caller
+/// drops it, and the result still lands in the job state.
+///
+/// The `VACUUM` runs on an inner task so that a panic surfaces as a recorded
+/// failure instead of leaving the slot claimed until the process restarts.
+fn spawn_compaction(
+    state: &AdminState,
+    job_id: String,
+) -> tokio::sync::oneshot::Receiver<Result<CompactReport, String>> {
+    let writer = state.writer.clone();
+    let jobs = state.compact_jobs.clone();
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    tokio::spawn(async move {
+        let work = tokio::spawn(async move { writer.compact().await });
+        let outcome = match work.await {
+            Ok(Ok(summary)) => Ok(CompactReport {
                 bytes_before: summary.bytes_before,
                 bytes_after: summary.bytes_after,
                 bytes_reclaimed: summary.bytes_reclaimed(),
-            };
-            (
-                StatusCode::OK,
-                Json(serde_json::to_value(&report).unwrap_or_else(|_| serde_json::json!({}))),
-            )
-        }
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({ "error": e.to_string() })),
-        ),
-    }
+            }),
+            Ok(Err(error)) => Err(error.to_string()),
+            Err(join) => Err(format!("compaction stopped unexpectedly: {join}")),
+        };
+        jobs.finish(&job_id, outcome.clone());
+        let _ = tx.send(outcome);
+    });
+    rx
+}
+
+/// `GET /admin/compact` — status of the latest compaction job. Never touches
+/// the writer, so it answers while a `VACUUM` holds it.
+async fn handle_compact_status(State(state): State<Arc<AdminState>>) -> Json<CompactJobStatus> {
+    Json(state.compact_jobs.status())
 }
 
 /// JSON request body for `POST /admin/reclaim-ledger-versions`.
@@ -5320,6 +5400,9 @@ async fn handle_reclaim_ledger_versions(
     }
 }
 
+/// `POST /admin/delete-workspace` — remove a workspace and, via cascade, every
+/// project/page under it. Guarded: refuses a non-empty workspace unless
+/// `force` (a typo shouldn't wipe live data). Orphan-workspace cleanup.
 async fn handle_delete_workspace(
     State(state): State<Arc<AdminState>>,
     actor_ext: Option<axum::Extension<ai_memory_core::ActorContext>>,
@@ -9043,6 +9126,7 @@ mod tests {
             .unwrap()
             .with_store_reader(store.reader.clone());
         let router = admin_router(AdminState {
+            compact_jobs: Default::default(),
             ingest_metrics: std::sync::Arc::new(ai_memory_core::IngestMetrics::default()),
             writer: store.writer.clone(),
             reader: store.reader.clone(),
@@ -9112,6 +9196,7 @@ mod tests {
             .unwrap();
 
         let router = admin_router(AdminState {
+            compact_jobs: Default::default(),
             ingest_metrics: std::sync::Arc::new(ai_memory_core::IngestMetrics::default()),
             writer: store.writer.clone(),
             reader: store.reader.clone(),
@@ -9239,6 +9324,7 @@ mod tests {
         }
 
         let router = admin_router(AdminState {
+            compact_jobs: Default::default(),
             ingest_metrics: std::sync::Arc::new(ai_memory_core::IngestMetrics::default()),
             writer: store.writer.clone(),
             reader: store.reader.clone(),
@@ -9477,6 +9563,7 @@ mod tests {
         }
 
         let router = admin_router(AdminState {
+            compact_jobs: Default::default(),
             ingest_metrics: std::sync::Arc::new(ai_memory_core::IngestMetrics::default()),
             writer: store.writer.clone(),
             reader: store.reader.clone(),
@@ -9674,6 +9761,7 @@ mod tests {
         store.writer.end_session(ended, None).await.unwrap();
 
         let router = admin_router(AdminState {
+            compact_jobs: Default::default(),
             ingest_metrics: std::sync::Arc::new(ai_memory_core::IngestMetrics::default()),
             writer: store.writer.clone(),
             reader: store.reader.clone(),
@@ -9897,6 +9985,7 @@ mod tests {
             .unwrap()
             .with_store_reader(store.reader.clone());
         let router = admin_router(AdminState {
+            compact_jobs: Default::default(),
             ingest_metrics: std::sync::Arc::new(ai_memory_core::IngestMetrics::default()),
             writer: store.writer.clone(),
             reader: store.reader.clone(),
@@ -10464,6 +10553,7 @@ mod tests {
         llm: Option<Arc<dyn LlmProvider>>,
     ) -> AdminState {
         AdminState {
+            compact_jobs: Default::default(),
             ingest_metrics: std::sync::Arc::new(ai_memory_core::IngestMetrics::default()),
             writer: store.writer.clone(),
             reader: store.reader.clone(),
@@ -11966,6 +12056,7 @@ mod tests {
             .with_admission_chain(chain)
             .with_store_reader(store.reader.clone());
         let router = admin_router(AdminState {
+            compact_jobs: Default::default(),
             ingest_metrics: std::sync::Arc::new(ai_memory_core::IngestMetrics::default()),
             writer: store.writer.clone(),
             reader: store.reader.clone(),
@@ -12078,6 +12169,7 @@ mod tests {
             .with_admission_chain(chain)
             .with_store_reader(store.reader.clone());
         let router = admin_router(AdminState {
+            compact_jobs: Default::default(),
             ingest_metrics: std::sync::Arc::new(ai_memory_core::IngestMetrics::default()),
             writer: store.writer.clone(),
             reader: store.reader.clone(),
@@ -12183,6 +12275,7 @@ mod tests {
             .with_admission_chain(chain)
             .with_store_reader(store.reader.clone());
         let router = admin_router(AdminState {
+            compact_jobs: Default::default(),
             ingest_metrics: std::sync::Arc::new(ai_memory_core::IngestMetrics::default()),
             writer: store.writer.clone(),
             reader: store.reader.clone(),
@@ -12294,6 +12387,7 @@ mod tests {
             .with_admission_chain(chain)
             .with_store_reader(store.reader.clone());
         let router = admin_router(AdminState {
+            compact_jobs: Default::default(),
             ingest_metrics: std::sync::Arc::new(ai_memory_core::IngestMetrics::default()),
             writer: store.writer.clone(),
             reader: store.reader.clone(),
@@ -12844,6 +12938,7 @@ mod tests {
         let wiki = Wiki::new(tmp.path(), store.writer.clone()).unwrap();
         let pepper = ai_memory_store::TokenPepper::new("test-pepper-admin");
         let router = admin_router(AdminState {
+            compact_jobs: Default::default(),
             ingest_metrics: std::sync::Arc::new(ai_memory_core::IngestMetrics::default()),
             writer: store.writer.clone(),
             reader: store.reader.clone(),
@@ -12903,6 +12998,7 @@ mod tests {
         let wiki = Wiki::new(tmp.path(), store.writer.clone()).unwrap();
         let pepper = ai_memory_store::TokenPepper::new("test-pepper-admin");
         let router = admin_router(AdminState {
+            compact_jobs: Default::default(),
             ingest_metrics: std::sync::Arc::new(ai_memory_core::IngestMetrics::default()),
             writer: store.writer.clone(),
             reader: store.reader.clone(),
@@ -13603,6 +13699,7 @@ mod tests {
         let store = Store::open(tmp.path()).unwrap();
         let wiki = Wiki::new(tmp.path(), store.writer.clone()).unwrap();
         let router = admin_router(AdminState {
+            compact_jobs: Default::default(),
             ingest_metrics: std::sync::Arc::new(ai_memory_core::IngestMetrics::default()),
             writer: store.writer.clone(),
             reader: store.reader.clone(),
@@ -13737,6 +13834,7 @@ mod tests {
         let missing_db_reader =
             ai_memory_store::ReaderPool::new(&tmp.path().join("missing.sqlite"), 1).unwrap();
         let router = admin_router(AdminState {
+            compact_jobs: Default::default(),
             ingest_metrics: std::sync::Arc::new(ai_memory_core::IngestMetrics::default()),
             writer: store.writer.clone(),
             reader: missing_db_reader,
@@ -14583,6 +14681,7 @@ mod tests {
         let store = Store::open(tmp.path()).unwrap();
         let wiki = Wiki::new(tmp.path(), store.writer.clone()).unwrap();
         let router = admin_router(AdminState {
+            compact_jobs: Default::default(),
             ingest_metrics: std::sync::Arc::new(ai_memory_core::IngestMetrics::default()),
             writer: store.writer.clone(),
             reader: store.reader.clone(),
