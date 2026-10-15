@@ -69,7 +69,7 @@ version in [`docs/changelog/`](docs/changelog/):
   ordinary page named like a ledger stays versioned. A ledger an earlier
   version committed is dropped from the git index, never from disk, by the next
   checkpoint. Existing history keeps its old blobs; `docs/lifecycle-ops.md`
-  explains how an operator can rewrite it. (#PRNUM)
+  explains how an operator can rewrite it. (akitaonrails/ai-memory#1318)
 
 ## [3.0.0] - 2026-10-13
 
