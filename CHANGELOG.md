@@ -72,7 +72,7 @@ version in [`docs/changelog/`](docs/changelog/):
   and checkpoints the WAL on SIGINT, SIGTERM, Ctrl-C or the end of stdio
   input, waiting at most 5 seconds; a read that arrives after that point is
   refused. A hard kill before the checkpoint still leaves the WAL to replay.
-  (#PRNUM)
+  (akitaonrails/ai-memory#1317)
 
 ## [3.0.0] - 2026-10-13
 
