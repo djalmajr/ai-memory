@@ -511,6 +511,17 @@ pub(crate) enum WriteCmd {
         mode: crate::ops::PurgeMode,
         reply: oneshot::Sender<StoreResult<crate::ops::PurgeSessionSummary>>,
     },
+    /// Final `wal_checkpoint(TRUNCATE)`, then close the connection and stop
+    /// the actor. See [`WriterHandle::checkpoint_and_close`].
+    Close {
+        reply: oneshot::Sender<()>,
+    },
+    /// Test seam: read `PRAGMA journal_size_limit` off the writer's own
+    /// connection, the only place the pragma is set.
+    #[cfg(test)]
+    JournalSizeLimit {
+        reply: oneshot::Sender<StoreResult<i64>>,
+    },
     /// Reclaim free pages on demand: rebuild the FTS indexes and `VACUUM`,
     /// deleting nothing. See [`ops::compact`].
     Compact {
@@ -2459,6 +2470,31 @@ impl WriterHandle {
         rx.await.map_err(|_| StoreError::WriterClosed)?
     }
 
+    /// Truncate the WAL, close the writer's connection and stop the actor,
+    /// waiting until that has happened. Later calls fail with
+    /// [`StoreError::WriterClosed`]. Returns at once if the actor already
+    /// stopped.
+    ///
+    /// Queued behind every command already accepted, so it also waits for a
+    /// long-running one (a `VACUUM`); callers bound it with a timeout. A
+    /// checkpoint a reader holds back is logged, never an error.
+    pub async fn checkpoint_and_close(&self) {
+        let (tx, rx) = oneshot::channel();
+        if self.send(WriteCmd::Close { reply: tx }).await.is_ok() {
+            // The reply follows the checkpoint and the connection close; a
+            // dropped sender means the actor stopped without answering.
+            let _ = rx.await;
+        }
+    }
+
+    /// `PRAGMA journal_size_limit` as the writer's connection reports it.
+    #[cfg(test)]
+    pub(crate) async fn journal_size_limit(&self) -> StoreResult<i64> {
+        let (tx, rx) = oneshot::channel();
+        self.send(WriteCmd::JournalSizeLimit { reply: tx }).await?;
+        rx.await.map_err(|_| StoreError::WriterClosed)?
+    }
+
     /// Reclaim free pages on demand, deleting nothing.
     ///
     /// Runs through the writer actor like every other exclusive operation, so
@@ -4401,6 +4437,25 @@ fn worker_loop(mut conn: Connection, mut rx: mpsc::Receiver<WriteCmd>) {
                     mode,
                 );
                 send_or_warn(reply, result, "purge_session");
+            }
+            WriteCmd::Close { reply } => {
+                ops::truncate_wal_best_effort(&conn, "shutdown");
+                // Close before replying, so the caller's return means the
+                // connection is released.
+                drop(conn);
+                send_or_warn(reply, (), "close");
+                // Same drain as `Shutdown`: callers that already hold a
+                // permit see `WriterClosed` instead of waiting forever.
+                rx.close();
+                while rx.blocking_recv().is_some() {}
+                break;
+            }
+            #[cfg(test)]
+            WriteCmd::JournalSizeLimit { reply } => {
+                let result = conn
+                    .query_row("PRAGMA journal_size_limit", [], |row| row.get(0))
+                    .map_err(StoreError::from);
+                send_or_warn(reply, result, "journal_size_limit");
             }
             WriteCmd::Compact { reply } => {
                 let result = ops::compact(&mut conn);
