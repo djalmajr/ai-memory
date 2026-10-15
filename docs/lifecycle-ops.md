@@ -75,6 +75,23 @@ pages. The rebuild is needed because an ordinary delete leaves the tokens inside
 the index segments, and a `VACUUM` alone does not clear them. It needs free disk space of roughly the database's own size and takes
 minutes on a large store, which is why it is opt-in.
 
+`VACUUM` rewrites every page through the SQLite write-ahead log, so the `-wal`
+file next to `memory.sqlite` grows to roughly the database's size while it runs.
+`compact`, `reclaim-ledger-versions --compact` and the purges with `--compact`
+therefore run `PRAGMA wal_checkpoint(TRUNCATE)` right after the `VACUUM`, and the
+`-wal` goes back to zero bytes. If a reader holds an old snapshot the checkpoint
+cannot finish: the command still succeeds, `ai-memory` logs a `warn` with the
+`busy`, `log` and `checkpointed` counts, and the `-wal` keeps its size until a
+later checkpoint after that reader is gone (the writer waits up to 5 seconds for
+readers before giving up). The writer connection also sets `journal_size_limit`
+to 64 MiB, which is the size the `-wal` is cut back to after any checkpoint. It
+is not a cap: a running transaction, or a reader that blocks the checkpoint, can
+push the file past it. On `SIGINT`, `SIGTERM`, Ctrl-C or the end of stdio input, `serve` closes its read
+connections and runs one last checkpoint, waiting at most 5 seconds for it; a
+read still running keeps its connection until it ends, and the checkpoint is
+best effort. A `SIGKILL` leaves the `-wal` as it was and the next start replays
+it.
+
 **`--compact` is not forensic erasure.** The wiki git repository stores page
 content in its objects *and its commit messages*, and any backup taken before
 the purge still contains everything. Removing the bytes from the live SQLite
@@ -941,6 +958,52 @@ What it does not recover:
 - Sessions, observations, handoffs, users, audit rows, access counters, and
   embeddings. Those live only in SQLite and require a full `backup` / `restore`
   if you need to roll them back.
+
+### Hook event ledgers are not in the wiki's git history
+
+The raw hook event ledgers (`log.md` and `log-YYYY-MM.md` under each project)
+are append-only logs that can reach hundreds of megabytes. Git stores every new
+version of a file as a whole blob, and the server never packs or prunes the wiki
+repository, so each checkpoint that followed a hook append added another copy of
+the ledger: one install's `wiki/.git` grew to 3.49 GB. Nothing reads ledger
+history back from git: `restore-page` and `checkpoints` work on pages, and
+`backup` copies the data directory from disk.
+
+Since this change a checkpoint leaves ledgers out of the commit. A file counts as
+a ledger only when its name has the ledger shape **and** its first 8 KiB open
+with a hook log entry (`## [timestamp] ...`, under optional frontmatter), the
+same test the indexer and `reclaim-ledger-versions` use. A page that merely is
+named `log-2026-09.md` stays versioned. The ledger file itself is never touched.
+A ledger that an earlier version already committed is dropped from the git index
+(`git rm --cached`) by the first checkpoint that sees it, so existing installs
+stop growing without any step from you. The check runs when a checkpoint stages
+files and does a bounded prefix read (at most 8 KiB) per check, never the
+whole file; a ledger appended between that read and the commit is simply not in
+the commit.
+
+What this does **not** do: history already written keeps its old blobs, so
+`wiki/.git` does not shrink by itself, and checkpoints taken before the upgrade
+still contain old ledger versions. The server never rewrites or garbage-collects
+that history. Shrinking it is an operator task, and it is destructive: every
+commit id changes, so OIDs you noted from `ai-memory checkpoints` stop resolving,
+and `git gc --prune=now` makes the old blobs unrecoverable. Stop the server, take
+a `backup` first, and only then, as an example:
+
+```bash
+cd <data-dir>/wiki
+# Let the upgraded server take one checkpoint first, so HEAD no longer tracks the
+# ledgers, and copy them aside anyway: a history rewrite resets the working tree.
+# The globs match by name only. If you keep an ordinary page named like a
+# ledger, they also delete that page's history, so narrow them first.
+git filter-repo --force --invert-paths \
+  --path-glob '*/log.md' \
+  --path-glob '*/log-[0-9][0-9][0-9][0-9]-[0-9][0-9].md'
+git reflog expire --expire=now --all
+git gc --prune=now --aggressive
+```
+
+Start the server again afterwards. `git filter-repo` is a separate tool and is
+not installed with ai-memory.
 
 ### `backup`
 

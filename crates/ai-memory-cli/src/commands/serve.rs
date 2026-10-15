@@ -1475,6 +1475,7 @@ pub async fn run(config: &Config, args: ServeArgs) -> Result<()> {
                     }
                 }
             }
+            close_store(&store).await;
         }
         TransportKind::Http => {
             seed_active_project_fallback(&store.reader, &active_project).await;
@@ -1998,12 +1999,39 @@ pub async fn run(config: &Config, args: ServeArgs) -> Result<()> {
                     ),
                 }
             }
+            close_store(&store).await;
             if let Some(serve_result) = serve_result {
                 serve_result?;
             }
         }
     }
     Ok(())
+}
+
+/// Checkpoint the WAL and close the store's connections on the way out.
+///
+/// `main` ends the process without joining the store writer (detached tasks
+/// still hold clones of its handle), so the connection is never closed and the
+/// whole `-wal` is left for the next start to replay: 9 minutes for a 17.8 GB
+/// one after a `VACUUM`. Bounded by [`SHUTDOWN_GRACE`] because the close queues
+/// behind whatever the writer is running, and a stuck query must not turn a
+/// stop back into a SIGKILL.
+async fn close_store(store: &Store) {
+    close_store_within(store, SHUTDOWN_GRACE).await;
+}
+
+/// [`close_store`] with the deadline as a parameter, so a test can pin the
+/// bound without waiting out the real one. `true` when the store closed in
+/// time.
+async fn close_store_within(store: &Store, grace: Duration) -> bool {
+    if tokio::time::timeout(grace, store.close()).await.is_err() {
+        tracing::warn!(
+            grace_secs = grace.as_secs(),
+            "store did not close within the shutdown grace period; exiting anyway"
+        );
+        return false;
+    }
+    true
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3381,6 +3409,35 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tempfile::TempDir;
     use tower::ServiceExt;
+
+    /// The shutdown close queues behind whatever the writer is running, so the
+    /// deadline is what keeps a stuck query from turning a stop back into a
+    /// SIGKILL. The writer is made busy for real: another connection holds the
+    /// write lock, so the writer's next command (the close itself, or the
+    /// write queued before it) waits in SQLite's 5s busy handler.
+    #[tokio::test]
+    async fn close_store_returns_within_its_grace_while_the_writer_is_busy() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let blocker = rusqlite::Connection::open(store.db_path()).unwrap();
+        blocker.execute_batch("BEGIN IMMEDIATE").unwrap();
+        let writer = store.writer.clone();
+        let queued = tokio::spawn(async move { writer.get_or_create_workspace("blocked").await });
+
+        let started = std::time::Instant::now();
+        let closed = close_store_within(&store, Duration::from_millis(200)).await;
+        let elapsed = started.elapsed();
+
+        // Let the writer go before asserting, so a failure does not leave it
+        // parked for the rest of its busy timeout.
+        blocker.execute_batch("ROLLBACK").unwrap();
+        let _ = queued.await;
+        assert!(!closed, "the close cannot finish while the writer is stuck");
+        assert!(
+            elapsed < Duration::from_secs(3),
+            "close_store waited {elapsed:?} for a stuck writer instead of giving up"
+        );
+    }
 
     /// An owner-check failure of the startup wiki baseline checkpoint must be
     /// classified as an ERROR-worthy `OwnerFailure`, not the WARN-only
