@@ -38,7 +38,7 @@ use flate2::read::GzDecoder;
 use sha2::{Digest, Sha256};
 use tracing::info;
 
-use crate::cli::{AgentChoice, InstallHooksArgs, UpgradeArgs};
+use crate::cli::{AgentChoice, HookInstallScope, InstallHooksArgs, UpgradeArgs};
 use crate::commands::install_hooks;
 use crate::config::Config;
 use crate::install_layout::{HOOKS_DIR_NAME, shipped_binary_name};
@@ -72,6 +72,7 @@ pub async fn run(config: &Config, args: UpgradeArgs) -> Result<()> {
     let base = release_base_url(config);
     let tag = resolve_tag(&fetcher, &base, args.version.as_deref()).await?;
     if skip_when_current(&tag, args.force) {
+        refresh_plugins(config, &super::user_service::SystemRunner);
         return Ok(());
     }
 
@@ -80,6 +81,7 @@ pub async fn run(config: &Config, args: UpgradeArgs) -> Result<()> {
 
     // Sync FS after await is intentional for this CLI one-shot path.
     refresh_staged_hooks(config)?;
+    refresh_plugins(config, &super::user_service::SystemRunner);
     warn_remote_server(config);
     println!("✓ upgraded to {tag}");
     info!(%tag, path = %exe.display(), "native upgrade complete");
@@ -802,6 +804,41 @@ fn refresh_staged_hooks(config: &Config) -> Result<()> {
     Ok(())
 }
 
+/// Keep the marketplace plugins in step with the binary (#1166). Claude Code
+/// does not auto-update a third-party marketplace unless the user turned that
+/// on, so the Claude Code plugin is updated here. Codex is only told what to
+/// run: its hooks must be re-trusted only when a command changes, and the
+/// operator should see that happen in Codex itself.
+fn refresh_plugins(config: &Config, runner: &dyn super::user_service::CommandRunner) {
+    use super::agent_plugins::{self, PluginHarness};
+    let Some(home) = super::run::native_home(config) else {
+        return;
+    };
+    let env = |name: &str| {
+        config
+            .runtime_env
+            .process_env()
+            .iter()
+            .find(|(key, _)| key.as_os_str() == name)
+            .map(|(_, value)| value.clone())
+    };
+    for plugin in agent_plugins::installed(&home, &env) {
+        match plugin.harness {
+            PluginHarness::ClaudeCode => {
+                println!("→ updating the ai-memory Claude Code plugin");
+                for line in agent_plugins::update_claude_code(runner) {
+                    println!("    {line}");
+                }
+            }
+            PluginHarness::Codex => println!(
+                "→ the ai-memory Codex plugin is installed: run `codex plugin marketplace upgrade \
+                 ai-memory` and `codex plugin add {}` to update it",
+                agent_plugins::PLUGIN_ID
+            ),
+        }
+    }
+}
+
 fn staged_hooks_root(config: &Config) -> PathBuf {
     install_hooks::hook_staging_root(
         &config.data_dir,
@@ -827,12 +864,53 @@ fn refresh_agent_list(config: &Config, agents: &StagedAgentList) {
 }
 
 fn apply_staged_agent_hooks(config: &Config, name: &str, agent: AgentChoice) {
+    if agent == AgentChoice::ClaudeCode
+        && let Some(settings) = claude_user_level_install_absent()
+    {
+        println!(
+            "    (no ai-memory hooks in {} — skipping the user-level re-apply; the staged \
+             scripts are refreshed, but `--scope project` files are not rewritten: re-run \
+             `ai-memory install-hooks --agent {name} --scope project --apply` in each such \
+             checkout to pick up hook-command changes)",
+            settings.display()
+        );
+        match install_hooks::restage_claude_code_scripts(&config.data_dir, None) {
+            Ok(staged) => println!("    restaged {}", staged.display()),
+            Err(err) => println!(
+                "      (skipped — {err:#}; re-run `ai-memory install-hooks \
+                 --agent {name} --scope project --apply` in each checkout)"
+            ),
+        }
+        return;
+    }
     println!("    ai-memory install-hooks --agent {name} --apply");
     if let Err(err) = install_hooks::run(config, apply_hooks_args(agent)) {
         println!(
             "      (skipped — {err:#}; re-run with the same --server-url / --auth-token used originally)"
         );
     }
+}
+
+/// The user-level Claude Code settings path when that file provably holds no
+/// ai-memory install: it is missing, or parses without one of our hooks. A
+/// `--scope project` install stages the same scripts without touching that
+/// file, so a staged `claude-code` dir alone no longer proves a user-level
+/// install exists — and a bare re-apply would create one the operator never
+/// asked for. `None` when the file carries our hooks, and also when it cannot
+/// be read or parsed: the re-apply then runs and reports that error, as it
+/// did before project scope existed.
+fn claude_user_level_install_absent() -> Option<PathBuf> {
+    claude_user_level_install_absent_at(install_hooks::claude_settings_path().ok()?)
+}
+
+fn claude_user_level_install_absent_at(path: PathBuf) -> Option<PathBuf> {
+    let content = match fs::read_to_string(&path) {
+        Ok(content) => content,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Some(path),
+        Err(_) => return None,
+    };
+    let document: serde_json::Value = serde_json::from_str(&content).ok()?;
+    (!install_hooks::document_carries_ai_memory_hooks(&document)).then_some(path)
 }
 
 fn apply_hooks_args(agent: AgentChoice) -> InstallHooksArgs {
@@ -844,6 +922,7 @@ fn apply_hooks_args(agent: AgentChoice) -> InstallHooksArgs {
         as_user: None,
         apply: true,
         config_file: None,
+        scope: HookInstallScope::Global,
         project_strategy: None,
         capture_assistant: false,
         capture_mode: None,
@@ -998,6 +1077,37 @@ mod tests {
     use tar::Header;
     use zip::ZipWriter;
     use zip::write::SimpleFileOptions;
+
+    /// `upgrade` keeps an installed Claude Code plugin in step with the
+    /// binary: marketplace update, then plugin update. Without the plugin,
+    /// and for the Codex plugin, it runs nothing.
+    #[test]
+    fn upgrade_updates_an_installed_claude_code_plugin_only() {
+        use crate::commands::agent_plugins::test_support::{
+            RecordingRunner, install_claude_plugin, install_codex_plugin,
+        };
+        let home = tempfile::tempdir().unwrap();
+        let config = Config {
+            home_dir: Some(home.path().to_string_lossy().into_owned()),
+            ..Config::default()
+        };
+
+        let runner = RecordingRunner::new(None);
+        refresh_plugins(&config, &runner);
+        install_codex_plugin(home.path());
+        refresh_plugins(&config, &runner);
+        assert!(runner.calls.borrow().is_empty(), "{:?}", runner.calls);
+
+        install_claude_plugin(home.path(), "0.0.1", true);
+        refresh_plugins(&config, &runner);
+        assert_eq!(
+            *runner.calls.borrow(),
+            vec![
+                "claude plugin marketplace update ai-memory",
+                "claude plugin update ai-memory@ai-memory"
+            ]
+        );
+    }
 
     #[test]
     fn release_asset_name_for_covers_unix_and_windows_matrix() {
@@ -1613,6 +1723,62 @@ mod tests {
         assert!(!content_length_exceeds_limit(64, 64));
         assert!(content_length_exceeds_limit(65, 64));
         assert!(!content_length_exceeds_limit(0, 1));
+    }
+
+    /// The claude-code refresh guard: a missing or third-party-only user-level
+    /// settings file means the hooks live in a `--scope project` file, and the
+    /// refresh must not create a user-level install. A file that exists but
+    /// does not parse is not "absent": the re-apply must run and report it.
+    #[test]
+    fn claude_refresh_skips_only_a_provably_absent_user_level_install() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let settings = tmp.path().join("settings.json");
+        let absent = |why: &str| {
+            assert_eq!(
+                claude_user_level_install_absent_at(settings.clone()).as_deref(),
+                Some(settings.as_path()),
+                "{why}"
+            );
+        };
+        let present = |why: &str| {
+            assert_eq!(
+                claude_user_level_install_absent_at(settings.clone()),
+                None,
+                "{why}"
+            );
+        };
+        absent("a missing file holds no install");
+        fs::write(
+            &settings,
+            r#"{"hooks":{"Notification":[{"matcher":"","hooks":[{"type":"command","command":"/usr/bin/n.sh"}]}]}}"#,
+        )
+        .unwrap();
+        absent("a third-party hook is not an ai-memory install");
+        fs::write(&settings, "{ not json").unwrap();
+        present("an unparsable file must reach install_hooks::run so the error surfaces");
+        fs::write(
+            &settings,
+            r#"{"hooks":{"Stop":[{"matcher":"","hooks":[{"type":"command","command":"AI_MEMORY_HOOK_URL=http://127.0.0.1:49374 /h/.local/share/ai-memory/hooks/claude-code/stop.sh"}]}]}}"#,
+        )
+        .unwrap();
+        present("our hook means a user-level install to refresh");
+    }
+
+    /// With only project-scoped installs, the refresh must still re-copy the
+    /// scripts those installs point at.
+    #[test]
+    fn restage_refreshes_the_claude_scripts_without_a_settings_file() {
+        let data = tempfile::TempDir::new().unwrap();
+        let hooks_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../hooks");
+        let staged =
+            install_hooks::restage_claude_code_scripts(data.path(), Some(&hooks_dir)).unwrap();
+        assert!(staged.starts_with(data.path()), "{staged:?}");
+        let scripts = fs::read_dir(&staged)
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|entry| entry.path().extension().is_some_and(|ext| ext == "sh"))
+            .count();
+        assert!(scripts > 0, "no hook scripts staged under {staged:?}");
     }
 
     #[test]

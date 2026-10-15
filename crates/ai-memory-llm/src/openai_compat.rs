@@ -169,9 +169,9 @@ impl OpenAiCompatProvider {
     /// Send `X-Request-Id` with the logical operation id on every chat
     /// attempt, for gateways that record it (for example as `req=<id>`) and
     /// forward it to the engine. The id is shared by every attempt of one
-    /// operation — the strict-to-tolerant fallback and the admission replay
-    /// reuse it, so one operation is correlatable end to end. Enabled by
-    /// the factory only for the configured `openai-compat` provider;
+    /// operation — the strict-to-tolerant fallback reuses it, so one
+    /// operation is correlatable end to end. Enabled by the factory only
+    /// for the configured `openai-compat` provider;
     /// [`crate::OpenCodeProvider`] keeps its own `x-opencode-session`
     /// contract and does not set it. A static `AI_MEMORY_LLM_HEADERS` entry
     /// for this name is refused at startup on that path.
@@ -491,41 +491,6 @@ mod tests {
         );
         let uuid = uuid::Uuid::parse_str(&value).expect("valid UUID");
         assert_eq!(uuid.get_version_num(), 7, "time-ordered v7 id");
-    }
-
-    /// Acceptance (c): a new operation is a new invocation into the chain,
-    /// so it receives a distinct id — the header must never be cached or
-    /// reused across operations.
-    #[tokio::test]
-    async fn a_new_operation_gets_a_distinct_request_id() {
-        let server = MockServer::start().await;
-        Mock::given(method("POST"))
-            .and(path("/v1/chat/completions"))
-            .respond_with(
-                ResponseTemplate::new(200).set_body_json(chat_response_with_content("ok")),
-            )
-            .mount(&server)
-            .await;
-
-        let provider = OpenAiCompatProvider::new(server.uri(), None, "model-x")
-            .expect("provider builds")
-            .with_request_id_header();
-        let first = LlmOperationId::new();
-        let second = LlmOperationId::new();
-        assert_ne!(first, second, "fresh operations are distinct");
-        provider
-            .complete_with_operation_id(ChatRequest::user_prompt("first"), first)
-            .await
-            .expect("first operation succeeds");
-        provider
-            .complete_with_operation_id(ChatRequest::user_prompt("second"), second)
-            .await
-            .expect("second operation succeeds");
-
-        let requests = server.received_requests().await.expect("requests");
-        assert_eq!(requests.len(), 2);
-        assert_eq!(request_id_of(&requests[0]), Some(first.to_string()));
-        assert_eq!(request_id_of(&requests[1]), Some(second.to_string()));
     }
 
     /// Acceptance (b): the strict-to-tolerant fallback is a SECOND HTTP

@@ -74,12 +74,17 @@ WORKDIR /work
 #   - the crates, with their vendored assets (ai-memory-web/static/...);
 #   - hooks/, installed into the runtime image below;
 #   - docs/logo.png, embedded by ai-memory-web (routes/statics.rs
-#     include_bytes!) in every release build.
-COPY Cargo.toml Cargo.lock rust-toolchain.toml ./
+#     include_bytes!) in every release build;
+#   - LICENSE (include_str!'d by `render-plugins`) and the packaged systemd /
+#     launchd templates (include_str!'d by `ai-memory setup`'s user-service
+#     rendering): upstream 3.0 compiles them into the binary.
+COPY Cargo.toml Cargo.lock rust-toolchain.toml LICENSE ./
 COPY crates/ crates/
 COPY evals/ evals/
 COPY hooks/ hooks/
 COPY docs/logo.png docs/logo.png
+COPY packaging/systemd packaging/systemd
+COPY packaging/launchd packaging/launchd
 RUN cargo build --release -p ai-memory-cli \
  && cp target/release/ai-memory /usr/local/bin/ai-memory
 

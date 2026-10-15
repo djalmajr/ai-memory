@@ -40,6 +40,11 @@ pub enum ConsolidatorError {
     #[error(transparent)]
     Store(#[from] ai_memory_store::StoreError),
 
+    /// Cross-scope link validation could not resolve a named scope (a real
+    /// store failure — a merely absent scope is de-linked, not an error).
+    #[error(transparent)]
+    Scope(#[from] ai_memory_store::ScopeResolutionError),
+
     /// Underlying wiki error.
     #[error(transparent)]
     Wiki(#[from] ai_memory_wiki::WikiError),
@@ -103,6 +108,7 @@ pub fn redacted_error_summary(error: &ConsolidatorError) -> String {
     let (class, status) = match error {
         ConsolidatorError::Memory(_) => ("memory", None),
         ConsolidatorError::Store(_) => ("store", None),
+        ConsolidatorError::Scope(_) => ("scope", None),
         ConsolidatorError::Wiki(_) => ("wiki", None),
         ConsolidatorError::Llm(llm) => (llm.class(), llm.http_status()),
         ConsolidatorError::Serde(_) => ("serde", None),
@@ -454,7 +460,21 @@ impl Consolidator {
             page.title = new_title;
         }
 
+        // #1218: a cross-scope link the model invented — body wikilink or
+        // `relations:` entry — must not be written. Resolve each against the
+        // store; de-link unresolved body links and drop unresolved relations,
+        // so the write cannot mint a dangling cross-project edge the lint
+        // pass would flag.
         let mut frontmatter = build_frontmatter(&page, session_id, agent_kind);
+        let unresolved = crate::link_guard::unresolved_cross_scope_links(
+            &self.reader,
+            ws,
+            &[(path, page.body_markdown.as_str(), &frontmatter)],
+        )
+        .await?;
+        page.body_markdown =
+            crate::link_guard::delink_body(&page.body_markdown, path, &unresolved).into_owned();
+        crate::link_guard::prune_relations(&mut frontmatter, &unresolved);
         // The map-reduce pipeline stamps its own publication marker so a
         // later run can distinguish its own publication from the heuristic
         // synthesizer's page. The single-prompt pipeline passes `None`.
@@ -576,6 +596,24 @@ impl Consolidator {
             return Ok(Some(scope));
         }
         Ok(self.reader.session_project_ids(session_id).await?)
+    }
+
+    /// Whether the calling agent wrote the session page through
+    /// `memory_write_page` ([`Wiki::session_page_written_by_agent`]). The
+    /// SessionEnd worker then leaves the page alone instead of replacing it
+    /// with a completion from the server's provider, however many
+    /// observations arrived after it.
+    ///
+    /// # Errors
+    /// Propagates store and wiki errors other than a missing page.
+    pub async fn session_page_written_by_agent(
+        &self,
+        session_id: SessionId,
+    ) -> ConsolidatorResult<bool> {
+        let (ws, proj) = self.resolve_target(session_id).await?;
+        Ok(self
+            .wiki
+            .session_page_written_by_agent(ws, proj, session_id)?)
     }
 
     /// Resolve the session's creating harness from the persisted session row.
@@ -703,12 +741,7 @@ impl Consolidator {
         }
     }
 
-    /// Latest page titles for duplicate-title avoidance on the session
-    /// page, seen through the same owner visibility as the slot
-    /// snapshots. The session's OWN page is excluded: re-consolidation
-    /// refreshing its own previous title is correct, not a collision.
-    /// Best-effort — a store hiccup degrades to "no context" rather
-    /// than failing consolidation.
+    /// See [`existing_session_page_titles`].
     async fn existing_page_titles(
         &self,
         workspace_id: WorkspaceId,
@@ -716,42 +749,8 @@ impl Consolidator {
         actor: &ai_memory_core::ActorContext,
         session_id: SessionId,
     ) -> Vec<String> {
-        let own_path = format!("sessions/{session_id}.md");
-        match self
-            .reader
-            .briefing_for_project(
-                workspace_id,
-                project_id,
-                EXISTING_TITLES_QUERY_LIMIT,
-                ai_memory_core::OwnerFilter::for_actor_context(actor),
-                false,
-            )
+        existing_session_page_titles(&self.reader, workspace_id, project_id, actor, session_id)
             .await
-        {
-            Ok(brief) => {
-                let from_briefing = brief
-                    .recent_pages
-                    .iter()
-                    .chain(brief.pinned.iter())
-                    .chain(brief.rules.iter())
-                    .chain(brief.slots.iter())
-                    .filter(|p| p.path != own_path)
-                    .map(|p| p.title.clone());
-                let from_settled = brief
-                    .settled
-                    .iter()
-                    .filter(|p| p.path != own_path)
-                    .map(|p| p.title.clone());
-                from_briefing.chain(from_settled).collect()
-            }
-            Err(err) => {
-                warn!(
-                    error = %err,
-                    "existing-title query failed; skipping duplicate-title context"
-                );
-                Vec::new()
-            }
-        }
     }
 
     async fn slot_snapshots(
@@ -875,6 +874,11 @@ impl Consolidator {
         let existing_titles = self
             .existing_page_titles(ws, proj, &actor, session_id)
             .await;
+        // One LLM operation, one identity (see `consolidate_session`): the
+        // fresh id is shared by every attempt of this invocation; a
+        // re-entry after a crash or a new queue claim is a new operation
+        // with a new id.
+        let operation_id = LlmOperationId::new();
         let request = build_batch_request_with_slots(
             session_id,
             &observations,
@@ -1057,6 +1061,27 @@ impl Consolidator {
             }
             requests.push(req);
             outcomes_preview.push(outcome);
+        }
+
+        // #1218: same cross-scope link guard as the single-page path, run
+        // once over every proposed body so the store checks batch too.
+        // De-linking rewrites in memory only; `apply_batch` below stays the
+        // single atomic write.
+        let unresolved = {
+            let pages: Vec<(&PagePath, &str, &serde_json::Value)> = requests
+                .iter()
+                .map(|req| (&req.path, req.body.as_str(), &req.frontmatter))
+                .collect();
+            crate::link_guard::unresolved_cross_scope_links(&self.reader, ws, &pages).await?
+        };
+        if !unresolved.is_empty() {
+            for (req, outcome) in requests.iter_mut().zip(outcomes_preview.iter_mut()) {
+                let rewritten =
+                    crate::link_guard::delink_body(&req.body, &req.path, &unresolved).into_owned();
+                req.body = rewritten.clone();
+                outcome.new_body_markdown = rewritten;
+                crate::link_guard::prune_relations(&mut req.frontmatter, &unresolved);
+            }
         }
 
         let ids = self.wiki.apply_batch(requests).await?;
@@ -2380,7 +2405,8 @@ fn build_final_request_single(
     let instructions_block =
         render_instructions_block(instructions, optional_budget.saturating_div(2));
     let current_body_budget = optional_budget.saturating_sub(count_chars(&instructions_block));
-    let titles_block = render_title_uniqueness_section(existing_titles);
+    let titles_block =
+        render_title_uniqueness_section(existing_titles, current_body_budget.saturating_div(2));
     let current_body_budget = current_body_budget.saturating_sub(count_chars(&titles_block));
     let mut suffix = render_current_body_section(current_body, current_body_budget);
     suffix.push_str(&titles_block);
@@ -2506,13 +2532,13 @@ fn build_final_request_batch(
          \x20\x20\"rationale\": \"<one short sentence about why this batch>\"\n\
          }\n",
     );
-    let titles_block = render_title_uniqueness_section(existing_titles);
     let optional_budget = budgets.optional_context_budget::<ConsolidatedBatch>(
         BATCH_SYSTEM_PROMPT,
-        count_chars(&prefix)
-            .saturating_add(count_chars(&mandatory_suffix))
-            .saturating_add(count_chars(&titles_block)),
+        count_chars(&prefix).saturating_add(count_chars(&mandatory_suffix)),
     );
+    let titles_block =
+        render_title_uniqueness_section(existing_titles, optional_budget.saturating_div(2));
+    let optional_budget = optional_budget.saturating_sub(count_chars(&titles_block));
     let instructions_block =
         render_instructions_block(instructions, optional_budget.saturating_div(2));
     let slots_budget = optional_budget.saturating_sub(count_chars(&instructions_block));
@@ -2976,14 +3002,15 @@ fn build_batch_request_with_slots(
          \x20\x20\"rationale\": \"<one short sentence about why this batch>\"\n\
          }\n",
     );
-    let titles_block = render_title_uniqueness_section(existing_titles);
     let optional_budget = budgets.optional_context_budget::<ConsolidatedBatch>(
         BATCH_SYSTEM_PROMPT,
         count_chars(&fixed_header)
             .saturating_add(count_chars(&mandatory_suffix))
-            .saturating_add(count_chars(&observations_header))
-            .saturating_add(count_chars(&titles_block)),
+            .saturating_add(count_chars(&observations_header)),
     );
+    let titles_block =
+        render_title_uniqueness_section(existing_titles, optional_budget.saturating_div(2));
+    let optional_budget = optional_budget.saturating_sub(count_chars(&titles_block));
     let instructions_block =
         render_instructions_block(instructions, optional_budget.saturating_div(2));
     let slots_budget = optional_budget.saturating_sub(count_chars(&instructions_block));
@@ -3054,7 +3081,11 @@ fn render_slot_snapshots(slots: &[SlotSnapshot], max_chars: usize) -> String {
 /// is plain-text-editable + version-controlled as a Markdown file
 /// alongside the code. Public so off-tree harnesses (`evals/`) can
 /// inspect the exact prompt without duplicating it.
-pub const BATCH_SYSTEM_PROMPT: &str = include_str!("../prompts/batch_consolidate_system.md");
+pub const BATCH_SYSTEM_PROMPT: &str = crate::prompt_template::prompt_with_wikilinks!(
+    include_str!("../prompts/batch_consolidate_system.md"),
+    "the observations or page body",
+    "the observations"
+);
 
 fn build_request(
     session_id: SessionId,
@@ -3081,7 +3112,8 @@ fn build_request(
     let instructions_block =
         render_instructions_block(instructions, optional_budget.saturating_div(2));
     let current_body_budget = optional_budget.saturating_sub(count_chars(&instructions_block));
-    let titles_block = render_title_uniqueness_section(existing_titles);
+    let titles_block =
+        render_title_uniqueness_section(existing_titles, current_body_budget.saturating_div(2));
     let current_body_budget = current_body_budget.saturating_sub(count_chars(&titles_block));
     let current_body_block = render_current_body_section(current_body, current_body_budget);
 
@@ -3145,6 +3177,21 @@ pub const DEFAULT_CONSOLIDATION_MAX_OUTPUT_TOKENS: u32 = 32_000;
 /// back for the common case while leaving English budgets close to before.
 pub const DEFAULT_CONSOLIDATION_INPUT_TOKEN_SAFETY_MARGIN: f64 = 0.8;
 
+/// The char budget a configured input token limit really buys, at a given
+/// safety margin: `max_input_tokens * CHARS_PER_TOKEN * safety_margin`.
+///
+/// This is the single definition of the number the consolidation builders run
+/// with. Exposed so `config` can refuse a budget whose *effective* size cannot
+/// hold the fixed prompts plus [`MIN_OBSERVATION_RESERVE_CHARS`] of evidence,
+/// rather than comparing the raw token count and ignoring the margin (#1234).
+#[must_use]
+pub fn effective_input_chars(max_input_tokens: usize, safety_margin: f64) -> usize {
+    let nominal = max_input_tokens.saturating_mul(CHARS_PER_TOKEN);
+    // Callers pass a validated `0 < margin <= 1`, so the product never exceeds
+    // `nominal` and the cast cannot overflow.
+    (nominal as f64 * safety_margin) as usize
+}
+
 /// Conservative character-to-token estimate for provider-neutral budgeting.
 /// The exact tokenizer is provider/model-specific, so this is a target rather
 /// than a hard token count. Three characters per token plus the default
@@ -3166,9 +3213,20 @@ const SCHEMA_SERIALIZATION_FALLBACK_CHARS: usize = 32_000;
 const MIN_OBSERVATION_RESERVE_CHARS: usize = 1_024;
 
 /// Smallest input budget that still leaves room for observations after
-/// the fixed prompts and structured-output schema. Below this the batch prompt
-/// can leave too little room for observations.
-pub const MIN_CONSOLIDATION_MAX_INPUT_TOKENS: usize = 6_000;
+/// the fixed prompts and structured-output schema, **at the shipped safety
+/// margin**, plus [`MIN_OBSERVATION_RESERVE_CHARS`] of evidence.
+///
+/// The budget the builders run with is
+/// `max_input_tokens * CHARS_PER_TOKEN * input_token_safety_margin`, so the
+/// floor has to clear the fixed part at the *default* margin (0.8), not at the
+/// nominal 1.0 the builders use when they are handed a bare limit. On today's
+/// prompts the batch fixed part is 18,997 chars ([system][user][schema][envelope]),
+/// so the floor is `(18,997 + 1,024) / (3 * 0.8) = 8,342`, rounded up to 8,350.
+/// `advertised_minimum_input_limit_still_carries_observation_evidence` is what
+/// holds this honest: it builds with the default margin, so the next time the
+/// prompts grow it fails there rather than silently sending the model an
+/// evidence-free prompt.
+pub const MIN_CONSOLIDATION_MAX_INPUT_TOKENS: usize = 8_350;
 
 /// Smallest useful structured-output allowance. Lower values are unlikely to
 /// fit even one concise batch update and its JSON framing.
@@ -3212,10 +3270,7 @@ impl PromptBudgets {
         max_output_tokens: u32,
         safety_margin: f64,
     ) -> Self {
-        let nominal = max_input_tokens.saturating_mul(CHARS_PER_TOKEN);
-        // `safety_margin` is validated to `0 < margin <= 1` at config load, so
-        // the product never exceeds `nominal` and the cast cannot overflow.
-        let max_input_chars = (nominal as f64 * safety_margin) as usize;
+        let max_input_chars = effective_input_chars(max_input_tokens, safety_margin);
         Self {
             max_input_chars,
             max_output_tokens,
@@ -3521,6 +3576,29 @@ fn slugify_for_rule(title: &str) -> String {
         out.pop();
     }
     if out.is_empty() {
+        // A title with no ASCII letter or digit (Cyrillic, CJK, ...) would
+        // share one name with every other such title, and each rule would
+        // overwrite the last. Name it after the title instead. A title with
+        // no letter or digit at all has nothing to name it by. The hash takes
+        // the same fold as the ASCII slug (lower-cased words, separators
+        // collapsed) so a restated rule updates its own page; combining
+        // marks stay with their letter so `й` and `и` remain distinct.
+        let in_word = |c: char| c.is_alphanumeric() || ('\u{0300}'..='\u{036F}').contains(&c);
+        let key = decomposed
+            .split(|c: char| !in_word(c))
+            .filter(|word| !word.is_empty())
+            .map(str::to_lowercase)
+            .collect::<Vec<_>>()
+            .join("-");
+        if key.chars().any(char::is_alphanumeric) {
+            let digest = Sha256::digest(key.as_bytes());
+            let hex: String = digest
+                .iter()
+                .take(4)
+                .map(|byte| format!("{byte:02x}"))
+                .collect();
+            return format!("rule-{hex}");
+        }
         return "rule".into();
     }
     if out.len() > 60 {
@@ -3593,39 +3671,98 @@ fn retitle_leading_h1(body: &str, old: &str, new: &str) -> String {
 }
 
 /// The bounded existing-titles list for the consolidation prompt.
-fn render_existing_titles(titles: &[String]) -> String {
-    titles
-        .iter()
-        .take(EXISTING_TITLES_PROMPT_LIMIT)
-        .map(|t| format!("- {t}\n"))
-        .collect()
-}
-
 /// Shared uniqueness block injected into both consolidation prompts.
 /// The system prompt carries the durable rule; this carries the
 /// project's actual titles, which only the caller can see. Absent
 /// when the project has no other pages — the rule has nothing to
 /// list, and the fixed prompt text would otherwise eat into the
 /// minimum observation budget.
-fn render_title_uniqueness_section(titles: &[String]) -> String {
-    if titles.is_empty() {
-        return String::new();
-    }
-    format!(
-        "\n## Existing page titles in this project\n\
+///
+/// The block is optional context, so it lists only the titles that fit in
+/// `max_chars` (at most [`EXISTING_TITLES_PROMPT_LIMIT`]) and is left out
+/// when not even one does. Without that bound, a project's titles could
+/// take the room reserved for observations at a small input budget.
+fn render_title_uniqueness_section(titles: &[String], max_chars: usize) -> String {
+    const HEADER: &str = "\n## Existing page titles in this project\n\
          Do not reuse any of these for a page title — a case-insensitive \
          match counts as a reuse. The title must distinguish THIS session \
          (goal, outcome, or target); a generic phrase that other runs of \
-         the same harness would also produce is not a title.\n{}\n",
-        render_existing_titles(titles)
-    )
+         the same harness would also produce is not a title.\n";
+    let mut used = count_chars(HEADER).saturating_add(1);
+    let mut lines = String::new();
+    for title in titles.iter().take(EXISTING_TITLES_PROMPT_LIMIT) {
+        let line = format!("- {title}\n");
+        let next = used.saturating_add(count_chars(&line));
+        if next > max_chars {
+            continue;
+        }
+        used = next;
+        lines.push_str(&line);
+    }
+    if lines.is_empty() {
+        return String::new();
+    }
+    format!("{HEADER}{lines}\n")
 }
 
-/// Shared collision backstop for both session-page write paths.
+/// Latest page titles for duplicate-title avoidance on the session
+/// page, seen through the same owner visibility as the slot
+/// snapshots. The session's OWN page is excluded: re-consolidation
+/// refreshing its own previous title is correct, not a collision.
+/// Best-effort — a store hiccup degrades to "no context" rather
+/// than failing consolidation. Shared with the MCP `memory_write_page`
+/// session-page path, which writes the same page without a completion.
+pub async fn existing_session_page_titles(
+    reader: &ReaderPool,
+    workspace_id: WorkspaceId,
+    project_id: ProjectId,
+    actor: &ai_memory_core::ActorContext,
+    session_id: SessionId,
+) -> Vec<String> {
+    let own_path = format!("sessions/{session_id}.md");
+    match reader
+        .briefing_for_project(
+            workspace_id,
+            project_id,
+            EXISTING_TITLES_QUERY_LIMIT,
+            ai_memory_core::OwnerFilter::for_actor_context(actor),
+            false,
+        )
+        .await
+    {
+        Ok(brief) => {
+            let from_briefing = brief
+                .recent_pages
+                .iter()
+                .chain(brief.pinned.iter())
+                .chain(brief.rules.iter())
+                .chain(brief.slots.iter())
+                .filter(|p| p.path != own_path)
+                .map(|p| p.title.clone());
+            let from_settled = brief
+                .settled
+                .iter()
+                .filter(|p| p.path != own_path)
+                .map(|p| p.title.clone());
+            from_briefing.chain(from_settled).collect()
+        }
+        Err(err) => {
+            warn!(
+                error = %err,
+                "existing-title query failed; skipping duplicate-title context"
+            );
+            Vec::new()
+        }
+    }
+}
+
+/// Shared collision backstop for every session-page write path: the
+/// single-page and batch consolidations, and `memory_write_page` with a
+/// `session_id`.
 /// When `title` already names another latest page (case-insensitive,
 /// whitespace-collapsed — the M8 grouping), suffix the session short
 /// id and retitle a matching leading H1. `None` when the title is free.
-fn disambiguate_colliding_session_title(
+pub fn disambiguate_colliding_session_title(
     title: &str,
     body: &str,
     existing_titles: &[String],
@@ -3680,7 +3817,11 @@ fn disambiguate_anchor_title(
 
 /// System prompt for single-page consolidation. Loaded at compile
 /// time from `prompts/single_consolidate_system.md`.
-const SYSTEM_PROMPT: &str = include_str!("../prompts/single_consolidate_system.md");
+pub(crate) const SYSTEM_PROMPT: &str = crate::prompt_template::prompt_with_wikilinks!(
+    include_str!("../prompts/single_consolidate_system.md"),
+    "the observations or page body",
+    "the observations"
+);
 
 #[cfg(test)]
 mod tests {
@@ -3888,7 +4029,7 @@ mod tests {
     #[test]
     fn render_title_uniqueness_section_bounded_and_absent_when_empty() {
         let titles: Vec<String> = (0..30).map(|i| format!("Title {i}")).collect();
-        let section = render_title_uniqueness_section(&titles);
+        let section = render_title_uniqueness_section(&titles, usize::MAX);
         assert!(section.contains("Title 0\n") && section.contains("Title 14\n"));
         assert!(!section.contains("Title 15\n"), "prompt list is bounded");
         assert!(section.contains("case-insensitive"));
@@ -3896,7 +4037,7 @@ mod tests {
         // A brand-new project omits the block entirely: the durable rule
         // lives in the system prompt, and fixed prompt text must not eat
         // into the advertised minimum observation budget.
-        assert!(render_title_uniqueness_section(&[]).is_empty());
+        assert!(render_title_uniqueness_section(&[], usize::MAX).is_empty());
     }
 
     #[test]
@@ -4159,7 +4300,8 @@ mod tests {
         let instructions_block =
             render_instructions_block(instructions, optional_budget.saturating_div(2));
         let current_body_budget = optional_budget.saturating_sub(count_chars(&instructions_block));
-        let titles_block = render_title_uniqueness_section(existing_titles);
+        let titles_block =
+            render_title_uniqueness_section(existing_titles, current_body_budget.saturating_div(2));
         let current_body_budget = current_body_budget.saturating_sub(count_chars(&titles_block));
         let mut suffix = render_current_body_section(current_body, current_body_budget);
         suffix.push_str(&titles_block);
@@ -4212,13 +4354,13 @@ mod tests {
         prefix.push_str(&session_id.to_string());
         prefix.push_str("\n\nObservations:\n");
 
-        let titles_block = render_title_uniqueness_section(existing_titles);
         let optional_budget = budgets.optional_context_budget::<ConsolidatedBatch>(
             BATCH_SYSTEM_PROMPT,
-            count_chars(&prefix)
-                .saturating_add(count_chars(mandatory_suffix))
-                .saturating_add(count_chars(&titles_block)),
+            count_chars(&prefix).saturating_add(count_chars(mandatory_suffix)),
         );
+        let titles_block =
+            render_title_uniqueness_section(existing_titles, optional_budget.saturating_div(2));
+        let optional_budget = optional_budget.saturating_sub(count_chars(&titles_block));
         let instructions_block =
             render_instructions_block(instructions, optional_budget.saturating_div(2));
         let slots_budget = optional_budget.saturating_sub(count_chars(&instructions_block));
@@ -4324,12 +4466,13 @@ mod tests {
 
     /// The single-page observation budget must count the titles block: on a
     /// knife-edge input budget calibrated so all three equal observations do
-    /// not fit, the middle one is pruned (first and last are hard anchors);
-    /// dropping `count_chars(&titles_block)` from the `remaining_input_chars`
-    /// sum (mutation S2-single-budget-drops-titles) grows the budget by the
-    /// titles' size and renders all three. This test asserts the production
-    /// shape exactly, with a large deterministic titles block and real
-    /// pruning, so the mutant fails while the control passes.
+    /// not fit, the middle one is pruned (first and last are hard anchors).
+    /// If the titles block were left out of the `remaining_input_chars`
+    /// sum, the budget would grow by the titles' size and all three
+    /// observations would render. This test asserts the production shape
+    /// exactly, with a large deterministic titles block and real pruning,
+    /// so a sum missing the titles block fails it while the correct sum
+    /// passes.
     #[test]
     fn single_observation_budget_accounts_for_the_titles_block() {
         let sid: SessionId = "0193e7a1-0000-7000-8000-000000000001"
@@ -4339,18 +4482,19 @@ mod tests {
         // fixed field lengths — v7 UUID ids are always 36 chars) render
         // blocks of identical length. The first and last are hard anchors
         // (never pruned), so the middle one is the only prunable block and
-        // the budget sits exactly on the three-block edge.
-        let observations = vec![obs_of_size(400), obs_of_size(400), obs_of_size(400)];
-        // A deterministic titles block well above the calibration gap
-        // (the renderer caps the list at EXISTING_TITLES_PROMPT_LIMIT, so
-        // the block size is stable across runs).
-        let titles: Vec<String> = (0..80)
-            .map(|i| format!("Existing page title {i:02} with a stable suffix"))
+        // the budget sits exactly on the three-block edge. The blocks are
+        // large enough that the titles block fits the optional allowance
+        // (what is left after the observation reserve), so it is rendered.
+        let observations = vec![obs_of_size(2_900), obs_of_size(2_900), obs_of_size(2_900)];
+        // A deterministic titles block well above the calibration gap, and
+        // small enough to fit the optional allowance at this budget.
+        let titles: Vec<String> = (0..4)
+            .map(|i| format!("Existing page title {i:02}"))
             .collect();
-        let titles_block = render_title_uniqueness_section(&titles);
+        let titles_block = render_title_uniqueness_section(&titles, usize::MAX);
         let title_chars = count_chars(&titles_block);
         assert!(
-            title_chars >= 512,
+            title_chars >= 256,
             "the fixture needs a titles block well above the calibration gap: {title_chars}"
         );
 
@@ -4423,6 +4567,10 @@ mod tests {
 
         let request = build_request(sid, &observations, "", None, budgets, &titles);
         let user = &request.messages[0].content;
+        assert!(
+            user.contains(titles_block.trim()),
+            "the titles block fits the optional allowance and is rendered whole"
+        );
         assert_eq!(
             user.matches("--- observation").count(),
             2,
@@ -4501,102 +4649,9 @@ mod tests {
         assert_eq!(new_content.matches("_slots/draft.md").count(), 1);
     }
 
-    /// [retry] The default builders are deterministic: repeating the build
-    /// with the same inputs produces byte-identical requests, so no retry
-    /// or provider path can observe a different prompt.
-    #[test]
-    fn default_builders_are_deterministic_across_repeats() {
-        let sid: SessionId = "0193e7a1-0000-7000-8000-000000000001"
-            .parse()
-            .expect("fixed session id");
-        let observations = vec![obs_of_size(40), obs_of_size(60)];
-        let budgets = PromptBudgets::from_limits(16_000, 8_000);
-        let titles = vec!["Existing Title".to_string()];
-
-        let single_a = build_request(
-            sid,
-            &observations,
-            "# body\n\nstable",
-            Some("prefer concise notes"),
-            budgets,
-            &titles,
-        );
-        let single_b = build_request(
-            sid,
-            &observations,
-            "# body\n\nstable",
-            Some("prefer concise notes"),
-            budgets,
-            &titles,
-        );
-        assert_eq!(
-            single_a.messages[0].content, single_b.messages[0].content,
-            "repeating the single-page build must be byte-identical"
-        );
-        assert_eq!(single_a.max_tokens, single_b.max_tokens);
-        assert_eq!(single_a.system, single_b.system);
-
-        let slots = vec![SlotSnapshot {
-            path: "_slots/focus.md".into(),
-            title: "Focus".into(),
-            slot_kind: SlotKind::State,
-            body: "working context".into(),
-        }];
-        let batch_a = build_batch_request_with_slots(
-            sid,
-            &observations,
-            &slots,
-            Some("prefer concise notes"),
-            budgets,
-            &titles,
-        );
-        let batch_b = build_batch_request_with_slots(
-            sid,
-            &observations,
-            &slots,
-            Some("prefer concise notes"),
-            budgets,
-            &titles,
-        );
-        assert_eq!(
-            batch_a.messages[0].content, batch_b.messages[0].content,
-            "repeating the batch build must be byte-identical"
-        );
-        assert_eq!(batch_a.max_tokens, batch_b.max_tokens);
-        assert_eq!(batch_a.system, batch_b.system);
-    }
-
-    /// [clock] The builders carry no clock: session and observation ids come
-    /// in from their inputs and render verbatim, unchanged across repeated
-    /// runs of the same build.
-    #[test]
-    fn default_builders_render_input_ids_verbatim_without_per_run_minting() {
-        let sid: SessionId = "0193e7a1-0000-7000-8000-000000000001"
-            .parse()
-            .expect("fixed session id");
-        let mut observation = obs_of_size(40);
-        observation.id = "0193e7a2-1111-7000-8000-000000000002"
-            .parse()
-            .expect("fixed observation id");
-        let observations = vec![observation];
-
-        let first = build_request(sid, &observations, "", None, PromptBudgets::default(), &[]);
-        let prompt = first.messages[0].content.clone();
-        assert!(prompt.contains("Session id: 0193e7a1-0000-7000-8000-000000000001"));
-        assert!(
-            prompt.contains("0193e7a2-1111-7000-8000-000000000002"),
-            "observation ids must render verbatim from their inputs"
-        );
-        let again = build_request(sid, &observations, "", None, PromptBudgets::default(), &[]);
-        assert_eq!(
-            prompt, again.messages[0].content,
-            "re-running the builder must not mint or rotate ids"
-        );
-    }
-
-    /// [crash] The reorder is pure in-memory assembly: even on degenerate
-    /// inputs the builders finish without touching external state and emit a
-    /// well-formed request with the system prompt still separate.
+    /// The reorder is pure in-memory assembly: even on degenerate inputs the
+    /// builders finish without touching external state and emit a well-formed
+    /// request with the system prompt still separate.
     #[test]
     fn default_builders_total_on_empty_and_minimum_budget_inputs() {
         let budgets = PromptBudgets::from_limits(
@@ -4801,6 +4856,115 @@ mod tests {
                 prompt.contains("JSON keys stay in English"),
                 "{name} prompt"
             );
+            // Lint reports a missing `project:` / `_global:` target as
+            // `broken_link`, so the prompt must not license inventing one.
+            assert!(
+                prompt.contains("Never invent project names or page paths"),
+                "{name} prompt"
+            );
+            assert!(prompt.contains("page body"), "{name} prompt");
+            assert!(prompt.contains("not a repo file path"), "{name} prompt");
+            assert!(
+                prompt.contains("never pad with a cross-scope link"),
+                "{name} prompt"
+            );
+            assert!(
+                !prompt.contains("A link whose target does not exist yet is acceptable"),
+                "{name} prompt must scope the pending-link allowance to the same project"
+            );
+        }
+    }
+
+    /// #1219: a numeric quota ("2-5 links per page, zero links should be
+    /// rare") pressures the model to invent links to hit the number. The
+    /// prompts must state that zero links is a fine outcome, that links
+    /// need a genuine reason visible in the input, and that padding to
+    /// hit a number is never acceptable — while keeping the #1217
+    /// cross-scope restriction intact.
+    #[test]
+    fn consolidation_system_prompts_do_not_pressure_invented_links() {
+        for (name, prompt) in [("single", SYSTEM_PROMPT), ("batch", BATCH_SYSTEM_PROMPT)] {
+            assert!(
+                prompt.contains("zero links is fine"),
+                "{name} prompt must permit a linkless page"
+            );
+            assert!(
+                prompt.contains("genuine reason"),
+                "{name} prompt must require a genuine reason to link"
+            );
+            assert!(
+                prompt.contains("Never pad a page with links to hit a number"),
+                "{name} prompt must forbid quota padding"
+            );
+            assert!(
+                prompt.contains("never pad with a cross-scope link"),
+                "{name} prompt must keep the #1217 cross-scope restriction"
+            );
+            assert!(
+                !prompt.contains("zero links should be rare"),
+                "{name} prompt must not stigmatise a linkless page"
+            );
+            assert!(
+                !prompt.contains("2-5"),
+                "{name} prompt must not carry a numeric link quota"
+            );
+        }
+    }
+
+    /// #1221: consolidation was losing the tail of a session — an
+    /// unanswered final prompt, a late correction to a "done" milestone,
+    /// the last reported metrics of in-flight work, operator "run X when Y"
+    /// instructions, and how to reach and verify external systems the
+    /// session touched. Each rule must be pinned in both prompts.
+    #[test]
+    fn consolidation_system_prompts_preserve_terminal_state_and_carried_detail() {
+        for (name, prompt) in [("single", SYSTEM_PROMPT), ("batch", BATCH_SYSTEM_PROMPT)] {
+            // 1. Terminal state: unanswered prompt / abnormal stop is said
+            //    explicitly; in-flight work is pending state, not done.
+            assert!(prompt.contains("Terminal state"), "{name} prompt");
+            assert!(
+                prompt.contains("ends on an unanswered prompt"),
+                "{name} prompt"
+            );
+            assert!(prompt.contains("without a normal stop"), "{name} prompt");
+            assert!(prompt.contains("pending state"), "{name} prompt");
+            // 2. Late corrections: final state only, superseded claim is
+            //    history at most.
+            assert!(prompt.contains("Late corrections"), "{name} prompt");
+            assert!(
+                prompt.contains("corrects an earlier \"done\""),
+                "{name} prompt"
+            );
+            assert!(
+                prompt.contains("state only the final state"),
+                "{name} prompt"
+            );
+            assert!(prompt.contains("as history at most"), "{name} prompt");
+            // 3. Final metrics of in-flight work, verbatim.
+            assert!(prompt.contains("Final metrics"), "{name} prompt");
+            assert!(
+                prompt.contains("sizes, rates, counts, ETAs"),
+                "{name} prompt"
+            );
+            // 4. Operator "run X when Y" instructions carried verbatim with
+            //    their preconditions into Next steps / Pending.
+            assert!(prompt.contains("Operator instructions"), "{name} prompt");
+            assert!(prompt.contains("run X when Y"), "{name} prompt");
+            assert!(prompt.contains("preconditions"), "{name} prompt");
+            assert!(prompt.contains("Next steps / Pending"), "{name} prompt");
+            // 5. Access and verification for external systems: extraction
+            //    grounded in the observations, never secrets themselves.
+            assert!(prompt.contains("Access and verification"), "{name} prompt");
+            assert!(
+                prompt.contains("NEVER secrets or tokens themselves"),
+                "{name} prompt"
+            );
+            assert!(prompt.contains("job-state marker"), "{name} prompt");
+            assert!(prompt.contains("staged-script paths"), "{name} prompt");
+            assert!(
+                prompt.contains("extraction, not scaffolding"),
+                "{name} prompt"
+            );
         }
     }
 
@@ -4910,11 +5074,26 @@ mod tests {
         assert!(request.messages[0].content.contains("observation"));
     }
 
+    /// #1234: the floor constant is advertised as the smallest budget that
+    /// still leaves room for observations, and `config` refuses anything below
+    /// it. That promise is only real at the margin the builders actually run
+    /// with: the char budget is
+    /// `max_input_tokens * CHARS_PER_TOKEN * input_token_safety_margin`, so a
+    /// floor derived at the nominal margin 1.0 can leave nothing once the
+    /// production default of 0.8 is applied. This test used
+    /// `PromptBudgets::from_limits` (margin 1.0) and so stayed green while a
+    /// default-margin install at the floor rendered zero observations and sent
+    /// the model a prompt with no evidence at all.
+    ///
+    /// It now builds with `DEFAULT_CONSOLIDATION_INPUT_TOKEN_SAFETY_MARGIN`,
+    /// which is what makes the next prompt growth fail here instead of
+    /// silently emptying the prompt in production.
     #[test]
     fn advertised_minimum_input_limit_still_carries_observation_evidence() {
-        let budgets = PromptBudgets::from_limits(
+        let budgets = PromptBudgets::from_limits_with_margin(
             MIN_CONSOLIDATION_MAX_INPUT_TOKENS,
             MIN_CONSOLIDATION_MAX_OUTPUT_TOKENS,
+            DEFAULT_CONSOLIDATION_INPUT_TOKEN_SAFETY_MARGIN,
         );
         let observations = vec![obs_of_size(500)];
         let single = build_request(SessionId::new(), &observations, "", None, budgets, &[]);
@@ -4954,6 +5133,62 @@ mod tests {
             "batch floor request must not omit observations"
         );
         assert_batch_dump_follows_observations_header(batch_user);
+    }
+
+    /// At the floor, a project's existing titles are optional context: they
+    /// must not take the room reserved for observations. Fifteen realistic
+    /// titles (the prompt limit) used to be subtracted as fixed text, which
+    /// left the observation budget at zero for any project with that many
+    /// pages; an observation that fits the reserve must still render whole.
+    #[test]
+    fn existing_titles_never_take_the_observation_reserve_at_the_floor() {
+        let budgets = PromptBudgets::from_limits_with_margin(
+            MIN_CONSOLIDATION_MAX_INPUT_TOKENS,
+            MIN_CONSOLIDATION_MAX_OUTPUT_TOKENS,
+            DEFAULT_CONSOLIDATION_INPUT_TOKEN_SAFETY_MARGIN,
+        );
+        let titles: Vec<String> = (0..EXISTING_TITLES_PROMPT_LIMIT)
+            .map(|i| format!("Fixed the consolidation floor regression number {i:02}"))
+            .collect();
+        let body_len = 800;
+        let observations = vec![obs_of_size(body_len)];
+        let whole_body = "x".repeat(body_len);
+        let single = build_request(SessionId::new(), &observations, "", None, budgets, &titles);
+        let batch = build_batch_request_with_slots(
+            SessionId::new(),
+            &observations,
+            &[],
+            None,
+            budgets,
+            &titles,
+        );
+        for (label, request) in [("single", &single), ("batch", &batch)] {
+            let user = &request.messages[0].content;
+            assert!(
+                user.contains(&whole_body),
+                "{label} floor request with titles must keep the observation reserve"
+            );
+            assert!(!user.contains("no projection budget"), "{label}");
+        }
+        assert!(estimated_input_chars::<ConsolidatedPage>(&single) <= budgets.max_input_chars);
+        assert!(estimated_input_chars::<ConsolidatedBatch>(&batch) <= budgets.max_input_chars);
+
+        // Control: with a roomy budget every title is listed.
+        let roomy = PromptBudgets::from_limits(DEFAULT_CONSOLIDATION_MAX_INPUT_TOKENS, 4_000);
+        let request = build_batch_request_with_slots(
+            SessionId::new(),
+            &observations,
+            &[],
+            None,
+            roomy,
+            &titles,
+        );
+        for title in &titles {
+            assert!(
+                request.messages[0].content.contains(title.as_str()),
+                "{title}"
+            );
+        }
     }
 
     /// The body excerpt keeps its absolute ceiling on a huge budget: past
@@ -5026,9 +5261,14 @@ mod tests {
 
     /// The batch path must include schema and dynamic slot snapshots in its
     /// envelope instead of assuming a fixed number of slots.
+    ///
+    /// The budget sits above the validated floor so the optional-context
+    /// block reaches its clipping regime (a visible `[truncated]` marker)
+    /// rather than being dropped whole: at the floor the growing system
+    /// prompt leaves no optional-context room at all.
     #[test]
     fn batch_budget_accounts_for_many_slot_snapshots() {
-        let budgets = PromptBudgets::from_limits(6_500, 1_000);
+        let budgets = PromptBudgets::from_limits(8_000, 1_000);
         let observations = (0..64).map(|_| obs_of_size(4_000)).collect::<Vec<_>>();
         let slots = (0..100)
             .map(|index| SlotSnapshot {
@@ -5086,13 +5326,45 @@ mod tests {
         assert_eq!(slugify_for_rule("---hyphenated---"), "hyphenated");
     }
 
-    /// Non-Latin / empty-after-cleanup titles fall back to a static
-    /// slug instead of producing an invalid PagePath.
+    /// Empty and punctuation-only titles fall back to a static slug
+    /// instead of producing an invalid PagePath.
     #[test]
     fn slugify_falls_back_for_unprintable_titles() {
         assert_eq!(slugify_for_rule(""), "rule");
         assert_eq!(slugify_for_rule("!!!"), "rule");
-        assert_eq!(slugify_for_rule("中文"), "rule");
+    }
+
+    /// A title in a script with no ASCII letters would slug to `rule` like
+    /// every other, and each rule would overwrite the last at
+    /// `_rules/rule.md`. Each gets a name of its own, stable across
+    /// spellings of the same title and always a valid page path.
+    #[test]
+    fn slugify_names_non_latin_titles_apart() {
+        let chinese = slugify_for_rule("中文");
+        let russian = slugify_for_rule("Не коммитить секреты");
+        assert!(chinese.starts_with("rule-"), "{chinese}");
+        assert!(russian.starts_with("rule-"), "{russian}");
+        assert_ne!(chinese, russian);
+        assert_eq!(slugify_for_rule("中文"), chinese);
+        // `й` as one scalar and as `и` + a combining breve are one title.
+        assert_eq!(
+            slugify_for_rule("\u{439}\u{43e}"),
+            slugify_for_rule("\u{438}\u{306}\u{43e}")
+        );
+        // A restated title updates its own page, as an ASCII one does: case,
+        // spacing and punctuation do not name a new rule.
+        assert_eq!(slugify_for_rule("не коммитить  секреты!"), russian);
+        assert_eq!(slugify_for_rule("НЕ КОММИТИТЬ, СЕКРЕТЫ."), russian);
+        // A combining mark is part of its letter, not a separator.
+        assert_ne!(
+            slugify_for_rule("\u{439}\u{43e}"),
+            slugify_for_rule("\u{438} \u{43e}")
+        );
+        for slug in [chinese, russian] {
+            let path = format!("_rules/{slug}.md");
+            let path = PagePath::new(path).unwrap();
+            path.ensure_portable().unwrap();
+        }
     }
 
     /// Very long titles get capped at 60 chars with no trailing dash.
@@ -5136,11 +5408,11 @@ mod tests {
         );
     }
 
-    /// #886: a CJK-only title still folds to nothing and falls back to the
-    /// static slug — diacritic folding must not resurrect it.
+    /// #886: a CJK-only title still folds to no ASCII slug — diacritic
+    /// folding must not resurrect it — and takes the title-keyed fallback.
     #[test]
     fn slugify_cjk_still_falls_back() {
-        assert_eq!(slugify_for_rule("中文标题"), "rule");
+        assert!(slugify_for_rule("中文标题").starts_with("rule-"));
     }
 
     /// A slug whose first 60 chars already end on a whole word keeps that
@@ -5949,6 +6221,63 @@ mod tests {
         })
     }
 
+    /// Records the operation id of every structured call and answers a
+    /// fixed valid page or batch — the id is the subject under test, not
+    /// the response.
+    struct OpIdCapturingLlm {
+        response: serde_json::Value,
+        ids: std::sync::Arc<std::sync::Mutex<Vec<LlmOperationId>>>,
+    }
+
+    impl OpIdCapturingLlm {
+        /// Build a capturing LLM, keeping a shared handle to the ids it
+        /// records so a test can assert on them after the run.
+        fn new(
+            response: serde_json::Value,
+        ) -> (Self, std::sync::Arc<std::sync::Mutex<Vec<LlmOperationId>>>) {
+            let ids = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+            (
+                Self {
+                    response,
+                    ids: ids.clone(),
+                },
+                ids,
+            )
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl LlmProvider for OpIdCapturingLlm {
+        fn name(&self) -> &'static str {
+            "capturing"
+        }
+        fn model(&self) -> &str {
+            "capturing"
+        }
+        async fn complete(
+            &self,
+            _request: ChatRequest,
+        ) -> ai_memory_llm::LlmResult<ai_memory_llm::ChatResponse> {
+            unreachable!("consolidation only uses structured completion");
+        }
+        async fn complete_structured_raw(
+            &self,
+            _request: ChatRequest,
+            _schema: serde_json::Value,
+        ) -> ai_memory_llm::LlmResult<serde_json::Value> {
+            Ok(self.response.clone())
+        }
+        async fn complete_structured_raw_with_operation_id(
+            &self,
+            request: ChatRequest,
+            schema: serde_json::Value,
+            operation_id: LlmOperationId,
+        ) -> ai_memory_llm::LlmResult<serde_json::Value> {
+            self.ids.lock().unwrap().push(operation_id);
+            self.complete_structured_raw(request, schema).await
+        }
+    }
+
     /// A briefly overloaded provider must not end the consolidation: the
     /// retry absorbs it and the caller still gets the page.
     #[tokio::test]
@@ -6045,6 +6374,151 @@ mod tests {
             page_missing(&wiki, ws, proj, &format!("sessions/{session}.md")),
             "a failed consolidation must not write a page"
         );
+    }
+
+    /// Gateway compatibility of a fresh operation id: the 36-character
+    /// hyphenated UUID v7 form a gateway records in `X-Request-Id`.
+    fn assert_fresh_gateway_form(id: LlmOperationId) {
+        let s = id.to_string();
+        assert_eq!(s.len(), 36, "the hyphenated wire form is 36 chars: {s}");
+        let parsed = uuid::Uuid::parse_str(&s).expect("parses as a UUID");
+        assert_eq!(
+            parsed.get_version_num(),
+            7,
+            "a fresh operation id is UUID v7: {s}"
+        );
+    }
+
+    /// Operation identity: two consolidation invocations of the SAME
+    /// session are two LLM operations — two distinct fresh UUID v7 ids,
+    /// never the session id. Controls use a v7 session (`SessionId::new`)
+    /// and a v4-style session (the random form agents commonly carry), so
+    /// no derivation from the session's own bytes can sneak back in.
+    #[tokio::test]
+    async fn each_invocation_gets_a_fresh_operation_id_independent_of_the_session() {
+        let actor = ai_memory_core::ActorContext::anonymous();
+        // v7 (time-ordered) and v4 (random, agent-style) sessions.
+        let sessions = [SessionId::new(), SessionId(uuid::Uuid::new_v4())];
+        for session in sessions {
+            let tmp = tempfile::tempdir().unwrap();
+            let store = ai_memory_store::Store::open(tmp.path()).unwrap();
+            let ws = store
+                .writer
+                .get_or_create_workspace("default")
+                .await
+                .unwrap();
+            let proj = store
+                .writer
+                .get_or_create_project(ws, "scratch", None)
+                .await
+                .unwrap();
+            seed_session(store.db_path(), session, ws, proj);
+            let wiki = Wiki::new(tmp.path(), store.writer.clone()).unwrap();
+
+            // Two single invocations of the SAME session: two distinct
+            // fresh v7 ids, neither one the session id.
+            let (llm1, ids1) = OpIdCapturingLlm::new(scripted_page());
+            Consolidator::new(
+                store.reader.clone(),
+                store.writer.clone(),
+                wiki.clone(),
+                Arc::new(llm1),
+                ws,
+                proj,
+            )
+            .consolidate_session(session, false, actor.clone(), None, None)
+            .await
+            .unwrap();
+            let (llm2, ids2) = OpIdCapturingLlm::new(scripted_page());
+            Consolidator::new(
+                store.reader.clone(),
+                store.writer.clone(),
+                wiki.clone(),
+                Arc::new(llm2),
+                ws,
+                proj,
+            )
+            .consolidate_session(session, false, actor.clone(), None, None)
+            .await
+            .unwrap();
+            let single1 = ids1.lock().unwrap().clone();
+            let single2 = ids2.lock().unwrap().clone();
+            assert_eq!(single1.len(), 1, "one default single call per invocation");
+            assert_eq!(single2.len(), 1, "one default single call per invocation");
+            assert_ne!(
+                single1[0], single2[0],
+                "two single invocations of one session get distinct operation ids"
+            );
+            assert_fresh_gateway_form(single1[0]);
+            assert_fresh_gateway_form(single2[0]);
+            assert_ne!(
+                single1[0].to_string(),
+                session.to_string(),
+                "the operation id is never the session id"
+            );
+
+            // Same for the multi default path: two invocations, two ids.
+            let batch = serde_json::json!({
+                "rationale": "test operation identity",
+                "updates": [
+                    {
+                        "path": format!("sessions/{session}.md"),
+                        "tier": "episodic",
+                        "kind": "fact",
+                        "title": "Session narrative",
+                        "body_markdown": "Session body.",
+                        "tags": []
+                    },
+                    {
+                        "path": "concepts/queue.md",
+                        "tier": "semantic",
+                        "kind": "fact",
+                        "title": "Queue",
+                        "body_markdown": "Concept body.",
+                        "tags": []
+                    }
+                ]
+            });
+            let (llm3, ids3) = OpIdCapturingLlm::new(batch.clone());
+            Consolidator::new(
+                store.reader.clone(),
+                store.writer.clone(),
+                wiki.clone(),
+                Arc::new(llm3),
+                ws,
+                proj,
+            )
+            .consolidate_session_multi(session, false, actor.clone(), None, None)
+            .await
+            .unwrap();
+            let (llm4, ids4) = OpIdCapturingLlm::new(batch);
+            Consolidator::new(
+                store.reader.clone(),
+                store.writer.clone(),
+                wiki.clone(),
+                Arc::new(llm4),
+                ws,
+                proj,
+            )
+            .consolidate_session_multi(session, false, actor.clone(), None, None)
+            .await
+            .unwrap();
+            let multi1 = ids3.lock().unwrap().clone();
+            let multi2 = ids4.lock().unwrap().clone();
+            assert_eq!(multi1.len(), 1, "one default multi call per invocation");
+            assert_eq!(multi2.len(), 1, "one default multi call per invocation");
+            assert_ne!(
+                multi1[0], multi2[0],
+                "two multi invocations of one session get distinct operation ids"
+            );
+            assert_fresh_gateway_form(multi1[0]);
+            assert_fresh_gateway_form(multi2[0]);
+            assert_ne!(
+                multi1[0].to_string(),
+                session.to_string(),
+                "the operation id is never the session id"
+            );
+        }
     }
 
     async fn write_slot(wiki: &Wiki, ws: WorkspaceId, proj: ProjectId, path: &str, body: &str) {
@@ -9085,19 +9559,6 @@ mod tests {
         );
     }
 
-    /// Gateway compatibility of a fresh operation id: the 36-character
-    /// hyphenated UUID v7 form a gateway records in `X-Request-Id`.
-    fn assert_fresh_gateway_form(id: LlmOperationId) {
-        let s = id.to_string();
-        assert_eq!(s.len(), 36, "the hyphenated wire form is 36 chars: {s}");
-        let parsed = uuid::Uuid::parse_str(&s).expect("parses as a UUID");
-        assert_eq!(
-            parsed.get_version_num(),
-            7,
-            "a fresh operation id is UUID v7: {s}"
-        );
-    }
-
     /// A model change between runs invalidates every checkpoint: the
     /// fingerprints carry the model, so the resume re-runs the map instead
     /// of reusing outputs produced by another model.
@@ -9247,7 +9708,7 @@ mod tests {
     /// random form agents commonly carry), so no derivation from the
     /// session's own bytes can sneak back in.
     #[tokio::test]
-    async fn each_invocation_gets_a_fresh_operation_id_independent_of_the_session() {
+    async fn each_harness_invocation_gets_a_fresh_operation_id_independent_of_the_session() {
         let t = ChunkedTest::fresh().await;
         let actor = ai_memory_core::ActorContext::anonymous();
         // v7 (time-ordered) and v4 (random, agent-style) sessions.
@@ -9588,5 +10049,228 @@ mod tests {
         }
         // Every captured request fit the ceiling.
         assert!(llm.counts().iter().all(|&c| c <= ceiling));
+    }
+
+    /// Write one page into a second project of the fixture's workspace, so a
+    /// cross-scope wikilink has something real to resolve to.
+    async fn seed_other_project_page(
+        store: &ai_memory_store::Store,
+        wiki: &Wiki,
+        ws: WorkspaceId,
+        project: &str,
+        path: &str,
+    ) {
+        let other = store
+            .writer
+            .get_or_create_project(ws, project.to_string(), None)
+            .await
+            .unwrap();
+        wiki.write_page(WritePageRequest {
+            workspace_id: ws,
+            project_id: other,
+            path: PagePath::new(path).unwrap(),
+            frontmatter: serde_json::json!({}),
+            body: "Existing target page.".into(),
+            tier: Tier::Semantic,
+            pinned: false,
+            title: None,
+            admission_ctx: None,
+            author_id: None,
+            actor: ai_memory_core::ActorContext::anonymous(),
+            evidence: Vec::new(),
+        })
+        .await
+        .unwrap();
+    }
+
+    /// Same, for the reserved `_global` preferences project, which lives in
+    /// the default workspace and goes through its own scope helper.
+    async fn seed_global_page(store: &ai_memory_store::Store, wiki: &Wiki, path: &str) {
+        let global = ai_memory_store::create_global_scope(&store.writer)
+            .await
+            .unwrap();
+        wiki.write_page(WritePageRequest {
+            workspace_id: global.workspace_id,
+            project_id: global.project_id,
+            path: PagePath::new(path).unwrap(),
+            frontmatter: serde_json::json!({}),
+            body: "A standing preference.".into(),
+            tier: Tier::Semantic,
+            pinned: false,
+            title: None,
+            admission_ctx: None,
+            author_id: None,
+            actor: ai_memory_core::ActorContext::anonymous(),
+            evidence: Vec::new(),
+        })
+        .await
+        .unwrap();
+    }
+
+    /// #1218: a batch whose model output invents cross-scope wikilinks must
+    /// not write them as links. `[[_global:nope]]` (missing page in the
+    /// reserved project), `[[otherproj:notes/missing.md]]` (missing page in
+    /// a real project) and `[[ghostproj:x.md]]` (a project that does not
+    /// exist at all) are all de-linked to plain text before the write.
+    /// Controls in the same body: a cross-scope link to an existing page
+    /// survives byte-identical, and a same-project pending link stays
+    /// untouched — pending links are by design (#1218 scope).
+    #[tokio::test]
+    async fn batch_delinks_invented_cross_scope_wikilinks() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (store, wiki, session, ws, proj) = batch_fixture(tmp.path()).await;
+        seed_other_project_page(&store, &wiki, ws, "otherproj", "notes/exists.md").await;
+        seed_global_page(&store, &wiki, "prefs.md").await;
+
+        let path = PagePath::new("notes/with-links.md").unwrap();
+        let body = "Invented: [[_global:nope]], [[otherproj:notes/missing.md]], \
+                    [[ghostproj:x.md]]. \
+                    Controls: [[otherproj:notes/exists.md]], [[_global:prefs.md|the prefs]], \
+                    [[notes/pending.md]].";
+        let outcomes = Consolidator::new(
+            store.reader.clone(),
+            store.writer.clone(),
+            wiki.clone(),
+            Arc::new(ScriptedLlm(batch_targeting(path.as_str(), body))),
+            ws,
+            proj,
+        )
+        .consolidate_session_multi(
+            session,
+            false,
+            ai_memory_core::ActorContext::anonymous(),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let stored = wiki.read_page(ws, proj, &path).unwrap();
+        // Invented links are plain text now: brackets dropped, label kept.
+        assert!(!stored.body.contains("[[_global:nope]]"));
+        assert!(!stored.body.contains("[[otherproj:notes/missing.md]]"));
+        assert!(!stored.body.contains("[[ghostproj:x.md]]"));
+        assert!(stored.body.contains("_global:nope"));
+        assert!(stored.body.contains("otherproj:notes/missing.md"));
+        assert!(stored.body.contains("ghostproj:x.md"));
+        assert!(
+            stored.body.contains("[[otherproj:notes/exists.md]]"),
+            "a cross-scope link to an existing page survives byte-identical: {}",
+            stored.body
+        );
+        assert!(
+            stored.body.contains("[[_global:prefs.md|the prefs]]"),
+            "a resolved _global link keeps its label form: {}",
+            stored.body
+        );
+        assert!(
+            stored.body.contains("[[notes/pending.md]]"),
+            "a same-project pending link is by design untouched: {}",
+            stored.body
+        );
+        // The outcome reports the body as actually written.
+        assert_eq!(outcomes.len(), 1);
+        assert_eq!(outcomes[0].new_body_markdown, stored.body);
+
+        // And the lint pass has nothing left to flag: no dangling
+        // cross-project edge was minted.
+        let dangling = store
+            .reader
+            .dangling_cross_project_links(ws, proj)
+            .await
+            .unwrap();
+        assert!(
+            dangling.is_empty(),
+            "de-linking must leave no dangling cross-project edges: {dangling:?}"
+        );
+    }
+
+    /// #1218 on the single-page path: the session page gets the same guard
+    /// before `Wiki::write_page`.
+    #[tokio::test]
+    async fn single_page_delinks_invented_cross_scope_wikilinks() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (store, wiki, session, ws, proj) = batch_fixture(tmp.path()).await;
+        seed_other_project_page(&store, &wiki, ws, "otherproj", "notes/exists.md").await;
+
+        let response = serde_json::json!({
+            "title": "Link cleanup",
+            "body_markdown": "Saw [[otherproj:notes/missing.md]] and \
+                              [[otherproj:notes/exists.md]] and [[notes/pending.md]].",
+            "tags": [],
+        });
+        Consolidator::new(
+            store.reader.clone(),
+            store.writer.clone(),
+            wiki.clone(),
+            Arc::new(ScriptedLlm(response)),
+            ws,
+            proj,
+        )
+        .consolidate_session(
+            session,
+            false,
+            ai_memory_core::ActorContext::anonymous(),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let path = PagePath::new(format!("sessions/{session}.md")).unwrap();
+        let stored = wiki.read_page(ws, proj, &path).unwrap();
+        assert!(!stored.body.contains("[[otherproj:notes/missing.md]]"));
+        assert!(stored.body.contains("otherproj:notes/missing.md"));
+        assert!(stored.body.contains("[[otherproj:notes/exists.md]]"));
+        assert!(stored.body.contains("[[notes/pending.md]]"));
+    }
+
+    /// #1218 covers typed `relations:` edges too: an unresolved cross-scope
+    /// relation target is dropped before the write (an emptied relation goes
+    /// with it), while a live cross-scope target and a same-project target
+    /// stay, so frontmatter cannot mint the dangling edge the body guard
+    /// prevents.
+    #[tokio::test]
+    async fn single_page_drops_unresolved_cross_scope_relations() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (store, wiki, session, ws, proj) = batch_fixture(tmp.path()).await;
+        seed_other_project_page(&store, &wiki, ws, "otherproj", "notes/exists.md").await;
+
+        let response = serde_json::json!({
+            "title": "Relation cleanup",
+            "body_markdown": "No links in the body.",
+            "tags": [],
+            "relations": {
+                "causes": ["otherproj:notes/missing.md", "otherproj:notes/exists.md", "notes/local.md"],
+                "fixes": ["ghostproj:x.md"],
+            },
+        });
+        Consolidator::new(
+            store.reader.clone(),
+            store.writer.clone(),
+            wiki.clone(),
+            Arc::new(ScriptedLlm(response)),
+            ws,
+            proj,
+        )
+        .consolidate_session(
+            session,
+            false,
+            ai_memory_core::ActorContext::anonymous(),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let path = PagePath::new(format!("sessions/{session}.md")).unwrap();
+        let stored = wiki.read_page(ws, proj, &path).unwrap();
+        assert_eq!(
+            stored.frontmatter["relations"]["causes"],
+            serde_json::json!(["otherproj:notes/exists.md", "notes/local.md"]),
+            "{}",
+            stored.frontmatter
+        );
+        assert!(stored.frontmatter["relations"].get("fixes").is_none());
     }
 }

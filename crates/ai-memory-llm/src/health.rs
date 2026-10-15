@@ -345,12 +345,10 @@ impl LlmProvider for HealthRecordingLlmProvider {
         result
     }
 
-    /// Forward the caller's operation id to the inner provider instead of
-    /// falling through to the trait default, which would drop it and make
-    /// the inner admission layer mint a fresh one — an external retry of the
-    /// same logical operation (the consolidator's fast retry) must keep the
-    /// id that correlated the first attempt on the wire. One observation per
-    /// return, exactly like the id-less path.
+    // The operation-id variants must be forwarded, not left to the trait
+    // defaults: those call `self.complete*`, which drops the caller's id, so
+    // the inner provider would mint a fresh one per call and every retry of
+    // one logical operation would look unrelated on the wire.
     async fn complete_with_operation_id(
         &self,
         request: ChatRequest,
@@ -374,9 +372,6 @@ impl LlmProvider for HealthRecordingLlmProvider {
         result
     }
 
-    /// Same id-forwarding contract as [`Self::complete_with_operation_id`]
-    /// for the structured path, which is the one the consolidator's retry
-    /// loop actually drives.
     async fn complete_structured_raw_with_operation_id(
         &self,
         request: ChatRequest,
@@ -771,6 +766,80 @@ mod tests {
         async fn embed_query(&self, _text: &str) -> LlmResult<Vec<f32>> {
             Ok(vec![0.0, 1.0])
         }
+    }
+
+    /// Records the operation id each operation-aware call receives.
+    #[derive(Default)]
+    struct OperationIdLlm {
+        seen: Mutex<Vec<LlmOperationId>>,
+    }
+
+    #[async_trait]
+    impl LlmProvider for OperationIdLlm {
+        fn name(&self) -> &'static str {
+            "fake"
+        }
+
+        fn model(&self) -> &str {
+            "fake-model"
+        }
+
+        async fn complete(&self, _request: ChatRequest) -> LlmResult<ChatResponse> {
+            Ok(ChatResponse {
+                text: "pong".to_string(),
+                usage: None,
+                model: "fake-model".to_string(),
+            })
+        }
+
+        async fn complete_with_operation_id(
+            &self,
+            request: ChatRequest,
+            operation_id: LlmOperationId,
+        ) -> LlmResult<ChatResponse> {
+            self.seen.lock().unwrap().push(operation_id);
+            self.complete(request).await
+        }
+
+        async fn complete_structured_raw(
+            &self,
+            _request: ChatRequest,
+            _schema: serde_json::Value,
+        ) -> LlmResult<serde_json::Value> {
+            Ok(serde_json::json!({ "ok": true }))
+        }
+
+        async fn complete_structured_raw_with_operation_id(
+            &self,
+            request: ChatRequest,
+            schema: serde_json::Value,
+            operation_id: LlmOperationId,
+        ) -> LlmResult<serde_json::Value> {
+            self.seen.lock().unwrap().push(operation_id);
+            self.complete_structured_raw(request, schema).await
+        }
+    }
+
+    #[tokio::test]
+    async fn llm_wrapper_forwards_the_callers_operation_id() {
+        let health = ProviderHealth::default();
+        let inner = Arc::new(OperationIdLlm::default());
+        let llm = health.wrap_llm_provider(inner.clone(), "openai", "gpt-test", None);
+        let id = LlmOperationId::new();
+
+        llm.complete_with_operation_id(ChatRequest::user_prompt("ping"), id)
+            .await
+            .unwrap();
+        llm.complete_structured_raw_with_operation_id(
+            ChatRequest::user_prompt("ping"),
+            serde_json::json!({}),
+            id,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(*inner.seen.lock().unwrap(), vec![id, id]);
+        assert_eq!(health.snapshot().llm.status, ProviderHealthStatus::Ok);
     }
 
     #[tokio::test]
