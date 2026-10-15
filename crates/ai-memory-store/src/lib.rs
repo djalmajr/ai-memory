@@ -132,6 +132,14 @@ pub const CLIENT_ACTIVITY_OVERFLOW_CLIENT: &str = "other";
 /// Default soft cap for the read-only connection pool.
 const READER_POOL_SOFT_CAP: usize = 4;
 
+/// Size the `-wal` file is truncated back to after a checkpoint (`PRAGMA
+/// journal_size_limit`). SQLite's default keeps the file at its high-water
+/// mark forever, so one large transaction (a `VACUUM`, a backfill, a bulk
+/// import) leaves a `-wal` as big as the database, and a crash then replays it
+/// in full on the next start. This does not cap a running transaction: the WAL
+/// still grows as far as that transaction needs.
+const WAL_JOURNAL_SIZE_LIMIT_BYTES: i64 = 64 * 1024 * 1024;
+
 /// Open (and migrate) a [`Store`] rooted at the given data directory.
 pub struct Store {
     /// Cloneable handle to submit mutations.
@@ -157,6 +165,7 @@ impl Store {
 
         let mut conn = Connection::open(&db_path)?;
         conn.pragma_update(None, "journal_mode", "WAL")?;
+        conn.pragma_update(None, "journal_size_limit", WAL_JOURNAL_SIZE_LIMIT_BYTES)?;
         conn.pragma_update(None, "synchronous", "NORMAL")?;
         conn.pragma_update(None, "busy_timeout", 5_000)?; // ms
 
@@ -214,6 +223,23 @@ impl Store {
     #[must_use]
     pub fn db_path(&self) -> &Path {
         &self.db_path
+    }
+
+    /// Release the database for process exit: close the read pool (idle
+    /// connections dropped, later reads refused with
+    /// [`StoreError::ReaderClosed`], a read still running dropping its
+    /// connection on return), then have the writer run a final
+    /// `wal_checkpoint(TRUNCATE)`, close its connection and stop.
+    ///
+    /// The server exits without joining the writer thread (detached tasks keep
+    /// clones of [`WriterHandle`] alive), so without this a stop leaves the
+    /// whole `-wal` behind for the next start to replay. Best effort: a
+    /// checkpoint held back by a reader is logged, not returned, and commands
+    /// sent afterwards fail with [`StoreError::WriterClosed`]. Wrap the call in
+    /// a timeout; it waits behind whatever the writer is running.
+    pub async fn close(&self) {
+        self.reader.close();
+        self.writer.checkpoint_and_close().await;
     }
 }
 
