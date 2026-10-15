@@ -11,7 +11,7 @@ use std::pin::Pin;
 use std::process::Stdio;
 use std::time::Duration;
 
-use ai_memory_core::{Observation, PagePath, ProjectId, SessionId, WorkspaceId};
+use ai_memory_core::{Observation, PagePath, ProjectId, Sanitizer, SessionId, WorkspaceId};
 use ai_memory_llm::{
     ChatMessage, ChatRequest, LlmError, LlmOperationId, LlmProvider, Role,
     complete_structured_with_operation_id,
@@ -97,6 +97,9 @@ pub const DEFAULT_AUTO_IMPROVE_MAX_PROPOSALS: usize = 5;
 pub const DEFAULT_AUTO_IMPROVE_PROPOSAL_ACTOR: &str = "auto_improve";
 /// Default wiki-relative folder for pending proposal sidecar markdown.
 pub const DEFAULT_AUTO_IMPROVE_PENDING_PATH: &str = "_pending/auto-improve";
+/// Evidence label of the entry the eval gate adds to a passing proposal; its
+/// structured result attaches to this entry.
+const AUTO_IMPROVE_EVAL_EVIDENCE_PAGE: &str = "auto_improve_eval";
 
 /// Default target prefixes guarded by the optional external eval command.
 pub fn default_auto_improve_eval_targets() -> Vec<String> {
@@ -503,6 +506,38 @@ pub struct AutoImproveReport {
     pub rejected_candidates: Vec<AutoImproveRejectedCandidate>,
     /// Non-fatal validation or budget notes.
     pub warnings: Vec<String>,
+    #[serde(default, skip_deserializing, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) eval_results: Vec<AutoImproveEvalResult>,
+}
+
+impl AutoImproveReport {
+    /// Serialize the server's observations of the existing eval executions.
+    pub fn eval_results(&self) -> impl Serialize + '_ {
+        &self.eval_results
+    }
+
+    /// Pending evidence, with the observed result attached only to its evaluated body.
+    ///
+    /// # Errors
+    /// Returns an error if evidence cannot be serialized.
+    pub fn proposal_evidence_json(
+        &self,
+        proposal: &AutoImproveProposal,
+    ) -> serde_json::Result<serde_json::Value> {
+        let mut evidence = serde_json::to_value(&proposal.evidence)?;
+        if let Some(result) = self.eval_results.iter().find(|result| {
+            result.status == EvalStatus::Success
+                && result.target_path == proposal.path
+                && result.after_body_sha256 == sha256_hex(proposal.body_markdown.as_bytes())
+        }) && let Some(entry) = evidence.as_array_mut().and_then(|entries| {
+            entries
+                .iter_mut()
+                .rfind(|entry| entry["page"] == AUTO_IMPROVE_EVAL_EVIDENCE_PAGE)
+        }) {
+            entry["eval_result"] = serde_json::to_value(result)?;
+        }
+        Ok(evidence)
+    }
 }
 
 /// Run a read-only auto-improvement review for one session.
@@ -542,6 +577,7 @@ pub async fn run_auto_improve_review(
             proposals: Vec::new(),
             rejected_candidates: vec![rejection],
             warnings: Vec::new(),
+            eval_results: Vec::new(),
         });
     }
 
@@ -619,7 +655,7 @@ pub async fn run_auto_improve_review(
         validate_response(raw, &cfg, &existing_index);
     rejected_candidates.extend(prompt_input.rejected_candidates);
     warnings.extend(prompt_input.warnings);
-    apply_eval_gate(
+    let eval_results = apply_eval_gate(
         reader,
         workspace_id,
         project_id,
@@ -651,6 +687,7 @@ pub async fn run_auto_improve_review(
         proposals,
         rejected_candidates,
         warnings,
+        eval_results,
     })
 }
 
@@ -677,6 +714,58 @@ struct AutoImproveEvalResponse {
     reason: Option<String>,
 }
 
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum EvalStatus {
+    Success,
+    Rejected,
+    Failure,
+    Timeout,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct AutoImproveEvalResult {
+    eval_id: uuid::Uuid,
+    target_path: String,
+    checker_name: String,
+    checker_invocation_digest: String,
+    proposal_sha256: Option<String>,
+    before_body_sha256: String,
+    after_body_sha256: String,
+    materialized_base_body_sha256: Option<String>,
+    status: EvalStatus,
+    passed: Option<bool>,
+    score_before: Option<f64>,
+    score_after: Option<f64>,
+    reason: Option<String>,
+}
+
+fn eval_request<'a>(
+    proposal: &'a AutoImproveProposal,
+    before_body: &'a str,
+) -> AutoImproveEvalRequest<'a> {
+    AutoImproveEvalRequest {
+        path: &proposal.path,
+        kind: &proposal.kind,
+        operation: &proposal.operation,
+        edit_mode: &proposal.edit_mode,
+        title: &proposal.title,
+        confidence: proposal.confidence,
+        rationale: &proposal.rationale,
+        before_body,
+        after_body: &proposal.body_markdown,
+        expected_base_body_sha256: proposal.expected_base_body_sha256.as_deref(),
+    }
+}
+
+fn sanitize_eval_reason(reason: &str) -> String {
+    cap_text_with_marker(
+        &Sanitizer::builtin().scrub(reason),
+        MAX_EVAL_REASON_CHARS,
+        "eval reason",
+    )
+}
+
 pub(crate) async fn apply_eval_gate(
     reader: &ReaderPool,
     workspace_id: WorkspaceId,
@@ -685,9 +774,9 @@ pub(crate) async fn apply_eval_gate(
     proposals: &mut Vec<AutoImproveProposal>,
     rejected: &mut Vec<AutoImproveRejectedCandidate>,
     warnings: &mut Vec<String>,
-) -> AutoImproveResult<()> {
+) -> AutoImproveResult<Vec<AutoImproveEvalResult>> {
     if !eval.enabled {
-        return Ok(());
+        return Ok(Vec::new());
     }
     let mut before_bodies = BTreeMap::new();
     for proposal in proposals.iter() {
@@ -701,8 +790,10 @@ pub(crate) async fn apply_eval_gate(
             .unwrap_or_default();
         before_bodies.insert(proposal.path.clone(), before_body);
     }
-    apply_eval_gate_with_before_bodies(eval, proposals, rejected, warnings, &before_bodies).await;
-    Ok(())
+    Ok(
+        apply_eval_gate_with_before_bodies(eval, proposals, rejected, warnings, &before_bodies)
+            .await,
+    )
 }
 
 async fn apply_eval_gate_with_before_bodies(
@@ -711,9 +802,9 @@ async fn apply_eval_gate_with_before_bodies(
     rejected: &mut Vec<AutoImproveRejectedCandidate>,
     warnings: &mut Vec<String>,
     before_bodies: &BTreeMap<String, String>,
-) {
+) -> Vec<AutoImproveEvalResult> {
     if !eval.enabled {
-        return;
+        return Vec::new();
     }
     if eval.command.trim().is_empty() {
         warnings.push(
@@ -722,26 +813,60 @@ async fn apply_eval_gate_with_before_bodies(
     }
 
     let mut accepted = Vec::with_capacity(proposals.len());
+    let mut results = Vec::new();
     for mut proposal in proposals.drain(..) {
         if !eval_targets_path(eval, &proposal.path) {
             accepted.push(proposal);
             continue;
         }
         let before_body = before_bodies.get(&proposal.path).map_or("", String::as_str);
-        match run_eval_for_proposal(eval, &proposal, before_body).await {
+        let stdin = serde_json::to_vec(&eval_request(&proposal, before_body))
+            .map_err(|e| EvalRunError::Error(e.to_string()));
+        let program = eval.command.split_whitespace().next().unwrap_or("");
+        let mut result = AutoImproveEvalResult {
+            eval_id: uuid::Uuid::now_v7(),
+            target_path: proposal.path.clone(),
+            checker_name: sanitize_eval_reason(program.rsplit(['/', '\\']).next().unwrap_or("")),
+            checker_invocation_digest: sha256_hex(eval.command.as_bytes()),
+            proposal_sha256: stdin.as_ref().ok().map(|bytes| sha256_hex(bytes)),
+            before_body_sha256: sha256_hex(before_body.as_bytes()),
+            after_body_sha256: sha256_hex(proposal.body_markdown.as_bytes()),
+            materialized_base_body_sha256: proposal.expected_base_body_sha256.clone(),
+            status: EvalStatus::Failure,
+            passed: None,
+            score_before: None,
+            score_after: None,
+            reason: None,
+        };
+        let outcome = match stdin {
+            Ok(stdin) => run_eval_for_proposal(eval, stdin).await,
+            Err(error) => Err(error),
+        };
+        match outcome {
             Ok(outcome) => {
+                result.passed = Some(outcome.passed);
+                result.score_before = outcome.score_before;
+                result.score_after = outcome.score_after;
                 let delta = outcome
                     .score_before
                     .zip(outcome.score_after)
                     .map(|(before, after)| after - before);
                 let delta_ok = delta.is_none_or(|value| value >= eval.min_delta);
                 if outcome.passed && delta_ok {
+                    result.status = EvalStatus::Success;
+                    result.reason = outcome.reason.as_deref().map(sanitize_eval_reason);
                     proposal.evidence.push(AutoImproveEvidence {
-                        page: "auto_improve_eval".into(),
+                        page: AUTO_IMPROVE_EVAL_EVIDENCE_PAGE.into(),
                         quote: format_eval_evidence(&outcome, delta),
                     });
                     accepted.push(proposal);
                 } else {
+                    result.status = EvalStatus::Rejected;
+                    result.reason = Some(sanitize_eval_reason(&format_eval_failure(
+                        &outcome,
+                        delta,
+                        eval.min_delta,
+                    )));
                     rejected.push(eval_rejection(
                         "eval_gate_failed",
                         &proposal,
@@ -749,17 +874,21 @@ async fn apply_eval_gate_with_before_bodies(
                     ));
                 }
             }
-            Err(EvalRunError::Timeout) => rejected.push(eval_rejection(
-                "eval_gate_timeout",
-                &proposal,
-                format!("eval command timed out after {}s", eval.timeout_secs),
-            )),
+            Err(EvalRunError::Timeout) => {
+                result.status = EvalStatus::Timeout;
+                let reason = format!("eval command timed out after {}s", eval.timeout_secs);
+                result.reason = Some(reason.clone());
+                rejected.push(eval_rejection("eval_gate_timeout", &proposal, reason));
+            }
             Err(EvalRunError::Error(message)) => {
+                result.reason = Some(sanitize_eval_reason(&message));
                 rejected.push(eval_rejection("eval_gate_error", &proposal, message))
             }
         }
+        results.push(result);
     }
     *proposals = accepted;
+    results
 }
 
 fn eval_targets_path(eval: &AutoImproveEvalConfig, path: &str) -> bool {
@@ -777,26 +906,12 @@ enum EvalRunError {
 
 async fn run_eval_for_proposal(
     eval: &AutoImproveEvalConfig,
-    proposal: &AutoImproveProposal,
-    before_body: &str,
+    stdin: Vec<u8>,
 ) -> Result<AutoImproveEvalResponse, EvalRunError> {
     let mut parts = eval.command.split_whitespace();
     let Some(program) = parts.next() else {
         return Err(EvalRunError::Error("eval command is empty".into()));
     };
-    let input = AutoImproveEvalRequest {
-        path: &proposal.path,
-        kind: &proposal.kind,
-        operation: &proposal.operation,
-        edit_mode: &proposal.edit_mode,
-        title: &proposal.title,
-        confidence: proposal.confidence,
-        rationale: &proposal.rationale,
-        before_body,
-        after_body: &proposal.body_markdown,
-        expected_base_body_sha256: proposal.expected_base_body_sha256.as_deref(),
-    };
-    let stdin = serde_json::to_vec(&input).map_err(|e| EvalRunError::Error(e.to_string()))?;
     let mut child = tokio::process::Command::new(program)
         .args(parts)
         .stdin(Stdio::piped())
@@ -917,11 +1032,7 @@ fn format_eval_failure(
     delta: Option<f64>,
     min_delta: f64,
 ) -> String {
-    let reason = cap_text_with_marker(
-        outcome.reason.as_deref().unwrap_or("eval did not pass"),
-        MAX_EVAL_REASON_CHARS,
-        "eval reason",
-    );
+    let reason = sanitize_eval_reason(outcome.reason.as_deref().unwrap_or("eval did not pass"));
     match (
         outcome.passed,
         outcome.score_before,
@@ -943,7 +1054,7 @@ fn eval_rejection(
     AutoImproveRejectedCandidate {
         reason: reason.into(),
         evidence: cap_text_with_marker(
-            &evidence,
+            &Sanitizer::builtin().scrub(&evidence),
             MAX_REJECTION_SUMMARY_CHARS,
             "eval rejection evidence",
         ),
@@ -1681,6 +1792,13 @@ fn validate_proposal(
     if proposal.operation != CANONICAL_OPERATION {
         return Err("unsupported_operation".into());
     }
+    // Confidence is documented as `0.0..=1.0`. A model that answers in percent
+    // (`85`) would clear the floor below and be stored, and shown to the
+    // reviewer, as 8500%. NaN fails every comparison, so it needs this test
+    // too.
+    if !(0.0..=1.0).contains(&proposal.confidence) {
+        return Err("confidence_out_of_range".into());
+    }
     if proposal.confidence < cfg.min_confidence {
         return Err("confidence_below_threshold".into());
     }
@@ -2267,10 +2385,10 @@ mod tests {
     }
 
     #[cfg(unix)]
-    fn write_eval_script(body: &str) -> String {
+    fn write_eval_script(body: &str) -> (tempfile::TempDir, String) {
         use std::os::unix::fs::PermissionsExt;
-        let dir = tempfile::TempDir::new().unwrap().keep();
-        let path = dir.join("eval.sh");
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("eval.sh");
         std::fs::write(&path, body).unwrap();
         let mut perms = std::fs::metadata(&path).unwrap().permissions();
         perms.set_mode(0o755);
@@ -2279,13 +2397,14 @@ mod tests {
         // temp file directly. Some Linux filesystems can briefly report
         // ETXTBSY for direct exec under parallel tests even after write(2)
         // returns and the file handle has been dropped.
-        format!("sh {}", path.display())
+        let command = format!("sh {}", path.display());
+        (dir, command)
     }
 
     #[cfg(windows)]
-    fn write_eval_script(body: &str) -> String {
-        let dir = tempfile::TempDir::new().unwrap().keep();
-        let path = dir.join("eval.ps1");
+    fn write_eval_script(body: &str) -> (tempfile::TempDir, String) {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("eval.ps1");
         let body = match body {
             "#!/bin/sh\ncat >/dev/null\nprintf '%s' '{\"score_before\":0.72,\"score_after\":0.76,\"passed\":true}'\n" => {
                 "$null = [Console]::In.ReadToEnd()\n[Console]::Out.Write('{\"score_before\":0.72,\"score_after\":0.76,\"passed\":true}')\n"
@@ -2294,6 +2413,9 @@ mod tests {
             "#!/bin/sh\ncat >/dev/null\nprintf '%s' '{\"score_before\":0.72,\"score_after\":0.70,\"passed\":true}'\n" => {
                 "$null = [Console]::In.ReadToEnd()\n[Console]::Out.Write('{\"score_before\":0.72,\"score_after\":0.70,\"passed\":true}')\n"
                     .into()
+            }
+            "#!/bin/sh\ncat >/dev/null\nprintf '%s' '{\"passed\":false,\"reason\":\"structure check failed\"}'\n" => {
+                "$null = [Console]::In.ReadToEnd()\n[Console]::Out.Write('{\"passed\":false,\"reason\":\"structure check failed\"}')\n".into()
             }
             "#!/bin/sh\ncat >/dev/null\nexit 7\n" => {
                 "$null = [Console]::In.ReadToEnd()\nexit 7\n".into()
@@ -2315,11 +2437,12 @@ mod tests {
             other => panic!("unmapped eval script fixture for Windows: {other:?}"),
         };
         std::fs::write(&path, body).unwrap();
-        format!(
+        let command = format!(
             "{} -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File {}",
             ai_memory_test_support::powershell_exe(),
             path.display()
-        )
+        );
+        (dir, command)
     }
 
     #[tokio::test]
@@ -2327,7 +2450,7 @@ mod tests {
         let mut proposals = vec![proposal("_rules/test.md", "rule", 0.9)];
         let mut rejected = Vec::new();
         let mut warnings = Vec::new();
-        apply_eval_gate_with_before_bodies(
+        let results = apply_eval_gate_with_before_bodies(
             &AutoImproveEvalConfig::default(),
             &mut proposals,
             &mut rejected,
@@ -2335,6 +2458,7 @@ mod tests {
             &BTreeMap::new(),
         )
         .await;
+        assert!(results.is_empty());
         assert_eq!(proposals.len(), 1);
         assert!(rejected.is_empty());
         assert!(warnings.is_empty());
@@ -2342,7 +2466,7 @@ mod tests {
 
     #[tokio::test]
     async fn passing_eval_allows_proposal_and_records_evidence() {
-        let script = write_eval_script(
+        let (_eval_dir, script) = write_eval_script(
             "#!/bin/sh\ncat >/dev/null\nprintf '%s' '{\"score_before\":0.72,\"score_after\":0.76,\"passed\":true}'\n",
         );
         let mut proposals = vec![proposal("_rules/test.md", "rule", 0.9)];
@@ -2366,15 +2490,77 @@ mod tests {
         assert!(rejected.is_empty());
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn structured_eval_records_server_observation() {
+        let (_eval_dir, command) = write_eval_script(
+            "#!/bin/sh\ncat >/dev/null\nprintf '%s' '{\"passed\":true,\"score_before\":0.72,\"score_after\":0.76,\"run_id\":\"caller-run\",\"eval_id\":\"caller-eval\",\"checker_invocation_digest\":\"caller-digest\",\"after_body_sha256\":\"caller-body\"}'\n",
+        );
+        let candidate = proposal("_rules/test.md", "rule", 0.9);
+        let proposal_digest = sha256_hex(
+            &serde_json::to_vec(&AutoImproveEvalRequest {
+                path: &candidate.path,
+                kind: &candidate.kind,
+                operation: &candidate.operation,
+                edit_mode: &candidate.edit_mode,
+                title: &candidate.title,
+                confidence: candidate.confidence,
+                rationale: &candidate.rationale,
+                before_body: "original body",
+                after_body: &candidate.body_markdown,
+                expected_base_body_sha256: candidate.expected_base_body_sha256.as_deref(),
+            })
+            .unwrap(),
+        );
+        let after_digest = sha256_hex(candidate.body_markdown.as_bytes());
+        let mut proposals = vec![candidate];
+        let mut rejected = Vec::new();
+        let results = apply_eval_gate_with_before_bodies(
+            &eval_cfg(command.clone()),
+            &mut proposals,
+            &mut rejected,
+            &mut Vec::new(),
+            &BTreeMap::from([("_rules/test.md".into(), "original body".into())]),
+        )
+        .await;
+        let results = serde_json::to_value(results).unwrap();
+        assert_eq!(results[0]["status"], "success");
+        assert!(results[0].get("run_id").is_none());
+        assert_ne!(results[0]["eval_id"], "caller-eval");
+        assert_eq!(
+            results[0]["eval_id"]
+                .as_str()
+                .unwrap()
+                .parse::<uuid::Uuid>()
+                .unwrap()
+                .get_version_num(),
+            7,
+        );
+        assert_eq!(results[0]["checker_name"], "sh");
+        assert_eq!(
+            results[0]["checker_invocation_digest"],
+            sha256_hex(command.as_bytes())
+        );
+        assert_eq!(results[0]["proposal_sha256"], proposal_digest);
+        assert_eq!(
+            results[0]["before_body_sha256"],
+            sha256_hex(b"original body")
+        );
+        assert_eq!(results[0]["after_body_sha256"], after_digest);
+        assert!(results[0]["materialized_base_body_sha256"].is_null());
+        assert_eq!(proposals.len(), 1);
+        assert!(rejected.is_empty());
+    }
+
     #[tokio::test]
     async fn failing_eval_filters_and_records_rejection() {
-        let script = write_eval_script(
+        let (_eval_dir, script) = write_eval_script(
             "#!/bin/sh\ncat >/dev/null\nprintf '%s' '{\"score_before\":0.72,\"score_after\":0.70,\"passed\":true}'\n",
         );
         let mut proposals = vec![proposal("procedures/test.md", "procedure", 0.9)];
         let mut rejected = Vec::new();
         let mut warnings = Vec::new();
-        apply_eval_gate_with_before_bodies(
+        let results = apply_eval_gate_with_before_bodies(
             &eval_cfg(script),
             &mut proposals,
             &mut rejected,
@@ -2382,6 +2568,12 @@ mod tests {
             &BTreeMap::new(),
         )
         .await;
+        assert_eq!(
+            serde_json::to_value(&results).unwrap()[0]["status"],
+            "rejected"
+        );
+        assert_eq!(results[0].passed, Some(true));
+        assert_eq!(results[0].score_after, Some(0.70));
         assert!(proposals.is_empty());
         assert_eq!(rejected.len(), 1);
         assert_eq!(rejected[0].reason, "eval_gate_failed");
@@ -2389,6 +2581,30 @@ mod tests {
             rejected[0].target_path.as_deref(),
             Some("procedures/test.md")
         );
+    }
+
+    #[tokio::test]
+    async fn eval_reports_rejected_when_scorer_returns_false() {
+        let (_eval_dir, script) = write_eval_script(
+            "#!/bin/sh\ncat >/dev/null\nprintf '%s' '{\"passed\":false,\"reason\":\"structure check failed\"}'\n",
+        );
+        let mut proposals = vec![proposal("procedures/test.md", "procedure", 0.9)];
+        let mut rejected = Vec::new();
+        let results = apply_eval_gate_with_before_bodies(
+            &eval_cfg(script),
+            &mut proposals,
+            &mut rejected,
+            &mut Vec::new(),
+            &BTreeMap::new(),
+        )
+        .await;
+        assert_eq!(
+            serde_json::to_value(&results).unwrap()[0]["status"],
+            "rejected"
+        );
+        assert_eq!(results[0].passed, Some(false));
+        assert!(proposals.is_empty());
+        assert_eq!(rejected[0].reason, "eval_gate_failed");
     }
 
     // #834: the folder filter decides which of a project's durable knowledge the
@@ -2461,13 +2677,13 @@ mod tests {
                 "eval_gate_timeout",
             ),
         ];
-        for (command, expected_reason) in cases {
+        for ((_eval_dir, command), expected_reason) in cases {
             let mut cfg = eval_cfg(command);
             cfg.timeout_secs = if cfg!(windows) { 8 } else { 1 };
             let mut proposals = vec![proposal("_rules/test.md", "rule", 0.9)];
             let mut rejected = Vec::new();
             let mut warnings = Vec::new();
-            apply_eval_gate_with_before_bodies(
+            let results = apply_eval_gate_with_before_bodies(
                 &cfg,
                 &mut proposals,
                 &mut rejected,
@@ -2475,6 +2691,22 @@ mod tests {
                 &BTreeMap::new(),
             )
             .await;
+            assert_eq!(results.len(), 1);
+            assert_eq!(
+                results[0].status,
+                if expected_reason == "eval_gate_timeout" {
+                    EvalStatus::Timeout
+                } else {
+                    EvalStatus::Failure
+                }
+            );
+            assert!(results[0].passed.is_none());
+            assert!(
+                results[0]
+                    .reason
+                    .as_ref()
+                    .is_some_and(|reason| !reason.is_empty())
+            );
             assert!(proposals.is_empty());
             assert_eq!(rejected[0].reason, expected_reason);
         }
@@ -2482,7 +2714,7 @@ mod tests {
 
     #[tokio::test]
     async fn eval_timeout_covers_blocked_stdin_write() {
-        let script = write_eval_script("#!/bin/sh\nsleep 5\n");
+        let (_eval_dir, script) = write_eval_script("#!/bin/sh\nsleep 5\n");
         let mut cfg = eval_cfg(script);
         cfg.timeout_secs = 1;
         let mut proposal = proposal("_rules/test.md", "rule", 0.9);
@@ -2520,7 +2752,7 @@ mod tests {
         // One zero-padded printf writes the 70,000 bytes at once. A shell loop
         // printing one byte per iteration took longer than the gate's 2s
         // timeout on a loaded machine, which failed the test as a timeout.
-        let script = write_eval_script("#!/bin/sh\nprintf '%070000d' 0\n");
+        let (_eval_dir, script) = write_eval_script("#!/bin/sh\nprintf '%070000d' 0\n");
         let mut proposals = vec![proposal("_rules/test.md", "rule", 0.9)];
         let mut rejected = Vec::new();
         let mut warnings = Vec::new();
@@ -2563,13 +2795,26 @@ mod tests {
         assert!(evidence.len() < MAX_EVAL_REASON_CHARS + 200);
     }
 
+    #[test]
+    fn eval_reason_scrubs_a_secret_straddling_the_cap() {
+        let reason = format!(
+            "{} ghp_{}",
+            "a".repeat(MAX_EVAL_REASON_CHARS - 12),
+            "F".repeat(36)
+        );
+        let captured = sanitize_eval_reason(&reason);
+        assert!(!captured.contains("ghp_"));
+        assert!(captured.contains("[REDACTED:"));
+        assert!(captured.chars().count() < MAX_EVAL_REASON_CHARS + 100);
+    }
+
     #[tokio::test]
     async fn non_targeted_proposal_bypasses_eval() {
-        let script = write_eval_script("#!/bin/sh\nexit 7\n");
+        let (_eval_dir, script) = write_eval_script("#!/bin/sh\nexit 7\n");
         let mut proposals = vec![proposal("gotchas/test.md", "gotcha", 0.9)];
         let mut rejected = Vec::new();
         let mut warnings = Vec::new();
-        apply_eval_gate_with_before_bodies(
+        let results = apply_eval_gate_with_before_bodies(
             &eval_cfg(script),
             &mut proposals,
             &mut rejected,
@@ -2577,6 +2822,7 @@ mod tests {
             &BTreeMap::new(),
         )
         .await;
+        assert!(results.is_empty());
         assert_eq!(proposals.len(), 1);
         assert!(rejected.is_empty());
     }
@@ -3438,6 +3684,28 @@ mod tests {
         assert_eq!(rejected.len(), 2);
         assert_eq!(rejected[0].reason, "confidence_below_threshold");
         assert_eq!(rejected[1].reason, "unsupported_path_prefix");
+    }
+
+    #[test]
+    fn validation_rejects_confidence_outside_the_unit_interval() {
+        let raw = AutoImproveLlmResponse {
+            summary: "ok".into(),
+            proposals: vec![
+                proposal("gotchas/percent.md", "gotcha", 85.0),
+                proposal("gotchas/nan.md", "gotcha", f32::NAN),
+                proposal("gotchas/negative.md", "gotcha", -0.5),
+                proposal("gotchas/one.md", "gotcha", 1.0),
+            ],
+            rejected_candidates: Vec::new(),
+        };
+        let (accepted, rejected, _warnings) =
+            validate_response(raw, &cfg(), &ExistingPageIndex::default());
+        assert_eq!(accepted.len(), 1);
+        assert_eq!(accepted[0].path, "gotchas/one.md");
+        assert_eq!(rejected.len(), 3);
+        for rejection in &rejected {
+            assert_eq!(rejection.reason, "confidence_out_of_range");
+        }
     }
 
     #[test]

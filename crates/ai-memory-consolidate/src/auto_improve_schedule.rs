@@ -30,6 +30,11 @@ use crate::{
     run_auto_improve_review,
 };
 
+/// `ActorContext.agent` the scheduler stamps on proposals it auto-approves
+/// (`decided_by_actor_json`). The profile harvester reads it to keep model
+/// output nobody reviewed out of the cross-project profile (#1211).
+pub const AUTO_IMPROVE_AUTO_APPROVE_AGENT: &str = "auto_improve_scheduler_auto_approve";
+
 /// Settings for the scheduled auto-improvement loop, already mapped from
 /// the host's configuration. Bundles the review config with the
 /// scheduler-only knobs so the tick driver takes a single value.
@@ -116,6 +121,16 @@ pub struct ScheduledAutoImproveTickOutcome {
     pub parked: usize,
     /// Cross-session ("experience") passes that ran this tick.
     pub experience_runs: usize,
+    /// Redacted class/status summaries of this tick's review and experience
+    /// failures, pushed in the same arms that log the `error_summary`
+    /// warnings, so the warnings' content is observable without log capture
+    /// (a callsite's cached `Interest` is process-wide and can be silenced by
+    /// a sibling test under a single-process harness).
+    pub failure_summaries: Vec<String>,
+    /// The proposals behind `skipped`: everything the store declined to
+    /// stage this tick. The per-session path warns about each of these; the
+    /// typed copy lets the unattended path be asserted without log capture.
+    pub skipped_proposals: Vec<SkippedProposal>,
 }
 
 struct ScheduledAutoImproveContext<'a> {
@@ -214,6 +229,9 @@ pub async fn run_auto_improve_scheduler_tick(
                         Ok(Some(run)) => {
                             outcome.experience_runs += 1;
                             outcome.skipped += run.skipped.len();
+                            outcome
+                                .skipped_proposals
+                                .extend(run.skipped.iter().cloned());
                             if let Err(e) = writer
                                 .mark_experience_pass_run(scope.workspace_id, scope.project_id)
                                 .await
@@ -243,6 +261,7 @@ pub async fn run_auto_improve_scheduler_tick(
                             // anyhow chain is transparent to the provider
                             // error and would print the response body.
                             let error_summary = redacted_scheduler_error_summary(&e);
+                            outcome.failure_summaries.push(error_summary.clone());
                             if is_terminal_llm_error(&e) {
                                 match writer
                                     .mark_experience_pass_run(scope.workspace_id, scope.project_id)
@@ -331,6 +350,9 @@ pub async fn run_auto_improve_scheduler_tick(
                 Ok(run) => {
                     outcome.reviewed += 1;
                     outcome.skipped += run.skipped.len();
+                    outcome
+                        .skipped_proposals
+                        .extend(run.skipped.iter().cloned());
                     info!(
                         workspace = %scope.workspace_name,
                         project = %scope.project_name,
@@ -367,12 +389,13 @@ pub async fn run_auto_improve_scheduler_tick(
                     // so retryable failures get another tick. The admission wrapper's
                     // terminal errors have already exhausted their safe retry policy,
                     // so park those claims immediately and prevent a third replay.
-                    let terminal = is_terminal_llm_error(&e);
                     // Redacted summary only: this exact string is persisted
                     // to the claim's `last_error` and logged — the `Display`
                     // of the anyhow chain would leak the provider body to
                     // both.
                     let error_summary = redacted_scheduler_error_summary(&e);
+                    outcome.failure_summaries.push(error_summary.clone());
+                    let terminal = is_terminal_llm_error(&e);
                     let attempts = match if terminal {
                         ctx.writer
                             .park_auto_improve_claim_failure(
@@ -429,26 +452,6 @@ pub async fn run_auto_improve_scheduler_tick(
     Ok(outcome)
 }
 
-fn is_terminal_llm_error(error: &anyhow::Error) -> bool {
-    error.chain().any(|cause| {
-        if let Some(review_error) = cause.downcast_ref::<AutoImproveError>() {
-            matches!(
-                review_error,
-                AutoImproveError::Llm(
-                    LlmError::AmbiguousRetryExhausted { .. } | LlmError::InputLimit { .. }
-                )
-            )
-        } else {
-            cause.downcast_ref::<LlmError>().is_some_and(|llm_error| {
-                matches!(
-                    llm_error,
-                    LlmError::AmbiguousRetryExhausted { .. } | LlmError::InputLimit { .. }
-                )
-            })
-        }
-    })
-}
-
 /// Redacted one-line summary of a scheduler failure, for the persisted claim
 /// `last_error` and the tick/experience log events.
 ///
@@ -467,7 +470,7 @@ fn redacted_scheduler_error_summary(error: &anyhow::Error) -> String {
         if let Some(review_error) = cause.downcast_ref::<AutoImproveError>() {
             return redacted_auto_improve_summary(review_error);
         }
-        if let Some(llm_error) = cause.downcast_ref::<LlmError>() {
+        if let Some(llm_error) = cause.downcast_ref::<ai_memory_llm::LlmError>() {
             return format!(
                 "auto-improve failed: class={} status={}",
                 llm_error.class(),
@@ -479,6 +482,26 @@ fn redacted_scheduler_error_summary(error: &anyhow::Error) -> String {
         }
     }
     "auto-improve failed: class=unrecognized status=none".to_string()
+}
+
+fn is_terminal_llm_error(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        if let Some(review_error) = cause.downcast_ref::<AutoImproveError>() {
+            matches!(
+                review_error,
+                AutoImproveError::Llm(
+                    LlmError::AmbiguousRetryExhausted { .. } | LlmError::InputLimit { .. }
+                )
+            )
+        } else {
+            cause.downcast_ref::<LlmError>().is_some_and(|llm_error| {
+                matches!(
+                    llm_error,
+                    LlmError::AmbiguousRetryExhausted { .. } | LlmError::InputLimit { .. }
+                )
+            })
+        }
+    })
 }
 
 async fn run_scheduled_auto_improve(
@@ -573,6 +596,7 @@ async fn stage_and_apply(
                     "max_rule_page_tokens": cfg.max_rule_page_tokens,
                     "max_procedure_page_tokens": cfg.max_procedure_page_tokens,
                     "eval": cfg.eval,
+                    "eval_results": report.eval_results(),
                     "require_approval": ctx.settings.require_approval,
                 }),
                 proposal_actor: ActorContext {
@@ -605,7 +629,7 @@ async fn stage_and_apply(
                 ctx.project_id,
                 *proposal_id,
                 ActorContext {
-                    agent: Some("auto_improve_scheduler_auto_approve".into()),
+                    agent: Some(AUTO_IMPROVE_AUTO_APPROVE_AGENT.into()),
                     ..ActorContext::default()
                 },
                 None,
@@ -664,8 +688,7 @@ async fn scheduled_auto_improve_new_proposals(
             title: p.title.clone(),
             confidence: f64::from(p.confidence),
             rationale: p.rationale.clone(),
-            evidence_json: serde_json::to_value(&p.evidence)
-                .unwrap_or_else(|_| serde_json::json!([])),
+            evidence_json: report.proposal_evidence_json(p)?,
             body_markdown: p.body_markdown.clone(),
             artifact_sha256: None,
             edit_mode: Some(p.edit_mode.clone()),
@@ -698,7 +721,6 @@ mod tests {
     use ai_memory_store::Store;
     use std::future::Future;
     use std::pin::Pin;
-    use std::sync::Mutex;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tempfile::TempDir;
 
@@ -735,6 +757,407 @@ mod tests {
         {
             Box::pin(async move { panic!("preflight-skipped scheduler test must not call LLM") })
         }
+    }
+
+    /// A provider that rejects the scheduled review with a private body:
+    /// the claim's persisted `last_error` and the tick warnings must carry
+    /// class/status only, never the body.
+    struct SchedulerSentinelLlm {
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl LlmProvider for SchedulerSentinelLlm {
+        fn name(&self) -> &'static str {
+            "scheduler-sentinel"
+        }
+
+        fn model(&self) -> &str {
+            "sentinel-model"
+        }
+
+        fn complete<'life0, 'async_trait>(
+            &'life0 self,
+            _request: ChatRequest,
+        ) -> Pin<Box<dyn Future<Output = LlmResult<ChatResponse>> + Send + 'async_trait>>
+        where
+            'life0: 'async_trait,
+            Self: 'async_trait,
+        {
+            Box::pin(async move {
+                Err(LlmError::Provider {
+                    status: 400,
+                    body: "SENTINEL_PRIVATE_BODY".into(),
+                })
+            })
+        }
+
+        fn complete_structured_raw<'life0, 'async_trait>(
+            &'life0 self,
+            _request: ChatRequest,
+            _schema: serde_json::Value,
+        ) -> Pin<Box<dyn Future<Output = LlmResult<serde_json::Value>> + Send + 'async_trait>>
+        where
+            'life0: 'async_trait,
+            Self: 'async_trait,
+        {
+            let calls = Arc::clone(&self.calls);
+            Box::pin(async move {
+                calls.fetch_add(1, Ordering::SeqCst);
+                Err(LlmError::Provider {
+                    status: 400,
+                    body: "SENTINEL_PRIVATE_BODY".into(),
+                })
+            })
+        }
+    }
+
+    /// Cross-session fake that fails the experience review with a private
+    /// body: the experience warnings must carry class/status only.
+    struct ExperienceSentinelLlm;
+
+    impl LlmProvider for ExperienceSentinelLlm {
+        fn name(&self) -> &'static str {
+            "experience-sentinel"
+        }
+
+        fn model(&self) -> &str {
+            "sentinel-model"
+        }
+
+        fn complete<'life0, 'async_trait>(
+            &'life0 self,
+            _request: ChatRequest,
+        ) -> Pin<Box<dyn Future<Output = LlmResult<ChatResponse>> + Send + 'async_trait>>
+        where
+            'life0: 'async_trait,
+            Self: 'async_trait,
+        {
+            Box::pin(async move {
+                Ok(ChatResponse {
+                    text: "unused".into(),
+                    usage: None,
+                    model: "sentinel-model".into(),
+                })
+            })
+        }
+
+        fn complete_structured_raw<'life0, 'async_trait>(
+            &'life0 self,
+            _request: ChatRequest,
+            _schema: serde_json::Value,
+        ) -> Pin<Box<dyn Future<Output = LlmResult<serde_json::Value>> + Send + 'async_trait>>
+        where
+            'life0: 'async_trait,
+            Self: 'async_trait,
+        {
+            Box::pin(async move {
+                Err(LlmError::Provider {
+                    status: 400,
+                    body: "SENTINEL_PRIVATE_BODY".into(),
+                })
+            })
+        }
+    }
+
+    /// Read the persisted claim row directly. A retryable claim is not
+    /// parked, so the typed parked-claims listing never sees it — the only
+    /// way to assert what a single retryable failure persisted.
+    fn claim_row(
+        db_path: &std::path::Path,
+        ws: WorkspaceId,
+        proj: ProjectId,
+        session: SessionId,
+    ) -> (String, u32) {
+        let conn = rusqlite::Connection::open(db_path).unwrap();
+        conn.query_row(
+            "SELECT last_error, attempts FROM auto_improve_scheduler_claims \
+             WHERE workspace_id = ?1 AND project_id = ?2 AND session_id = ?3",
+            rusqlite::params![ws.as_bytes(), proj.as_bytes(), session.as_bytes()],
+            |row| {
+                let last_error: Option<String> = row.get(0)?;
+                Ok((last_error.unwrap(), row.get(1)?))
+            },
+        )
+        .expect("the claim row must exist after a failed review")
+    }
+
+    /// A retryable provider failure must persist only the redacted
+    /// class/status summary to the claim's `last_error` on every attempt,
+    /// keep the existing attempts/park policy, and leave a fresh store
+    /// handle (process restart) unable to find the body in the DB.
+    #[tokio::test]
+    async fn scheduled_retryable_failure_persists_only_class_status_summary() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let wiki = Wiki::new(tmp.path(), store.writer.clone()).unwrap();
+        let ws = store
+            .writer
+            .get_or_create_workspace("default")
+            .await
+            .unwrap();
+        let project = store
+            .writer
+            .get_or_create_project(ws, "retry-sentinel", None)
+            .await
+            .unwrap();
+        initialize_auto_improve_scheduler_scopes(&store.reader, &store.writer)
+            .await
+            .unwrap();
+        let session_id = seed_reviewable_session(&store, ws, project).await;
+        let calls = Arc::new(AtomicUsize::new(0));
+        let llm: Arc<dyn LlmProvider> = Arc::new(SchedulerSentinelLlm {
+            calls: Arc::clone(&calls),
+        });
+        let settings = ScheduledAutoImproveSettings {
+            review: AutoImproveReviewConfig {
+                min_observations: 3,
+                min_session_duration_secs: 0,
+                ..AutoImproveReviewConfig::default()
+            },
+            require_approval: true,
+            min_session_age_secs: 0,
+            max_sessions_per_tick: 10,
+            experience: None,
+        };
+
+        let expected = "auto-improve failed: class=provider status=400";
+
+        // The failure warning is asserted from the typed tick outcome
+        // (`failure_summaries`, pushed in the same arm that logs the
+        // `error_summary` warning) rather than a capturing subscriber: a
+        // callsite's cached `Interest` is computed process-wide by whichever
+        // thread first executes it, and under a single-process harness a
+        // sibling test can register these `warn!` callsites with no
+        // subscriber installed, silencing them for this test.
+
+        // Attempt 1: retryable provider 400 → the claim records the attempt
+        // (not parked). The persisted column carries only class/status.
+        let first =
+            run_auto_improve_scheduler_tick(&store.reader, &store.writer, &wiki, &llm, &settings)
+                .await
+                .unwrap();
+        assert_eq!(first.errors, 1, "the retryable failure must be reported");
+        assert_eq!(
+            first.parked, 0,
+            "a retryable failure must not park the claim"
+        );
+        let (last_error, attempts) = claim_row(store.db_path(), ws, project, session_id);
+        assert_eq!(attempts, 1);
+        assert_eq!(
+            last_error, expected,
+            "the persisted last_error must be the redacted summary"
+        );
+        assert!(!last_error.contains("SENTINEL_PRIVATE_BODY"));
+
+        // Attempt 2: the claim re-arms and each attempt writes only the safe
+        // summary.
+        let second =
+            run_auto_improve_scheduler_tick(&store.reader, &store.writer, &wiki, &llm, &settings)
+                .await
+                .unwrap();
+        assert_eq!(second.errors, 1);
+        assert_eq!(second.parked, 0);
+        let (last_error, attempts) = claim_row(store.db_path(), ws, project, session_id);
+        assert_eq!(attempts, 2);
+        assert_eq!(last_error, expected);
+
+        // Attempt 3 exhausts the budget: the claim parks and stops being a
+        // candidate — the policy is unchanged by the redaction.
+        let third =
+            run_auto_improve_scheduler_tick(&store.reader, &store.writer, &wiki, &llm, &settings)
+                .await
+                .unwrap();
+        assert_eq!(third.errors, 1);
+        assert_eq!(third.parked, 1, "the third attempt must park the claim");
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
+
+        let fourth =
+            run_auto_improve_scheduler_tick(&store.reader, &store.writer, &wiki, &llm, &settings)
+                .await
+                .unwrap();
+        assert_eq!(fourth.errors, 0, "a parked claim must not be retried");
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            3,
+            "the parked claim must not call the LLM"
+        );
+
+        // No warning may carry the body; the class/status label must stay
+        // diagnosable. Every failing tick reported exactly one summary.
+        for (tick, outcome) in [(1, &first), (2, &second), (3, &third)] {
+            assert_eq!(
+                outcome.failure_summaries,
+                [expected],
+                "tick {tick} must warn with class/status only"
+            );
+            assert!(
+                !outcome.failure_summaries[0].contains("SENTINEL_PRIVATE_BODY"),
+                "no provider body may reach the scheduler log: {}",
+                outcome.failure_summaries[0]
+            );
+        }
+
+        // Crash contract: a process death right after the write (before the
+        // warning) leaves only the redacted value. A fresh handle on the
+        // same DB file finds class/status, never the body.
+        drop(wiki);
+        drop(store);
+        let restarted = Store::open(tmp.path()).unwrap();
+        let (last_error, attempts) = claim_row(restarted.db_path(), ws, project, session_id);
+        assert_eq!((attempts, last_error.as_str()), (3, expected));
+        let parked = restarted
+            .reader
+            .auto_improve_parked_claims(ws, project)
+            .await
+            .unwrap();
+        assert_eq!(parked.len(), 1);
+        assert_eq!(parked[0].last_error.as_deref(), Some(expected));
+    }
+
+    /// An experience pass failure must warn with the redacted class/status
+    /// and never the provider body. The warning's content is asserted from
+    /// the typed tick outcome (`failure_summaries`, pushed in the same arm
+    /// that logs the `error_summary` warning) rather than a capturing
+    /// subscriber: a callsite's cached `Interest` is computed process-wide by
+    /// whichever thread first executes it, and under a single-process harness
+    /// a sibling test can register the `warn!` callsite with no subscriber
+    /// installed, silencing it for this test.
+    #[tokio::test]
+    async fn experience_pass_failure_warns_class_status_not_body() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let wiki = Wiki::new(tmp.path(), store.writer.clone())
+            .unwrap()
+            .with_store_reader(store.reader.clone());
+        let ws = store
+            .writer
+            .get_or_create_workspace("default")
+            .await
+            .unwrap();
+        let project = store
+            .writer
+            .get_or_create_project(ws, "experience-sentinel", None)
+            .await
+            .unwrap();
+        assert_eq!(
+            initialize_auto_improve_scheduler_scopes(&store.reader, &store.writer)
+                .await
+                .unwrap(),
+            (1, 0)
+        );
+
+        // Three completed sessions AFTER init, each with a summary page —
+        // the cadence gate is due (same fixture as the cadence-gating test).
+        tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+        for _ in 0..3 {
+            let session_id = SessionId::new();
+            store
+                .writer
+                .begin_session(ai_memory_core::NewSession {
+                    occurred_at: None,
+                    id: session_id,
+                    workspace_id: ws,
+                    project_id: project,
+                    agent_kind: ai_memory_core::AgentKind::OpenCode,
+                    cwd: None,
+                    actor_user: None,
+                })
+                .await
+                .unwrap();
+            store.writer.end_session(session_id, None).await.unwrap();
+            wiki.write_page(ai_memory_wiki::WritePageRequest {
+                workspace_id: ws,
+                project_id: project,
+                path: PagePath::new(format!("sessions/{session_id}.md")).unwrap(),
+                frontmatter: serde_json::json!({"title": "session"}),
+                body: "tag main then deploy; restart stack".into(),
+                tier: ai_memory_core::Tier::Episodic,
+                pinned: false,
+                title: None,
+                admission_ctx: None,
+                author_id: None,
+                actor: ActorContext::anonymous(),
+                evidence: Vec::new(),
+            })
+            .await
+            .unwrap();
+        }
+
+        let settings = ScheduledAutoImproveSettings {
+            review: AutoImproveReviewConfig::default(),
+            require_approval: true,
+            min_session_age_secs: 0,
+            max_sessions_per_tick: 10,
+            experience: Some(crate::ExperienceConfig {
+                sessions: 10,
+                min_new_sessions: 3,
+                ..crate::ExperienceConfig::default()
+            }),
+        };
+        let llm: Arc<dyn LlmProvider> = Arc::new(ExperienceSentinelLlm);
+
+        let outcome =
+            run_auto_improve_scheduler_tick(&store.reader, &store.writer, &wiki, &llm, &settings)
+                .await
+                .unwrap();
+
+        assert_eq!(outcome.experience_runs, 0, "{outcome:?}");
+        assert_eq!(
+            outcome.errors, 1,
+            "the experience failure must be reported once: {outcome:?}"
+        );
+        assert_eq!(
+            outcome.failure_summaries,
+            ["auto-improve failed: class=provider status=400"],
+            "the failure warning must carry class/status only"
+        );
+        assert!(
+            !outcome.failure_summaries[0].contains("SENTINEL_PRIVATE_BODY"),
+            "no provider body may reach the experience log: {}",
+            outcome.failure_summaries[0]
+        );
+    }
+
+    /// The scheduler redaction boundary classifies by the typed chain: a
+    /// typed review error reuses the redacted summary, a bare `LlmError`
+    /// keeps the same shape, and an unrecognized cause (including a non-LLM
+    /// one whose `Display` carries the sentinel) gets a generic safe class
+    /// with no free text.
+    #[test]
+    fn redacted_scheduler_error_summary_classifies_the_typed_chain() {
+        let provider_400 = anyhow::Error::new(AutoImproveError::Llm(LlmError::Provider {
+            status: 400,
+            body: "SENTINEL_PRIVATE_BODY".into(),
+        }));
+        assert_eq!(
+            redacted_scheduler_error_summary(&provider_400),
+            "auto-improve failed: class=provider status=400"
+        );
+
+        // The same failure without the typed wrapper: identical shape.
+        let bare = anyhow::Error::new(LlmError::Provider {
+            status: 400,
+            body: "SENTINEL_PRIVATE_BODY".into(),
+        });
+        assert_eq!(
+            redacted_scheduler_error_summary(&bare),
+            redacted_scheduler_error_summary(&provider_400)
+        );
+
+        // Non-LLM control: a string-only chain whose `Display` carries the
+        // sentinel must not leak it.
+        let opaque = anyhow::anyhow!("store blip with SENTINEL_PRIVATE_BODY details");
+        assert_eq!(
+            redacted_scheduler_error_summary(&opaque),
+            "auto-improve failed: class=unrecognized status=none"
+        );
+
+        // A non-LLM typed variant keeps its fixed label and `none` status.
+        let missing = anyhow::Error::new(AutoImproveError::SessionNotFound(SessionId::new()));
+        assert_eq!(
+            redacted_scheduler_error_summary(&missing),
+            "auto-improve failed: class=session-not-found status=none"
+        );
     }
 
     struct TerminalLlm {
@@ -876,546 +1299,6 @@ mod tests {
         assert_eq!(second.errors, 0, "parked claim must not be retried");
         assert_eq!(second.reviewed, 0);
         assert_eq!(calls.load(Ordering::SeqCst), 1);
-    }
-
-    /// A provider that rejects the scheduled review with a private body:
-    /// the claim's persisted `last_error` and the tick warnings must carry
-    /// class/status only, never the body.
-    struct SchedulerSentinelLlm {
-        calls: Arc<AtomicUsize>,
-    }
-
-    impl LlmProvider for SchedulerSentinelLlm {
-        fn name(&self) -> &'static str {
-            "scheduler-sentinel"
-        }
-
-        fn model(&self) -> &str {
-            "sentinel-model"
-        }
-
-        fn complete<'life0, 'async_trait>(
-            &'life0 self,
-            _request: ChatRequest,
-        ) -> Pin<Box<dyn Future<Output = LlmResult<ChatResponse>> + Send + 'async_trait>>
-        where
-            'life0: 'async_trait,
-            Self: 'async_trait,
-        {
-            Box::pin(async move {
-                Err(LlmError::Provider {
-                    status: 400,
-                    body: "SENTINEL_PRIVATE_BODY".into(),
-                })
-            })
-        }
-
-        fn complete_structured_raw<'life0, 'async_trait>(
-            &'life0 self,
-            _request: ChatRequest,
-            _schema: serde_json::Value,
-        ) -> Pin<Box<dyn Future<Output = LlmResult<serde_json::Value>> + Send + 'async_trait>>
-        where
-            'life0: 'async_trait,
-            Self: 'async_trait,
-        {
-            let calls = Arc::clone(&self.calls);
-            Box::pin(async move {
-                calls.fetch_add(1, Ordering::SeqCst);
-                Err(LlmError::Provider {
-                    status: 400,
-                    body: "SENTINEL_PRIVATE_BODY".into(),
-                })
-            })
-        }
-    }
-
-    /// A terminal provider failure with no body field: its `Display` differs
-    /// from the redacted summary, so equality with the summary proves the
-    /// persisted value was redacted.
-    struct SchedulerTerminalLlm;
-
-    impl LlmProvider for SchedulerTerminalLlm {
-        fn name(&self) -> &'static str {
-            "scheduler-terminal"
-        }
-
-        fn model(&self) -> &str {
-            "terminal-model"
-        }
-
-        fn complete<'life0, 'async_trait>(
-            &'life0 self,
-            _request: ChatRequest,
-        ) -> Pin<Box<dyn Future<Output = LlmResult<ChatResponse>> + Send + 'async_trait>>
-        where
-            'life0: 'async_trait,
-            Self: 'async_trait,
-        {
-            Box::pin(async move {
-                Err(LlmError::AmbiguousRetryExhausted {
-                    class: "provider",
-                    status: Some(503),
-                })
-            })
-        }
-
-        fn complete_structured_raw<'life0, 'async_trait>(
-            &'life0 self,
-            _request: ChatRequest,
-            _schema: serde_json::Value,
-        ) -> Pin<Box<dyn Future<Output = LlmResult<serde_json::Value>> + Send + 'async_trait>>
-        where
-            'life0: 'async_trait,
-            Self: 'async_trait,
-        {
-            Box::pin(async move {
-                Err(LlmError::AmbiguousRetryExhausted {
-                    class: "provider",
-                    status: Some(503),
-                })
-            })
-        }
-    }
-
-    /// Cross-session fake that fails the experience review with a private
-    /// body: the experience warnings must carry class/status only.
-    struct ExperienceSentinelLlm;
-
-    impl LlmProvider for ExperienceSentinelLlm {
-        fn name(&self) -> &'static str {
-            "experience-sentinel"
-        }
-
-        fn model(&self) -> &str {
-            "sentinel-model"
-        }
-
-        fn complete<'life0, 'async_trait>(
-            &'life0 self,
-            _request: ChatRequest,
-        ) -> Pin<Box<dyn Future<Output = LlmResult<ChatResponse>> + Send + 'async_trait>>
-        where
-            'life0: 'async_trait,
-            Self: 'async_trait,
-        {
-            Box::pin(async move {
-                Ok(ChatResponse {
-                    text: "unused".into(),
-                    usage: None,
-                    model: "sentinel-model".into(),
-                })
-            })
-        }
-
-        fn complete_structured_raw<'life0, 'async_trait>(
-            &'life0 self,
-            _request: ChatRequest,
-            _schema: serde_json::Value,
-        ) -> Pin<Box<dyn Future<Output = LlmResult<serde_json::Value>> + Send + 'async_trait>>
-        where
-            'life0: 'async_trait,
-            Self: 'async_trait,
-        {
-            Box::pin(async move {
-                Err(LlmError::Provider {
-                    status: 400,
-                    body: "SENTINEL_PRIVATE_BODY".into(),
-                })
-            })
-        }
-    }
-
-    /// Read the persisted claim row directly. A retryable claim is not
-    /// parked, so the typed parked-claims listing never sees it — the only
-    /// way to assert what a single retryable failure persisted.
-    fn claim_row(
-        db_path: &std::path::Path,
-        ws: WorkspaceId,
-        proj: ProjectId,
-        session: SessionId,
-    ) -> (String, u32) {
-        let conn = rusqlite::Connection::open(db_path).unwrap();
-        conn.query_row(
-            "SELECT last_error, attempts FROM auto_improve_scheduler_claims \
-             WHERE workspace_id = ?1 AND project_id = ?2 AND session_id = ?3",
-            rusqlite::params![ws.as_bytes(), proj.as_bytes(), session.as_bytes()],
-            |row| {
-                let last_error: Option<String> = row.get(0)?;
-                Ok((last_error.unwrap(), row.get(1)?))
-            },
-        )
-        .expect("the claim row must exist after a failed review")
-    }
-
-    /// A retryable provider failure must persist only the redacted
-    /// class/status summary to the claim's `last_error` on every attempt,
-    /// keep the existing attempts/park/terminal policy, and leave a fresh
-    /// store handle (process restart) unable to find the body in the DB.
-    #[tokio::test]
-    async fn scheduled_retryable_failure_persists_only_class_status_summary() {
-        let tmp = TempDir::new().unwrap();
-        let store = Store::open(tmp.path()).unwrap();
-        let wiki = Wiki::new(tmp.path(), store.writer.clone()).unwrap();
-        let ws = store
-            .writer
-            .get_or_create_workspace("default")
-            .await
-            .unwrap();
-        let project = store
-            .writer
-            .get_or_create_project(ws, "retry-sentinel", None)
-            .await
-            .unwrap();
-        initialize_auto_improve_scheduler_scopes(&store.reader, &store.writer)
-            .await
-            .unwrap();
-        let session_id = seed_reviewable_session(&store, ws, project).await;
-        let calls = Arc::new(AtomicUsize::new(0));
-        let llm: Arc<dyn LlmProvider> = Arc::new(SchedulerSentinelLlm {
-            calls: Arc::clone(&calls),
-        });
-        let settings = ScheduledAutoImproveSettings {
-            review: AutoImproveReviewConfig {
-                min_observations: 3,
-                min_session_duration_secs: 0,
-                ..AutoImproveReviewConfig::default()
-            },
-            require_approval: true,
-            min_session_age_secs: 0,
-            max_sessions_per_tick: 10,
-            experience: None,
-        };
-
-        let expected = "auto-improve failed: class=provider status=400";
-        let logs = CapturedLogs::default();
-        let subscriber = tracing_subscriber::fmt()
-            .with_max_level(tracing::Level::INFO)
-            .with_writer(logs.clone())
-            .without_time()
-            .with_ansi(false)
-            .finish();
-        let guard = tracing::subscriber::set_default(subscriber);
-
-        // Attempt 1: retryable provider 400 → the claim records the attempt
-        // (not parked). The persisted column carries only class/status.
-        let first =
-            run_auto_improve_scheduler_tick(&store.reader, &store.writer, &wiki, &llm, &settings)
-                .await
-                .unwrap();
-        assert_eq!(first.errors, 1, "the retryable failure must be reported");
-        assert_eq!(
-            first.parked, 0,
-            "a retryable failure must not park the claim"
-        );
-        let (last_error, attempts) = claim_row(store.db_path(), ws, project, session_id);
-        assert_eq!(attempts, 1);
-        assert_eq!(
-            last_error, expected,
-            "the persisted last_error must be the redacted summary"
-        );
-        assert!(!last_error.contains("SENTINEL_PRIVATE_BODY"));
-
-        // Attempt 2: the claim re-arms and each attempt writes only the safe
-        // summary.
-        let second =
-            run_auto_improve_scheduler_tick(&store.reader, &store.writer, &wiki, &llm, &settings)
-                .await
-                .unwrap();
-        assert_eq!(second.errors, 1);
-        assert_eq!(second.parked, 0);
-        let (last_error, attempts) = claim_row(store.db_path(), ws, project, session_id);
-        assert_eq!(attempts, 2);
-        assert_eq!(last_error, expected);
-
-        // Attempt 3 exhausts the budget: the claim parks and stops being a
-        // candidate — the policy is unchanged by the redaction.
-        let third =
-            run_auto_improve_scheduler_tick(&store.reader, &store.writer, &wiki, &llm, &settings)
-                .await
-                .unwrap();
-        assert_eq!(third.errors, 1);
-        assert_eq!(third.parked, 1, "the third attempt must park the claim");
-        assert_eq!(calls.load(Ordering::SeqCst), 3);
-
-        let fourth =
-            run_auto_improve_scheduler_tick(&store.reader, &store.writer, &wiki, &llm, &settings)
-                .await
-                .unwrap();
-        assert_eq!(fourth.errors, 0, "a parked claim must not be retried");
-        assert_eq!(
-            calls.load(Ordering::SeqCst),
-            3,
-            "the parked claim must not call the LLM"
-        );
-        drop(guard);
-
-        // No warning may carry the body; the class/status label must stay
-        // diagnosable.
-        let logged = String::from_utf8(logs.0.lock().unwrap().clone()).unwrap();
-        assert!(
-            !logged.contains("SENTINEL_PRIVATE_BODY"),
-            "no provider body may reach the scheduler log: {logged}"
-        );
-        assert!(
-            logged.contains("scheduled auto-improve failed"),
-            "the failure event must fire: {logged}"
-        );
-        assert!(
-            logged.contains("class=provider status=400"),
-            "the redacted class/status must stay diagnosable: {logged}"
-        );
-
-        // Crash contract: a process death right after the write (before the
-        // warning) leaves only the redacted value. A fresh handle on the
-        // same DB file finds class/status, never the body.
-        drop(wiki);
-        drop(store);
-        let restarted = Store::open(tmp.path()).unwrap();
-        let (last_error, attempts) = claim_row(restarted.db_path(), ws, project, session_id);
-        assert_eq!((attempts, last_error.as_str()), (3, expected));
-        let parked = restarted
-            .reader
-            .auto_improve_parked_claims(ws, project)
-            .await
-            .unwrap();
-        assert_eq!(parked.len(), 1);
-        assert_eq!(parked[0].last_error.as_deref(), Some(expected));
-    }
-
-    /// A terminal provider failure parks the claim immediately; the
-    /// persisted `last_error` must be the redacted summary, readable after a
-    /// restart through the operator-facing listing.
-    #[tokio::test]
-    async fn scheduled_terminal_failure_persists_only_class_status_summary() {
-        let tmp = TempDir::new().unwrap();
-        let store = Store::open(tmp.path()).unwrap();
-        let wiki = Wiki::new(tmp.path(), store.writer.clone()).unwrap();
-        let ws = store
-            .writer
-            .get_or_create_workspace("default")
-            .await
-            .unwrap();
-        let project = store
-            .writer
-            .get_or_create_project(ws, "terminal-sentinel", None)
-            .await
-            .unwrap();
-        initialize_auto_improve_scheduler_scopes(&store.reader, &store.writer)
-            .await
-            .unwrap();
-        let session_id = seed_reviewable_session(&store, ws, project).await;
-        let llm: Arc<dyn LlmProvider> = Arc::new(SchedulerTerminalLlm);
-        let settings = ScheduledAutoImproveSettings {
-            review: AutoImproveReviewConfig {
-                min_observations: 3,
-                min_session_duration_secs: 0,
-                ..AutoImproveReviewConfig::default()
-            },
-            require_approval: true,
-            min_session_age_secs: 0,
-            max_sessions_per_tick: 10,
-            experience: None,
-        };
-
-        // The terminal variant's Display carries no body, but it is a
-        // different string than the summary — equality proves redaction.
-        let expected = "auto-improve failed: class=ambiguous_retry_exhausted status=503";
-        let logs = CapturedLogs::default();
-        let subscriber = tracing_subscriber::fmt()
-            .with_max_level(tracing::Level::INFO)
-            .with_writer(logs.clone())
-            .without_time()
-            .with_ansi(false)
-            .finish();
-        let guard = tracing::subscriber::set_default(subscriber);
-        let first =
-            run_auto_improve_scheduler_tick(&store.reader, &store.writer, &wiki, &llm, &settings)
-                .await
-                .unwrap();
-        assert_eq!(first.errors, 1, "the terminal failure must be reported");
-        assert_eq!(first.parked, 1, "a terminal failure must park the claim");
-        drop(guard);
-
-        let (last_error, attempts) = claim_row(store.db_path(), ws, project, session_id);
-        assert_eq!(attempts, ai_memory_store::AUTO_IMPROVE_CLAIM_MAX_ATTEMPTS);
-        assert_eq!(
-            last_error, expected,
-            "the persisted last_error must be the redacted summary"
-        );
-
-        let logged = String::from_utf8(logs.0.lock().unwrap().clone()).unwrap();
-        assert!(
-            logged.contains("class=ambiguous_retry_exhausted status=503"),
-            "the redacted class/status must stay diagnosable: {logged}"
-        );
-
-        // Restart: the operator-facing parked-claims listing must show the
-        // summary, not the cause's Display.
-        drop(wiki);
-        drop(store);
-        let restarted = Store::open(tmp.path()).unwrap();
-        let parked = restarted
-            .reader
-            .auto_improve_parked_claims(ws, project)
-            .await
-            .unwrap();
-        assert_eq!(parked.len(), 1);
-        assert_eq!(parked[0].session_id, session_id);
-        assert_eq!(parked[0].last_error.as_deref(), Some(expected));
-    }
-
-    /// An experience pass failure must warn with the redacted class/status
-    /// and never the provider body.
-    #[tokio::test]
-    async fn experience_pass_failure_warns_class_status_not_body() {
-        let tmp = TempDir::new().unwrap();
-        let store = Store::open(tmp.path()).unwrap();
-        let wiki = Wiki::new(tmp.path(), store.writer.clone())
-            .unwrap()
-            .with_store_reader(store.reader.clone());
-        let ws = store
-            .writer
-            .get_or_create_workspace("default")
-            .await
-            .unwrap();
-        let project = store
-            .writer
-            .get_or_create_project(ws, "experience-sentinel", None)
-            .await
-            .unwrap();
-        assert_eq!(
-            initialize_auto_improve_scheduler_scopes(&store.reader, &store.writer)
-                .await
-                .unwrap(),
-            (1, 0)
-        );
-
-        // Three completed sessions AFTER init, each with a summary page —
-        // the cadence gate is due (same fixture as the cadence-gating test).
-        tokio::time::sleep(std::time::Duration::from_millis(2)).await;
-        for _ in 0..3 {
-            let session_id = SessionId::new();
-            store
-                .writer
-                .begin_session(ai_memory_core::NewSession {
-                    occurred_at: None,
-                    id: session_id,
-                    workspace_id: ws,
-                    project_id: project,
-                    agent_kind: ai_memory_core::AgentKind::OpenCode,
-                    cwd: None,
-                    actor_user: None,
-                })
-                .await
-                .unwrap();
-            store.writer.end_session(session_id, None).await.unwrap();
-            wiki.write_page(ai_memory_wiki::WritePageRequest {
-                workspace_id: ws,
-                project_id: project,
-                path: PagePath::new(format!("sessions/{session_id}.md")).unwrap(),
-                frontmatter: serde_json::json!({"title": "session"}),
-                body: "tag main then deploy; restart stack".into(),
-                tier: ai_memory_core::Tier::Episodic,
-                pinned: false,
-                title: None,
-                admission_ctx: None,
-                author_id: None,
-                actor: ActorContext::anonymous(),
-                evidence: Vec::new(),
-            })
-            .await
-            .unwrap();
-        }
-
-        let settings = ScheduledAutoImproveSettings {
-            review: AutoImproveReviewConfig::default(),
-            require_approval: true,
-            min_session_age_secs: 0,
-            max_sessions_per_tick: 10,
-            experience: Some(crate::ExperienceConfig {
-                sessions: 10,
-                min_new_sessions: 3,
-                ..crate::ExperienceConfig::default()
-            }),
-        };
-        let llm: Arc<dyn LlmProvider> = Arc::new(ExperienceSentinelLlm);
-
-        let logs = CapturedLogs::default();
-        let subscriber = tracing_subscriber::fmt()
-            .with_max_level(tracing::Level::INFO)
-            .with_writer(logs.clone())
-            .without_time()
-            .with_ansi(false)
-            .finish();
-        let guard = tracing::subscriber::set_default(subscriber);
-        let outcome =
-            run_auto_improve_scheduler_tick(&store.reader, &store.writer, &wiki, &llm, &settings)
-                .await
-                .unwrap();
-        drop(guard);
-
-        assert_eq!(outcome.experience_runs, 0, "{outcome:?}");
-        assert_eq!(
-            outcome.errors, 1,
-            "the experience failure must be reported once: {outcome:?}"
-        );
-
-        let logged = String::from_utf8(logs.0.lock().unwrap().clone()).unwrap();
-        assert!(
-            !logged.contains("SENTINEL_PRIVATE_BODY"),
-            "no provider body may reach the experience log: {logged}"
-        );
-        assert!(
-            logged.contains("experience pass failed"),
-            "the failure warning must fire: {logged}"
-        );
-        assert!(
-            logged.contains("class=provider status=400"),
-            "the redacted class/status must stay diagnosable: {logged}"
-        );
-    }
-
-    /// The scheduler redaction boundary classifies by the typed chain: a
-    /// typed review error reuses the redacted summary, a bare `LlmError`
-    /// keeps the same shape, and an unrecognized cause (including a non-LLM
-    /// one whose `Display` carries the sentinel) gets a generic safe class
-    /// with no free text.
-    #[test]
-    fn redacted_scheduler_error_summary_classifies_the_typed_chain() {
-        let provider_400 = anyhow::Error::new(AutoImproveError::Llm(LlmError::Provider {
-            status: 400,
-            body: "SENTINEL_PRIVATE_BODY".into(),
-        }));
-        assert_eq!(
-            redacted_scheduler_error_summary(&provider_400),
-            "auto-improve failed: class=provider status=400"
-        );
-
-        // The same failure without the typed wrapper: identical shape.
-        let bare = anyhow::Error::new(LlmError::Provider {
-            status: 400,
-            body: "SENTINEL_PRIVATE_BODY".into(),
-        });
-        assert_eq!(
-            redacted_scheduler_error_summary(&bare),
-            redacted_scheduler_error_summary(&provider_400)
-        );
-
-        // Non-LLM control: a string-only chain whose `Display` carries the
-        // sentinel must not leak it.
-        let opaque = anyhow::anyhow!("store blip with SENTINEL_PRIVATE_BODY details");
-        assert_eq!(
-            redacted_scheduler_error_summary(&opaque),
-            "auto-improve failed: class=unrecognized status=none"
-        );
-
-        // A non-LLM typed variant keeps its fixed label and `none` status.
-        let missing = anyhow::Error::new(AutoImproveError::SessionNotFound(SessionId::new()));
-        assert_eq!(
-            redacted_scheduler_error_summary(&missing),
-            "auto-improve failed: class=session-not-found status=none"
-        );
     }
 
     #[tokio::test]
@@ -1931,30 +1814,6 @@ mod tests {
 
     const COLLIDING_PATH: &str = "procedures/release.md";
 
-    #[derive(Clone, Default)]
-    struct CapturedLogs(Arc<Mutex<Vec<u8>>>);
-
-    struct CapturedLogWriter(Arc<Mutex<Vec<u8>>>);
-
-    impl std::io::Write for CapturedLogWriter {
-        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-            self.0.lock().unwrap().extend_from_slice(buf);
-            Ok(buf.len())
-        }
-
-        fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
-        }
-    }
-
-    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CapturedLogs {
-        type Writer = CapturedLogWriter;
-
-        fn make_writer(&'a self) -> Self::Writer {
-            CapturedLogWriter(Arc::clone(&self.0))
-        }
-    }
-
     async fn seed_reviewable_session(store: &Store, ws: WorkspaceId, proj: ProjectId) -> SessionId {
         let session_id = SessionId::new();
         store
@@ -2037,11 +1896,17 @@ mod tests {
     }
 
     /// The unattended path has no response for anyone to read, so a proposal the
-    /// store declines has exactly two places left to surface: the typed tick
-    /// outcome and the warning log. Without both, a run that lost its only
-    /// proposal to a collision is byte-identical to a run that produced nothing.
+    /// store declines must surface in the typed tick outcome (which the warning
+    /// log mirrors). Without it, a run that lost its only proposal to a
+    /// collision is byte-identical to a run that produced nothing. The
+    /// assertion reads `skipped_proposals` — pushed from the same `run.skipped`
+    /// the warning loop logs — rather than a capturing subscriber: a callsite's
+    /// cached `Interest` is computed process-wide by whichever thread first
+    /// executes it, and under a single-process harness a sibling test can
+    /// register the `warn!` callsite with no subscriber installed, silencing it
+    /// for this test.
     #[tokio::test]
-    async fn a_scheduled_run_reports_a_collision_in_its_outcome_and_its_log() {
+    async fn a_scheduled_run_reports_a_collision_in_its_outcome() {
         let tmp = TempDir::new().unwrap();
         let store = Store::open(tmp.path()).unwrap();
         let wiki = Wiki::new(tmp.path(), store.writer.clone()).unwrap();
@@ -2091,23 +1956,11 @@ mod tests {
         );
         assert_eq!(run.skipped[0].target_path, COLLIDING_PATH);
 
-        // `#[tokio::test]` runs a current-thread runtime, so the thread-local
-        // default subscriber installed here stays in force across the awaits.
-        let logs = CapturedLogs::default();
-        let subscriber = tracing_subscriber::fmt()
-            .with_max_level(tracing::Level::INFO)
-            .with_writer(logs.clone())
-            .without_time()
-            // ANSI escapes would split `skipped=1` across colour codes.
-            .with_ansi(false)
-            .finish();
         let tick_session = seed_reviewable_session(&store, ws, proj).await;
-        let guard = tracing::subscriber::set_default(subscriber);
         let tick =
             run_auto_improve_scheduler_tick(&store.reader, &store.writer, &wiki, &llm, &settings)
                 .await
                 .unwrap();
-        drop(guard);
         assert_eq!(tick.errors, 0);
         assert!(
             tick.reviewed >= 1,
@@ -2116,11 +1969,11 @@ mod tests {
         assert_eq!(tick.skipped, 1, "the tick must count the dropped proposal");
         assert_ne!(tick_session, session_id);
 
-        let captured = String::from_utf8(logs.0.lock().unwrap().clone()).unwrap();
-        assert!(
-            captured.contains("scheduled auto-improve proposal was not staged")
-                && captured.contains(COLLIDING_PATH),
-            "the log must name the dropped target: {captured}"
+        assert_eq!(
+            tick.skipped_proposals.len(),
+            1,
+            "the tick must carry the dropped proposal, not just the count"
         );
+        assert_eq!(tick.skipped_proposals[0].target_path, COLLIDING_PATH);
     }
 }

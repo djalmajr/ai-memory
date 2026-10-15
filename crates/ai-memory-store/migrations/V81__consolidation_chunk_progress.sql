@@ -1,10 +1,11 @@
--- Provenance and renumbering: this table was introduced in the fork as
--- migration V68. Upstream 2.5.2 added its own V68–V71 (project_grants and
--- successors), so the fork's migration was renumbered to V72, after them.
--- The DDL is idempotent (IF NOT EXISTS) because stores that applied the old
--- V68 already have the table; the deploy removes the old
--- `68 consolidation_chunk_progress` row from `refinery_schema_history`
--- before the first boot of the new binary.
+-- Provenance and numbering: this table was introduced in the fork as
+-- migration V68, renumbered to V72 after upstream 2.5.2 added V68-V71, and
+-- renumbered again to V81 after upstream 3.0.0 took V72-V80. The DDL is
+-- idempotent (IF NOT EXISTS) because stores that applied an earlier
+-- numbering already have the table. Such a store keeps a history row
+-- `72 consolidation_chunk_progress`; refinery (abort_divergent = false)
+-- treats V72 as applied and skips upstream's V72 body, which V73 supersedes
+-- (it rebuilds `sessions` with the complete agent_kind list).
 --
 -- Durable per-block progress for opt-in map-reduce consolidation so a
 -- crashed or re-run consolidation reuses LLM extractions that already

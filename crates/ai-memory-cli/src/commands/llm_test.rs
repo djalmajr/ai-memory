@@ -87,6 +87,7 @@ impl From<LlmProviderChoice> for ProviderChoice {
             LlmProviderChoice::Codex => Self::Codex,
             LlmProviderChoice::Copilot => Self::Copilot,
             LlmProviderChoice::Opencode => Self::OpenCode,
+            LlmProviderChoice::Cursor => Self::Cursor,
         }
     }
 }
@@ -100,6 +101,14 @@ mod tests {
         assert_eq!(
             ProviderChoice::from(LlmProviderChoice::AnthropicOauth),
             ProviderChoice::AnthropicOAuth
+        );
+    }
+
+    #[test]
+    fn cursor_choice_maps_to_runtime_provider() {
+        assert_eq!(
+            ProviderChoice::from(LlmProviderChoice::Cursor),
+            ProviderChoice::Cursor
         );
     }
 
