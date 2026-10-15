@@ -219,6 +219,20 @@ impl OpenAiProvider {
         self
     }
 
+    /// Send [`REQUEST_ID_HEADER`] with the logical operation id on every
+    /// chat attempt. The id is created before the first attempt and reused
+    /// by every fallback, so all attempts of one operation carry exactly
+    /// the same value. Enabled by the factory only for the configured
+    /// `openai-compat` provider; a static `AI_MEMORY_LLM_HEADERS` entry
+    /// for this name is refused there at startup, and
+    /// [`ExtraHeaders::apply`] replaces per name either way, so one value
+    /// always reaches the wire.
+    #[must_use]
+    pub(crate) fn with_request_id_header(mut self) -> Self {
+        self.request_id_header = true;
+        self
+    }
+
     /// Send `chat_template_kwargs: {"enable_thinking": false}` with every
     /// chat request. Thinking-capable local engines (vLLM / SGLang serving
     /// Qwen3-class models) otherwise spend the output budget on a reasoning
@@ -230,20 +244,6 @@ impl OpenAiProvider {
     #[must_use]
     pub(crate) fn with_disable_thinking(mut self, enabled: bool) -> Self {
         self.disable_thinking = enabled;
-        self
-    }
-
-    /// Send [`REQUEST_ID_HEADER`] with the logical operation id on every
-    /// chat attempt. The id is created before the first attempt and reused
-    /// by every fallback and the admission replay, so all attempts of one
-    /// operation carry exactly the same value. Enabled by the factory only
-    /// for the configured `openai-compat` provider; a static
-    /// `AI_MEMORY_LLM_HEADERS` entry for this name is refused there at
-    /// startup, and [`ExtraHeaders::apply`] replaces per name either way,
-    /// so one value always reaches the wire.
-    #[must_use]
-    pub(crate) fn with_request_id_header(mut self) -> Self {
-        self.request_id_header = true;
         self
     }
 

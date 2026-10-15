@@ -10,9 +10,12 @@
 
 pub mod actor;
 pub mod admin;
+pub mod admin_profile;
 pub mod auth;
 mod compact_job;
 pub mod human_auth;
+pub mod identity;
+pub mod metrics;
 mod server;
 
 pub use actor::actor_from_headers;
@@ -24,6 +27,7 @@ pub use human_auth::{
     HumanAuthRuntime, expire_legacy_cookie_mw, internal_auth_router, public_auth_router,
     require_dual_auth, session_auth_router,
 };
+pub use metrics::McpMetrics;
 pub use server::{AiMemoryServer, MEMORY_INSTRUCTIONS};
 
 // Integration tests compile into this crate's test harness instead of a

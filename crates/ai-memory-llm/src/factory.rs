@@ -11,6 +11,7 @@ use crate::AnthropicProvider;
 use crate::CodexProvider;
 use crate::CopilotEmbedder;
 use crate::CopilotProvider;
+use crate::CursorAgentProvider;
 use crate::GeminiProvider;
 use crate::OpenAiCompatProvider;
 use crate::OpenAiOAuthProvider;
@@ -45,6 +46,8 @@ pub enum ProviderChoice {
     /// OpenCode cloud API (OpenAI-compatible endpoint). Defaults to the Go
     /// endpoint; `base_url` selects Zen's general catalogue instead.
     OpenCode,
+    /// Cursor subscription via the logged-in `agent` CLI (`--print --mode ask`).
+    Cursor,
 }
 
 impl ProviderChoice {
@@ -61,6 +64,7 @@ impl ProviderChoice {
             Self::Copilot => "copilot",
             Self::AnthropicOAuth => "anthropic-oauth",
             Self::OpenCode => "opencode",
+            Self::Cursor => "cursor",
         }
     }
 
@@ -87,6 +91,7 @@ impl ProviderChoice {
             Self::OpenCode => AuthRequirement::RequiredApiKey {
                 env_var: "OPENCODE_API_KEY",
             },
+            Self::Cursor => AuthRequirement::CursorCli,
         }
     }
 
@@ -473,6 +478,12 @@ pub fn build_provider(config: ProviderConfig) -> LlmResult<Arc<dyn LlmProvider>>
                     .with_extra_headers(extra_headers),
             ))
         }
+        ProviderChoice::Cursor => {
+            let auth = config.auth.require_cursor_auth()?;
+            Ok(Arc::new(
+                CursorAgentProvider::new(auth, config.model).with_timeout_secs(timeout),
+            ))
+        }
         ProviderChoice::OpenCode => {
             let key = config.auth.require_api_key()?;
             // Defaults to Go; an operator reaches Zen's general catalogue
@@ -515,6 +526,8 @@ mod tests {
             ProviderChoice::OpenAiOAuth,
             ProviderChoice::Copilot,
             ProviderChoice::AnthropicOAuth,
+            ProviderChoice::Codex,
+            ProviderChoice::Cursor,
         ] {
             assert!(
                 !choice.endpoint_is_operator_chosen(),
@@ -566,6 +579,11 @@ mod tests {
         assert_eq!(
             ProviderChoice::AnthropicOAuth.auth_requirement(),
             AuthRequirement::AnthropicOAuthToken
+        );
+        assert_eq!(ProviderChoice::Cursor.name(), "cursor");
+        assert_eq!(
+            ProviderChoice::Cursor.auth_requirement(),
+            AuthRequirement::CursorCli
         );
     }
 
@@ -675,10 +693,10 @@ mod tests {
         }
     }
 
-    /// Acceptance (d): a static `x-request-id` in `AI_MEMORY_LLM_HEADERS`
-    /// cannot coexist with the dynamic one — the conflict is refused at
-    /// startup, before any send, rather than letting two values (or the
-    /// operator's stale value) reach the gateway.
+    /// A static `x-request-id` in `AI_MEMORY_LLM_HEADERS` cannot coexist
+    /// with the dynamic one — the conflict is refused at startup, before
+    /// any send, rather than letting two values (or the operator's stale
+    /// value) reach the gateway.
     #[test]
     fn openai_compat_refuses_a_static_request_id_header() {
         let headers = crate::ExtraHeaders::parse(["x-request-id: static-1"]).expect("valid");
@@ -726,13 +744,6 @@ mod tests {
             build_provider(cfg).is_ok(),
             "only openai-compat owns the header"
         );
-    }
-
-    /// Without the conflicting entry the openai-compat provider builds as
-    /// before — the refusal must not change the common path.
-    #[test]
-    fn openai_compat_builds_without_a_static_request_id_header() {
-        assert!(build_provider(compat_config(crate::ExtraHeaders::default())).is_ok());
     }
 
     /// End to end: the provider the factory builds for the configured

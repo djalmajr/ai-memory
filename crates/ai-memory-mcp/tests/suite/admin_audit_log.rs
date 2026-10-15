@@ -16,6 +16,7 @@ async fn make_admin_state(tmp: &TempDir) -> (AdminState, Store) {
     let state = AdminState {
         compact_jobs: Default::default(),
         ingest_metrics: std::sync::Arc::new(ai_memory_core::IngestMetrics::default()),
+        mcp_metrics: std::sync::Arc::new(ai_memory_mcp::McpMetrics::default()),
         writer: store.writer.clone(),
         reader: store.reader.clone(),
         wiki,

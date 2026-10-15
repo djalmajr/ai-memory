@@ -487,6 +487,10 @@ fn docker_wrappers_keep_stdin_attached_independently_of_tty_allocation() {
         posix.contains("CLAUDE_CODE_SESSION_ID"),
         "POSIX wrapper must forward Claude's session id into the bridge container"
     );
+    assert!(
+        posix.contains("  MUSE_SESSION_ID \\"),
+        "POSIX wrapper must forward Muse's session id into the bridge container"
+    );
     assert!(posix.contains("git -C \"${PWD}\" rev-parse --show-toplevel"));
     assert!(posix.contains("AI_MEMORY_SCOPE_CWD=/scope${SCOPE_REL}"));
     assert!(posix.contains("${SCOPE_ROOT}:/scope:ro"));
@@ -507,6 +511,10 @@ fn docker_wrappers_keep_stdin_attached_independently_of_tty_allocation() {
     assert!(
         powershell.contains("\"CLAUDE_CODE_SESSION_ID\""),
         "PowerShell wrapper must forward Claude's session id into the bridge container"
+    );
+    assert!(
+        powershell.contains("\"MUSE_SESSION_ID\""),
+        "PowerShell wrapper must forward Muse's session id into the bridge container"
     );
     assert!(powershell.contains("AI_MEMORY_SCOPE_CWD=$ScopeCwd"));
     assert!(powershell.contains("${ScopeRoot}:/scope:ro"));
@@ -671,6 +679,7 @@ fn wrapper_updates_and_install_docs_use_verified_release_assets() {
         "ai-memory-wrapper.cmd",
         "ai-memory-install-hooks",
         "ai-memory-hooks.tar.gz",
+        "install.sh",
     ] {
         assert!(release.contains(asset), "release must publish {asset}");
         assert!(
@@ -759,7 +768,23 @@ fn workflows_keep_fixed_rust_jobs_on_the_fixed_toolchain() {
 fn dev_loop_is_wired_consistently() {
     // One gate, written down in four places; keep them from drifting apart.
     let ci = read_repo(".github/workflows/ci.yml");
-    assert!(ci.contains("cargo test --workspace --all-targets"));
+    assert!(ci.contains("cargo nextest run --workspace --all-targets --profile ci"));
+    // nextest does not run doctests.
+    assert!(ci.contains("cargo test --workspace --doc"));
+    // Windows stays on plain `cargo test`: nextest's per-test processes cost
+    // more there than its parallelism saves.
+    let windows = read_repo(".github/workflows/windows.yml");
+    assert!(windows.contains("cargo test --workspace --all-targets"));
+    // The `ci` profile is what makes CI a full gate: every tier, nothing
+    // turned green by a retry.
+    let nextest = read_repo(".config/nextest.toml");
+    let ci_profile = nextest
+        .split("[profile.ci]")
+        .nth(1)
+        .expect("nextest.toml defines [profile.ci]");
+    let ci_profile = ci_profile.split("\n[").next().unwrap_or(ci_profile);
+    assert!(ci_profile.contains("default-filter = \"all()\""));
+    assert!(ci_profile.contains("retries = 0"));
     assert!(
         ci.contains("TAILWIND_BUILD=1"),
         "CI must regenerate the stylesheet somewhere"
@@ -818,6 +843,29 @@ fn dev_loop_is_wired_consistently() {
 }
 
 #[cfg(unix)]
+#[test]
+fn hook_installer_normalizes_the_open_code_alias() {
+    let tmp = tempfile::tempdir().unwrap();
+    let output = shell_script_command(&repo_root().join("scripts/install-hooks.sh"))
+        .args(["--agent", "open-code", "--to"])
+        .arg(tmp.path().join("hooks"))
+        .env("HOME", tmp.path())
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "installer failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("install-hooks --agent opencode --apply"),
+        "{stdout}"
+    );
+    assert!(!stdout.contains("unsupported agent"), "{stdout}");
+}
+
+#[cfg(unix)]
 fn installed_hook_names(agent_arg: &str, canonical_agent: &str, hooks: &[&str]) -> Vec<String> {
     let tmp = tempfile::tempdir().unwrap();
     let bundle = tmp.path().join("bundle/hooks").join(canonical_agent);
@@ -829,6 +877,11 @@ fn installed_hook_names(agent_arg: &str, canonical_agent: &str, hooks: &[&str]) 
         )
         .unwrap();
     }
+    std::fs::write(
+        tmp.path().join("bundle/hooks/_lib.sh"),
+        "# shared helper sourced by every event script\n",
+    )
+    .unwrap();
     let archive = tmp.path().join("ai-memory-hooks.tar.gz");
     let status = Command::new("tar")
         .arg("-czf")
@@ -886,6 +939,10 @@ fn installed_hook_names(agent_arg: &str, canonical_agent: &str, hooks: &[&str]) 
         "installer failed: stdout={} stderr={}",
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        destination.join("_lib.sh").is_file(),
+        "the shared helper must land beside the agent directories"
     );
     let installed = destination.join(canonical_agent);
     let mut names = std::fs::read_dir(&installed)
@@ -1313,12 +1370,47 @@ fn skip_pre_push_tests<T>(reason: &str) -> Option<T> {
 fn resolve_in_path(path: &std::ffi::OsStr, tool: &str) -> Option<PathBuf> {
     std::env::split_paths(path).find_map(|dir| {
         let bare = dir.join(tool);
-        if bare.is_file() {
+        if is_executable_candidate(&bare) {
             return Some(bare);
         }
         let exe = dir.join(format!("{tool}.exe"));
-        exe.is_file().then_some(exe)
+        is_executable_candidate(&exe).then_some(exe)
     })
+}
+
+#[cfg(any(unix, windows))]
+fn is_executable_candidate(path: &Path) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::metadata(path)
+            .is_ok_and(|metadata| metadata.is_file() && metadata.permissions().mode() & 0o111 != 0)
+    }
+    #[cfg(windows)]
+    {
+        path.is_file()
+    }
+}
+
+#[test]
+#[cfg(unix)]
+fn pre_push_fixture_path_skips_non_executable_shadows() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let temp = tempfile::TempDir::new().unwrap();
+    let shadow_dir = temp.path().join("shadow");
+    let executable_dir = temp.path().join("executable");
+    std::fs::create_dir(&shadow_dir).unwrap();
+    std::fs::create_dir(&executable_dir).unwrap();
+    let shadow = shadow_dir.join("env");
+    std::fs::write(&shadow, "not executable").unwrap();
+    std::fs::set_permissions(&shadow, std::fs::Permissions::from_mode(0o644)).unwrap();
+    let executable = executable_dir.join("env");
+    std::fs::write(&executable, "#!/bin/sh\nexit 0\n").unwrap();
+    std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let path = std::env::join_paths([shadow_dir.as_os_str(), executable_dir.as_os_str()]).unwrap();
+
+    assert_eq!(resolve_in_path(&path, "env"), Some(executable));
 }
 
 /// macOS hands back `/var/folders/...` while Git reports `/private/var/...`.
@@ -1390,7 +1482,7 @@ fn fixture_path(bin: &Path) -> Option<std::ffi::OsString> {
         let Some(real) = dirs
             .iter()
             .map(|dir| dir.join(tool))
-            .find(|candidate| candidate.is_file())
+            .find(|candidate| is_executable_candidate(candidate))
         else {
             return skip_pre_push_tests(&format!("{tool} was not found on PATH"));
         };
@@ -1483,14 +1575,14 @@ struct PrePushFixture {
     cygpath: Option<PathBuf>,
     hook_toplevel: String,
     fixture_toplevel: String,
+    _guard: tempfile::TempDir,
 }
 
 #[cfg(any(unix, windows))]
 impl PrePushFixture {
     fn new() -> Option<Self> {
-        // `keep()`: the sandbox is the evidence behind a failure, so it outlives
-        // the test rather than being deleted on drop.
-        let root = sandbox_root(tempfile::tempdir().unwrap().keep());
+        let guard = tempfile::tempdir().unwrap();
+        let root = sandbox_root(guard.path().to_path_buf());
         assert!(
             !root.starts_with(repo_root()),
             "the sandbox must live outside this checkout, got {}",
@@ -1552,6 +1644,7 @@ impl PrePushFixture {
             system_config,
             hook_toplevel: String::new(),
             fixture_toplevel: String::new(),
+            _guard: guard,
         };
         fixture.git(&fixture.hook_repo, &["init", "-q"]);
         fixture.git(&fixture.fixture_repo, &["init", "-q"]);
@@ -2561,6 +2654,8 @@ mod slow {
             "session-end",
             "session-start",
             "stop",
+            "subagent-start",
+            "subagent-stop",
             "user-prompt-submit",
         ];
 
@@ -2583,6 +2678,43 @@ mod slow {
             .map(|hook| format!("{hook}.sh"))
             .collect::<Vec<_>>();
         assert_eq!(names, expected);
+    }
+
+    // The installer lists each agent's scripts by hand, so a bundle that gains
+    // or loses a script leaves the list stale: a script the list still asks for
+    // aborts the install, and one it never asks for is silently not installed.
+    // Feeding it the file names the repository bundles really ship catches both.
+    #[cfg(unix)]
+    #[test]
+    fn hook_installer_installs_every_script_each_shipped_bundle_has() {
+        for agent in [
+            "claude-code",
+            "codex",
+            "cursor",
+            "gemini-cli",
+            "antigravity-cli",
+            "grok",
+            "kimi-code",
+            "kiro-cli",
+            "command-code",
+        ] {
+            let mut shipped = std::fs::read_dir(repo_root().join("hooks").join(agent))
+                .unwrap()
+                .filter_map(|entry| {
+                    let name = entry.unwrap().file_name().into_string().unwrap();
+                    name.strip_suffix(".sh").map(str::to_owned)
+                })
+                .collect::<Vec<_>>();
+            shipped.sort();
+            let hooks = shipped.iter().map(String::as_str).collect::<Vec<_>>();
+            let expected = shipped
+                .iter()
+                .map(|hook| format!("{hook}.sh"))
+                .collect::<Vec<_>>();
+
+            let installed = installed_hook_names(agent, agent, &hooks);
+            assert_eq!(installed, expected, "{agent}");
+        }
     }
 
     #[cfg(unix)]
