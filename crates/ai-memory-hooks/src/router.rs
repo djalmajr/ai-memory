@@ -14807,6 +14807,18 @@ mod tests {
         )
         .await
         .unwrap();
+        // A page write nobody committed. The prompt above also appends to the
+        // hook ledger, which checkpoints no longer commit, so the ledger alone
+        // cannot be the pending write a recovery commit picks up.
+        let pending = ai_memory_core::PagePath::new("notes/pending.md").unwrap();
+        state
+            .wiki
+            .git()
+            .write_atomic(
+                &state.wiki.abs_path(state.workspace_id, target, &pending),
+                b"pending\n",
+            )
+            .unwrap();
         state.ingest_metrics.record_persisted(123);
         let outcome = process_authorized(
             &state,

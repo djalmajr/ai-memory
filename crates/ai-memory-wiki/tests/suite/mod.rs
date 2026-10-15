@@ -3,3 +3,4 @@
 //! no extra binary; a new file must be declared below.
 
 mod admission;
+mod wiki_git_ledgers;
