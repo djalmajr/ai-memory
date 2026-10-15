@@ -11,6 +11,17 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ## [Unreleased]
 
+### Fixed
+- Fixed the hook event ledgers (`log.md`, `log-YYYY-MM.md`) being committed to
+  the wiki's git repository. Every checkpoint after a hook append wrote a new
+  whole-file blob of the ledger, and nothing packed them: one install's
+  `wiki/.git` reached 3.49 GB, 229 MB per version of a single ledger.
+  Checkpoints now leave ledgers out, recognized by name and by content, so an
+  ordinary page named like a ledger stays versioned. A ledger an earlier
+  version committed is dropped from the git index, never from disk, by the next
+  checkpoint. Existing history keeps its old blobs; `docs/lifecycle-ops.md`
+  explains how an operator can rewrite it. (#PRNUM)
+
 ## [3.0.0] - 2026-10-13
 
 ### Added

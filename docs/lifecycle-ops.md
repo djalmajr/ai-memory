@@ -942,6 +942,52 @@ What it does not recover:
   embeddings. Those live only in SQLite and require a full `backup` / `restore`
   if you need to roll them back.
 
+### Hook event ledgers are not in the wiki's git history
+
+The raw hook event ledgers (`log.md` and `log-YYYY-MM.md` under each project)
+are append-only logs that can reach hundreds of megabytes. Git stores every new
+version of a file as a whole blob, and the server never packs or prunes the wiki
+repository, so each checkpoint that followed a hook append added another copy of
+the ledger: one install's `wiki/.git` grew to 3.49 GB. Nothing reads ledger
+history back from git: `restore-page` and `checkpoints` work on pages, and
+`backup` copies the data directory from disk.
+
+Since this change a checkpoint leaves ledgers out of the commit. A file counts as
+a ledger only when its name has the ledger shape **and** its first 8 KiB open
+with a hook log entry (`## [timestamp] ...`, under optional frontmatter), the
+same test the indexer and `reclaim-ledger-versions` use. A page that merely is
+named `log-2026-09.md` stays versioned. The ledger file itself is never touched.
+A ledger that an earlier version already committed is dropped from the git index
+(`git rm --cached`) by the first checkpoint that sees it, so existing installs
+stop growing without any step from you. The check runs when a checkpoint stages
+files and does a bounded prefix read (at most 8 KiB) per check, never the
+whole file; a ledger appended between that read and the commit is simply not in
+the commit.
+
+What this does **not** do: history already written keeps its old blobs, so
+`wiki/.git` does not shrink by itself, and checkpoints taken before the upgrade
+still contain old ledger versions. The server never rewrites or garbage-collects
+that history. Shrinking it is an operator task, and it is destructive: every
+commit id changes, so OIDs you noted from `ai-memory checkpoints` stop resolving,
+and `git gc --prune=now` makes the old blobs unrecoverable. Stop the server, take
+a `backup` first, and only then, as an example:
+
+```bash
+cd <data-dir>/wiki
+# Let the upgraded server take one checkpoint first, so HEAD no longer tracks the
+# ledgers, and copy them aside anyway: a history rewrite resets the working tree.
+# The globs match by name only. If you keep an ordinary page named like a
+# ledger, they also delete that page's history, so narrow them first.
+git filter-repo --force --invert-paths \
+  --path-glob '*/log.md' \
+  --path-glob '*/log-[0-9][0-9][0-9][0-9]-[0-9][0-9].md'
+git reflog expire --expire=now --all
+git gc --prune=now --aggressive
+```
+
+Start the server again afterwards. `git filter-repo` is a separate tool and is
+not installed with ai-memory.
+
 ### `backup`
 
 ```bash
