@@ -5566,7 +5566,72 @@ pub(crate) fn reclaim_freed_pages(conn: &Connection) -> StoreResult<()> {
     }
     batch.push_str("VACUUM;");
     conn.execute_batch(&batch)?;
+    truncate_wal_best_effort(conn, "vacuum");
     Ok(())
+}
+
+/// The `(busy, log, checkpointed)` row `PRAGMA wal_checkpoint` returns.
+///
+/// `busy` is non-zero when a reader kept the checkpoint from finishing. `log`
+/// and `checkpointed` are WAL frame counts, and both are `-1` when the
+/// database is not in WAL mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct WalCheckpoint {
+    pub(crate) busy: i64,
+    pub(crate) log: i64,
+    pub(crate) checkpointed: i64,
+}
+
+/// Checkpoint the whole WAL into the database file and truncate it to zero
+/// bytes.
+///
+/// # Errors
+/// Propagates the SQL error. A checkpoint that a reader holds back is not an
+/// error: it is reported through [`WalCheckpoint::busy`].
+pub(crate) fn wal_checkpoint_truncate(conn: &Connection) -> StoreResult<WalCheckpoint> {
+    Ok(
+        conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| {
+            Ok(WalCheckpoint {
+                busy: row.get(0)?,
+                log: row.get(1)?,
+                checkpointed: row.get(2)?,
+            })
+        })?,
+    )
+}
+
+/// Truncate the WAL, and log instead of failing when that cannot be done.
+///
+/// `VACUUM` rewrites every page through the WAL. SQLite's automatic checkpoint
+/// copies those pages back but never shrinks the file, so a `VACUUM` on a
+/// multi-gigabyte database leaves a `-wal` as large as the database until the
+/// next clean close, and a crash or a `SIGKILL` makes the next start replay it
+/// in full. Truncating here, right after the rewrite, is what stops that.
+///
+/// Best effort and deliberately not retried: the operation this follows has
+/// already committed, so a reader that holds the checkpoint back (or a failed
+/// checkpoint) must not turn it into an error. `journal_size_limit` and the
+/// next checkpoint reclaim the space once the reader is gone.
+pub(crate) fn truncate_wal_best_effort(conn: &Connection, after: &'static str) {
+    match wal_checkpoint_truncate(conn) {
+        Ok(WalCheckpoint { busy: 0, .. }) => {}
+        Ok(WalCheckpoint {
+            busy,
+            log,
+            checkpointed,
+        }) => tracing::warn!(
+            after,
+            busy,
+            log,
+            checkpointed,
+            "WAL checkpoint(TRUNCATE) was blocked by an active reader; the -wal file keeps its size until a later checkpoint"
+        ),
+        Err(error) => tracing::warn!(
+            after,
+            %error,
+            "WAL checkpoint(TRUNCATE) failed; the -wal file keeps its size until a later checkpoint"
+        ),
+    }
 }
 
 /// What one [`compact`] run reclaimed.
@@ -5847,6 +5912,7 @@ pub fn reclaim_ledger_versions(
         // `VACUUM` cannot run inside a transaction, and it is the whole-file
         // rewrite `compact` already documents the cost of.
         conn.execute_batch("VACUUM;")?;
+        truncate_wal_best_effort(conn, "vacuum");
         summary.compacted = true;
         summary.bytes_after = database_bytes(conn)?;
     }
@@ -11039,6 +11105,91 @@ pub(crate) mod tests {
             wal_len < 256 * 1024,
             "WAL not bounded by the between-batch checkpoint: {wal_len} bytes"
         );
+    }
+
+    /// A checkpoint a reader holds back must not fail the operation it follows:
+    /// the `VACUUM` has already committed. It is logged with the
+    /// `(busy, log, checkpointed)` triple, left for a later checkpoint, and
+    /// converges once the reader is gone.
+    ///
+    /// The test zeroes `busy_timeout` (rusqlite defaults to 5s) so the blocked
+    /// checkpoint returns at once; the server's writer connection waits up to
+    /// its own 5s timeout for the reader first.
+    #[test]
+    fn compact_survives_a_checkpoint_blocked_by_an_open_reader() {
+        let (tmp, mut conn, ..) = fresh_db();
+        conn.pragma_update(None, "journal_mode", "WAL").unwrap();
+        conn.pragma_update(None, "busy_timeout", 0).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE junk (b BLOB);
+             INSERT INTO junk VALUES (zeroblob(500000));
+             INSERT INTO junk VALUES (zeroblob(500000));
+             DELETE FROM junk;",
+        )
+        .unwrap();
+        let wal = tmp.path().join("test.sqlite-wal");
+
+        // A read transaction pins a snapshot older than the VACUUM's frames.
+        let reader = Connection::open(tmp.path().join("test.sqlite")).unwrap();
+        reader
+            .execute_batch("BEGIN; SELECT count(*) FROM junk;")
+            .unwrap();
+
+        let mut summary = None;
+        let logs = capture_warnings(|| summary = Some(compact(&mut conn)));
+        summary
+            .unwrap()
+            .expect("a blocked checkpoint must not fail the VACUUM that preceded it");
+        // The subscriber colours field names; drop the escape sequences so
+        // the `busy=1` below reads as plain text.
+        let mut plain = String::new();
+        let mut chars = logs.chars();
+        while let Some(c) = chars.next() {
+            if c == '\u{1b}' {
+                chars.by_ref().find(|c| *c == 'm');
+            } else {
+                plain.push(c);
+            }
+        }
+        assert!(
+            plain.contains("blocked by an active reader")
+                && plain.contains("busy=1")
+                && plain.contains("log=")
+                && plain.contains("checkpointed="),
+            "the blocked checkpoint is logged with its triple: {plain:?}"
+        );
+        assert!(
+            std::fs::metadata(&wal).unwrap().len() > 0,
+            "control: the reader really did hold the checkpoint back"
+        );
+
+        // Convergence, no retry loop needed: the next checkpoint finishes.
+        reader.execute_batch("COMMIT;").unwrap();
+        let triple = wal_checkpoint_truncate(&conn).unwrap();
+        assert_eq!(triple.busy, 0);
+        assert_eq!(std::fs::metadata(&wal).unwrap().len(), 0);
+    }
+
+    /// Control for the warning above: an unblocked checkpoint is silent, so a
+    /// log line means a reader really did hold it back.
+    #[test]
+    fn compact_truncates_the_wal_without_warning_when_no_reader_is_open() {
+        let (tmp, mut conn, ..) = fresh_db();
+        conn.pragma_update(None, "journal_mode", "WAL").unwrap();
+        conn.execute_batch(
+            "CREATE TABLE junk (b BLOB);
+             INSERT INTO junk VALUES (zeroblob(500000));
+             DELETE FROM junk;",
+        )
+        .unwrap();
+
+        let mut summary = None;
+        let logs = capture_warnings(|| summary = Some(compact(&mut conn)));
+        summary.unwrap().unwrap();
+
+        assert!(!logs.contains("checkpoint"), "unexpected warning: {logs:?}");
+        let wal = tmp.path().join("test.sqlite-wal");
+        assert_eq!(std::fs::metadata(wal).map_or(0, |m| m.len()), 0);
     }
 
     #[test]

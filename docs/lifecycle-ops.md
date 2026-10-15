@@ -75,6 +75,23 @@ pages. The rebuild is needed because an ordinary delete leaves the tokens inside
 the index segments, and a `VACUUM` alone does not clear them. It needs free disk space of roughly the database's own size and takes
 minutes on a large store, which is why it is opt-in.
 
+`VACUUM` rewrites every page through the SQLite write-ahead log, so the `-wal`
+file next to `memory.sqlite` grows to roughly the database's size while it runs.
+`compact`, `reclaim-ledger-versions --compact` and the purges with `--compact`
+therefore run `PRAGMA wal_checkpoint(TRUNCATE)` right after the `VACUUM`, and the
+`-wal` goes back to zero bytes. If a reader holds an old snapshot the checkpoint
+cannot finish: the command still succeeds, `ai-memory` logs a `warn` with the
+`busy`, `log` and `checkpointed` counts, and the `-wal` keeps its size until a
+later checkpoint after that reader is gone (the writer waits up to 5 seconds for
+readers before giving up). The writer connection also sets `journal_size_limit`
+to 64 MiB, which is the size the `-wal` is cut back to after any checkpoint. It
+is not a cap: a running transaction, or a reader that blocks the checkpoint, can
+push the file past it. On `SIGINT`, `SIGTERM`, Ctrl-C or the end of stdio input, `serve` closes its read
+connections and runs one last checkpoint, waiting at most 5 seconds for it; a
+read still running keeps its connection until it ends, and the checkpoint is
+best effort. A `SIGKILL` leaves the `-wal` as it was and the next start replays
+it.
+
 **`--compact` is not forensic erasure.** The wiki git repository stores page
 content in its objects *and its commit messages*, and any backup taken before
 the purge still contains everything. Removing the bytes from the live SQLite
