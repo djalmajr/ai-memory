@@ -1624,6 +1624,7 @@ pub async fn run(config: &Config, args: ServeArgs) -> Result<()> {
             });
             let admin = admin_router_with_sweep_tuning(
                 AdminState {
+                    compact_jobs: Default::default(),
                     ingest_metrics: ingest_metrics.clone(),
                     // The tool server's own instance, so /admin/metrics reads
                     // what memory_query records.

@@ -12,6 +12,11 @@ version in [`docs/changelog/`](docs/changelog/):
 ## [Unreleased]
 
 ### Added
+- Added a background mode to `POST /admin/compact` (`"background": true`,
+  answered `202`) and a `GET /admin/compact` status route, so a compaction that
+  outlasts a proxy timeout is followed instead of cut off with `524`. Both forms
+  share one single-flight slot and answer `409` while a compaction runs.
+  (#7)
 - Added opt-in map-reduce consolidation: with `[consolidation]
   chunk_input_tokens > 0` (env `AI_MEMORY_CONSOLIDATION__CHUNK_INPUT_TOKENS`),
   a session's observation log is consolidated through sequential,
