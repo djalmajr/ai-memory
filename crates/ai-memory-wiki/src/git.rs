@@ -688,6 +688,62 @@ impl GitAdapter {
         Ok(out)
     }
 
+    /// Return up to `limit` commits, newest first, that changed the file at
+    /// `path` (relative to the repo root), including the commit that deleted
+    /// it. At most `max_walk` commits are inspected, so a page untouched for a
+    /// long history costs a bounded walk rather than the whole repository.
+    ///
+    /// # Errors
+    /// Propagates any underlying libgit2 error.
+    pub fn path_checkpoints(
+        &self,
+        path: &Path,
+        limit: usize,
+        max_walk: usize,
+    ) -> WikiResult<Vec<Checkpoint>> {
+        let repo = open_validated_repository(&self.root).map_err(|error| match error {
+            OpenRepositoryError::Git(error) => map_git_err(error),
+            OpenRepositoryError::Wiki(error) => error,
+        })?;
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let mut walk = repo.revwalk().map_err(map_git_err)?;
+        if walk.push_head().is_err() {
+            return Ok(Vec::new());
+        }
+        let blob_at = |commit: &git2::Commit<'_>| {
+            commit
+                .tree()
+                .ok()
+                .and_then(|tree| tree.get_path(path).ok())
+                .map(|entry| entry.id())
+        };
+        let mut out = Vec::new();
+        for oid in walk.take(max_walk) {
+            let oid = oid.map_err(map_git_err)?;
+            let commit = repo.find_commit(oid).map_err(map_git_err)?;
+            let parent_blob = commit.parent(0).ok().and_then(|p| blob_at(&p));
+            if blob_at(&commit) == parent_blob {
+                continue;
+            }
+            out.push(Checkpoint {
+                oid: oid.to_string(),
+                summary: commit
+                    .summary()
+                    .ok()
+                    .flatten()
+                    .unwrap_or("(no summary)")
+                    .to_string(),
+                time: commit.time().seconds(),
+            });
+            if out.len() >= limit {
+                break;
+            }
+        }
+        Ok(out)
+    }
+
     /// Read `path` as it existed at `rev`.
     ///
     /// `path` is relative to the wiki repo root. The returned bytes are the
@@ -1736,6 +1792,47 @@ mod tests {
         ));
         assert_eq!(adapter.commit_count(), 0);
         assert_eq!(std::fs::read(external.join("HEAD")).unwrap(), before);
+    }
+
+    #[test]
+    fn path_checkpoints_lists_changes_and_deletion_and_stops_at_the_walk_cap() {
+        let tmp = tempdir();
+        let root = tmp.path().join("wiki");
+        let adapter = GitAdapter::open_or_init(&root).unwrap();
+        std::fs::write(root.join("page.md"), "v1").unwrap();
+        adapter.commit_all("write v1").unwrap();
+        std::fs::write(root.join("page.md"), "v2").unwrap();
+        adapter.commit_all("write v2").unwrap();
+        std::fs::remove_file(root.join("page.md")).unwrap();
+        adapter.commit_all("delete").unwrap();
+        for i in 0..3 {
+            std::fs::write(root.join("other.md"), format!("o{i}")).unwrap();
+            adapter.commit_all("unrelated").unwrap();
+        }
+        let summaries = |hits: Vec<Checkpoint>| -> Vec<String> {
+            hits.into_iter().map(|c| c.summary).collect()
+        };
+
+        let all = adapter
+            .path_checkpoints(Path::new("page.md"), 10, 100)
+            .unwrap();
+        assert_eq!(summaries(all), ["delete", "write v2", "write v1"]);
+        let limited = adapter
+            .path_checkpoints(Path::new("page.md"), 1, 100)
+            .unwrap();
+        assert_eq!(summaries(limited), ["delete"]);
+        // Three unrelated commits sit on top: a walk of four sees only the
+        // delete, a walk of three sees nothing.
+        let capped = adapter
+            .path_checkpoints(Path::new("page.md"), 10, 4)
+            .unwrap();
+        assert_eq!(summaries(capped), ["delete"]);
+        assert!(
+            adapter
+                .path_checkpoints(Path::new("page.md"), 10, 3)
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]

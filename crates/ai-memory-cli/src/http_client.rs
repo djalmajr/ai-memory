@@ -402,11 +402,9 @@ fn build_url_with_query(
 
 /// Turn a low-level reqwest connect/timeout error into a friendlier
 /// message that surfaces the resolved server URL. The common cases are
-/// "Connection refused" and a connect that never completes: on Windows a
-/// closed loopback port is routinely dropped (timed out) by the firewall
-/// instead of being refused, and both mean the same operator problem —
-/// the CLI defaulted to (or was pointed at) an endpoint where nothing
-/// answered.
+/// "Connection refused", a connect that never completes, and a peer that
+/// closes before sending an HTTP response. They all mean the same operator
+/// problem: the CLI was pointed at an endpoint where no server answered.
 pub(crate) fn augment_connect_error(
     err: reqwest::Error,
     endpoint: &ServerEndpoint,
@@ -447,13 +445,10 @@ pub(crate) fn server_unreachable(err: &anyhow::Error) -> bool {
     !answered && err.chain().any(error_chain_indicates_no_answer)
 }
 
-/// Whether an error chain means "nothing answered at the transport
-/// layer": reqwest classified it as a connect-phase or timeout failure,
-/// or a `ConnectionRefused`/`TimedOut` io::Error — or its platform
-/// wording — is buried in the source chain. reqwest wraps its errors
-/// deeply, and matching only an explicit RST would hide the diagnosis
-/// from exactly the hosts (windows-latest among them) whose firewalls
-/// turn a refused loopback connect into a silent timeout.
+/// Whether an error chain means "nothing answered at the transport layer".
+/// reqwest may classify this as a connect/timeout failure or wrap the socket
+/// error deeply. A peer can also accept and close before the HTTP response,
+/// which is equally unreachable from the caller's perspective.
 fn error_chain_indicates_no_answer(err: &(dyn std::error::Error + 'static)) -> bool {
     if let Some(req) = err.downcast_ref::<reqwest::Error>()
         && (req.is_connect() || req.is_timeout())
@@ -465,13 +460,25 @@ fn error_chain_indicates_no_answer(err: &(dyn std::error::Error + 'static)) -> b
         if let Some(io) = e.downcast_ref::<std::io::Error>()
             && matches!(
                 io.kind(),
-                std::io::ErrorKind::ConnectionRefused | std::io::ErrorKind::TimedOut
+                std::io::ErrorKind::ConnectionRefused
+                    | std::io::ErrorKind::ConnectionReset
+                    | std::io::ErrorKind::ConnectionAborted
+                    | std::io::ErrorKind::BrokenPipe
+                    | std::io::ErrorKind::UnexpectedEof
+                    | std::io::ErrorKind::TimedOut
             )
         {
             return true;
         }
         let wording = e.to_string().to_ascii_lowercase();
-        if wording.contains("connection refused") || wording.contains("timed out") {
+        if wording.contains("connection refused")
+            || wording.contains("connection reset")
+            || wording.contains("connection aborted")
+            || wording.contains("connection closed before message completed")
+            || wording.contains("unexpected eof")
+            || wording.contains("broken pipe")
+            || wording.contains("timed out")
+        {
             return true;
         }
         src = e.source();
@@ -899,21 +906,17 @@ mod tests {
     // Server reachability probe
     // ----------------------------------------------------------------
 
-    /// Bind a loopback listener, capture its address, and release it: the
-    /// next connection to that address is refused. Rebinding races exist on
-    /// loopback but are vanishingly rare under a test load.
-    async fn closed_port_endpoint() -> ServerEndpoint {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let address = listener.local_addr().unwrap();
-        drop(listener);
-        ServerEndpoint::from_pair(Some(format!("http://{address}")), None)
+    /// Keep a listener bound and close every accepted connection so parallel
+    /// tests cannot reuse an allegedly closed ephemeral port.
+    fn no_answer_endpoint() -> ServerEndpoint {
+        ServerEndpoint::from_pair(Some(ai_memory_test_support::dead_http_endpoint()), None)
     }
 
     #[tokio::test]
-    async fn probe_reports_a_closed_port_as_unreachable_with_the_diagnosis() {
-        let endpoint = closed_port_endpoint().await;
+    async fn probe_reports_an_accept_then_close_peer_as_unreachable_with_the_diagnosis() {
+        let endpoint = no_answer_endpoint();
         let ServerProbe::Unreachable(error) = probe_server(&endpoint).await else {
-            panic!("a closed port must be Unreachable");
+            panic!("a peer that closes before responding must be Unreachable");
         };
         let url = endpoint.build_url("/workstream/runs");
         let augmented = augment_connect_error(error, &endpoint, &url);

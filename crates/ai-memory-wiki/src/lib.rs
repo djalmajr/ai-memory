@@ -34,8 +34,8 @@ pub use markdown::{
 pub use migrations::run_pending as run_wiki_migrations;
 pub use watcher::{DEBOUNCE_WINDOW, RECONCILE_INTERVAL, WatcherHandle};
 pub use wiki::{
-    ConditionalWrite, MoveSessionOutcome, PurgeSessionOutcome, SessionPageFile, Wiki,
-    WritePageRequest,
+    ConditionalWrite, EventLedgerFile, MoveSessionOutcome, PAGE_CHECKPOINT_WALK_LIMIT,
+    PurgeSessionOutcome, SessionPageFile, Wiki, WritePageRequest,
 };
 
 // Integration tests compile into this crate's test harness instead of a

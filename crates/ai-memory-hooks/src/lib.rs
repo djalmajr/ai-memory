@@ -23,11 +23,13 @@
 
 pub mod antigravity;
 mod assistant_capture;
+mod brief_tiers;
 pub mod capture_policy;
 pub mod drop_list;
 mod grants;
 pub mod log;
 pub mod payload;
+mod recap;
 pub mod router;
 pub mod synth;
 pub mod workstream;
@@ -55,14 +57,15 @@ pub use drop_list::IngestDropList;
 pub use payload::{
     HookEnvelope, HookEvent, NOTIFICATION_EXCERPT_MAX_BYTES, POST_COMPACTION_EXCERPT_MAX_BYTES,
     USER_PROMPT_EXCERPT_MAX_BYTES, agent_from_payload, cap_lifecycle_body_for_client,
-    hook_payload_context,
+    hook_payload_context, user_prompt_text,
 };
+pub use recap::RECAP_BUDGET_MIN;
 pub use router::{
     DEFAULT_HOOK_INGEST_MAX_IN_FLIGHT, DEFAULT_INGEST_GATE_MAX_ENTRIES,
     DEFAULT_PROJECT_CACHE_MAX_ENTRIES, HookState, IngestGates, IngestRateLimiter, ProjectCache,
     ProjectCacheStore, SubagentSessionSet, SubagentSessions, hook_router,
 };
-pub use synth::synthesize_session_page;
+pub use synth::{SessionDigest, synthesize_session_page};
 pub use workstream::{WorkstreamState, workstream_router};
 
 /// Request header every first-party client (native hook and CLI, the shell and

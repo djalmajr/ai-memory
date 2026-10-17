@@ -69,6 +69,199 @@ async fn open_session(
     id
 }
 
+/// A SessionEnd digest takes a raw session id internally, but the reader must
+/// still require the admitted scope. Otherwise a future caller could render a
+/// foreign project's prompts merely by learning its id.
+#[tokio::test]
+async fn session_end_readers_refuse_foreign_session_ids() {
+    use ai_memory_core::{NewObservation, ObservationKind, Sanitized, Sanitizer};
+
+    let tmp = tempfile::tempdir().unwrap();
+    let store = Store::open(tmp.path()).unwrap();
+    let ws = store
+        .writer
+        .get_or_create_workspace("default")
+        .await
+        .unwrap();
+    let home = store
+        .writer
+        .get_or_create_project(ws, "home", None)
+        .await
+        .unwrap();
+    let sibling = store
+        .writer
+        .get_or_create_project(ws, "sibling", None)
+        .await
+        .unwrap();
+    let other_ws = store.writer.get_or_create_workspace("other").await.unwrap();
+    let session = open_session(&store, ws, home, AgentKind::Codex).await;
+    store
+        .writer
+        .insert_observation(Sanitized::new(
+            NewObservation {
+                occurred_at: None,
+                session_id: session,
+                workspace_id: ws,
+                project_id: home,
+                kind: ObservationKind::UserPrompt,
+                extension: None,
+                source_event: None,
+                title: "private prompt".into(),
+                body: "foreign scopes must not read this".into(),
+                importance: 5,
+            },
+            &Sanitizer::builtin(),
+        ))
+        .await
+        .unwrap();
+
+    assert!(
+        store
+            .reader
+            .session_has_substantive_observation(ws, home, session)
+            .await
+            .unwrap(),
+        "the owning scope is the legitimate control"
+    );
+    let total = store
+        .reader
+        .read_session_observations(ws, home, session, |snapshot| {
+            Ok(snapshot.kind_summary()?.total)
+        })
+        .await
+        .unwrap();
+    assert_eq!(total, 1);
+
+    for (attempt_ws, attempt_project) in [(ws, sibling), (other_ws, home)] {
+        assert!(
+            !store
+                .reader
+                .session_has_substantive_observation(attempt_ws, attempt_project, session)
+                .await
+                .unwrap(),
+            "a foreign scope must not learn the session's substantive state"
+        );
+        let error = store
+            .reader
+            .read_session_observations(attempt_ws, attempt_project, session, |snapshot| {
+                Ok(snapshot.kind_summary()?.total)
+            })
+            .await
+            .unwrap_err();
+        assert!(matches!(error, StoreError::SessionCollision));
+    }
+
+    let missing = SessionId::new();
+    let error = store
+        .reader
+        .read_session_observations(ws, home, missing, |snapshot| {
+            Ok(snapshot.kind_summary()?.total)
+        })
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(error, StoreError::SessionCollision),
+        "missing and foreign ids deliberately expose the same refusal"
+    );
+}
+
+/// The point-fetch rowid API is scoped to the snapshot's session: a
+/// `rowid` belonging to another session is refused through a legitimate
+/// snapshot, while the session's own rowid is returned (the legitimate
+/// control). A constructor-only test cannot see the removal of the
+/// `session_id = ?1` predicate alone — this one hands a foreign rowid to a
+/// legitimate session and asserts the refusal.
+#[tokio::test]
+async fn rowid_fetch_refuses_foreign_sessions_with_legitimate_control() {
+    use ai_memory_core::{NewObservation, ObservationKind, Sanitized, Sanitizer};
+
+    let tmp = tempfile::tempdir().unwrap();
+    let store = Store::open(tmp.path()).unwrap();
+    let (ws, proj) = scope(&store).await;
+    let session_a = open_session(&store, ws, proj, AgentKind::Codex).await;
+    let session_b = open_session(&store, ws, proj, AgentKind::Codex).await;
+    let sanitizer = Sanitizer::builtin();
+    for (session, tag) in [(session_a, "a"), (session_b, "b")] {
+        for i in 0..12u32 {
+            store
+                .writer
+                .insert_observation(Sanitized::new(
+                    NewObservation {
+                        occurred_at: None,
+                        session_id: session,
+                        workspace_id: ws,
+                        project_id: proj,
+                        kind: ObservationKind::PostToolUse,
+                        extension: None,
+                        source_event: None,
+                        title: "routine".into(),
+                        body: format!("{tag} row {i}"),
+                        importance: 1,
+                    },
+                    &sanitizer,
+                ))
+                .await
+                .unwrap();
+        }
+    }
+
+    // Each session's first rowid: session B's rows landed after session
+    // A's, so the rowids are distinct.
+    let conn = rusqlite::Connection::open(store.db_path()).unwrap();
+    let first_rowid = |session: SessionId| {
+        conn.query_row(
+            "SELECT rowid FROM observations WHERE session_id = ?1 ORDER BY rowid LIMIT 1",
+            rusqlite::params![session.as_bytes()],
+            |row| row.get(0),
+        )
+        .unwrap()
+    };
+    let rowid_a = first_rowid(session_a);
+    let rowid_b = first_rowid(session_b);
+    assert_ne!(rowid_a, rowid_b, "the attack needs distinct rowids");
+
+    // Legitimate control: a session reads its own rowid through its own
+    // legitimate snapshot.
+    let own = store
+        .reader
+        .read_session_observations_in_scope(ws, proj, session_a, move |snapshot| {
+            snapshot.row_by_rowid(rowid_a)
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        own.as_ref().map(|observation| observation.body.as_str()),
+        Some("a row 0"),
+        "the session's own rowid must be readable"
+    );
+
+    // The attack: session A's legitimate snapshot handed session B's rowid.
+    let foreign = store
+        .reader
+        .read_session_observations_in_scope(ws, proj, session_a, move |snapshot| {
+            snapshot.row_by_rowid(rowid_b)
+        })
+        .await
+        .unwrap();
+    assert!(
+        foreign.is_none(),
+        "a foreign session's rowid must be refused by the session-scoped fetch"
+    );
+
+    // And the mirror: session B's snapshot handed session A's rowid.
+    let foreign_mirror = store
+        .reader
+        .read_session_observations_in_scope(ws, proj, session_b, move |snapshot| {
+            snapshot.row_by_rowid(rowid_a)
+        })
+        .await
+        .unwrap();
+    assert!(
+        foreign_mirror.is_none(),
+        "the refusal must hold in both directions"
+    );
+}
+
 fn page(ws: WorkspaceId, proj: ProjectId, path: &str, title: &str, body: &str) -> NewPage {
     NewPage {
         workspace_id: ws,
@@ -893,6 +1086,115 @@ async fn a_second_accept_cannot_steal_an_accepted_handoff() {
         accepted_session.as_deref(),
         Some(&winner.as_bytes()[..]),
         "and the winning session must not have been overwritten by the loser"
+    );
+}
+
+/// Two parallel sessions in separate Tokio worker threads concurrently race
+/// to claim the exact same open handoff baton via `tokio::join!`.
+///
+/// Invariant: Under genuine multi-threaded concurrency, the single-writer
+/// transaction guard (`WHERE state = 'open'`) must ensure that exactly one
+/// session claims the baton (`true`) and the loser receives `false`.
+/// The winning session's attribution is committed atomically and cannot be
+/// overwritten or corrupted by the losing task.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn concurrent_accept_race_on_single_handoff_yields_exactly_one_winner() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = Store::open(tmp.path()).unwrap();
+    let (ws, proj) = scope(&store).await;
+
+    let id = store
+        .writer
+        .insert_handoff(NewHandoff {
+            workspace_id: ws,
+            project_id: proj,
+            from_agent: AgentKind::ClaudeCode,
+            to_agent: None,
+            from_session_id: None,
+            summary: "concurrent race for the baton".into(),
+            next_steps: Vec::new(),
+            open_questions: Vec::new(),
+            files_touched: Vec::new(),
+            cwd: None,
+            owner_user: None,
+        })
+        .await
+        .unwrap();
+
+    let accept = |agent: AgentKind, session: SessionId| HandoffAcceptance {
+        handoff_id: id,
+        workspace_id: ws,
+        project_id: proj,
+        accepting_agent: agent,
+        accepting_session: Some(session),
+        accepting_user: None,
+        owner_filter: OwnerFilter::Any,
+        receiving_cwd: None,
+    };
+
+    let session_a = open_session(&store, ws, proj, AgentKind::Codex).await;
+    let session_b = open_session(&store, ws, proj, AgentKind::OpenCode).await;
+
+    let (res_a, res_b) = tokio::join!(
+        store
+            .writer
+            .accept_handoff(accept(AgentKind::Codex, session_a)),
+        store
+            .writer
+            .accept_handoff(accept(AgentKind::OpenCode, session_b)),
+    );
+    let outcome_a = res_a.unwrap();
+    let outcome_b = res_b.unwrap();
+
+    // Invariant: Exactly one must succeed, and the other must be refused.
+    assert!(
+        (outcome_a && !outcome_b) || (!outcome_a && outcome_b),
+        "exactly one session must win the claim; got outcome_a={outcome_a}, outcome_b={outcome_b}"
+    );
+
+    let (winner_agent, winner_session, loser_agent, loser_session) = if outcome_a {
+        ("codex", session_a, AgentKind::OpenCode, session_b)
+    } else {
+        ("opencode", session_b, AgentKind::Codex, session_a)
+    };
+
+    let handoff_bytes = id.as_bytes().to_vec();
+    let (state, accepted_by, accepted_session): (String, Option<String>, Option<Vec<u8>>) = store
+        .reader
+        .with_conn(move |conn| {
+            Ok(conn.query_row(
+                "SELECT state, accepted_by, accepted_by_session FROM handoffs WHERE id = ?1",
+                rusqlite::params![handoff_bytes],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )?)
+        })
+        .await
+        .unwrap();
+
+    assert_eq!(
+        state, "accepted",
+        "the baton state must be transitioned to accepted"
+    );
+    assert_eq!(
+        accepted_by.as_deref(),
+        Some(winner_agent),
+        "the winner agent must be recorded as accepted_by"
+    );
+    assert_eq!(
+        accepted_session.as_deref(),
+        Some(&winner_session.as_bytes()[..]),
+        "the winning session id must be recorded in accepted_by_session"
+    );
+
+    // Subsequent retry by the loser must be cleanly rejected without modifying anything.
+    let retry = store
+        .writer
+        .accept_handoff(accept(loser_agent, loser_session))
+        .await
+        .unwrap();
+    assert!(
+        !retry,
+        "subsequent retry by the losing session must return false"
     );
 }
 
@@ -3550,6 +3852,7 @@ async fn explained_search_as(
                 include_superseded: false,
                 explain: true,
                 owner,
+                filter: ai_memory_store::PageFilter::default(),
             },
         )
         .await
@@ -3664,4 +3967,275 @@ async fn observation_excerpts_follow_the_session_owner_while_the_vote_stays_shar
         .find(|(hit, _)| hit.path.as_str() == a_path)
         .unwrap();
     assert!(hit.snippet.contains("quasar"), "{}", hit.snippet);
+}
+
+/// The self-service purge checks exact ownership in the writer transaction,
+/// including previews; shared legacy rows are readable but never user-deletable.
+#[tokio::test]
+async fn owned_session_purge_refuses_foreign_shared_and_wrong_scope_sessions() {
+    use ai_memory_core::IdentityKey;
+    use ai_memory_store::{Compaction, PurgeMode};
+    let tmp = tempfile::tempdir().unwrap();
+    let store = Store::open(tmp.path()).unwrap();
+    let (ws, proj) = scope(&store).await;
+    let user = store
+        .writer
+        .create_human_user(
+            NewUser {
+                username: "purge-alice".into(),
+                name: None,
+                email: None,
+            },
+            ai_memory_core::UserRole::User,
+            None,
+            false,
+        )
+        .await
+        .unwrap();
+    let other = store
+        .writer
+        .get_or_create_project(ws, "other", None)
+        .await
+        .unwrap();
+    let mut sessions = Vec::new();
+    for owner in [Some("user:purge-alice"), Some("user:purge-bob"), None] {
+        let sid = SessionId::new();
+        store
+            .writer
+            .begin_session(NewSession {
+                occurred_at: None,
+                id: sid,
+                workspace_id: ws,
+                project_id: proj,
+                agent_kind: AgentKind::Codex,
+                cwd: None,
+                actor_user: owner.map(str::to_string),
+            })
+            .await
+            .unwrap();
+        sessions.push(sid);
+    }
+    for mode in [PurgeMode::Preview, PurgeMode::Commit] {
+        for (project, sid) in [
+            (proj, sessions[1]),
+            (proj, sessions[2]),
+            (other, sessions[0]),
+        ] {
+            let result = store
+                .writer
+                .purge_owned_session(
+                    ws,
+                    project,
+                    sid,
+                    IdentityKey::User("purge-alice".into()),
+                    Some(user),
+                    mode,
+                )
+                .await;
+            assert!(matches!(result, Err(StoreError::NotFound(_))));
+            assert!(
+                store
+                    .reader
+                    .session_summary_scoped(ws, proj, sid, OwnerFilter::Any)
+                    .await
+                    .unwrap()
+                    .is_some()
+            );
+        }
+    }
+    store
+        .writer
+        .purge_owned_session(
+            ws,
+            proj,
+            sessions[0],
+            IdentityKey::User("purge-alice".into()),
+            Some(user),
+            PurgeMode::Preview,
+        )
+        .await
+        .unwrap();
+    assert!(
+        store
+            .reader
+            .session_summary_scoped(ws, proj, sessions[0], OwnerFilter::Any)
+            .await
+            .unwrap()
+            .is_some()
+    );
+    // Simulate a grant revoked after the HTTP preflight: the writer must refuse.
+    store
+        .writer
+        .set_access_mode(proj, ai_memory_store::AccessMode::Restricted)
+        .await
+        .unwrap();
+    assert!(matches!(
+        store
+            .writer
+            .purge_owned_session(
+                ws,
+                proj,
+                sessions[0],
+                IdentityKey::User("purge-alice".into()),
+                Some(user),
+                PurgeMode::Commit
+            )
+            .await,
+        Err(StoreError::Forbidden(_))
+    ));
+    store
+        .writer
+        .set_access_mode(proj, ai_memory_store::AccessMode::Open)
+        .await
+        .unwrap();
+    store
+        .writer
+        .purge_owned_session(
+            ws,
+            proj,
+            sessions[0],
+            IdentityKey::User("purge-alice".into()),
+            Some(user),
+            PurgeMode::Commit,
+        )
+        .await
+        .unwrap();
+    assert!(
+        store
+            .reader
+            .session_summary_scoped(ws, proj, sessions[0], OwnerFilter::Any)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    // Admin control remains able to purge an ownerless legacy session.
+    store
+        .writer
+        .purge_session(
+            ws,
+            proj,
+            sessions[2],
+            Some(user),
+            Compaction::Skip,
+            PurgeMode::Commit,
+        )
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn owned_session_purge_refuses_cross_project_cascades_with_admin_control() {
+    use ai_memory_core::{IdentityKey, NewObservation, ObservationKind, Sanitized, Sanitizer};
+    use ai_memory_store::{Compaction, PurgeMode};
+    let tmp = tempfile::tempdir().unwrap();
+    let store = Store::open(tmp.path()).unwrap();
+    let (ws, proj) = scope(&store).await;
+    let user = store
+        .writer
+        .create_human_user(
+            NewUser {
+                username: "cascade-alice".into(),
+                name: None,
+                email: None,
+            },
+            ai_memory_core::UserRole::User,
+            None,
+            false,
+        )
+        .await
+        .unwrap();
+    let foreign = store
+        .writer
+        .get_or_create_project(ws, "foreign", None)
+        .await
+        .unwrap();
+    let sid = SessionId::new();
+    store
+        .writer
+        .begin_session(NewSession {
+            occurred_at: None,
+            id: sid,
+            workspace_id: ws,
+            project_id: proj,
+            agent_kind: AgentKind::Codex,
+            cwd: None,
+            actor_user: Some("user:cascade-alice".into()),
+        })
+        .await
+        .unwrap();
+    let observation = NewObservation {
+        session_id: sid,
+        workspace_id: ws,
+        project_id: foreign,
+        kind: ObservationKind::UserPrompt,
+        extension: None,
+        source_event: None,
+        title: "foreign record".into(),
+        body: "must survive a self-service purge".into(),
+        importance: 5,
+        occurred_at: None,
+    };
+    store
+        .writer
+        .insert_observation(Sanitized::new(observation, &Sanitizer::default()))
+        .await
+        .unwrap();
+    for mode in [PurgeMode::Preview, PurgeMode::Commit] {
+        assert!(matches!(
+            store
+                .writer
+                .purge_owned_session(
+                    ws,
+                    proj,
+                    sid,
+                    IdentityKey::User("cascade-alice".into()),
+                    Some(user),
+                    mode
+                )
+                .await,
+            Err(StoreError::InvalidState(_))
+        ));
+        assert_eq!(
+            store
+                .reader
+                .observations_for_session(sid)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+    let preview = store
+        .writer
+        .purge_session(
+            ws,
+            proj,
+            sid,
+            Some(user),
+            Compaction::Skip,
+            PurgeMode::Preview,
+        )
+        .await
+        .unwrap();
+    assert_eq!(preview.collateral_observations_deleted, 1);
+    store
+        .writer
+        .purge_session(
+            ws,
+            proj,
+            sid,
+            Some(user),
+            Compaction::Skip,
+            PurgeMode::Commit,
+        )
+        .await
+        .unwrap();
+    assert!(
+        store
+            .reader
+            .observations_for_session(sid)
+            .await
+            .unwrap()
+            .is_empty()
+    );
 }

@@ -269,11 +269,18 @@ fn wikilink_href_label(raw: &str, workspace: &str, project: &str) -> Option<(Str
     // Reject non-page extensions, normalise the `.md` suffix, then rely on
     // the canonical page-path validator for traversal, absolute paths,
     // Windows prefixes, backslashes, and empty segments.
+    //
+    // A directory target (trailing slash, empty last segment) and a
+    // stem-less `.md` cannot name a page; leaving them as literal text
+    // aligns web rendering with the wiki link extractor.
     let path = path_part.trim();
     if path.is_empty() {
         return None;
     }
     let last_segment = path.rsplit('/').next().unwrap_or("");
+    if last_segment.is_empty() || last_segment == ".md" {
+        return None;
+    }
     let path = if last_segment.contains('.') {
         if !path.ends_with(".md") {
             return None;
@@ -1147,6 +1154,23 @@ mod tests {
             "scratch",
         );
         assert!(!d.contains("<a href"), "invalid page path: {d}");
+    }
+
+    #[test]
+    fn wikilink_directory_and_stemless_targets_stay_literal() {
+        // A trailing slash (directory target) or a stem-less `.md` cannot
+        // name a page; rewrite must not emit broken 404 links.
+        let html = render(
+            "[[notes/]] [[notes/.md]] [[.md]] [[other:notes/]] [[notes/|Folder]]",
+            "default",
+            "scratch",
+        );
+        assert!(!html.contains("<a href"), "no linkified targets: {html}");
+        assert!(html.contains("[[notes/]]"));
+        assert!(html.contains("[[notes/.md]]"));
+        assert!(html.contains("[[.md]]"));
+        assert!(html.contains("[[other:notes/]]"));
+        assert!(html.contains("[[notes/|Folder]]"));
     }
 
     /// A `~~~` fence must NOT be closed by a `` ``` `` line and vice

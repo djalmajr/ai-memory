@@ -1282,6 +1282,309 @@ mod tests {
         }
     }
 
+    /// V81 rebuilds `sessions` again, for CodeBuddy Code: rows, the ingest
+    /// keys and observations that reference them, and the scope-pairing
+    /// triggers all survive, and a `codebuddy` session is accepted afterwards.
+    #[test]
+    fn v80_to_v81_preserves_sessions_ingest_keys_and_observations_and_accepts_codebuddy() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        run_to(&mut conn, 80).unwrap();
+        conn.pragma_update(None, "foreign_keys", "ON").unwrap();
+        let workspace_id = crate::ops::get_or_create_workspace(&mut conn, "default").unwrap();
+        let project_id =
+            crate::ops::get_or_create_project(&mut conn, &workspace_id, "project", None).unwrap();
+        let existing = SessionId::new();
+        conn.execute(
+            "INSERT INTO sessions \
+             (id, workspace_id, project_id, agent_kind, cwd, started_at, ended_at, \
+              ended_observation_count, actor_user) \
+             VALUES (?1, ?2, ?3, 'muse', '/repo', 1, 2, 7, 'user:alice')",
+            params![
+                existing.as_bytes(),
+                workspace_id.as_bytes(),
+                project_id.as_bytes(),
+            ],
+        )
+        .unwrap();
+        // V80 cannot store a CodeBuddy session yet.
+        assert!(
+            conn.execute(
+                "INSERT INTO sessions \
+                 (id, workspace_id, project_id, agent_kind, started_at) \
+                 VALUES (?1, ?2, ?3, 'codebuddy', 1)",
+                params![
+                    SessionId::new().as_bytes(),
+                    workspace_id.as_bytes(),
+                    project_id.as_bytes(),
+                ],
+            )
+            .is_err(),
+            "the V80 CHECK must reject codebuddy"
+        );
+        conn.execute(
+            "INSERT INTO ingest_keys (project_id, key, seen_at, session_id, agent_kind) \
+             VALUES (?1, 'k1', 1, ?2, 'muse')",
+            params![project_id.as_bytes(), existing.as_bytes()],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO observations \
+             (id, session_id, workspace_id, project_id, kind, title, body, created_at) \
+             VALUES (?1, ?2, ?3, ?4, 'prompt', 'kept', 'kept body', 1)",
+            params![
+                uuid::Uuid::new_v4().as_bytes(),
+                existing.as_bytes(),
+                workspace_id.as_bytes(),
+                project_id.as_bytes(),
+            ],
+        )
+        .unwrap();
+
+        conn.pragma_update(None, "foreign_keys", "OFF").unwrap();
+        run(&mut conn).unwrap();
+        conn.pragma_update(None, "foreign_keys", "ON").unwrap();
+
+        let preserved: (String, String, i64, Option<String>) = conn
+            .query_row(
+                "SELECT agent_kind, cwd, ended_observation_count, actor_user \
+                 FROM sessions WHERE id = ?1",
+                params![existing.as_bytes()],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            preserved,
+            ("muse".into(), "/repo".into(), 7, Some("user:alice".into()))
+        );
+        let observations: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM observations WHERE session_id = ?1",
+                params![existing.as_bytes()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(observations, 1, "the session's observations survive");
+        for table in ["ingest_keys", "observations"] {
+            let dangling: i64 = conn
+                .query_row(
+                    &format!("SELECT COUNT(*) FROM pragma_foreign_key_check('{table}')"),
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(dangling, 0, "{table} must still reference sessions");
+        }
+
+        crate::ops::begin_session(
+            &mut conn,
+            &NewSession {
+                occurred_at: None,
+                id: SessionId::new(),
+                workspace_id,
+                project_id,
+                agent_kind: AgentKind::CodeBuddy,
+                cwd: Some("/repo".into()),
+                actor_user: Some("user:alice".into()),
+            },
+        )
+        .unwrap();
+
+        for name in [
+            "idx_sessions_open_owner",
+            "sessions_ws_proj_pairing_ai",
+            "auto_improve_scheduler_claims_session_pairing_ai",
+            "session_consolidation_jobs_session_pairing_ai",
+        ] {
+            let kind = if name.starts_with("idx_") {
+                "index"
+            } else {
+                "trigger"
+            };
+            assert_eq!(schema_object_count(&conn, kind, name), 1, "missing {name}");
+        }
+    }
+
+    /// V83 expands the sessions enum for IBM Bob. Existing sessions and
+    /// dependent observations survive the table rebuild, while the old V82
+    /// constraint rejects the new value and the migrated schema accepts it.
+    #[test]
+    fn v82_to_v83_preserves_sessions_and_observations_and_accepts_ibm_bob() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        run_to(&mut conn, 82).unwrap();
+        conn.pragma_update(None, "foreign_keys", "ON").unwrap();
+        let workspace_id = crate::ops::get_or_create_workspace(&mut conn, "default").unwrap();
+        let project_id =
+            crate::ops::get_or_create_project(&mut conn, &workspace_id, "project", None).unwrap();
+        let existing = SessionId::new();
+        conn.execute(
+            "INSERT INTO sessions \
+             (id, workspace_id, project_id, agent_kind, cwd, started_at, actor_user) \
+             VALUES (?1, ?2, ?3, 'codebuddy', '/repo', 1, 'user:alice')",
+            params![
+                existing.as_bytes(),
+                workspace_id.as_bytes(),
+                project_id.as_bytes(),
+            ],
+        )
+        .unwrap();
+        assert!(
+            conn.execute(
+                "INSERT INTO sessions \
+                 (id, workspace_id, project_id, agent_kind, started_at) \
+                 VALUES (?1, ?2, ?3, 'ibm-bob', 1)",
+                params![
+                    SessionId::new().as_bytes(),
+                    workspace_id.as_bytes(),
+                    project_id.as_bytes(),
+                ],
+            )
+            .is_err(),
+            "the V82 CHECK must reject ibm-bob"
+        );
+        conn.execute(
+            "INSERT INTO observations \
+             (id, session_id, workspace_id, project_id, kind, title, body, created_at) \
+             VALUES (?1, ?2, ?3, ?4, 'prompt', 'kept', 'kept body', 1)",
+            params![
+                uuid::Uuid::new_v4().as_bytes(),
+                existing.as_bytes(),
+                workspace_id.as_bytes(),
+                project_id.as_bytes(),
+            ],
+        )
+        .unwrap();
+
+        conn.pragma_update(None, "foreign_keys", "OFF").unwrap();
+        run(&mut conn).unwrap();
+        conn.pragma_update(None, "foreign_keys", "ON").unwrap();
+
+        let preserved: (String, String, Option<String>) = conn
+            .query_row(
+                "SELECT agent_kind, cwd, actor_user FROM sessions WHERE id = ?1",
+                params![existing.as_bytes()],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            preserved,
+            (
+                "codebuddy".into(),
+                "/repo".into(),
+                Some("user:alice".into())
+            )
+        );
+        let observations: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM observations WHERE session_id = ?1",
+                params![existing.as_bytes()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(observations, 1, "the session's observations survive");
+
+        crate::ops::begin_session(
+            &mut conn,
+            &NewSession {
+                occurred_at: None,
+                id: SessionId::new(),
+                workspace_id,
+                project_id,
+                agent_kind: AgentKind::IbmBob,
+                cwd: Some("/repo".into()),
+                actor_user: Some("user:alice".into()),
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            conn.query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .unwrap(),
+            0
+        );
+        for name in [
+            "idx_sessions_open_owner",
+            "sessions_ws_proj_pairing_ai",
+            "auto_improve_scheduler_claims_session_pairing_ai",
+            "session_consolidation_jobs_session_pairing_ai",
+        ] {
+            let kind = if name.starts_with("idx_") {
+                "index"
+            } else {
+                "trigger"
+            };
+            assert_eq!(schema_object_count(&conn, kind, name), 1, "missing {name}");
+        }
+    }
+
+    #[test]
+    fn v81_to_v82_preserves_managed_runs_and_adds_previous_session_identity() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        run_to(&mut conn, 81).unwrap();
+        conn.pragma_update(None, "foreign_keys", "ON").unwrap();
+        let workspace = crate::ops::get_or_create_workspace(&mut conn, "default").unwrap();
+        let project =
+            crate::ops::get_or_create_project(&mut conn, &workspace, "project", None).unwrap();
+        let workstream = ai_memory_core::WorkstreamId::new();
+        let run_id = ai_memory_core::ManagedRunId::new();
+        conn.execute(
+            "INSERT INTO workstreams \
+             (id, workspace_id, project_id, repo_fingerprint, worktree_fingerprint, name, cwd, \
+              created_at, selected_at, updated_at) \
+             VALUES (?1, ?2, ?3, 'repo', 'tree', 'default', '/repo', 1, 1, 1)",
+            params![
+                workstream.as_bytes(),
+                workspace.as_bytes(),
+                project.as_bytes(),
+            ],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO managed_runs \
+             (id, workstream_id, agent_kind, lease_owner, state, sync_after, sync_through, \
+              context_delivered, lease_expires_at, started_at) \
+             VALUES (?1, ?2, 'codex', 'host:1', 'finished', 3, 7, 1, 10, 1)",
+            params![run_id.as_bytes(), workstream.as_bytes()],
+        )
+        .unwrap();
+
+        run(&mut conn).unwrap();
+
+        let preserved: (String, i64, i64, Option<String>, Option<String>) = conn
+            .query_row(
+                "SELECT agent_kind, sync_after, sync_through, previous_agent_kind, \
+                        previous_native_session_id \
+                 FROM managed_runs WHERE id = ?1",
+                params![run_id.as_bytes()],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(preserved, ("codex".into(), 3, 7, None, None));
+        conn.execute(
+            "UPDATE managed_runs SET previous_agent_kind = 'claude-code', \
+             previous_native_session_id = 'native-1' WHERE id = ?1",
+            params![run_id.as_bytes()],
+        )
+        .unwrap();
+        let previous: (String, String) = conn
+            .query_row(
+                "SELECT previous_agent_kind, previous_native_session_id \
+                 FROM managed_runs WHERE id = ?1",
+                params![run_id.as_bytes()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(previous, ("claude-code".into(), "native-1".into()));
+    }
+
     /// V62 was reshaped in place (#776) from an in-migration backfill to
     /// DDL-only + a boot-path backfill, changing its checksum. A store that
     /// applied the ORIGINAL V62 recorded the old checksum; `run` must still
@@ -1452,34 +1755,34 @@ mod tests {
         );
     }
 
-    /// The fork migration (V81; introduced as V68, then V72) is idempotent: a
-    /// store that applied an earlier numbering already has the
+    /// The fork migration (V84; introduced as V68, then V72, then V81) is
+    /// idempotent: a store that applied an earlier numbering already has the
     /// `consolidation_chunk_progress` table and index, so `run()` must apply
-    /// V81 over the existing objects without failing on `table already
+    /// V84 over the existing objects without failing on `table already
     /// exists`, and the schema it leaves is the same one a fresh migration
     /// produces.
     #[test]
-    fn v81_fork_migration_is_idempotent_over_a_store_that_already_has_the_table() {
+    fn v84_fork_migration_is_idempotent_over_a_store_that_already_has_the_table() {
         let mut conn = Connection::open_in_memory().unwrap();
 
         // A store migrated to just before the fork's migration.
-        run_to(&mut conn, 80).unwrap();
+        run_to(&mut conn, 83).unwrap();
 
         // Simulate an earlier fork numbering having already run: the table
-        // and index exist, but there is no V81 history row. Use the exact
+        // and index exist, but there is no V84 history row. Use the exact
         // same DDL the migration emits so the "already exists" paths are the
         // real ones.
-        let (v81_name, v81_sql) = {
+        let (v84_name, v84_sql) = {
             let runner = migrations::runner();
             let m = runner
                 .get_migrations()
                 .iter()
-                .find(|m| m.version() == 81)
-                .expect("the fork V81 migration must be embedded");
+                .find(|m| m.version() == 84)
+                .expect("the fork V84 migration must be embedded");
             (m.name().to_string(), m.sql().unwrap().to_string())
         };
-        assert_eq!(v81_name, "consolidation_chunk_progress");
-        conn.execute_batch(&v81_sql).unwrap();
+        assert_eq!(v84_name, "consolidation_chunk_progress");
+        conn.execute_batch(&v84_sql).unwrap();
 
         // A row written under the old shape survives.
         conn.execute(
@@ -1488,9 +1791,9 @@ mod tests {
         )
         .unwrap();
 
-        // The new binary's `run()` applies V81 over the existing objects.
+        // The new binary's `run()` applies V84 over the existing objects.
         run(&mut conn)
-            .expect("V81 must apply idempotently over a store that already has the table");
+            .expect("V84 must apply idempotently over a store that already has the table");
 
         // The version is now recorded and the pre-existing row + index survive.
         assert_eq!(
@@ -1513,7 +1816,7 @@ mod tests {
             "the pre-existing row must survive the idempotent re-apply"
         );
         let versions = applied_versions(&conn);
-        assert!(versions.contains(&81), "V81 must be recorded: {versions:?}");
+        assert!(versions.contains(&84), "V84 must be recorded: {versions:?}");
     }
 
     /// The production store of the fork recorded this table as history row
@@ -1522,22 +1825,22 @@ mod tests {
     /// that store opening: refinery treats V72 as applied and skips upstream's
     /// V72 body, and V73 rebuilds `sessions` with the complete CHECK list
     /// (grizzybot included), so nothing is lost. The fork table survives and
-    /// V73..V81 are applied.
+    /// V73..V84 are applied.
     #[test]
     fn a_store_with_the_fork_v72_history_row_migrates_to_the_current_version() {
         let mut conn = Connection::open_in_memory().unwrap();
         run_to(&mut conn, 71).unwrap();
 
-        let v81_sql = {
+        let v84_sql = {
             let runner = migrations::runner();
             let m = runner
                 .get_migrations()
                 .iter()
-                .find(|m| m.version() == 81)
-                .expect("the fork V81 migration must be embedded");
+                .find(|m| m.version() == 84)
+                .expect("the fork V84 migration must be embedded");
             m.sql().unwrap().to_string()
         };
-        conn.execute_batch(&v81_sql).unwrap();
+        conn.execute_batch(&v84_sql).unwrap();
         conn.execute(
             "INSERT INTO refinery_schema_history (version, name, applied_on, checksum)              VALUES (72, 'consolidation_chunk_progress', '2026-09-28T00:00:00Z', '0')",
             [],
@@ -1547,7 +1850,7 @@ mod tests {
         run(&mut conn).expect("a store carrying the fork's V72 row must still open");
 
         let versions = applied_versions(&conn);
-        for version in 72..=81 {
+        for version in 72..=84 {
             assert!(
                 versions.contains(&version),
                 "V{version} must be recorded: {versions:?}"
@@ -1568,5 +1871,67 @@ mod tests {
             sessions_sql.contains("'grizzybot'"),
             "the skipped V72 must not leave sessions without grizzybot: {sessions_sql}"
         );
+    }
+
+    /// The fork's V81-era numbering recorded this table as history row
+    /// `81 consolidation_chunk_progress`, the number upstream 3.1.1 gave to
+    /// `sessions_codebuddy_agent_kind`. The relaxed divergence check keeps
+    /// that store opening: refinery treats V81 as applied and skips
+    /// upstream's V81 body, and V83 rebuilds `sessions` with the complete
+    /// CHECK list (codebuddy and ibm-bob included), so nothing is lost. The
+    /// fork table survives and V82..V84 are applied.
+    #[test]
+    fn a_store_with_the_fork_v81_history_row_migrates_to_the_current_version() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        run_to(&mut conn, 80).unwrap();
+
+        let v84_sql = {
+            let runner = migrations::runner();
+            let m = runner
+                .get_migrations()
+                .iter()
+                .find(|m| m.version() == 84)
+                .expect("the fork V84 migration must be embedded");
+            m.sql().unwrap().to_string()
+        };
+        conn.execute_batch(&v84_sql).unwrap();
+        conn.execute(
+            "INSERT INTO refinery_schema_history (version, name, applied_on, checksum)              VALUES (81, 'consolidation_chunk_progress', '2026-10-15T00:00:00Z', '0')",
+            [],
+        )
+        .unwrap();
+
+        run(&mut conn).expect("a store carrying the fork's V81 row must still open");
+
+        let versions = applied_versions(&conn);
+        for version in 81..=84 {
+            assert!(
+                versions.contains(&version),
+                "V{version} must be recorded: {versions:?}"
+            );
+        }
+        assert_eq!(
+            schema_object_count(&conn, "table", "consolidation_chunk_progress"),
+            1
+        );
+        conn.pragma_update(None, "foreign_keys", "ON").unwrap();
+        let workspace_id = crate::ops::get_or_create_workspace(&mut conn, "default").unwrap();
+        let project_id =
+            crate::ops::get_or_create_project(&mut conn, &workspace_id, "project", None).unwrap();
+        for agent_kind in [AgentKind::CodeBuddy, AgentKind::IbmBob] {
+            crate::ops::begin_session(
+                &mut conn,
+                &NewSession {
+                    occurred_at: None,
+                    id: SessionId::new(),
+                    workspace_id,
+                    project_id,
+                    agent_kind,
+                    cwd: Some("/repo".into()),
+                    actor_user: Some("user:alice".into()),
+                },
+            )
+            .unwrap_or_else(|e| panic!("{agent_kind:?} must be accepted: {e}"));
+        }
     }
 }

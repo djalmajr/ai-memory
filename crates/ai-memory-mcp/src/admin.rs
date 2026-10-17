@@ -62,11 +62,12 @@ use std::pin::Pin;
 use crate::compact_job::CompactJobStatus;
 use ai_memory_consolidate::{
     AutoImproveReviewConfig, AutoImproveTelemetryParams, AutoImproveTelemetryReport, Bootstrap,
-    BootstrapConfig, BootstrapOutcome, BootstrapSource, CuratorParams, CuratorReport,
-    EmbedBackfillCounts, EmbedBackfillOptions, ObservationRetention, SourceCounts,
-    prune_sources_to_budget, render_auto_improve_telemetry_report_markdown,
-    render_curator_report_markdown, run_auto_improve_review, run_auto_improve_telemetry_report,
-    run_curator_report_with_breadth, run_embedding_backfill, run_lint, run_sweep_with_compaction,
+    BootstrapConfig, BootstrapOutcome, BootstrapSource, ColdClusterDedup, CuratorParams,
+    CuratorReport, EmbedBackfillCounts, EmbedBackfillOptions, LedgerRetention,
+    ObservationRetention, SourceCounts, prune_sources_to_budget,
+    render_auto_improve_telemetry_report_markdown, render_curator_report_markdown,
+    run_auto_improve_review, run_auto_improve_telemetry_report, run_curator_report_with_breadth,
+    run_embedding_backfill, run_lint, run_sweep_with_ledgers,
 };
 use ai_memory_core::{
     ActiveProject, AgentKind, AutoImproveProposalId, Capability, DEFAULT_PROJECT_NAME,
@@ -104,6 +105,8 @@ const CONTRIBUTORS_WEBHOOK_NAME: &str = "contributors";
 struct SweepTuning {
     breadth_weight: f64,
     retention: ObservationRetention,
+    /// Opt-in age bound for the hook event ledgers (disabled by default).
+    ledger_retention: LedgerRetention,
     /// A2 opt-in: compact cold episodic pages instead of evicting them.
     compact_cold_episodic: bool,
 }
@@ -326,11 +329,10 @@ struct AutoImproveRequest {
     /// Pending proposal sidecar folder.
     #[serde(default = "default_auto_improve_pending_path")]
     pending_path: String,
-    /// Optional executable proposal eval gate. When omitted, direct admin
-    /// requests inherit the server's configured eval policy; CLI requests send
-    /// their local config explicitly.
+    /// Removed compatibility field. Executable eval policy is server-owned;
+    /// requests that still send this field fail closed.
     #[serde(default)]
-    eval: Option<ai_memory_consolidate::AutoImproveEvalConfig>,
+    eval: Option<serde_json::Value>,
     /// Removed compatibility field. Requests that still send it fail closed so
     /// old preview callers cannot accidentally write pages.
     #[serde(default)]
@@ -629,17 +631,20 @@ pub fn admin_router_with_decay_breadth(state: AdminState, breadth_weight: f64) -
         state,
         breadth_weight,
         ObservationRetention::default(),
+        LedgerRetention::default(),
         false,
     )
 }
 
 /// Build the admin router with every sweep knob that lives outside
-/// `DecayParams`, including the opt-in observation prune (disabled by default)
-/// and A2 extractive tier-down (`compact_cold_episodic`, off by default).
+/// `DecayParams`, including the opt-in observation prune (disabled by default),
+/// the opt-in event ledger age sweep (disabled by default) and A2 extractive
+/// tier-down (`compact_cold_episodic`, off by default).
 pub fn admin_router_with_sweep_tuning(
     state: AdminState,
     breadth_weight: f64,
     retention: ObservationRetention,
+    ledger_retention: LedgerRetention,
     compact_cold_episodic: bool,
 ) -> Router {
     let state = Arc::new(state);
@@ -759,6 +764,7 @@ pub fn admin_router_with_sweep_tuning(
         .layer(axum::Extension(SweepTuning {
             breadth_weight,
             retention,
+            ledger_retention,
             compact_cold_episodic,
         }))
 }
@@ -1711,6 +1717,37 @@ fn default_search_limit() -> usize {
     10
 }
 
+/// One hit of a cross-project `GET /admin/search` (no `workspace`/`project`).
+///
+/// The fields a global hit always carried (`id`, `path`, `title`, `snippet`,
+/// `rank`) plus the workspace and project the page lives in, so a caller can
+/// tell which repository each hit came from. A project-scoped search keeps
+/// returning plain [`ai_memory_store::PageHit`]s.
+#[derive(Debug, Serialize)]
+struct GlobalSearchHit {
+    id: ai_memory_core::PageId,
+    path: ai_memory_core::PagePath,
+    title: String,
+    snippet: String,
+    rank: f64,
+    workspace: String,
+    project: String,
+}
+
+impl From<ai_memory_store::PageHitWithMeta> for GlobalSearchHit {
+    fn from(hit: ai_memory_store::PageHitWithMeta) -> Self {
+        Self {
+            id: hit.id,
+            path: hit.path,
+            title: hit.title,
+            snippet: hit.snippet,
+            rank: hit.rank,
+            workspace: hit.workspace_name,
+            project: hit.project_name,
+        }
+    }
+}
+
 async fn handle_search(
     State(state): State<Arc<AdminState>>,
     Query(query): Query<SearchQuery>,
@@ -1722,12 +1759,11 @@ async fn handle_search(
     ) {
         (Some(workspace), Some(project)) => {
             match lookup_ws_proj_no_create(&state, workspace, project).await {
-                Ok((ws, proj)) => {
-                    state
-                        .reader
-                        .search_pages_for_project(ws, proj, query.q, limit, None)
-                        .await
-                }
+                Ok((ws, proj)) => state
+                    .reader
+                    .search_pages_for_project(ws, proj, query.q, limit, None)
+                    .await
+                    .and_then(|hits| Ok(serde_json::to_value(&hits)?)),
                 Err(e) => return e,
             }
         }
@@ -1739,13 +1775,26 @@ async fn handle_search(
                 })),
             );
         }
-        _ => state.reader.search_pages(query.q, limit, OPERATOR).await,
+        // Cross-project: every hit names its repository. `OPERATOR` reads
+        // every project because this route is root-only once the deployment
+        // distinguishes operators (`require_root_for_multiuser_admin`).
+        _ => state
+            .reader
+            .search_pages_with_meta(
+                query.q,
+                limit,
+                None,
+                OPERATOR,
+                ai_memory_store::PageFilter::default(),
+            )
+            .await
+            .and_then(|hits| {
+                let hits: Vec<GlobalSearchHit> = hits.into_iter().map(Into::into).collect();
+                Ok(serde_json::to_value(&hits)?)
+            }),
     };
     match search_result {
-        Ok(hits) => (
-            StatusCode::OK,
-            Json(serde_json::to_value(&hits).unwrap_or_else(|_| serde_json::json!([]))),
-        ),
+        Ok(hits) => (StatusCode::OK, Json(hits)),
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(serde_json::json!({ "error": e.to_string() })),
@@ -1788,6 +1837,10 @@ struct ReadPageResponse {
     frontmatter: serde_json::Value,
     #[serde(skip_serializing_if = "Option::is_none")]
     served_from: Option<&'static str>,
+    /// Set when the page's `expires_at` TTL has passed: an exact-path read
+    /// still serves the page, which search no longer lists.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    expired: bool,
 }
 
 async fn handle_read_page(
@@ -1848,6 +1901,18 @@ async fn handle_read_page(
         );
     };
 
+    // An expired page is still served (a read is not a search) but says so:
+    // search and the listings leave it out, so this flag is how the caller
+    // learns the page is only waiting for the forget sweep. Omitted while live.
+    let expired = match state
+        .reader
+        .page_expired_by_ids(ws, proj, page_path.as_str())
+        .await
+    {
+        Ok(expired) => expired.unwrap_or(false),
+        Err(e) => return internal_err(e.to_string()),
+    };
+
     match state.wiki.read_page(ws, proj, &page_path) {
         Ok(md) => {
             let title = md
@@ -1863,6 +1928,7 @@ async fn handle_read_page(
                 body: md.body,
                 frontmatter: md.frontmatter,
                 served_from: None,
+                expired,
             };
             (
                 StatusCode::OK,
@@ -1892,6 +1958,7 @@ async fn handle_read_page(
                     body: stored.body,
                     frontmatter,
                     served_from: Some("db-fallback"),
+                    expired,
                 };
                 (
                     StatusCode::OK,
@@ -2343,6 +2410,14 @@ async fn handle_auto_improve(
     headers: HeaderMap,
     Json(req): Json<AutoImproveRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<serde_json::Value>)> {
+    if req.eval.is_some() {
+        return Err((
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(serde_json::json!({
+                "error": "auto-improve eval request field was removed; configure [auto_improve.eval] on the server"
+            })),
+        ));
+    }
     if req.dry_run.is_some() || req.stage.is_some() || req.mode.is_some() {
         return Err((
             StatusCode::UNPROCESSABLE_ENTITY,
@@ -2389,10 +2464,7 @@ async fn handle_auto_improve(
         max_final_body_chars: req.max_final_body_chars,
         max_rule_page_tokens: req.max_rule_page_tokens,
         max_procedure_page_tokens: req.max_procedure_page_tokens,
-        eval: req
-            .eval
-            .clone()
-            .unwrap_or_else(|| state.auto_improve_review_config.eval.clone()),
+        eval: state.auto_improve_review_config.eval.clone(),
     };
 
     let report =
@@ -3937,7 +4009,7 @@ async fn handle_forget_sweep(
 ) -> Result<impl IntoResponse, (StatusCode, Json<serde_json::Value>)> {
     let (ws, proj) = lookup_ws_proj_no_create(&state, &req.workspace, &req.project).await?;
 
-    run_sweep_with_compaction(
+    run_sweep_with_ledgers(
         &state.reader,
         &state.writer,
         Some(&state.wiki),
@@ -3947,6 +4019,8 @@ async fn handle_forget_sweep(
         tuning.breadth_weight,
         tuning.retention,
         tuning.compact_cold_episodic,
+        ColdClusterDedup::default(),
+        tuning.ledger_retention,
         req.dry_run,
     )
     .await
@@ -11749,7 +11823,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn auto_improve_admin_omitted_eval_inherits_server_defaults() {
+    async fn auto_improve_admin_refuses_request_eval_and_inherits_server_defaults() {
         let tmp = TempDir::new().unwrap();
         let store = Store::open(tmp.path()).unwrap();
         let wiki = Wiki::new(tmp.path(), store.writer.clone())
@@ -11808,6 +11882,44 @@ mod tests {
             min_delta: 0.0,
         };
         let router = admin_router(state);
+
+        let rejected = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/admin/auto-improve")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&serde_json::json!({
+                            "workspace": "default",
+                            "project": "scratch",
+                            "session_id": session_id.to_string(),
+                            "min_observations": 1,
+                            "min_session_duration_secs": 0,
+                            "min_confidence": 0.75,
+                            "max_proposals_per_run": 5,
+                            "eval": {
+                                "enabled": true,
+                                "command": tmp.path().join("request-controlled-program").display().to_string(),
+                                "timeout_secs": 1,
+                                "targets": ["notes"],
+                                "min_delta": 0.0
+                            }
+                        }))
+                        .unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(rejected.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        let body = to_bytes(rejected.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            json["error"],
+            "auto-improve eval request field was removed; configure [auto_improve.eval] on the server"
+        );
 
         let resp = router
             .oneshot(

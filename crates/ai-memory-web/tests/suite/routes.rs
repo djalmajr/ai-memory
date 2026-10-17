@@ -367,6 +367,46 @@ async fn web_page_view_renders_author_chip_for_attributed_pages() {
 }
 
 #[tokio::test]
+async fn web_page_view_marks_an_expired_page() {
+    let (_tmp, store, wiki) = setup().await;
+    let ws = store
+        .writer
+        .get_or_create_workspace("default")
+        .await
+        .unwrap();
+    let proj = store
+        .writer
+        .get_or_create_project(ws, "scratch", None)
+        .await
+        .unwrap();
+    for (path, expires_at) in [
+        ("notes/dated.md", "2000-01-01"),
+        ("notes/later.md", "2999-01-01"),
+    ] {
+        let mut request = wiki_req(ws, proj, path, "# Dated Note\n\nSame body.");
+        request.frontmatter = serde_json::json!({"kind": "fact", "expires_at": expires_at});
+        wiki.write_page(request).await.unwrap();
+    }
+    let app = router(store.reader.clone(), wiki.clone());
+
+    // The page still opens by its URL; the badge says what every listing
+    // already leaves out.
+    let (status, dated) = get_body(&app, "/w/default/scratch/p/notes/dated.md").await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        dated.contains("Dated Note") && dated.contains("expired"),
+        "{dated}"
+    );
+    // A TTL still ahead shows no badge.
+    let (status, later) = get_body(&app, "/w/default/scratch/p/notes/later.md").await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        later.contains("Dated Note") && !later.contains("expired"),
+        "{later}"
+    );
+}
+
+#[tokio::test]
 async fn web_page_view_created_is_the_first_versions_date() {
     let (tmp, store, wiki) = setup().await;
     let ws = store
@@ -5048,6 +5088,134 @@ async fn page_sidebar_shows_links_and_hides_superseded_and_expired_neighbours() 
     assert!(source.contains("No page links here yet."), "{source}");
     // Under two headings, no outline.
     assert!(!source.contains("On this page"), "{source}");
+}
+
+/// Seed a live page, one whose TTL passed and one whose TTL is still ahead,
+/// all under `notes/`.
+async fn seed_expiry_mix(
+    wiki: &Wiki,
+    ws: ai_memory_core::WorkspaceId,
+    proj: ai_memory_core::ProjectId,
+) {
+    wiki.write_page(wiki_req(
+        ws,
+        proj,
+        "notes/live.md",
+        "# Live Note\n\nStill current.",
+    ))
+    .await
+    .unwrap();
+    for (path, body, expires_at) in [
+        (
+            "notes/expired.md",
+            "# Expired Note\n\nPast its date.",
+            "2000-01-01",
+        ),
+        ("notes/future.md", "# Future Note\n\nNot yet.", "2999-01-01"),
+    ] {
+        let mut request = wiki_req(ws, proj, path, body);
+        request.frontmatter = serde_json::json!({"kind": "fact", "expires_at": expires_at});
+        wiki.write_page(request).await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn project_tree_and_namespace_listing_hide_expired_pages() {
+    let (_tmp, store, wiki) = setup().await;
+    let ws = store
+        .writer
+        .get_or_create_workspace("default")
+        .await
+        .unwrap();
+    let proj = store
+        .writer
+        .get_or_create_project(ws, "scratch", None)
+        .await
+        .unwrap();
+    seed_expiry_mix(&wiki, ws, proj).await;
+    let mut only_expired = wiki_req(ws, proj, "gone/only.md", "# Only Gone\n\nPast its date.");
+    only_expired.frontmatter = serde_json::json!({"kind": "fact", "expires_at": "2000-01-01"});
+    wiki.write_page(only_expired).await.unwrap();
+    let app = router(store.reader.clone(), wiki.clone());
+
+    // The sidebar tree and the recent list: a TTL still ahead is kept.
+    let (status, project) = get_body(&app, "/w/default/scratch").await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        project.contains("Live Note") && project.contains("Future Note"),
+        "{project}"
+    );
+    assert!(!project.contains("Expired Note"), "{project}");
+    assert!(!project.contains("Only Gone"), "{project}");
+
+    let (status, namespace) = get_body(&app, "/w/default/scratch/p/notes/").await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        namespace.contains("Live Note") && namespace.contains("Future Note"),
+        "{namespace}"
+    );
+    assert!(!namespace.contains("Expired Note"), "{namespace}");
+    // A namespace left with no unexpired page lists nothing, like an empty one.
+    let (status, _) = get_body(&app, "/w/default/scratch/p/gone/").await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+
+    // An exact-path read is not a listing: the expired page still opens.
+    let (status, page) = get_body(&app, "/w/default/scratch/p/notes/expired.md").await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(page.contains("Expired Note"), "{page}");
+}
+
+#[tokio::test]
+async fn api_page_lists_hide_expired_pages_like_the_incremental_recent_form() {
+    let (_tmp, store, wiki) = setup().await;
+    let ws = store
+        .writer
+        .get_or_create_workspace("default")
+        .await
+        .unwrap();
+    let proj = store
+        .writer
+        .get_or_create_project(ws, "scratch", None)
+        .await
+        .unwrap();
+    seed_expiry_mix(&wiki, ws, proj).await;
+    let app = api_router(store.reader.clone(), wiki.clone());
+
+    let paths = |pages: &Value| -> Vec<String> {
+        pages
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|page| page["path"].as_str().unwrap().to_owned())
+            .collect()
+    };
+    let base = "/workspaces/default/projects/scratch";
+    let (status, pages) = get_body(&app, &format!("{base}/pages")).await;
+    assert_eq!(status, StatusCode::OK);
+    let listed = paths(&serde_json::from_str::<Value>(&pages).unwrap());
+    assert_eq!(listed, ["notes/future.md", "notes/live.md"], "{pages}");
+
+    // Both forms of the recent endpoint agree: the legacy array and the
+    // incremental object list the same pages.
+    let (status, legacy) = get_body(&app, &format!("{base}/recent?limit=10")).await;
+    assert_eq!(status, StatusCode::OK);
+    let mut legacy = paths(&serde_json::from_str::<Value>(&legacy).unwrap());
+    legacy.sort();
+    assert_eq!(legacy, ["notes/future.md", "notes/live.md"]);
+    let (status, incremental) = get_body(
+        &app,
+        &format!("{base}/recent?updated_since=1970-01-01T00:00:00Z&limit=10"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let incremental: Value = serde_json::from_str(&incremental).unwrap();
+    let mut incremental = paths(&incremental["pages"]);
+    incremental.sort();
+    assert_eq!(incremental, legacy);
+
+    // The single-page read keeps answering for the expired page.
+    let (status, _) = get_body(&app, &format!("{base}/pages/notes/expired.md")).await;
+    assert_eq!(status, StatusCode::OK);
 }
 
 #[tokio::test]

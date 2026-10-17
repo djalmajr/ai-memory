@@ -88,15 +88,17 @@ pub use reader::{
     ContaminationFinding, ContaminationReport, ContaminationSummary, ContradictionEdge,
     DecayCandidate, DecayTombstone, DerivedIndexStatus, EmbeddingTripleCount, FeedbackFinding,
     GraphVia, HealthDetail, HealthPage, HybridSearch, InboxCount, InboxEntry, ObservationHit,
-    ObservationOrder, ObservationPage, ObservationPageResult, ObservationRecord, OpenSession,
-    PAGE_VERSIONS_MAX_LIMIT, PageAuthor, PageHit, PageHitWithMeta, PageLinks, PageLinksPreview,
-    PageMeta, PageSummary, PageVersion, PageVersionBody, PageVersions,
-    ProjectCoordinateCollisionReason, ProjectCoordinateDiagnostic, ProjectCoordinateStatus,
-    ProjectSummary, RELATED_WALK_MAX_DEPTH, RELATED_WALK_MAX_NODES, ReaderPool,
-    ReindexTargetStatus, RelatedNode, RelatedPage, RrfContributions, ScopeRow, SearchExplain,
+    ObservationOrder, ObservationPage, ObservationPageResult, ObservationProjectionTotals,
+    ObservationRecord, OpenSession, PAGE_KINDS, PAGE_VERSIONS_MAX_LIMIT, PageAuthor, PageFilter,
+    PageHit, PageHitWithMeta, PageLinks, PageLinksPreview, PageMeta, PageSummary, PageVersion,
+    PageVersionBody, PageVersions, ProjectCoordinateCollisionReason, ProjectCoordinateDiagnostic,
+    ProjectCoordinateStatus, ProjectSummary, RELATED_WALK_MAX_DEPTH, RELATED_WALK_MAX_NODES,
+    ReaderPool, ReindexTargetStatus, RelatedNode, RelatedPage, RrfContributions,
+    SESSION_LINE_TITLE_CHARS, SUBSTANTIVE_OBSERVATION_KIND_SQL, ScopeRow, SearchExplain,
     SessionConsolidationQueue, SessionConsolidationSummary, SessionDependentRows,
-    SessionEndDisposition, SessionSummary, SettledPage, StatusCounts, StorageStatus,
-    StoredEmbedding, StoredPageBody, StreamTimings, VectorQuery, WorkspaceScopeRow,
+    SessionEndDisposition, SessionKindSummary, SessionLine, SessionObservationSnapshot,
+    SessionPromptTitles, SessionSummary, SessionToolTitles, SettledPage, StatusCounts,
+    StorageStatus, StoredEmbedding, StoredPageBody, StreamTimings, VectorQuery, WorkspaceScopeRow,
     WorkspaceSummary, f32_vec_to_bytes,
 };
 pub use retrieval_tuning::{RetrievalTuning, is_session_recall_query};
@@ -1039,6 +1041,7 @@ mod tests {
                 project_id: proj,
                 proposal_id: id,
                 reason: "admission denied".into(),
+                record_rejection: true,
                 actor: actor.clone(),
                 author_id: None,
             })
@@ -1068,12 +1071,70 @@ mod tests {
                     project_id: proj,
                     proposal_id: id,
                     reason: "again".into(),
+                    record_rejection: true,
                     actor,
                     author_id: None,
                 })
                 .await
                 .is_err()
         );
+    }
+
+    #[tokio::test]
+    async fn auto_improve_fail_without_rejection_leaves_rejections_empty() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let ws = store
+            .writer
+            .get_or_create_workspace("default")
+            .await
+            .unwrap();
+        let proj = store
+            .writer
+            .get_or_create_project(ws, "app", None)
+            .await
+            .unwrap();
+        let id = store
+            .writer
+            .stage_auto_improve_run(stage_input(
+                ws,
+                proj,
+                vec![proposal(
+                    "notes/outage.md",
+                    AutoImproveProposalOperation::Create,
+                    "outage",
+                )],
+            ))
+            .await
+            .unwrap()
+            .proposal_ids[0];
+        store
+            .writer
+            .fail_auto_improve_proposal(FailAutoImproveProposal {
+                workspace_id: ws,
+                project_id: proj,
+                proposal_id: id,
+                reason: "admission webhook policy request failed".into(),
+                record_rejection: false,
+                actor: ActorContext::default(),
+                author_id: None,
+            })
+            .await
+            .unwrap();
+        let detail = store
+            .reader
+            .auto_improve_proposal_detail(ws, proj, id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(detail.summary.status, AutoImproveProposalStatus::Failed);
+        assert_eq!(detail.events.last().unwrap().event, "failed");
+        let rejections = store
+            .reader
+            .recent_auto_improve_rejections(ws, proj, 10, None)
+            .await
+            .unwrap();
+        assert!(rejections.is_empty(), "{rejections:?}");
     }
 
     #[tokio::test]
@@ -1198,6 +1259,7 @@ mod tests {
                 project_id: proj,
                 proposal_id: failed_id,
                 reason: "admission denied".into(),
+                record_rejection: true,
                 actor: actor.clone(),
                 author_id: None,
             })
@@ -1956,6 +2018,47 @@ mod tests {
         );
     }
 
+    /// The brief's L0/L1 excerpts come from the frontmatter the core rows
+    /// carry, A2-compacted pages included.
+    #[tokio::test]
+    async fn session_brief_pages_carry_frontmatter() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let ws = store
+            .writer
+            .get_or_create_workspace("default")
+            .await
+            .unwrap();
+        let proj = store
+            .writer
+            .get_or_create_project(ws, "app", None)
+            .await
+            .unwrap();
+
+        let mut summarized = sample_page(ws, proj, "_rules/a-summarized.md", "full body");
+        summarized.frontmatter_json =
+            serde_json::json!({"abstract": "one-line pointer", "summary": "longer summary"});
+        store.writer.upsert_page(summarized).await.unwrap();
+        let mut compacted = sample_page(ws, proj, "_rules/b-compacted.md", "L1 line");
+        compacted.frontmatter_json = serde_json::json!({"compacted": true});
+        store.writer.upsert_page(compacted).await.unwrap();
+
+        let (core, _) = store
+            .reader
+            .session_brief_pages(ws, proj, 24, 10)
+            .await
+            .unwrap();
+        let by_path = |path: &str| core.iter().find(|p| p.path == path).unwrap();
+
+        let summarized = by_path("_rules/a-summarized.md");
+        assert_eq!(summarized.frontmatter_json["abstract"], "one-line pointer");
+        assert_eq!(summarized.frontmatter_json["summary"], "longer summary");
+        assert_eq!(
+            by_path("_rules/b-compacted.md").frontmatter_json["compacted"],
+            true
+        );
+    }
+
     #[tokio::test]
     async fn cross_project_links_surface_in_graph_briefing_and_lint() {
         let tmp = TempDir::new().unwrap();
@@ -2476,7 +2579,7 @@ mod tests {
 
         let global = store
             .reader
-            .search_pages_with_meta(query.into(), 10, None, None)
+            .search_pages_with_meta(query.into(), 10, None, None, crate::PageFilter::default())
             .await
             .unwrap();
         assert_eq!(global[0].path.as_str(), "decisions/embedding-policy.md");
@@ -4899,6 +5002,55 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn reader_list_unexpired_pages_hides_only_the_expired_ones() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let ws = store
+            .writer
+            .get_or_create_workspace("default")
+            .await
+            .unwrap();
+        let proj = store
+            .writer
+            .get_or_create_project(ws, "scratch", None)
+            .await
+            .unwrap();
+        let now = jiff::Timestamp::now().as_second();
+        let at = |seconds: i64| Some(jiff::Timestamp::from_second(seconds).unwrap());
+        for (path, expires_at) in [
+            ("expired.md", at(now - 60)),
+            ("future.md", at(now + 3_600)),
+            ("live.md", None),
+        ] {
+            let mut page = sample_page(ws, proj, path, "body");
+            page.expires_at = expires_at;
+            store.writer.upsert_page(page).await.unwrap();
+        }
+
+        let paths = |pages: Vec<PageSummary>| -> Vec<String> {
+            pages.into_iter().map(|p| p.path).collect()
+        };
+        // The full listing keeps the expired page for the callers that
+        // copy or audit every current page.
+        assert_eq!(
+            paths(store.reader.list_pages("default", "scratch").await.unwrap()),
+            ["expired.md", "future.md", "live.md"]
+        );
+        // The reader-facing listing drops it, and only it: a TTL still
+        // ahead and no TTL at all both stay.
+        assert_eq!(
+            paths(
+                store
+                    .reader
+                    .list_unexpired_pages("default", "scratch")
+                    .await
+                    .unwrap()
+            ),
+            ["future.md", "live.md"]
+        );
+    }
+
+    #[tokio::test]
     async fn reader_page_kinds_follow_canonical_paths_across_surfaces() {
         const CASES: [(&str, &str); 9] = [
             ("_rules/rule.md", "rule"),
@@ -5901,10 +6053,68 @@ mod tests {
             .await
             .unwrap();
         assert!(codex.native_session_id.is_none());
+        assert_eq!(
+            codex.previous_native_session,
+            Some(ai_memory_core::ManagedNativeSessionReference {
+                agent: AgentKind::ClaudeCode,
+                native_session_id: "claude-native".into(),
+            })
+        );
         assert!(
             !codex.may_adopt_existing_session,
             "an established Claude workstream must start a fresh Codex session"
         );
+        assert!(
+            store
+                .writer
+                .link_managed_run_session(codex.run_id, AgentKind::Codex, "codex-native")
+                .await
+                .unwrap()
+        );
+        assert_eq!(
+            store
+                .reader
+                .managed_run_context(codex.run_id, 1)
+                .await
+                .unwrap()
+                .unwrap()
+                .previous_native_session,
+            Some(ai_memory_core::ManagedNativeSessionReference {
+                agent: AgentKind::ClaudeCode,
+                native_session_id: "claude-native".into(),
+            }),
+            "linking the destination must not replace the pinned source"
+        );
+        store
+            .writer
+            .finish_workstream_run(
+                ManagedRunAuthority::from_auth(
+                    ai_memory_core::AuthLevel::Anonymous,
+                    None,
+                    None,
+                    &ai_memory_core::ActorContext::anonymous(),
+                    false,
+                ),
+                FinishWorkstreamRun {
+                    sanitizer: ai_memory_core::Sanitizer::default(),
+                    run_id: codex.run_id,
+                    native_session_id: Some("codex-native".into()),
+                    source_cursor: None,
+                    events: Vec::new(),
+                    complete: true,
+                    segment_path: None,
+                    exit_code: Some(0),
+                },
+            )
+            .await
+            .unwrap();
+
+        let same_harness = store
+            .writer
+            .prepare_workstream_run(prepare(AgentKind::Codex, "codex-again"))
+            .await
+            .unwrap();
+        assert!(same_harness.previous_native_session.is_none());
     }
 
     #[tokio::test]

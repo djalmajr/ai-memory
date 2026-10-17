@@ -386,7 +386,7 @@ fn is_response_format_rejection(err: &LlmError) -> bool {
 /// either truncates the object early or never closes it. This
 /// version tracks whether we're inside a `"..."` literal and
 /// honours backslash escapes the JSON spec defines.
-fn first_json_object(s: &str) -> Option<&str> {
+pub(crate) fn first_json_object(s: &str) -> Option<&str> {
     let start = s.find('{')?;
     let mut depth = 0_i32;
     let mut in_string = false;

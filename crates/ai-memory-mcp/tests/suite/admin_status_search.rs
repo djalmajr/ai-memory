@@ -47,14 +47,25 @@ async fn make_admin_state(tmp: &TempDir) -> (AdminState, Store) {
 }
 
 async fn seed_page(store: &Store, title: &str, path: &str, body: &str) {
+    seed_page_in(store, "default", "scratch", title, path, body).await;
+}
+
+async fn seed_page_in(
+    store: &Store,
+    workspace: &str,
+    project: &str,
+    title: &str,
+    path: &str,
+    body: &str,
+) -> ai_memory_core::ProjectId {
     let ws = store
         .writer
-        .get_or_create_workspace("default".to_string())
+        .get_or_create_workspace(workspace.to_string())
         .await
         .unwrap();
     let proj = store
         .writer
-        .get_or_create_project(ws, "scratch".to_string(), None)
+        .get_or_create_project(ws, project.to_string(), None)
         .await
         .unwrap();
     let page = NewPage {
@@ -73,6 +84,7 @@ async fn seed_page(store: &Store, title: &str, path: &str, body: &str) {
         evidence: Vec::new(),
     };
     store.writer.upsert_page(page).await.unwrap();
+    proj
 }
 
 async fn body_bytes(resp: axum::response::Response) -> Vec<u8> {
@@ -539,6 +551,175 @@ async fn search_returns_matching_hits() {
     assert_eq!(hits.len(), 1, "only the storage page mentions sqlite");
     assert_eq!(hits[0]["path"].as_str().unwrap(), "concepts/storage.md");
     assert_eq!(hits[0]["title"].as_str().unwrap(), "Storage architecture");
+}
+
+async fn get(app: axum::Router, uri: &str, level: Option<&str>) -> (StatusCode, Vec<u8>) {
+    let mut request = Request::builder().uri(uri);
+    if let Some(level) = level {
+        request = request.header("x-level", level);
+    }
+    let response = app
+        .oneshot(request.body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    (response.status(), body_bytes(response).await)
+}
+
+/// A search with no scope (`ai-memory search --global`, #1253) covers every
+/// project and says where each hit lives; a scoped search is unchanged.
+#[tokio::test]
+async fn global_search_tags_each_hit_with_its_workspace_and_project() {
+    let tmp = TempDir::new().unwrap();
+    let (state, store) = make_admin_state(&tmp).await;
+    seed_page_in(
+        &store,
+        "default",
+        "alpha",
+        "Alpha notes",
+        "notes/alpha.md",
+        "zephyrine storage notes for alpha",
+    )
+    .await;
+    seed_page_in(
+        &store,
+        "acme",
+        "beta",
+        "Beta notes",
+        "notes/beta.md",
+        "zephyrine storage notes for beta",
+    )
+    .await;
+    let app = admin_router(state);
+
+    let (status, body) = get(app.clone(), "/admin/search?q=zephyrine", None).await;
+    assert_eq!(status, StatusCode::OK);
+    let hits: Vec<serde_json::Value> = serde_json::from_slice(&body).unwrap();
+    let mut tagged: Vec<(String, String, String)> = hits
+        .iter()
+        .map(|hit| {
+            assert!(hit["id"].is_string(), "global hits keep their id: {hit}");
+            assert!(hit["title"].is_string() && hit["snippet"].is_string());
+            assert!(hit["rank"].is_number());
+            (
+                hit["workspace"].as_str().unwrap().to_owned(),
+                hit["project"].as_str().unwrap().to_owned(),
+                hit["path"].as_str().unwrap().to_owned(),
+            )
+        })
+        .collect();
+    tagged.sort();
+    assert_eq!(
+        tagged,
+        [
+            ("acme".into(), "beta".into(), "notes/beta.md".into()),
+            ("default".into(), "alpha".into(), "notes/alpha.md".into()),
+        ]
+    );
+
+    let (status, body) = get(
+        app,
+        "/admin/search?q=zephyrine&workspace=acme&project=beta",
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let hits: Vec<serde_json::Value> = serde_json::from_slice(&body).unwrap();
+    assert_eq!(hits.len(), 1, "a scoped search stays in its project");
+    assert_eq!(hits[0]["path"], "notes/beta.md");
+    assert!(hits[0].get("workspace").is_none() && hits[0].get("project").is_none());
+}
+
+/// The global search reads every project as the operator, so it must stay
+/// behind the root-only admin gate once the deployment distinguishes
+/// operators: a DB user or proxy-asserted user who could reach it would read a
+/// restricted project they hold no grant on. Root (the control) still sees it.
+#[tokio::test]
+async fn global_search_never_reaches_a_non_root_caller() {
+    for trusted_proxy in [false, true] {
+        let tmp = TempDir::new().unwrap();
+        let (mut state, store) = make_admin_state(&tmp).await;
+        state.trusted_proxy_identity = trusted_proxy;
+        seed_page_in(
+            &store,
+            "default",
+            "open",
+            "Open notes",
+            "notes/open.md",
+            "zephyrine open notes",
+        )
+        .await;
+        let secret = seed_page_in(
+            &store,
+            "default",
+            "secret",
+            "Secret notes",
+            "notes/secret-sentinel.md",
+            "zephyrine restricted notes",
+        )
+        .await;
+        store
+            .writer
+            .set_access_mode(secret, AccessMode::Restricted)
+            .await
+            .unwrap();
+        if !trusted_proxy {
+            // A DB user exists (no grant on `secret`): the store-level
+            // multi-user switch. The proxy case has no `users` rows at all.
+            store
+                .writer
+                .create_human_user(
+                    NewUser {
+                        username: "alice".into(),
+                        name: None,
+                        email: None,
+                    },
+                    ai_memory_core::UserRole::User,
+                    None,
+                    false,
+                )
+                .await
+                .unwrap();
+        }
+        let app = admin_router(state).layer(axum::middleware::from_fn(
+            |mut request: Request<Body>, next: axum::middleware::Next| async move {
+                let level = match request
+                    .headers()
+                    .get("x-level")
+                    .and_then(|value| value.to_str().ok())
+                {
+                    Some("root") => AuthLevel::Root,
+                    Some("user") => AuthLevel::User,
+                    _ => AuthLevel::Anonymous,
+                };
+                request.extensions_mut().insert(level);
+                request.extensions_mut().insert(ActorContext::anonymous());
+                next.run(request).await
+            },
+        ));
+
+        for (level, expected) in [
+            (Some("user"), StatusCode::FORBIDDEN),
+            (None, StatusCode::UNAUTHORIZED),
+        ] {
+            let (status, body) = get(app.clone(), "/admin/search?q=zephyrine", level).await;
+            assert_eq!(status, expected, "proxy={trusted_proxy} level={level:?}");
+            let body = String::from_utf8_lossy(&body);
+            assert!(
+                !body.contains("secret-sentinel") && !body.contains("zephyrine"),
+                "proxy={trusted_proxy} level={level:?} leaked a hit: {body}"
+            );
+        }
+
+        let (status, body) = get(app, "/admin/search?q=zephyrine", Some("root")).await;
+        assert_eq!(status, StatusCode::OK, "proxy={trusted_proxy}");
+        let hits: Vec<serde_json::Value> = serde_json::from_slice(&body).unwrap();
+        let mut projects: Vec<&str> = hits
+            .iter()
+            .map(|hit| hit["project"].as_str().unwrap())
+            .collect();
+        projects.sort_unstable();
+        assert_eq!(projects, ["open", "secret"], "proxy={trusted_proxy}");
+    }
 }
 
 #[tokio::test]

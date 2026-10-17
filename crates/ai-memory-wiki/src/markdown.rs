@@ -157,7 +157,11 @@ impl CodeFence {
     /// Returns `(updated_fence_state, line_is_code_or_fence)`.
     fn step(current: Option<Self>, line: &str) -> (Option<Self>, bool) {
         let in_fence = current.is_some();
-        let trimmed = line.trim_start();
+        let leading_spaces = line.as_bytes().iter().take_while(|&&b| b == b' ').count();
+        if leading_spaces > 3 {
+            return (current, in_fence);
+        }
+        let trimmed = &line[leading_spaces..];
         let glyph = match trimmed.chars().next() {
             Some(c @ ('`' | '~')) => c,
             _ => return (current, in_fence),
@@ -1839,6 +1843,58 @@ mod tests {
         let links4 = extract_links(md4, &path);
         assert_eq!(links4.len(), 1);
         assert_eq!(links4[0].path.as_str(), "outside.md");
+    }
+
+    #[test]
+    fn indented_pseudo_closers_do_not_expose_or_rewrite_fenced_links() {
+        let page = PagePath::new("concepts/a.md").unwrap();
+        let delink = BTreeSet::from([
+            (
+                None,
+                Some("infra".to_string()),
+                "runbooks/hidden.md".to_string(),
+            ),
+            (
+                None,
+                Some("infra".to_string()),
+                "runbooks/visible.md".to_string(),
+            ),
+        ]);
+
+        for prefix in ["    ", "\t", "\u{2003}"] {
+            let body = format!(
+                "````md\n{prefix}````\n[[decisions/hidden.md]]\n\
+                 [[infra:runbooks/hidden.md]]\n````\n[[decisions/visible.md]]\n\
+                 [[infra:runbooks/visible.md]]\n"
+            );
+            let links = extract_links(&body, &page);
+            let paths: Vec<&str> = links.iter().map(|link| link.path.as_str()).collect();
+            assert_eq!(
+                paths,
+                ["decisions/visible.md", "runbooks/visible.md"],
+                "prefix {prefix:?}"
+            );
+
+            let rewritten = rewrite_local_wikilinks(&body, &page, "proj");
+            assert!(
+                rewritten.contains("[[decisions/hidden.md]]"),
+                "prefix {prefix:?}: {rewritten}"
+            );
+            assert!(
+                rewritten.contains("[decisions/visible.md](../decisions/visible.md)"),
+                "prefix {prefix:?}: {rewritten}"
+            );
+
+            let delinked = delink_wikilinks(&body, &page, &delink);
+            assert!(
+                delinked.contains("[[infra:runbooks/hidden.md]]"),
+                "prefix {prefix:?}: {delinked}"
+            );
+            assert!(
+                delinked.contains("\ninfra:runbooks/visible.md\n"),
+                "prefix {prefix:?}: {delinked}"
+            );
+        }
     }
 
     #[test]
