@@ -16733,6 +16733,35 @@ pub(crate) mod tests {
         );
     }
 
+    /// `title:` must still filter on the title column when its term has
+    /// punctuation and has to be quoted.
+    #[test]
+    fn title_filter_on_punctuated_term_searches_only_titles() {
+        let (_tmp, mut conn, ws, proj) = fresh_db();
+        upsert_page(
+            &mut conn,
+            &NewPage {
+                title: "ai-memory handoff".into(),
+                ..page(ws, proj, "notes/titled.md", "unrelated body")
+            },
+        )
+        .unwrap();
+        upsert_page(
+            &mut conn,
+            &page(
+                ws,
+                proj,
+                "notes/mention.md",
+                "a body that mentions ai-memory",
+            ),
+        )
+        .unwrap();
+
+        let hits = fts_match_paths(&conn, "title:ai-memory")
+            .expect("column-filtered search must not raise an FTS5 syntax error");
+        assert_eq!(hits, vec!["notes/titled.md".to_string()]);
+    }
+
     /// Regression for the live-found hyphen bug: searching `ui-refresh`
     /// returned nothing in prod even though
     /// `follow-ups/ui-refresh-scroll-restoration.md` exists. The first fix
@@ -16780,6 +16809,32 @@ pub(crate) mod tests {
             "kept-hyphen phrase must not match"
         );
         assert_eq!(count("\"ui refresh\""), 1, "sub-token phrase must match");
+    }
+
+    /// A prefix search on a hyphenated term (`ai-mem*`) must still be a
+    /// prefix search once the token is quoted for its punctuation, and match
+    /// both the content token `ai-memory` and the split path index.
+    #[test]
+    fn prefix_search_on_punctuated_term_matches_content_and_path() {
+        let (_tmp, mut conn, ws, proj) = fresh_db();
+        upsert_page(
+            &mut conn,
+            &page(ws, proj, "notes/content.md", "we ship ai-memory today"),
+        )
+        .unwrap();
+        upsert_page(
+            &mut conn,
+            &page(ws, proj, "follow-ups/ui-refresh-scroll.md", "body text"),
+        )
+        .unwrap();
+
+        let hits = fts_match_paths(&conn, "ai-mem*")
+            .expect("prefix search must not raise an FTS5 syntax error");
+        assert_eq!(hits, vec!["notes/content.md".to_string()]);
+
+        let hits = fts_match_paths(&conn, "ui-ref*")
+            .expect("prefix search must not raise an FTS5 syntax error");
+        assert_eq!(hits, vec!["follow-ups/ui-refresh-scroll.md".to_string()]);
     }
 
     /// Issue #103 legacy heal: the two broad sentinels ($HOME and `/`) are

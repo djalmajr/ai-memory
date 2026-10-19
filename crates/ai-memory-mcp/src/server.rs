@@ -2641,8 +2641,11 @@ impl AiMemoryServer {
         self
     }
 
-    /// Attach the wiki handle. Without this, `memory_forget_sweep`
-    /// and `memory_lint` cannot write their report pages.
+    /// Attach the wiki handle. Without this, `memory_lint` returns an
+    /// error, and `memory_forget_sweep` refuses every pass that
+    /// deletes or rewrites a page (TTL, decay eviction, compaction,
+    /// cold-cluster dedup) and skips tombstone cleanup and the event-ledger
+    /// pass; only the observation prune still runs.
     #[must_use]
     pub fn with_wiki(mut self, wiki: Wiki) -> Self {
         self.wiki = Some(wiki);
@@ -5659,7 +5662,7 @@ impl AiMemoryServer {
             .filter(|id| !id.is_empty())
             .map(|id| {
                 HandoffId::from_str(id)
-                    .map_err(|e| McpError::internal_error(format!("invalid handoff_id: {e}"), None))
+                    .map_err(|e| McpError::invalid_params(format!("invalid handoff_id: {e}"), None))
             })
             .transpose()?;
         let handoff = if let Some(handoff_id) = requested_id {
@@ -5793,8 +5796,8 @@ impl AiMemoryServer {
         OptionalParts(parts): OptionalParts,
     ) -> Result<CallToolResult, McpError> {
         let aps_actor = Self::actor_key_from_parts(Some(&parts));
-        let handoff_id = HandoffId::from_str(&args.handoff_id)
-            .map_err(|e| McpError::internal_error(format!("invalid handoff_id: {e}"), None))?;
+        let handoff_id = HandoffId::from_str(args.handoff_id.trim())
+            .map_err(|e| McpError::invalid_params(format!("invalid handoff_id: {e}"), None))?;
         let (ws, proj) = self
             .effective_ids_for_mutation_args_with_actor(
                 args.workspace.as_deref(),
@@ -6080,7 +6083,7 @@ impl AiMemoryServer {
             match args.message_id.as_deref().map(str::trim) {
                 None | Some("") => None,
                 Some(id) => Some(ai_memory_core::MessageId::from_str(id).map_err(|e| {
-                    McpError::internal_error(format!("invalid message_id: {e}"), None)
+                    McpError::invalid_params(format!("invalid message_id: {e}"), None)
                 })?),
             };
         let actor_user = crate::actor::actor_from_parts(&parts)
@@ -6161,7 +6164,7 @@ impl AiMemoryServer {
             match args.message_id.as_deref().map(str::trim) {
                 None | Some("") => None,
                 Some(id) => Some(ai_memory_core::MessageId::from_str(id).map_err(|e| {
-                    McpError::internal_error(format!("invalid message_id: {e}"), None)
+                    McpError::invalid_params(format!("invalid message_id: {e}"), None)
                 })?),
             };
         let admission = self
@@ -18912,6 +18915,128 @@ mod tests {
             !src.contains("/handoff?"),
             "Grok SessionStart must not fetch the claiming /handoff endpoint"
         );
+    }
+
+    /// A malformed handoff or message id is caller input: it answers
+    /// `invalid params` (-32602) like a malformed session id, not an opaque
+    /// internal error, and keeps its message. Cancel trims the id the way
+    /// accept, pop and the admin routes already do.
+    #[tokio::test]
+    async fn malformed_handoff_and_message_ids_are_invalid_params() {
+        let (_tmp, _store, server, _ws, _pj) = setup_server().await;
+        let assert_invalid_params = |result: Result<CallToolResult, McpError>, what: &str| {
+            let err = result.expect_err("a malformed id must be refused");
+            assert_eq!(
+                err.code,
+                rmcp::model::ErrorCode::INVALID_PARAMS,
+                "{what}: {err}"
+            );
+            assert!(
+                err.to_string().contains(&format!("invalid {what}")),
+                "{err}"
+            );
+        };
+
+        assert_invalid_params(
+            server
+                .memory_handoff_accept(
+                    Parameters(HandoffAcceptArgs {
+                        cwd: None,
+                        project: None,
+                        workspace: None,
+                        any_owner: None,
+                        handoff_id: Some("nope".into()),
+                    }),
+                    OptionalParts(test_parts_default()),
+                )
+                .await,
+            "handoff_id",
+        );
+        assert_invalid_params(
+            server
+                .memory_handoff_cancel(
+                    Parameters(HandoffCancelArgs {
+                        handoff_id: "nope".into(),
+                        project: None,
+                        workspace: None,
+                        any_owner: None,
+                    }),
+                    OptionalParts(test_parts_default()),
+                )
+                .await,
+            "handoff_id",
+        );
+        assert_invalid_params(
+            server
+                .memory_message_pop(
+                    Parameters(MessagePopArgs {
+                        message_id: Some("abc".into()),
+                        project: Some("scratch".into()),
+                        workspace: Some("default".into()),
+                    }),
+                    OptionalParts(test_parts_default()),
+                )
+                .await,
+            "message_id",
+        );
+        assert_invalid_params(
+            server
+                .memory_message_cancel(
+                    Parameters(MessageCancelArgs {
+                        message_id: Some("abc".into()),
+                        project: Some("scratch".into()),
+                        workspace: Some("default".into()),
+                    }),
+                    OptionalParts(test_parts_default()),
+                )
+                .await,
+            "message_id",
+        );
+
+        // A valid id with surrounding whitespace still cancels.
+        let begin = server
+            .memory_handoff_begin(
+                Parameters(HandoffBeginArgs {
+                    summary: "padded id".into(),
+                    open_questions: vec![],
+                    next_steps: vec![],
+                    files_touched: vec![],
+                    cwd: Some("/tmp/aim".into()),
+                    project: None,
+                    workspace: None,
+                    shared: None,
+                }),
+                OptionalParts(test_parts_default()),
+            )
+            .await
+            .unwrap();
+        let begin_text = begin
+            .content
+            .first()
+            .and_then(|c| c.as_text())
+            .map(|t| t.text.clone())
+            .unwrap();
+        let begin_json: serde_json::Value = serde_json::from_str(&begin_text).unwrap();
+        let handoff_id = begin_json["handoff_id"].as_str().unwrap().to_string();
+        let cancel = server
+            .memory_handoff_cancel(
+                Parameters(HandoffCancelArgs {
+                    handoff_id: format!(" {handoff_id}\n"),
+                    project: None,
+                    workspace: None,
+                    any_owner: None,
+                }),
+                OptionalParts(test_parts_default()),
+            )
+            .await
+            .expect("a whitespace-padded id names the same handoff");
+        let cancel_text = cancel
+            .content
+            .first()
+            .and_then(|c| c.as_text())
+            .map(|t| t.text.clone())
+            .unwrap();
+        assert!(cancel_text.contains("\"cancelled\": true"), "{cancel_text}");
     }
 
     #[tokio::test]

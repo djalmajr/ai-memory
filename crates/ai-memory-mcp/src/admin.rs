@@ -3094,6 +3094,7 @@ struct ExpireHandoffsRequest {
     workspace: String,
     project: String,
     /// Mandatory. Without `confirm: true` the server returns 400.
+    #[serde(default)]
     confirm: bool,
     /// Only expire handoffs at least this many days old. Omitted clears the
     /// whole open backlog for the scope.
@@ -3532,14 +3533,14 @@ async fn handle_pending_write_diff(
     match pending_detail(&state, &id, &query).await {
         Ok((ws, proj, owned)) => {
             let detail = &owned.detail;
-            let before = state
+            let before = match state
                 .reader
                 .page_body_by_ids(ws, proj, detail.summary.target_path.as_str())
                 .await
-                .ok()
-                .flatten()
-                .map(|p| p.body)
-                .unwrap_or_default();
+            {
+                Ok(page) => page.map(|p| p.body).unwrap_or_default(),
+                Err(e) => return internal_err(e.to_string()),
+            };
             let diff = format!(
                 "--- before/{path}\n+++ after/{path}\n@@\n{before}\n--- proposed ---\n{after}\n",
                 path = detail.summary.target_path.as_str(),
@@ -4407,6 +4408,7 @@ struct PurgeSessionRequest {
     session_id: String,
     /// Mandatory confirmation flag. Without `confirm: true` the server
     /// returns 400 — purging is destructive and irreversible.
+    #[serde(default)]
     confirm: bool,
     /// Reclaim freed bytes: rebuild the FTS indexes and `VACUUM` after the
     /// delete commits. Off by default; see `ai_memory_store::Compaction` for
@@ -4940,6 +4942,7 @@ struct PurgeProjectRequest {
     project_id: Option<String>,
     /// Mandatory confirmation flag. Without `confirm: true` the server
     /// returns 400 — purging is destructive and irreversible.
+    #[serde(default)]
     confirm: bool,
     /// Purge even when a managed workstream under this project still holds a
     /// live run lease. Off by default: the cascade would delete that lease row
@@ -5527,7 +5530,10 @@ struct CompactRequest {
     /// Mandatory confirmation. Not because compaction destroys anything — it
     /// deletes nothing — but because it takes an exclusive lock and rewrites
     /// the whole database, so every write blocks until it finishes. That is an
-    /// availability decision, and it should be deliberate.
+    /// availability decision, and it should be deliberate. An omitted field
+    /// reads as `false`, so the caller gets the 400 that says what to send
+    /// instead of the extractor's bare 422.
+    #[serde(default)]
     confirm: bool,
     /// Answer `202` with the job's status at once instead of holding the
     /// request until the `VACUUM` finishes. Poll `GET /admin/compact`.
@@ -5658,6 +5664,7 @@ struct ReclaimLedgerVersionsRequest {
     /// `compact` it is not reversible by re-running anything: the bytes are
     /// only in the markdown the ledger mirrors, and only if the file on disk
     /// still holds them.
+    #[serde(default)]
     confirm: bool,
     /// Report what would go without deleting it. A dry run changes nothing,
     /// so it needs no `confirm` — that is the whole point of it.
@@ -6152,6 +6159,7 @@ struct MoveProjectRequest {
     to_workspace: String,
     /// Mandatory confirmation flag. The move PURGES the source after
     /// copying, so without `confirm: true` the server returns 400.
+    #[serde(default)]
     confirm: bool,
     /// Override the active-project guard. By default the server refuses (409)
     /// to move the project the hook router is currently writing to, since a
@@ -12434,6 +12442,60 @@ mod tests {
                 .is_none(),
             "reject must not write the target page"
         );
+    }
+
+    /// A failed read of the target page must not be rendered as a diff
+    /// against an empty page: that is the same response a proposal for a page
+    /// that does not exist yet gets, so a reviewer would see a create where
+    /// the proposal updates an existing page.
+    #[tokio::test]
+    async fn pending_write_diff_surfaces_a_failed_page_read() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let wiki = Wiki::new(tmp.path(), store.writer.clone())
+            .unwrap()
+            .with_store_reader(store.reader.clone());
+        let (ws, proj, proposal_id) = stage_pending_write(
+            &store,
+            "default",
+            "scratch",
+            "notes/pending.md",
+            "# Pending\n\nproposed body",
+        )
+        .await;
+        let router = admin_router(admin_state_for_store(&tmp, &store, wiki));
+        let request = || {
+            Request::builder()
+                .uri(format!(
+                    "/admin/pending-writes/{proposal_id}/diff?workspace=default&project=scratch"
+                ))
+                .body(Body::empty())
+                .unwrap()
+        };
+
+        // Control: an absent target page still diffs against an empty body.
+        let resp = router.clone().oneshot(request()).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        // Break only the page read; the proposal tables stay readable.
+        rusqlite::Connection::open(store.db_path())
+            .unwrap()
+            .execute_batch("ALTER TABLE pages RENAME TO pages_unreadable")
+            .unwrap();
+        assert!(
+            store
+                .reader
+                .page_body_by_ids(ws, proj, "notes/pending.md")
+                .await
+                .is_err(),
+            "fixture must make the page read fail"
+        );
+
+        let resp = router.oneshot(request()).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(body.get("diff").is_none(), "no fabricated diff: {body}");
     }
 
     #[tokio::test]
