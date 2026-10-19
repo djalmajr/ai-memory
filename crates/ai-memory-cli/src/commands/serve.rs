@@ -1172,7 +1172,24 @@ pub async fn run(config: &Config, args: ServeArgs) -> Result<()> {
     let mut shutdown = ShutdownSignals::install();
 
     validate_web_ui_args(args.enable_web, args.web_ui_dir.as_deref())?;
+    #[cfg(feature = "management-ui")]
+    if args.enable_management_ui && !matches!(args.transport, TransportKind::Http) {
+        anyhow::bail!("--enable-management-ui requires --transport http");
+    }
+
+    #[cfg(feature = "management-ui")]
+    if args.enable_management_ui && args.enable_web && normalize_prefix(&args.web_slug) == "/manage"
+    {
+        anyhow::bail!("the management console reserves /manage; choose a different --web-slug");
+    }
+
     refuse_a_missing_token_file(&config.auth)?;
+    if args.enable_session_management && !matches!(args.transport, TransportKind::Http) {
+        anyhow::bail!("--enable-session-management requires --transport http");
+    }
+    if args.enable_self_service_keys && !matches!(args.transport, TransportKind::Http) {
+        anyhow::bail!("--enable-self-service-keys requires --transport http");
+    }
     config.require_llm_fallback_credentials()?;
 
     // Merge config + CLI CORS origins (config first, CLI adds new entries).
@@ -1382,6 +1399,7 @@ pub async fn run(config: &Config, args: ServeArgs) -> Result<()> {
         .with_decay_params(decay_params)
         .with_decay_breadth_weight(config.decay.breadth_weight)
         .with_observation_retention(config.decay.observation_retention())
+        .with_ledger_retention(config.decay.ledger_retention())
         .with_compact_cold_episodic(config.decay.compact_cold_episodic)
         .with_contradiction_band(config.contradiction_band_min, config.contradiction_band_max)
         .with_auto_improve_require_approval(config.auto_improve.require_approval)
@@ -1659,6 +1677,7 @@ pub async fn run(config: &Config, args: ServeArgs) -> Result<()> {
                 },
                 config.decay.breadth_weight,
                 config.decay.observation_retention(),
+                config.decay.ledger_retention(),
                 config.decay.compact_cold_episodic,
             );
             // Multi-rung auth assembly:
@@ -1858,6 +1877,47 @@ pub async fn run(config: &Config, args: ServeArgs) -> Result<()> {
                     auth_state.clone(),
                     expire_legacy_cookie_mw,
                 )));
+            #[cfg(not(feature = "management-ui"))]
+            let management_ui_enabled = false;
+            #[cfg(feature = "management-ui")]
+            let management_ui_enabled = args.enable_management_ui;
+            let router = if args.enable_session_management || management_ui_enabled {
+                router.merge(ai_memory_mcp::session_management::router(
+                    ai_memory_mcp::session_management::SessionManagementState {
+                        reader: store.reader.clone(),
+                        writer: store.writer.clone(),
+                        wiki: wiki.clone(),
+                    },
+                    auth_state.clone(),
+                ))
+            } else {
+                router
+            };
+            let router = if args.enable_self_service_keys || management_ui_enabled {
+                router.merge(ai_memory_mcp::self_service_keys::router(
+                    ai_memory_mcp::self_service_keys::SelfServiceKeysState {
+                        reader: store.reader.clone(),
+                        writer: store.writer.clone(),
+                        pepper: config
+                            .auth
+                            .token_pepper
+                            .clone()
+                            .filter(|p| !p.trim().is_empty())
+                            .map(TokenPepper::new),
+                    },
+                    auth_state.clone(),
+                ))
+            } else {
+                router
+            };
+            #[cfg(feature = "management-ui")]
+            let router = if management_ui_enabled {
+                // Delegate forms to the same already-authenticated engine routers.
+                let backend = router.clone();
+                router.merge(ai_memory_web::management::router(&base_path, backend))
+            } else {
+                router
+            };
             let router = apply_host_layer(router, config.allowed_hosts.clone());
             // Host the entire surface under the configured base path. Empty
             // base = root (unchanged). The auth/host layers are already
@@ -2110,6 +2170,7 @@ async fn start_maintenance_scheduler(
                             &decay.decay_params(),
                             decay.breadth_weight,
                             decay.observation_retention(),
+                            decay.ledger_retention(),
                             decay.compact_cold_episodic,
                             decay.cold_cluster_dedup(dedup_embedding),
                         )
@@ -2128,6 +2189,9 @@ async fn start_maintenance_scheduler(
                             expired = outcome.expired,
                             hard_deleted = outcome.hard_deleted,
                             observations_pruned = outcome.observations_pruned,
+                            ledgers_pruned = outcome.ledgers_pruned,
+                            ledger_bytes_pruned = outcome.ledger_bytes_pruned,
+                            ledgers_undeleted = outcome.ledgers_undeleted,
                             errors = outcome.errors,
                             elapsed_ms = started.elapsed().as_millis(),
                             "scheduled forget sweep completed"
@@ -2545,6 +2609,9 @@ struct ScheduledSweepTickOutcome {
     expired: usize,
     hard_deleted: usize,
     observations_pruned: usize,
+    ledgers_pruned: usize,
+    ledger_bytes_pruned: u64,
+    ledgers_undeleted: usize,
     errors: usize,
 }
 
@@ -2556,6 +2623,7 @@ async fn run_scheduled_sweep_tick(
     decay: &ai_memory_store::DecayParams,
     breadth_weight: f64,
     retention: ObservationRetention,
+    ledgers: ai_memory_consolidate::LedgerRetention,
     compact_cold_episodic: bool,
     dedup: ai_memory_consolidate::ColdClusterDedup,
 ) -> Result<ScheduledSweepTickOutcome> {
@@ -2566,7 +2634,7 @@ async fn run_scheduled_sweep_tick(
     };
 
     for scope in scopes {
-        match ai_memory_consolidate::run_sweep_with_hygiene(
+        match ai_memory_consolidate::run_sweep_with_ledgers(
             reader,
             writer,
             Some(wiki),
@@ -2577,6 +2645,7 @@ async fn run_scheduled_sweep_tick(
             retention,
             compact_cold_episodic,
             dedup.clone(),
+            ledgers,
             false,
         )
         .await
@@ -2592,6 +2661,9 @@ async fn run_scheduled_sweep_tick(
                 outcome.expired += report.expired.len();
                 outcome.hard_deleted += report.hard_deleted;
                 outcome.observations_pruned += report.observations_pruned;
+                outcome.ledgers_pruned += report.ledgers_pruned;
+                outcome.ledger_bytes_pruned += report.ledger_bytes_pruned;
+                outcome.ledgers_undeleted += report.ledgers_undeleted;
             }
             Err(e) => {
                 outcome.errors += 1;
@@ -2931,34 +3003,36 @@ fn configure_consolidator(
         model = llm.model(),
         max_input_tokens = config.consolidation.max_input_tokens,
         max_output_tokens = config.consolidation.max_output_tokens,
+        verbatim_residue = config.consolidation.verbatim_residue,
         "memory_consolidate + PreCompact LLM checkpointing enabled",
     );
-    let mut consolidator = Consolidator::new(
-        store.reader.clone(),
-        store.writer.clone(),
-        wiki.clone(),
-        llm.clone(),
-        workspace_id,
-        project_id,
-    )
-    .with_per_user_slots(config.slots.per_user)
-    .with_prompt_limits(
-        config.consolidation.max_input_tokens,
-        config.consolidation.max_output_tokens,
-        config.consolidation.input_token_safety_margin,
-    );
-    // Opt-in map-reduce chunking (`[consolidation] chunk_input_tokens > 0`).
-    // Config validation already guarantees the readable tokenizer behind a
-    // positive `llm_max_input_tokens` when the mode is active; the builder
-    // re-checks the same preconditions for off-tree misuse.
-    consolidator = consolidator
+    let consolidator = Arc::new(
+        Consolidator::new(
+            store.reader.clone(),
+            store.writer.clone(),
+            wiki.clone(),
+            llm.clone(),
+            workspace_id,
+            project_id,
+        )
+        .with_per_user_slots(config.slots.per_user)
+        .with_verbatim_residue(config.consolidation.verbatim_residue)
+        .with_prompt_limits(
+            config.consolidation.max_input_tokens,
+            config.consolidation.max_output_tokens,
+            config.consolidation.input_token_safety_margin,
+        )
+        // Opt-in map-reduce chunking (`[consolidation] chunk_input_tokens > 0`).
+        // Config validation already guarantees the readable tokenizer behind a
+        // positive `llm_max_input_tokens` when the mode is active; the builder
+        // re-checks the same preconditions for off-tree misuse.
         .with_chunking(
             config.consolidation.chunk_input_tokens,
             config.llm_max_input_tokens,
             config.llm_tokenizer_path.as_deref(),
         )
-        .context("enabling consolidation map-reduce chunking")?;
-    let consolidator = Arc::new(consolidator);
+        .context("enabling consolidation map-reduce chunking")?,
+    );
     server = server.with_consolidator_arc(wiki.clone(), llm.clone(), consolidator.clone());
     // Optional post-RRF reranking rides on the same provider, so it is
     // only reachable once an LLM is configured at all. Off unless the
@@ -3395,6 +3469,41 @@ fn host_without_port(host: &str) -> &str {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(feature = "management-ui")]
+    #[tokio::test]
+    async fn management_ui_rejects_invalid_mounts_before_opening_the_store() {
+        use clap::Parser;
+        let tmp = tempfile::tempdir().unwrap();
+        let config = crate::config::Config {
+            data_dir: tmp.path().join("unopened"),
+            ..Default::default()
+        };
+        for args in [
+            vec!["ai-memory", "serve", "--enable-management-ui"],
+            vec![
+                "ai-memory",
+                "serve",
+                "--transport",
+                "http",
+                "--enable-management-ui",
+                "--enable-web",
+                "--web-slug",
+                "/manage/",
+            ],
+        ] {
+            let parsed = crate::cli::Cli::try_parse_from(args).unwrap();
+            let crate::cli::Command::Serve(args) = parsed.command else {
+                panic!("serve")
+            };
+            let error = super::run(&config, args).await.unwrap_err();
+            assert!(
+                error.to_string().contains("--transport http")
+                    || error.to_string().contains("reserves /manage")
+            );
+            assert!(!config.data_dir.exists());
+        }
+    }
+
     use super::*;
     use ai_memory_core::{
         AgentKind, ApiCredentialId, NewObservation, NewSession, NewUser, ObservationKind, PagePath,
@@ -5879,6 +5988,7 @@ mod tests {
             &decay,
             0.0,
             ObservationRetention::default(),
+            ai_memory_consolidate::LedgerRetention::default(),
             false,
             ai_memory_consolidate::ColdClusterDedup::default(),
         )

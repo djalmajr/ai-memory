@@ -9,6 +9,10 @@ repository.workspace = true
 authors.workspace = true
 description = "Read-only HTTP browser for the ai-memory wiki (project list, tree navigation, markdown rendering, FTS5 search)."
 
+[features]
+default = []
+management-ui = []
+
 [dependencies]
 ai-memory-core.workspace = true
 ai-memory-llm.workspace = true

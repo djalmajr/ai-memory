@@ -238,6 +238,11 @@ pub enum Command {
     /// Hidden hook spool drainer used by native session-end hooks.
     #[command(hide = true, name = "hook-drain")]
     HookDrain(HookDrainArgs),
+    /// Hidden Windows background host the logon entry `setup` installs
+    /// starts: it runs `serve` with no console window and restarts it after
+    /// a failure.
+    #[command(hide = true, name = "service-host")]
+    ServiceHost(ServiceHostArgs),
     /// Generate the marketplace plugins under `plugins/` and their catalogs
     /// (maintainer tool: `bin/release` and the drift test call it).
     #[command(hide = true, name = "render-plugins")]
@@ -1354,7 +1359,9 @@ pub struct AuthLoginArgs {
     pub client_id: Option<String>,
     /// OIDC issuer URL for `oidc-device` login, e.g. a Keycloak realm
     /// (`https://keycloak.example.com/realms/ai-memory`). Endpoints are
-    /// discovered from `<issuer>/.well-known/openid-configuration`.
+    /// discovered from `<issuer>/.well-known/openid-configuration`. The issuer
+    /// and both endpoints must use `https`; plain `http` is accepted only on
+    /// loopback.
     #[arg(long)]
     pub issuer: Option<String>,
 }
@@ -1967,14 +1974,36 @@ pub struct SetupArgs {
     pub yes: bool,
     /// Wire this agent instead of the detected ones. Repeat for several.
     /// Detection looks for each harness's session store or MCP config under
-    /// your home; OpenCode 2 and the Kiro CLI v3 engine are only wired when
-    /// named here.
+    /// your home. A detected or named `opencode` is wired for the major
+    /// `opencode --version` reports (`opencode2` forces V2 without probing);
+    /// the Kiro CLI v3 engine is only wired when named here.
     #[arg(long = "agent", value_enum)]
     pub agents: Vec<AgentChoice>,
     /// Do not install or start a user service; use this when the server
     /// already runs some other way (Docker, a packaged system unit).
     #[arg(long)]
     pub no_service: bool,
+    /// Print the plan and change nothing: what would be created, which
+    /// agents would be wired and why each was detected, and which supported
+    /// agents are not in the plan.
+    #[arg(long, conflicts_with = "yes")]
+    pub plan: bool,
+    /// With `--plan`, print the plan as a JSON document (its `format` field
+    /// names the layout version) for a script or front end to render.
+    #[arg(long, requires = "plan")]
+    pub json: bool,
+    /// Show the plan as a page in your browser, served on 127.0.0.1 behind a
+    /// one-time address printed here, and apply the agents you pick there.
+    /// Nothing changes until you press Apply.
+    #[arg(long, conflicts_with_all = ["yes", "plan"])]
+    pub web: bool,
+    /// With `--web`, print the page's address without opening a browser.
+    #[arg(long, requires = "web")]
+    pub no_open: bool,
+    /// With `--web`, stop when standard input closes. The desktop installer
+    /// holds the write end, so the page goes away with the app.
+    #[arg(long, requires = "web", hide = true)]
+    pub stop_on_stdin_eof: bool,
 }
 
 /// Arguments for `status`.
@@ -2031,6 +2060,10 @@ pub struct BackfillArgs {
     /// been attempted for this checkout. Not for interactive use.
     #[arg(long, hide = true)]
     pub auto: bool,
+    /// Internal ownership token for the automatic backfill's in-flight marker.
+    /// The SessionStart hook mints and passes it to its detached child.
+    #[arg(long, hide = true, requires = "auto")]
+    pub inflight_claim: Option<String>,
     /// Internal: deliver to the server the spawning hook is installed
     /// against, instead of the configured one. Set by the SessionStart
     /// trigger so the backfill cannot depend on the agent's environment.
@@ -2114,6 +2147,10 @@ pub struct SearchArgs {
     /// Project name. When omitted, auto-derived from the current project.
     #[arg(long)]
     pub project: Option<String>,
+    /// Search the wiki pages of every project instead of the current one.
+    /// Each hit is labelled with its `workspace/project`.
+    #[arg(long, conflicts_with_all = ["workspace", "project"])]
+    pub global: bool,
     /// Maximum number of hits to return.
     #[arg(short = 'n', long, default_value_t = 10)]
     pub limit: usize,
@@ -2432,6 +2469,18 @@ pub enum AgentChoice {
     /// Muse's own `SessionEnd` closes the session.
     #[value(alias = "muse-code", alias = "musecode")]
     Muse,
+    /// Tencent CodeBuddy Code (`codebuddy`) — lifecycle hooks merged into the
+    /// `hooks` key of `~/.codebuddy/settings.json`. CodeBuddy sends Claude
+    /// Code-shaped hook payloads on stdin, so each entry runs ai-memory's
+    /// native `hook` command directly; there is no script bundle. SessionStart
+    /// stdout (`hookSpecificOutput.additionalContext`) carries the handoff.
+    #[value(name = "codebuddy", alias = "code-buddy")]
+    CodeBuddy,
+    /// IBM Bob IDE — lifecycle hooks merged into the `hooks` key of
+    /// `~/.bob/settings/settings.json`. Bob sends Claude Code-shaped payloads
+    /// and injects plain `SessionStart` stdout into the model context.
+    #[value(name = "ibm-bob", alias = "bob")]
+    IbmBob,
 }
 
 impl AgentChoice {
@@ -2465,6 +2514,8 @@ impl AgentChoice {
             Self::CopilotCli => AgentKind::CopilotCli,
             Self::Droid => AgentKind::Droid,
             Self::Muse => AgentKind::Muse,
+            Self::CodeBuddy => AgentKind::CodeBuddy,
+            Self::IbmBob => AgentKind::IbmBob,
         }
     }
 
@@ -2485,7 +2536,9 @@ impl AgentChoice {
             | Self::Zcode
             | Self::Hermes
             | Self::Droid
-            | Self::Muse => None,
+            | Self::Muse
+            | Self::CodeBuddy
+            | Self::IbmBob => None,
             _ => Some(self.kind().as_str()),
         }
     }
@@ -2675,6 +2728,11 @@ pub enum McpClient {
     /// Command Code CLI — `~/.commandcode/mcp.json`.
     #[value(alias = "commandcode", alias = "cmdc", alias = "cmd")]
     CommandCode,
+    /// IBM Bob IDE — `~/.bob/settings/mcp.json`, using native Streamable HTTP.
+    /// Pair with `install-hooks --agent ibm-bob` for lifecycle capture and
+    /// plain-text `SessionStart` handoff delivery.
+    #[value(name = "ibm-bob", alias = "bob")]
+    IbmBob,
     /// GitHub Copilot CLI — `$COPILOT_HOME/mcp-config.json` (default
     /// `~/.copilot/mcp-config.json`), servers under the root `mcpServers` map
     /// with `type: "http"` + `url` + optional `headers` (#1040). Pair with
@@ -3094,6 +3152,14 @@ pub struct HookArgs {
 #[derive(Debug, Args)]
 pub struct HookDrainArgs {}
 
+/// Arguments for hidden `service-host`.
+#[derive(Debug, Args)]
+pub struct ServiceHostArgs {
+    /// Run the supervisor in this process instead of starting it detached.
+    #[arg(long)]
+    pub supervise: bool,
+}
+
 /// Arguments for hidden `render-plugins`.
 #[derive(Debug, Args)]
 pub struct RenderPluginsArgs {
@@ -3336,6 +3402,17 @@ pub enum TransportKind {
 /// Arguments for `serve`.
 #[derive(Debug, Args)]
 pub struct ServeArgs {
+    /// Serve the `/management/v1` session inspection and owned-purge routes to
+    /// signed-in browser users. Off by default; requires `--transport http`.
+    #[arg(long, env = "AI_MEMORY_ENABLE_SESSION_MANAGEMENT")]
+    pub enable_session_management: bool,
+
+    /// Let signed-in browser users issue and revoke their own `aim_` API keys
+    /// under `/management/v1/credentials`. Off by default; requires
+    /// `--transport http`.
+    #[arg(long, env = "AI_MEMORY_ENABLE_SELF_SERVICE_KEYS")]
+    pub enable_self_service_keys: bool,
+
     /// Transport to expose the MCP server on.
     #[arg(long, value_enum, default_value_t = TransportKind::Stdio)]
     pub transport: TransportKind,
@@ -3375,6 +3452,10 @@ pub struct ServeArgs {
     /// Bearer.
     #[arg(long, env = "AI_MEMORY_ENABLE_WEB")]
     pub enable_web: bool,
+    /// Enable the server-rendered management console at /manage (requires management-ui build feature).
+    #[cfg(feature = "management-ui")]
+    #[arg(long, env = "AI_MEMORY_ENABLE_MANAGEMENT_UI")]
+    pub enable_management_ui: bool,
     /// Mount only the read-only `/api/v1` JSON API. Off by default.
     ///
     /// `--enable-web` implies this API as before. Use this flag for
@@ -3468,6 +3549,46 @@ pub struct WritePageArgs {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn session_management_is_runtime_opt_in() {
+        let parsed = Cli::try_parse_from(["ai-memory", "serve"]).unwrap();
+        let Command::Serve(args) = parsed.command else {
+            panic!("serve")
+        };
+        assert!(!args.enable_session_management);
+        let parsed = Cli::try_parse_from([
+            "ai-memory",
+            "serve",
+            "--transport",
+            "http",
+            "--enable-session-management",
+        ])
+        .unwrap();
+        let Command::Serve(args) = parsed.command else {
+            panic!("serve")
+        };
+        assert!(args.enable_session_management);
+    }
+    #[test]
+    fn self_service_keys_is_runtime_opt_in() {
+        let parsed = Cli::try_parse_from(["ai-memory", "serve"]).unwrap();
+        let Command::Serve(args) = parsed.command else {
+            panic!("serve")
+        };
+        assert!(!args.enable_self_service_keys);
+        let parsed = Cli::try_parse_from([
+            "ai-memory",
+            "serve",
+            "--transport",
+            "http",
+            "--enable-self-service-keys",
+        ])
+        .unwrap();
+        let Command::Serve(args) = parsed.command else {
+            panic!("serve")
+        };
+        assert!(args.enable_self_service_keys);
+    }
     use super::*;
     use clap::{CommandFactory, Parser};
     use std::collections::BTreeSet;
@@ -3496,6 +3617,36 @@ mod tests {
         assert_eq!(args.enforced_by.as_deref(), Some("pre-push hook"));
     }
 
+    /// `search --global` drops the scope entirely, so naming one alongside it
+    /// is a contradiction clap rejects rather than one flag silently winning.
+    #[test]
+    fn search_global_parses_and_conflicts_with_an_explicit_scope() {
+        let parsed = Cli::try_parse_from(["ai-memory", "search", "wal", "--global"])
+            .expect("search --global parses");
+        let Command::Search(args) = parsed.command else {
+            panic!("expected search command");
+        };
+        assert!(args.global);
+        assert!(args.workspace.is_none() && args.project.is_none());
+
+        let default = Cli::try_parse_from(["ai-memory", "search", "wal"]).expect("search parses");
+        let Command::Search(args) = default.command else {
+            panic!("expected search command");
+        };
+        assert!(!args.global, "global search stays opt-in");
+
+        for flag in [["--workspace", "acme"], ["--project", "api"]] {
+            let error =
+                Cli::try_parse_from(["ai-memory", "search", "wal", "--global", flag[0], flag[1]])
+                    .expect_err("--global must conflict with an explicit scope");
+            assert_eq!(
+                error.kind(),
+                clap::error::ErrorKind::ArgumentConflict,
+                "{flag:?}"
+            );
+        }
+    }
+
     #[test]
     fn serve_api_only_flag_does_not_enable_the_web_ui() {
         let parsed =
@@ -3506,6 +3657,35 @@ mod tests {
         };
         assert!(args.enable_api);
         assert!(!args.enable_web);
+    }
+
+    #[cfg(feature = "management-ui")]
+    #[test]
+    fn management_ui_requires_explicit_runtime_opt_in() {
+        let parsed = Cli::try_parse_from(["ai-memory", "serve"]).unwrap();
+        let Command::Serve(args) = parsed.command else {
+            panic!("serve")
+        };
+        assert!(!args.enable_management_ui);
+        let parsed = Cli::try_parse_from([
+            "ai-memory",
+            "serve",
+            "--transport",
+            "http",
+            "--enable-management-ui",
+        ])
+        .unwrap();
+        let Command::Serve(args) = parsed.command else {
+            panic!("serve")
+        };
+        assert!(args.enable_management_ui);
+        assert!(!args.enable_web);
+    }
+
+    #[cfg(not(feature = "management-ui"))]
+    #[test]
+    fn management_ui_flag_is_absent_from_default_builds() {
+        assert!(Cli::try_parse_from(["ai-memory", "serve", "--enable-management-ui"]).is_err());
     }
 
     /// The management surface uses the design's spelling (#708):
@@ -4571,6 +4751,41 @@ mod tests {
                 panic!("expected install-mcp");
             };
             assert_eq!(args.client, McpClient::Droid);
+        }
+    }
+
+    #[test]
+    fn codebuddy_install_hooks_parses_with_the_kebab_alias() {
+        for alias in ["codebuddy", "code-buddy"] {
+            let hooks = Cli::try_parse_from(["ai-memory", "install-hooks", "--agent", alias])
+                .unwrap_or_else(|error| panic!("{alias}: {error}"));
+            let Command::InstallHooks(args) = hooks.command else {
+                panic!("expected install-hooks");
+            };
+            assert_eq!(args.agent, AgentChoice::CodeBuddy);
+            assert_eq!(args.agent.kind(), ai_memory_core::AgentKind::CodeBuddy);
+            assert_eq!(args.agent.script_hook_subdir(), None);
+        }
+    }
+
+    #[test]
+    fn ibm_bob_install_hooks_and_mcp_parse_with_both_aliases() {
+        for alias in ["ibm-bob", "bob"] {
+            let hooks = Cli::try_parse_from(["ai-memory", "install-hooks", "--agent", alias])
+                .unwrap_or_else(|error| panic!("{alias}: {error}"));
+            let Command::InstallHooks(args) = hooks.command else {
+                panic!("expected install-hooks");
+            };
+            assert_eq!(args.agent, AgentChoice::IbmBob);
+            assert_eq!(args.agent.kind(), ai_memory_core::AgentKind::IbmBob);
+            assert_eq!(args.agent.script_hook_subdir(), None);
+
+            let mcp = Cli::try_parse_from(["ai-memory", "install-mcp", "--client", alias])
+                .unwrap_or_else(|error| panic!("{alias}: {error}"));
+            let Command::InstallMcp(args) = mcp.command else {
+                panic!("expected install-mcp");
+            };
+            assert_eq!(args.client, McpClient::IbmBob);
         }
     }
 

@@ -62,11 +62,12 @@ use std::pin::Pin;
 use crate::compact_job::CompactJobStatus;
 use ai_memory_consolidate::{
     AutoImproveReviewConfig, AutoImproveTelemetryParams, AutoImproveTelemetryReport, Bootstrap,
-    BootstrapConfig, BootstrapOutcome, BootstrapSource, CuratorParams, CuratorReport,
-    EmbedBackfillCounts, EmbedBackfillOptions, ObservationRetention, SourceCounts,
-    prune_sources_to_budget, render_auto_improve_telemetry_report_markdown,
-    render_curator_report_markdown, run_auto_improve_review, run_auto_improve_telemetry_report,
-    run_curator_report_with_breadth, run_embedding_backfill, run_lint, run_sweep_with_compaction,
+    BootstrapConfig, BootstrapOutcome, BootstrapSource, ColdClusterDedup, CuratorParams,
+    CuratorReport, EmbedBackfillCounts, EmbedBackfillOptions, LedgerRetention,
+    ObservationRetention, SourceCounts, prune_sources_to_budget,
+    render_auto_improve_telemetry_report_markdown, render_curator_report_markdown,
+    run_auto_improve_review, run_auto_improve_telemetry_report, run_curator_report_with_breadth,
+    run_embedding_backfill, run_lint, run_sweep_with_ledgers,
 };
 use ai_memory_core::{
     ActiveProject, AgentKind, AutoImproveProposalId, Capability, DEFAULT_PROJECT_NAME,
@@ -104,6 +105,8 @@ const CONTRIBUTORS_WEBHOOK_NAME: &str = "contributors";
 struct SweepTuning {
     breadth_weight: f64,
     retention: ObservationRetention,
+    /// Opt-in age bound for the hook event ledgers (disabled by default).
+    ledger_retention: LedgerRetention,
     /// A2 opt-in: compact cold episodic pages instead of evicting them.
     compact_cold_episodic: bool,
 }
@@ -326,11 +329,10 @@ struct AutoImproveRequest {
     /// Pending proposal sidecar folder.
     #[serde(default = "default_auto_improve_pending_path")]
     pending_path: String,
-    /// Optional executable proposal eval gate. When omitted, direct admin
-    /// requests inherit the server's configured eval policy; CLI requests send
-    /// their local config explicitly.
+    /// Removed compatibility field. Executable eval policy is server-owned;
+    /// requests that still send this field fail closed.
     #[serde(default)]
-    eval: Option<ai_memory_consolidate::AutoImproveEvalConfig>,
+    eval: Option<serde_json::Value>,
     /// Removed compatibility field. Requests that still send it fail closed so
     /// old preview callers cannot accidentally write pages.
     #[serde(default)]
@@ -629,17 +631,20 @@ pub fn admin_router_with_decay_breadth(state: AdminState, breadth_weight: f64) -
         state,
         breadth_weight,
         ObservationRetention::default(),
+        LedgerRetention::default(),
         false,
     )
 }
 
 /// Build the admin router with every sweep knob that lives outside
-/// `DecayParams`, including the opt-in observation prune (disabled by default)
-/// and A2 extractive tier-down (`compact_cold_episodic`, off by default).
+/// `DecayParams`, including the opt-in observation prune (disabled by default),
+/// the opt-in event ledger age sweep (disabled by default) and A2 extractive
+/// tier-down (`compact_cold_episodic`, off by default).
 pub fn admin_router_with_sweep_tuning(
     state: AdminState,
     breadth_weight: f64,
     retention: ObservationRetention,
+    ledger_retention: LedgerRetention,
     compact_cold_episodic: bool,
 ) -> Router {
     let state = Arc::new(state);
@@ -759,6 +764,7 @@ pub fn admin_router_with_sweep_tuning(
         .layer(axum::Extension(SweepTuning {
             breadth_weight,
             retention,
+            ledger_retention,
             compact_cold_episodic,
         }))
 }
@@ -1711,6 +1717,37 @@ fn default_search_limit() -> usize {
     10
 }
 
+/// One hit of a cross-project `GET /admin/search` (no `workspace`/`project`).
+///
+/// The fields a global hit always carried (`id`, `path`, `title`, `snippet`,
+/// `rank`) plus the workspace and project the page lives in, so a caller can
+/// tell which repository each hit came from. A project-scoped search keeps
+/// returning plain [`ai_memory_store::PageHit`]s.
+#[derive(Debug, Serialize)]
+struct GlobalSearchHit {
+    id: ai_memory_core::PageId,
+    path: ai_memory_core::PagePath,
+    title: String,
+    snippet: String,
+    rank: f64,
+    workspace: String,
+    project: String,
+}
+
+impl From<ai_memory_store::PageHitWithMeta> for GlobalSearchHit {
+    fn from(hit: ai_memory_store::PageHitWithMeta) -> Self {
+        Self {
+            id: hit.id,
+            path: hit.path,
+            title: hit.title,
+            snippet: hit.snippet,
+            rank: hit.rank,
+            workspace: hit.workspace_name,
+            project: hit.project_name,
+        }
+    }
+}
+
 async fn handle_search(
     State(state): State<Arc<AdminState>>,
     Query(query): Query<SearchQuery>,
@@ -1722,12 +1759,11 @@ async fn handle_search(
     ) {
         (Some(workspace), Some(project)) => {
             match lookup_ws_proj_no_create(&state, workspace, project).await {
-                Ok((ws, proj)) => {
-                    state
-                        .reader
-                        .search_pages_for_project(ws, proj, query.q, limit, None)
-                        .await
-                }
+                Ok((ws, proj)) => state
+                    .reader
+                    .search_pages_for_project(ws, proj, query.q, limit, None)
+                    .await
+                    .and_then(|hits| Ok(serde_json::to_value(&hits)?)),
                 Err(e) => return e,
             }
         }
@@ -1739,13 +1775,26 @@ async fn handle_search(
                 })),
             );
         }
-        _ => state.reader.search_pages(query.q, limit, OPERATOR).await,
+        // Cross-project: every hit names its repository. `OPERATOR` reads
+        // every project because this route is root-only once the deployment
+        // distinguishes operators (`require_root_for_multiuser_admin`).
+        _ => state
+            .reader
+            .search_pages_with_meta(
+                query.q,
+                limit,
+                None,
+                OPERATOR,
+                ai_memory_store::PageFilter::default(),
+            )
+            .await
+            .and_then(|hits| {
+                let hits: Vec<GlobalSearchHit> = hits.into_iter().map(Into::into).collect();
+                Ok(serde_json::to_value(&hits)?)
+            }),
     };
     match search_result {
-        Ok(hits) => (
-            StatusCode::OK,
-            Json(serde_json::to_value(&hits).unwrap_or_else(|_| serde_json::json!([]))),
-        ),
+        Ok(hits) => (StatusCode::OK, Json(hits)),
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(serde_json::json!({ "error": e.to_string() })),
@@ -1788,6 +1837,10 @@ struct ReadPageResponse {
     frontmatter: serde_json::Value,
     #[serde(skip_serializing_if = "Option::is_none")]
     served_from: Option<&'static str>,
+    /// Set when the page's `expires_at` TTL has passed: an exact-path read
+    /// still serves the page, which search no longer lists.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    expired: bool,
 }
 
 async fn handle_read_page(
@@ -1848,6 +1901,18 @@ async fn handle_read_page(
         );
     };
 
+    // An expired page is still served (a read is not a search) but says so:
+    // search and the listings leave it out, so this flag is how the caller
+    // learns the page is only waiting for the forget sweep. Omitted while live.
+    let expired = match state
+        .reader
+        .page_expired_by_ids(ws, proj, page_path.as_str())
+        .await
+    {
+        Ok(expired) => expired.unwrap_or(false),
+        Err(e) => return internal_err(e.to_string()),
+    };
+
     match state.wiki.read_page(ws, proj, &page_path) {
         Ok(md) => {
             let title = md
@@ -1863,6 +1928,7 @@ async fn handle_read_page(
                 body: md.body,
                 frontmatter: md.frontmatter,
                 served_from: None,
+                expired,
             };
             (
                 StatusCode::OK,
@@ -1892,6 +1958,7 @@ async fn handle_read_page(
                     body: stored.body,
                     frontmatter,
                     served_from: Some("db-fallback"),
+                    expired,
                 };
                 (
                     StatusCode::OK,
@@ -2343,6 +2410,14 @@ async fn handle_auto_improve(
     headers: HeaderMap,
     Json(req): Json<AutoImproveRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<serde_json::Value>)> {
+    if req.eval.is_some() {
+        return Err((
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(serde_json::json!({
+                "error": "auto-improve eval request field was removed; configure [auto_improve.eval] on the server"
+            })),
+        ));
+    }
     if req.dry_run.is_some() || req.stage.is_some() || req.mode.is_some() {
         return Err((
             StatusCode::UNPROCESSABLE_ENTITY,
@@ -2389,10 +2464,7 @@ async fn handle_auto_improve(
         max_final_body_chars: req.max_final_body_chars,
         max_rule_page_tokens: req.max_rule_page_tokens,
         max_procedure_page_tokens: req.max_procedure_page_tokens,
-        eval: req
-            .eval
-            .clone()
-            .unwrap_or_else(|| state.auto_improve_review_config.eval.clone()),
+        eval: state.auto_improve_review_config.eval.clone(),
     };
 
     let report =
@@ -3022,6 +3094,7 @@ struct ExpireHandoffsRequest {
     workspace: String,
     project: String,
     /// Mandatory. Without `confirm: true` the server returns 400.
+    #[serde(default)]
     confirm: bool,
     /// Only expire handoffs at least this many days old. Omitted clears the
     /// whole open backlog for the scope.
@@ -3460,14 +3533,14 @@ async fn handle_pending_write_diff(
     match pending_detail(&state, &id, &query).await {
         Ok((ws, proj, owned)) => {
             let detail = &owned.detail;
-            let before = state
+            let before = match state
                 .reader
                 .page_body_by_ids(ws, proj, detail.summary.target_path.as_str())
                 .await
-                .ok()
-                .flatten()
-                .map(|p| p.body)
-                .unwrap_or_default();
+            {
+                Ok(page) => page.map(|p| p.body).unwrap_or_default(),
+                Err(e) => return internal_err(e.to_string()),
+            };
             let diff = format!(
                 "--- before/{path}\n+++ after/{path}\n@@\n{before}\n--- proposed ---\n{after}\n",
                 path = detail.summary.target_path.as_str(),
@@ -3937,7 +4010,7 @@ async fn handle_forget_sweep(
 ) -> Result<impl IntoResponse, (StatusCode, Json<serde_json::Value>)> {
     let (ws, proj) = lookup_ws_proj_no_create(&state, &req.workspace, &req.project).await?;
 
-    run_sweep_with_compaction(
+    run_sweep_with_ledgers(
         &state.reader,
         &state.writer,
         Some(&state.wiki),
@@ -3947,6 +4020,8 @@ async fn handle_forget_sweep(
         tuning.breadth_weight,
         tuning.retention,
         tuning.compact_cold_episodic,
+        ColdClusterDedup::default(),
+        tuning.ledger_retention,
         req.dry_run,
     )
     .await
@@ -4333,6 +4408,7 @@ struct PurgeSessionRequest {
     session_id: String,
     /// Mandatory confirmation flag. Without `confirm: true` the server
     /// returns 400 — purging is destructive and irreversible.
+    #[serde(default)]
     confirm: bool,
     /// Reclaim freed bytes: rebuild the FTS indexes and `VACUUM` after the
     /// delete commits. Off by default; see `ai_memory_store::Compaction` for
@@ -4866,6 +4942,7 @@ struct PurgeProjectRequest {
     project_id: Option<String>,
     /// Mandatory confirmation flag. Without `confirm: true` the server
     /// returns 400 — purging is destructive and irreversible.
+    #[serde(default)]
     confirm: bool,
     /// Purge even when a managed workstream under this project still holds a
     /// live run lease. Off by default: the cascade would delete that lease row
@@ -5453,7 +5530,10 @@ struct CompactRequest {
     /// Mandatory confirmation. Not because compaction destroys anything — it
     /// deletes nothing — but because it takes an exclusive lock and rewrites
     /// the whole database, so every write blocks until it finishes. That is an
-    /// availability decision, and it should be deliberate.
+    /// availability decision, and it should be deliberate. An omitted field
+    /// reads as `false`, so the caller gets the 400 that says what to send
+    /// instead of the extractor's bare 422.
+    #[serde(default)]
     confirm: bool,
     /// Answer `202` with the job's status at once instead of holding the
     /// request until the `VACUUM` finishes. Poll `GET /admin/compact`.
@@ -5584,6 +5664,7 @@ struct ReclaimLedgerVersionsRequest {
     /// `compact` it is not reversible by re-running anything: the bytes are
     /// only in the markdown the ledger mirrors, and only if the file on disk
     /// still holds them.
+    #[serde(default)]
     confirm: bool,
     /// Report what would go without deleting it. A dry run changes nothing,
     /// so it needs no `confirm` — that is the whole point of it.
@@ -6078,6 +6159,7 @@ struct MoveProjectRequest {
     to_workspace: String,
     /// Mandatory confirmation flag. The move PURGES the source after
     /// copying, so without `confirm: true` the server returns 400.
+    #[serde(default)]
     confirm: bool,
     /// Override the active-project guard. By default the server refuses (409)
     /// to move the project the hook router is currently writing to, since a
@@ -10639,6 +10721,48 @@ mod tests {
         assert!(on_disk.contains("[[decisions/b.md]]"));
     }
 
+    #[tokio::test]
+    async fn export_okf_labels_preserve_links_when_the_bundle_is_reindexed() {
+        let (tmp, router) = read_page_test_router();
+        post_write_page(&router, "default", "scratch", "notes/seed.md", "seed").await;
+        let project = scratch_project_dir(tmp.path());
+        std::fs::create_dir_all(project.join("concepts")).unwrap();
+        std::fs::write(
+            project.join("concepts/a.md"),
+            "---\ntype: Concept\n---\n\nSee [[notes/seed.md|array[0] access]].\n",
+        )
+        .unwrap();
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/admin/export-okf?workspace=default&project=scratch")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let decoder = flate2::read::GzDecoder::new(std::io::Cursor::new(bytes));
+        let mut archive = tar::Archive::new(decoder);
+        let mut exported = String::new();
+        for entry in archive.entries().unwrap() {
+            let mut entry = entry.unwrap();
+            if entry.path().unwrap().display().to_string() == "concepts/a.md" {
+                use std::io::Read as _;
+                entry.read_to_string(&mut exported).unwrap();
+            }
+        }
+        let document = ai_memory_wiki::parse(&exported).unwrap();
+        let path = ai_memory_core::PagePath::new("concepts/a.md").unwrap();
+        let links = ai_memory_wiki::extract_links(&document.body, &path);
+        assert_eq!(links.len(), 1, "{exported}");
+        assert_eq!(links[0].path.as_str(), "notes/seed.md");
+    }
+
     /// Post-audit regression: the things a REAL deployment's tree holds
     /// beside concept pages — typed scope manifests and _pending
     /// proposal sidecars — must not block the export. Sidecars are
@@ -11749,7 +11873,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn auto_improve_admin_omitted_eval_inherits_server_defaults() {
+    async fn auto_improve_admin_refuses_request_eval_and_inherits_server_defaults() {
         let tmp = TempDir::new().unwrap();
         let store = Store::open(tmp.path()).unwrap();
         let wiki = Wiki::new(tmp.path(), store.writer.clone())
@@ -11808,6 +11932,44 @@ mod tests {
             min_delta: 0.0,
         };
         let router = admin_router(state);
+
+        let rejected = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/admin/auto-improve")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&serde_json::json!({
+                            "workspace": "default",
+                            "project": "scratch",
+                            "session_id": session_id.to_string(),
+                            "min_observations": 1,
+                            "min_session_duration_secs": 0,
+                            "min_confidence": 0.75,
+                            "max_proposals_per_run": 5,
+                            "eval": {
+                                "enabled": true,
+                                "command": tmp.path().join("request-controlled-program").display().to_string(),
+                                "timeout_secs": 1,
+                                "targets": ["notes"],
+                                "min_delta": 0.0
+                            }
+                        }))
+                        .unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(rejected.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        let body = to_bytes(rejected.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            json["error"],
+            "auto-improve eval request field was removed; configure [auto_improve.eval] on the server"
+        );
 
         let resp = router
             .oneshot(
@@ -12280,6 +12442,60 @@ mod tests {
                 .is_none(),
             "reject must not write the target page"
         );
+    }
+
+    /// A failed read of the target page must not be rendered as a diff
+    /// against an empty page: that is the same response a proposal for a page
+    /// that does not exist yet gets, so a reviewer would see a create where
+    /// the proposal updates an existing page.
+    #[tokio::test]
+    async fn pending_write_diff_surfaces_a_failed_page_read() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let wiki = Wiki::new(tmp.path(), store.writer.clone())
+            .unwrap()
+            .with_store_reader(store.reader.clone());
+        let (ws, proj, proposal_id) = stage_pending_write(
+            &store,
+            "default",
+            "scratch",
+            "notes/pending.md",
+            "# Pending\n\nproposed body",
+        )
+        .await;
+        let router = admin_router(admin_state_for_store(&tmp, &store, wiki));
+        let request = || {
+            Request::builder()
+                .uri(format!(
+                    "/admin/pending-writes/{proposal_id}/diff?workspace=default&project=scratch"
+                ))
+                .body(Body::empty())
+                .unwrap()
+        };
+
+        // Control: an absent target page still diffs against an empty body.
+        let resp = router.clone().oneshot(request()).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        // Break only the page read; the proposal tables stay readable.
+        rusqlite::Connection::open(store.db_path())
+            .unwrap()
+            .execute_batch("ALTER TABLE pages RENAME TO pages_unreadable")
+            .unwrap();
+        assert!(
+            store
+                .reader
+                .page_body_by_ids(ws, proj, "notes/pending.md")
+                .await
+                .is_err(),
+            "fixture must make the page read fail"
+        );
+
+        let resp = router.oneshot(request()).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(body.get("diff").is_none(), "no fabricated diff: {body}");
     }
 
     #[tokio::test]

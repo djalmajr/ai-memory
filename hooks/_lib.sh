@@ -961,9 +961,18 @@ ai_memory_post_hook() {
 # Every request in this bundle sends `X-AI-Memory-Client`: an unauthenticated
 # server reached through a non-loopback host name refuses a handoff fetch
 # without it, because a web page cannot add that header to a request it makes.
+#
+# The GET claims the newest open handoff in whatever project the server
+# resolves. `ai_memory_marker_qs` adds `&cwd=` whenever the payload named a
+# directory, so a URL without it names no project: the server would fall back
+# to its default or the caller's last active project, and the claim could
+# consume another repository's handoff. Fetch nothing then; the handoff stays
+# open for memory_handoff_accept (parity with the native hook).
 ai_memory_get_handoff() {
     case "$1" in
         *"$AI_MEMORY_SERVER_ROUTED_QS"*|*'ai_memory_invalid_home_routes=1'*) return 0 ;;
+        *'&cwd='*) ;;
+        *) return 0 ;;
     esac
     _amhdr=$(ai_memory_auth_header_file)
     if [ -n "${AI_MEMORY_AUTH_TOKEN:-}" ]; then

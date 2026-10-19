@@ -509,6 +509,7 @@ pub(crate) enum WriteCmd {
         /// [`crate::ops::PurgeMode::Preview`] stops right after counting and
         /// never issues the delete — see [`crate::ops::PurgeMode`]'s doc.
         mode: crate::ops::PurgeMode,
+        owner: Option<IdentityKey>,
         reply: oneshot::Sender<StoreResult<crate::ops::PurgeSessionSummary>>,
     },
     /// Final `wal_checkpoint(TRUNCATE)`, then close the connection and stop
@@ -714,6 +715,10 @@ pub(crate) enum WriteCmd {
         label: String,
         token_hash: [u8; TOKEN_HASH_LEN],
         preview: Option<String>,
+        /// Refuse with [`StoreError::InvalidState`] when the user already
+        /// holds this many active credentials. Checked on the writer thread,
+        /// so concurrent creates cannot both slip under the limit.
+        max_active: Option<usize>,
         reply: oneshot::Sender<StoreResult<ApiCredentialId>>,
     },
     RotateApiCredential {
@@ -2425,6 +2430,55 @@ impl WriterHandle {
         compaction: crate::ops::Compaction,
         mode: crate::ops::PurgeMode,
     ) -> StoreResult<crate::ops::PurgeSessionSummary> {
+        self.purge_session_with_owner(
+            workspace_id,
+            project_id,
+            session_id,
+            author_id,
+            compaction,
+            mode,
+            None,
+        )
+        .await
+    }
+
+    /// Purge only a session stamped with this exact operator, never shared legacy rows.
+    /// Cross-project cascades are refused. Ownership is checked by the writer transaction.
+    ///
+    /// # Errors
+    /// Returns NotFound for a foreign/shared session, or propagates store failures.
+    pub async fn purge_owned_session(
+        &self,
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+        session_id: SessionId,
+        owner: IdentityKey,
+        author_id: Option<UserId>,
+        mode: crate::ops::PurgeMode,
+    ) -> StoreResult<crate::ops::PurgeSessionSummary> {
+        self.purge_session_with_owner(
+            workspace_id,
+            project_id,
+            session_id,
+            author_id,
+            crate::ops::Compaction::Skip,
+            mode,
+            Some(owner),
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn purge_session_with_owner(
+        &self,
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+        session_id: SessionId,
+        author_id: Option<UserId>,
+        compaction: crate::ops::Compaction,
+        mode: crate::ops::PurgeMode,
+        owner: Option<IdentityKey>,
+    ) -> StoreResult<crate::ops::PurgeSessionSummary> {
         let (tx, rx) = oneshot::channel();
         self.send(WriteCmd::PurgeSession {
             workspace_id,
@@ -2433,6 +2487,7 @@ impl WriterHandle {
             author_id,
             compaction,
             mode,
+            owner,
             reply: tx,
         })
         .await?;
@@ -3175,6 +3230,38 @@ impl WriterHandle {
         token_hash: [u8; TOKEN_HASH_LEN],
         preview: Option<String>,
     ) -> StoreResult<ApiCredentialId> {
+        self.send_create_api_credential(id, user_id, label, token_hash, preview, None)
+            .await
+    }
+
+    /// Insert a native API credential unless `user_id` already holds
+    /// `max_active` active ones.
+    ///
+    /// # Errors
+    /// [`StoreError::InvalidState`] at the limit; duplicate hash, writer
+    /// closed, SQL.
+    pub async fn create_api_credential_within_limit(
+        &self,
+        id: ApiCredentialId,
+        user_id: UserId,
+        label: String,
+        token_hash: [u8; TOKEN_HASH_LEN],
+        preview: Option<String>,
+        max_active: usize,
+    ) -> StoreResult<ApiCredentialId> {
+        self.send_create_api_credential(id, user_id, label, token_hash, preview, Some(max_active))
+            .await
+    }
+
+    async fn send_create_api_credential(
+        &self,
+        id: ApiCredentialId,
+        user_id: UserId,
+        label: String,
+        token_hash: [u8; TOKEN_HASH_LEN],
+        preview: Option<String>,
+        max_active: Option<usize>,
+    ) -> StoreResult<ApiCredentialId> {
         let (tx, rx) = oneshot::channel();
         self.send(WriteCmd::CreateApiCredential {
             id,
@@ -3182,6 +3269,7 @@ impl WriterHandle {
             label,
             token_hash,
             preview,
+            max_active,
             reply: tx,
         })
         .await?;
@@ -4425,9 +4513,10 @@ fn worker_loop(mut conn: Connection, mut rx: mpsc::Receiver<WriteCmd>) {
                 author_id,
                 compaction,
                 mode,
+                owner,
                 reply,
             } => {
-                let result = ops::purge_session(
+                let result = ops::purge_session_with_owner(
                     &mut conn,
                     workspace_id,
                     project_id,
@@ -4435,6 +4524,7 @@ fn worker_loop(mut conn: Connection, mut rx: mpsc::Receiver<WriteCmd>) {
                     author_id,
                     compaction,
                     mode,
+                    owner.as_ref(),
                 );
                 send_or_warn(reply, result, "purge_session");
             }
@@ -4765,16 +4855,32 @@ fn worker_loop(mut conn: Connection, mut rx: mpsc::Receiver<WriteCmd>) {
                 label,
                 token_hash,
                 preview,
+                max_active,
                 reply,
             } => {
-                let result = api_credentials::insert_api_credential(
-                    &conn,
-                    id,
-                    user_id,
-                    &label,
-                    &token_hash,
-                    preview.as_deref(),
-                );
+                let at_limit = match max_active {
+                    Some(max) => api_credentials::count_active_api_credentials_for_user(
+                        &conn,
+                        user_id,
+                        jiff::Timestamp::now().as_microsecond(),
+                    )
+                    .map(|active| (active >= max).then_some(max)),
+                    None => Ok(None),
+                };
+                let result = match at_limit {
+                    Ok(Some(max)) => Err(StoreError::InvalidState(format!(
+                        "active API key limit reached ({max}); revoke a key before creating another"
+                    ))),
+                    Ok(None) => api_credentials::insert_api_credential(
+                        &conn,
+                        id,
+                        user_id,
+                        &label,
+                        &token_hash,
+                        preview.as_deref(),
+                    ),
+                    Err(e) => Err(e),
+                };
                 send_or_warn(reply, result, "create_api_credential");
             }
             WriteCmd::RotateApiCredential {
