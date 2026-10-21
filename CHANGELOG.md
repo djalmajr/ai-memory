@@ -58,6 +58,15 @@ version in [`docs/changelog/`](docs/changelog/):
   `llm_tokenizer_path` and rejects fallback chains until their tokenizers can
   be checked independently. (#2)
 
+### Security
+- Updated `rustls-webpki` 0.103.15 → 0.103.16 for
+  [RUSTSEC-2026-0382](https://rustsec.org/advisories/RUSTSEC-2026-0382), in
+  which certificate verification may accept distrusted intermediates, and
+  `webpki-root-certs` 1.0.9 → 1.0.10 for
+  [RUSTSEC-2026-0383](https://rustsec.org/advisories/RUSTSEC-2026-0383), whose
+  bundled roots still trusted distrusted emSign intermediates. The importer,
+  relay and wiki sync companions take the same `rustls-webpki` bump.
+
 ### Fixed
 - Routed OpenCode's `claude-haiku-5-5` through the Anthropic Messages API for
   both Go and Zen instead of the unsupported Chat Completions protocol.
