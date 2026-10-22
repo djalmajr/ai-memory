@@ -151,6 +151,11 @@ version in [`docs/changelog/`](docs/changelog/):
   version committed is dropped from the git index, never from disk, by the next
   checkpoint. Existing history keeps its old blobs; `docs/lifecycle-ops.md`
   explains how an operator can rewrite it. (akitaonrails/ai-memory#1318)
+- Kept a fork store that recorded `consolidation_chunk_progress` as history
+  row 72 or 81 opening under upstream's strict migration validation (#1443):
+  only those two rows, matched by that exact name, are rewritten to the
+  embedded migration's name and checksum before the runner starts; every
+  other divergence still stops startup. (#16)
 - Added exact hover timestamps to `/web` page metadata, made the OKF upgrade
   dialog keyboard accessible, and added a labelled main-navigation landmark
   with current-page state and narrow-screen wrapping.
