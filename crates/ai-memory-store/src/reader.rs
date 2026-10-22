@@ -1643,8 +1643,11 @@ pub struct DerivedIndexStatus {
     pub observations_rows: u64,
     /// Rows currently present in the observation FTS5 index.
     pub observations_fts_rows: u64,
-    /// Latest pages without any embedding row whose body is non-empty —
-    /// i.e. the pages a backfill can actually act on.
+    /// Latest pages without an embedding row for the configured
+    /// `(provider, model, dim)` triple, whose body is non-empty — i.e. the
+    /// pages a backfill can actually act on. A vector stored under another
+    /// triple is stale and does not cover the page. Without a configured
+    /// embedder (the `None` query) this is "without any embedding row".
     pub latest_pages_missing_embeddings: u64,
     /// Latest pages without an embedding whose body is empty; no
     /// embedder can ever cover these (the backfill skips them by rule).
@@ -11415,6 +11418,11 @@ impl ReaderPool {
 
     /// Return health counters for derived indexes and link/embedding state.
     ///
+    /// "Missing" keeps its historical meaning here: a latest page has no
+    /// vector at all. Server health surfaces with a configured embedder use
+    /// [`Self::derived_index_status_for_embedding`] so vectors from an old
+    /// model do not hide the current backfill gap.
+    ///
     /// These checks are intentionally read-only and derived-index-safe: they
     /// report drift but do not repair it. Rebuild/backfill paths stay behind
     /// explicit admin operations.
@@ -11422,7 +11430,27 @@ impl ReaderPool {
     /// # Errors
     /// Propagates any SQL or pool error.
     pub async fn derived_index_status(&self) -> StoreResult<DerivedIndexStatus> {
-        self.with_conn(|conn| {
+        self.derived_index_status_inner(None).await
+    }
+
+    /// Return derived-index health while judging embedding coverage against
+    /// the configured `(provider, model, dim)` identity.
+    ///
+    /// # Errors
+    /// Propagates any SQL or pool error.
+    pub async fn derived_index_status_for_embedding(
+        &self,
+        configured_embedding: (String, String, u32),
+    ) -> StoreResult<DerivedIndexStatus> {
+        self.derived_index_status_inner(Some(configured_embedding))
+            .await
+    }
+
+    async fn derived_index_status_inner(
+        &self,
+        configured_embedding: Option<(String, String, u32)>,
+    ) -> StoreResult<DerivedIndexStatus> {
+        self.with_conn(move |conn| {
             let mut triples_stmt = conn.prepare(
                 "SELECT provider, model, dim, COUNT(*) \
                  FROM page_embeddings \
@@ -11481,14 +11509,38 @@ impl ReaderPool {
                 // as \"missing\" overstated the actionable number forever
                 // (observed live: a stable 427 that no backfill could
                 // ever clear). Unembeddable pages are reported apart.
-                latest_pages_missing_embeddings: count(
-                    conn,
-                    "SELECT COUNT(*) \
-                     FROM pages pg \
-                     LEFT JOIN page_embeddings pe ON pe.page_id = pg.id \
-                     WHERE pg.is_latest = 1 AND pe.page_id IS NULL \
-                       AND TRIM(pg.body) != ''",
-                )?,
+                // With a configured triple, "has a vector" means "has a
+                // vector the current model would produce": a row stored
+                // under an old triple is stale, and without the triple the
+                // count would read zero after every model switch.
+                latest_pages_missing_embeddings: match configured_embedding {
+                    Some((provider, model, dim)) => {
+                        let provider = provider.as_str();
+                        let model = model.as_str();
+                        let dim = i64::from(dim);
+                        count_bound(
+                            conn,
+                            "SELECT COUNT(*) \
+                             FROM pages pg \
+                             WHERE pg.is_latest = 1 AND TRIM(pg.body) != '' \
+                               AND NOT EXISTS ( \
+                                   SELECT 1 FROM page_embeddings pe \
+                                   WHERE pe.page_id = pg.id \
+                                     AND pe.provider = ?1 \
+                                     AND pe.model = ?2 \
+                                     AND pe.dim = ?3)",
+                            &[&provider, &model, &dim],
+                        )
+                    }
+                    None => count(
+                        conn,
+                        "SELECT COUNT(*) \
+                         FROM pages pg \
+                         LEFT JOIN page_embeddings pe ON pe.page_id = pg.id \
+                         WHERE pg.is_latest = 1 AND pe.page_id IS NULL \
+                           AND TRIM(pg.body) != ''",
+                    ),
+                }?,
                 latest_pages_unembeddable: count(
                     conn,
                     "SELECT COUNT(*) \

@@ -2693,6 +2693,9 @@ impl AiMemoryServer {
         followed by a bounded kind/tier/pinned/tag source-authority adjustment. \
         Returns up to `limit` pages with HTML-marked snippets and a rank \
         score (lower rank = better match). Only latest page versions. \
+        Query text is folded (a NUL becomes a space) and bounded to the \
+        first 4 KiB before parsing, so pasting a whole document searches \
+        only its opening. \
         Set `explain=true` to attach per-stream ranks, matched entities, raw \
         scores, RRF contributions, graph provenance, and the authority multiplier to \
         project/scopes hits; it also returns `streams_active` and per-stream \
@@ -2745,7 +2748,7 @@ impl AiMemoryServer {
                     .as_deref()
                     .is_some_and(|s| !s.trim().is_empty())
             {
-                return Err(McpError::internal_error(
+                return Err(McpError::invalid_params(
                     "global cannot be combined with workspace/project/scopes",
                     None,
                 ));
@@ -2790,7 +2793,7 @@ impl AiMemoryServer {
                     .as_deref()
                     .is_some_and(|s| !s.trim().is_empty()))
         {
-            return Err(McpError::internal_error(
+            return Err(McpError::invalid_params(
                 "scopes cannot be combined with workspace/project",
                 None,
             ));
@@ -2803,13 +2806,13 @@ impl AiMemoryServer {
         // of audit mode.
         if let Some(raw_as_of) = args.as_of.as_deref().filter(|s| !s.trim().is_empty()) {
             if args.global.unwrap_or(false) || !args.scopes.is_empty() {
-                return Err(McpError::internal_error(
+                return Err(McpError::invalid_params(
                     "as_of cannot be combined with global or scopes",
                     None,
                 ));
             }
             let instant: jiff::Timestamp = raw_as_of.trim().parse().map_err(|e| {
-                McpError::internal_error(format!("as_of must be an ISO-8601 instant: {e}"), None)
+                McpError::invalid_params(format!("as_of must be an ISO-8601 instant: {e}"), None)
             })?;
             let (ws, proj) = self
                 .effective_ids_for_read_args_with_actor(
@@ -4081,7 +4084,13 @@ impl AiMemoryServer {
                 None,
             ));
         };
-        let session_id = match args.session_id.as_deref() {
+        // Blank means omitted, as in `memory_consolidate`.
+        let session_id = match args
+            .session_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|raw| !raw.is_empty())
+        {
             Some(raw) => SessionId::from_str(raw)
                 .map_err(|e| McpError::invalid_params(e.to_string(), None))?,
             None => self
@@ -4409,9 +4418,9 @@ impl AiMemoryServer {
             .map_err(|e| McpError::invalid_params(e.to_string(), None))?;
         let precondition = page_precondition(args.expected_page_id.as_deref(), args.create_only)?;
         let path = PagePath::new(args.path.clone())
-            .map_err(|e| McpError::internal_error(format!("invalid path: {e}"), None))?;
+            .map_err(|e| McpError::invalid_params(format!("invalid path: {e}"), None))?;
         path.ensure_portable()
-            .map_err(|e| McpError::internal_error(format!("invalid path: {e}"), None))?;
+            .map_err(|e| McpError::invalid_params(format!("invalid path: {e}"), None))?;
         let path = self.place_slot_write(path, &parts).await?;
         let scope = args.scope.as_deref().map(str::trim);
         let profile_scope = scope == Some("profile");
@@ -4442,7 +4451,7 @@ impl AiMemoryServer {
                 .unwrap_or(if session_page { "episodic" } else { "semantic" });
         let tier: Tier = tier_name
             .parse()
-            .map_err(|_| McpError::internal_error(format!("unknown tier '{tier_name}'"), None))?;
+            .map_err(|_| McpError::invalid_params(format!("unknown tier '{tier_name}'"), None))?;
         if let Some(expires_at) = args
             .expires_at
             .as_deref()
@@ -4483,7 +4492,7 @@ impl AiMemoryServer {
                             .as_deref()
                             .is_some_and(|s| !s.trim().is_empty())
                     {
-                        return Err(McpError::internal_error(
+                        return Err(McpError::invalid_params(
                             "scope: \"global\" cannot be combined with workspace/project",
                             None,
                         ));
@@ -4508,7 +4517,7 @@ impl AiMemoryServer {
                             .as_deref()
                             .is_some_and(|s| !s.trim().is_empty())
                     {
-                        return Err(McpError::internal_error(
+                        return Err(McpError::invalid_params(
                             "scope: \"profile\" cannot be combined with workspace/project",
                             None,
                         ));
@@ -4524,7 +4533,7 @@ impl AiMemoryServer {
                     }
                 }
                 Some(other) => {
-                    return Err(McpError::internal_error(
+                    return Err(McpError::invalid_params(
                         format!(
                             "unknown scope '{other}': the supported values are \"global\" and \"profile\""
                         ),
@@ -4756,7 +4765,7 @@ impl AiMemoryServer {
 
         let page_path = if let Some(p) = args.path {
             PagePath::new(p)
-                .map_err(|e| McpError::internal_error(format!("invalid path: {e}"), None))?
+                .map_err(|e| McpError::invalid_params(format!("invalid path: {e}"), None))?
         } else if let Some(query) = args.query {
             let hits = self
                 .reader
@@ -5289,7 +5298,7 @@ impl AiMemoryServer {
             _ => None,
         };
         let path = PagePath::new(args.path.clone())
-            .map_err(|e| McpError::internal_error(format!("invalid path: {e}"), None))?;
+            .map_err(|e| McpError::invalid_params(format!("invalid path: {e}"), None))?;
         let (path, (ws, proj)) = match args.scope.as_deref().map(str::trim) {
             None | Some("") => (
                 self.place_slot_delete(path, &parts).await?,
@@ -10666,6 +10675,86 @@ mod tests {
         assert!(bad.is_err());
     }
 
+    /// Conflicting scope arguments and a malformed `as_of` are decided from
+    /// the request alone, so they are the caller's mistake: `memory_query`
+    /// answers `invalid params` like the page tools, not an internal error a
+    /// client would read as "the server broke, retry".
+    #[tokio::test]
+    async fn memory_query_answers_bad_arguments_with_invalid_params() {
+        let (_tmp, _store, server, _ws, _pj) = setup_server().await;
+        let base = || QueryArgs {
+            query: "karpathy".into(),
+            limit: Some(5),
+            project: None,
+            workspace: None,
+            scopes: Vec::new(),
+            global: None,
+            include_expired: None,
+            include_superseded: None,
+            pin_first: None,
+            explain: None,
+            as_of: None,
+            answer: None,
+            reasoning: None,
+        };
+        let scope = |project: &str| MemoryScopeArg {
+            workspace: "default".into(),
+            project: project.into(),
+        };
+
+        let mut global_project = base();
+        global_project.global = Some(true);
+        global_project.project = Some("scratch".into());
+
+        let mut global_workspace = base();
+        global_workspace.global = Some(true);
+        global_workspace.workspace = Some("default".into());
+
+        let mut global_scopes = base();
+        global_scopes.global = Some(true);
+        global_scopes.scopes = vec![scope("scratch")];
+
+        let mut scopes_project = base();
+        scopes_project.scopes = vec![scope("scratch")];
+        scopes_project.project = Some("scratch".into());
+
+        let mut scopes_workspace = base();
+        scopes_workspace.scopes = vec![scope("scratch")];
+        scopes_workspace.workspace = Some("default".into());
+
+        let mut as_of_scopes = base();
+        as_of_scopes.scopes = vec![scope("scratch")];
+        as_of_scopes.as_of = Some("2026-06-01T00:00:00Z".into());
+
+        let mut malformed_as_of = base();
+        malformed_as_of.as_of = Some("not-a-time".into());
+
+        for (what, args) in [
+            ("global + project", global_project),
+            ("global + workspace", global_workspace),
+            ("global + scopes", global_scopes),
+            ("scopes + project", scopes_project),
+            ("scopes + workspace", scopes_workspace),
+            ("as_of + scopes", as_of_scopes),
+            ("malformed as_of", malformed_as_of),
+        ] {
+            let err = server
+                .memory_query(Parameters(args), OptionalParts(test_parts_default()))
+                .await
+                .unwrap_err();
+            assert_eq!(
+                err.code,
+                rmcp::model::ErrorCode::INVALID_PARAMS,
+                "{what}: {err:?}"
+            );
+        }
+
+        server
+            .memory_query(Parameters(base()), OptionalParts(test_parts_default()))
+            .await
+            .expect("a well-formed query is not rejected");
+    }
+
     #[tokio::test]
     async fn memory_query_returns_hits_via_tool_method() {
         let (_tmp, _store, server, _ws, _pj) = setup_server().await;
@@ -15274,6 +15363,91 @@ mod tests {
         }
     }
 
+    /// A malformed path, tier or scope is the caller's mistake, so the page
+    /// tools answer `invalid params` like their siblings, not an internal
+    /// error a client would read as "the server broke, retry".
+    #[tokio::test]
+    async fn page_tools_answer_bad_path_tier_and_scope_with_invalid_params() {
+        let (tmp, store, server, _ws, _pj) = setup_server().await;
+        let server = server.with_wiki(Wiki::new(tmp.path(), store.writer.clone()).unwrap());
+        let write = |path: &str, tier: Option<&str>, scope: Option<&str>, project: Option<&str>| {
+            WritePageArgs {
+                metadata: Default::default(),
+                path: path.into(),
+                body: "# Page\n".into(),
+                title: None,
+                tier: tier.map(Into::into),
+                tags: vec![],
+                pinned: false,
+                project: project.map(Into::into),
+                workspace: None,
+                scope: scope.map(Into::into),
+                expires_at: None,
+                session_id: None,
+                create_only: false,
+                expected_page_id: None,
+            }
+        };
+        for args in [
+            write("notes/a|b.md", None, None, None),
+            write("../x.md", None, None, None),
+            write("notes/ok.md", Some("bogus"), None, None),
+            write("notes/ok.md", None, Some("global"), Some("x")),
+            write("notes/ok.md", None, Some("profile"), Some("x")),
+            write("notes/ok.md", None, Some("elsewhere"), None),
+        ] {
+            let what = format!("{:?} {:?} {:?}", args.path, args.tier, args.scope);
+            let err = server
+                .memory_write_page(Parameters(args), OptionalParts(test_parts_default()))
+                .await
+                .unwrap_err();
+            assert_eq!(
+                err.code,
+                rmcp::model::ErrorCode::INVALID_PARAMS,
+                "{what}: {err:?}"
+            );
+        }
+
+        let err = server
+            .memory_read_page(
+                Parameters(ReadPageArgs {
+                    query: None,
+                    path: Some("../x.md".into()),
+                    project: None,
+                    workspace: None,
+                    include_related: false,
+                    related_depth: None,
+                }),
+                OptionalParts(test_parts_default()),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(
+            err.code,
+            rmcp::model::ErrorCode::INVALID_PARAMS,
+            "read: {err:?}"
+        );
+
+        let err = server
+            .memory_delete_page(
+                Parameters(DeletePageArgs {
+                    scope: None,
+                    path: "../x.md".into(),
+                    project: None,
+                    workspace: None,
+                    expected_page_id: None,
+                }),
+                OptionalParts(test_parts_default()),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(
+            err.code,
+            rmcp::model::ErrorCode::INVALID_PARAMS,
+            "delete: {err:?}"
+        );
+    }
+
     #[tokio::test]
     async fn memory_write_page_rejects_workspace_without_project() {
         let tmp = TempDir::new().unwrap();
@@ -19778,6 +19952,59 @@ mod tests {
             "an unknown session read as a refusal: {}",
             err.message
         );
+    }
+
+    /// A blank `session_id` means omitted and a padded one names the same
+    /// session, as in `memory_consolidate` and
+    /// `memory_read_session_observations`.
+    #[tokio::test]
+    async fn auto_improve_reads_blank_session_id_as_omitted_and_trims_padding() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let wiki = Wiki::new(tmp.path(), store.writer.clone())
+            .unwrap()
+            .with_store_reader(store.reader.clone());
+        let ws = store
+            .writer
+            .get_or_create_workspace("default")
+            .await
+            .unwrap();
+        let proj = store
+            .writer
+            .get_or_create_project(ws, "scratch", None)
+            .await
+            .unwrap();
+        let older = seed_short_completed_session(&store, ws, proj).await;
+        tokio::time::sleep(Duration::from_millis(1)).await;
+        let latest = seed_short_completed_session(&store, ws, proj).await;
+
+        let llm: Arc<dyn LlmProvider> = Arc::new(PreflightMustNotCallLlm);
+        let consolidator = Arc::new(Consolidator::new(
+            store.reader.clone(),
+            store.writer.clone(),
+            wiki.clone(),
+            llm.clone(),
+            ws,
+            proj,
+        ));
+        let server = AiMemoryServer::new(store.reader.clone(), store.writer.clone(), ws, proj)
+            .with_consolidator_arc(wiki, llm, consolidator);
+
+        for (raw, expected) in [("  ".to_string(), latest), (format!("  {older}\n"), older)] {
+            let response = call_tool_json(
+                server
+                    .memory_auto_improve(
+                        Parameters(AutoImproveArgs {
+                            session_id: Some(raw.clone()),
+                            ..auto_improve_args(None)
+                        }),
+                        OptionalParts(test_parts_default()),
+                    )
+                    .await
+                    .unwrap_or_else(|e| panic!("session_id {raw:?}: {e:?}")),
+            );
+            assert_eq!(response["session_id"], expected.to_string(), "{raw:?}");
+        }
     }
 
     #[tokio::test]

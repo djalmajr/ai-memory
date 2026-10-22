@@ -74,6 +74,14 @@ pub fn parse(input: &str) -> WikiResult<Markdown> {
     // ending after it: a frontmatter-only file (a `_meta.md` scope manifest,
     // a stub page) saved by an editor that does not add a final newline.
     let split = rest.and_then(|rest| {
+        // An empty block puts the closing fence first, with no line before
+        // it to supply the newline `close` starts with.
+        if let Some(body) = rest.strip_prefix(&close[1..]) {
+            return Some(("", body));
+        }
+        if rest == "---" {
+            return Some(("", ""));
+        }
         rest.find(&close)
             .map(|end| (&rest[..end], &rest[end + close.len()..]))
             .or_else(|| rest.strip_suffix("\n---").map(|fm| (fm, "")))
@@ -690,7 +698,9 @@ fn resolve_local_wikilink(
         .map_or_else(Vec::new, |(dir, _)| {
             dir.split('/').filter(|s| !s.is_empty()).collect()
         });
-    let mut href = relative_href(&page_dir, &target);
+    // The wikilink names a literal path; a Markdown destination is a URL
+    // that `extract_links` decodes once, so a literal `%` leaves as `%25`.
+    let mut href = relative_href(&page_dir, &target).replace('%', "%25");
     href.push_str(suffix);
     let display = label
         .map(str::trim)
@@ -1342,6 +1352,29 @@ mod tests {
         assert_eq!(crlf.body, "");
     }
 
+    /// An empty block (`---` straight after `---`, the Jekyll idiom) is
+    /// frontmatter. Its closing fence has no newline in front of it, so it
+    /// was missed: the page body was read as YAML up to the next `---` rule,
+    /// or the whole file was kept as body.
+    #[test]
+    fn parses_empty_frontmatter_block() {
+        let md = parse("---\n---\n# Title\n\nIntro.\n\n---\n\nMore.\n").unwrap();
+        assert!(md.frontmatter.is_null(), "{:?}", md.frontmatter);
+        assert_eq!(md.body, "# Title\n\nIntro.\n\n---\n\nMore.\n");
+
+        let md = parse("---\n---\nbody").unwrap();
+        assert!(md.frontmatter.is_null());
+        assert_eq!(md.body, "body");
+
+        let crlf = parse("\u{FEFF}---\r\n---\r\nbody\r\n").unwrap();
+        assert!(crlf.frontmatter.is_null());
+        assert_eq!(crlf.body, "body\r\n");
+
+        let only = parse("---\n---").unwrap();
+        assert!(only.frontmatter.is_null());
+        assert_eq!(only.body, "");
+    }
+
     /// A body line that merely starts with `---` at the end of the file is
     /// not a closing fence.
     #[test]
@@ -1873,6 +1906,25 @@ mod tests {
             rewrite_local_wikilinks("[[decisions/b|  ]]", &path, "proj"),
             "[decisions/b](../decisions/b.md)"
         );
+    }
+
+    /// A wikilink names a literal page path, but the exported Markdown link
+    /// is a URL that `extract_links` decodes once. A `%` in the filename has
+    /// to leave as `%25`, or the export points at another page (`a%20b.md`
+    /// read as `a b.md`) or at none (`95%cap.md` does not decode).
+    #[test]
+    fn rewrite_local_wikilinks_keeps_a_literal_percent_in_the_target() {
+        let page = PagePath::new("notes/here.md").unwrap();
+        for (body, href) in [
+            ("See [[notes/a%20b]].\n", "a%2520b.md"),
+            ("See [[notes/cpu-95%cap]].\n", "cpu-95%25cap.md"),
+        ] {
+            let before = extract_links(body, &page);
+            assert_eq!(before.len(), 1, "{body}");
+            let exported = rewrite_local_wikilinks(body, &page, "proj");
+            assert!(exported.contains(&format!("]({href})")), "{exported}");
+            assert_eq!(extract_links(&exported, &page), before, "{exported}");
+        }
     }
 
     #[test]
