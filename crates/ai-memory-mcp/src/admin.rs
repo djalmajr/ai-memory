@@ -1036,10 +1036,7 @@ async fn build_okf_bundle_file(
         // prose outside the list structure (some strict OKF validators
         // read §11.3 as rejecting a stray sentence — issue #960 item 1).
         families.sort();
-        let listing: String = families
-            .iter()
-            .map(|f| format!("- [{f}/]({f}/)\n"))
-            .collect();
+        let listing = ai_memory_wiki::okf_directory_listing(&families);
         let index = format!(
             "---\nokf_version: \"0.2\"\n---\n\n# Bundle index — concept files by directory\n\n{listing}"
         );
@@ -1318,8 +1315,20 @@ async fn handle_list_projects(State(state): State<Arc<AdminState>>) -> impl Into
 }
 
 async fn handle_status(State(state): State<Arc<AdminState>>) -> impl IntoResponse {
+    // Count "missing" against the configured embedder's stored triple, so
+    // a model swap cannot read as a fully covered index; with no embedder
+    // configured the historical "no vector at all" count is kept.
+    let configured_embedding = state.embedder.as_deref().map(stored_embedding_identity);
     match state.reader.status_counts().await {
-        Ok(counts) => match state.reader.derived_index_status().await {
+        Ok(counts) => match match configured_embedding {
+            Some(identity) => {
+                state
+                    .reader
+                    .derived_index_status_for_embedding(identity)
+                    .await
+            }
+            None => state.reader.derived_index_status().await,
+        } {
             Ok(derived) => {
                 // Three pragma reads; a failure here must not take down the
                 // whole status response, which is also the health probe.
@@ -4105,6 +4114,21 @@ async fn embed_project_pages(
     .map_err(|e| internal_err(e.to_string()))
 }
 
+/// The `(provider, model, dim)` triple rows are stored under for one
+/// embedder: `model_identity()` (which folds in a configured document
+/// prefix), never the bare wire model name. `handle_embed`'s stale-row
+/// purge and `handle_status`'s missing-vector count must both match rows
+/// the way they are written, so they share this instead of each spelling
+/// the triple (a vector counts as covering a page only when this very
+/// identity would store one for it).
+fn stored_embedding_identity(embedder: &dyn Embedder) -> (String, String, u32) {
+    (
+        embedder.provider().to_string(),
+        embedder.model_identity(),
+        embedder.dim(),
+    )
+}
+
 async fn handle_embed(
     State(state): State<Arc<AdminState>>,
     Json(req): Json<EmbedRequest>,
@@ -4121,12 +4145,7 @@ async fn handle_embed(
         }
     };
 
-    let provider = embedder.provider().to_string();
-    // Not `.model()`: the purge below must match the identity rows were
-    // actually stored under (a document-prefix change), not the wire
-    // model name. See `Embedder::model_identity`.
-    let model = embedder.model_identity();
-    let dim = embedder.dim();
+    let (provider, model, dim) = stored_embedding_identity(&*embedder);
 
     let mut totals = EmbedBackfillCounts::default();
 
@@ -10428,6 +10447,7 @@ mod tests {
         let wiki = Wiki::new(tmp.path(), store.writer.clone())
             .unwrap()
             .with_store_reader(store.reader.clone());
+        let web = ai_memory_web::router(store.reader.clone(), wiki.clone());
         let router = admin_router(AdminState {
             compact_jobs: Default::default(),
             ingest_metrics: std::sync::Arc::new(ai_memory_core::IngestMetrics::default()),
@@ -10453,7 +10473,7 @@ mod tests {
             scope_invalidator: None,
             trusted_proxy_identity: false,
         });
-        (tmp, router)
+        (tmp, router.nest("/web", web))
     }
 
     /// The exported tarball is a valid OKF v0.2 bundle: fresh index.md
@@ -10511,6 +10531,87 @@ mod tests {
         let fm = ai_memory_wiki::parse(&page_body).unwrap().frontmatter;
         assert!(ai_memory_core::okf::is_conformant(&fm));
         assert_eq!(fm["type"], "Gotcha");
+    }
+
+    #[tokio::test]
+    async fn export_okf_directory_index_links_are_clickable() {
+        let (_tmp, router) = read_page_test_router();
+        let cases = [
+            ("notes", "notes", "notes/"),
+            ("team notes", "team%20notes", "team notes/"),
+            ("notes [draft", "notes%20%5Bdraft", "notes [draft/"),
+            ("c# 50%", "c%23%2050%25", "c# 50%/"),
+            ("日本語", "%E6%97%A5%E6%9C%AC%E8%AA%9E", "日本語/"),
+            ("&copy;", "%26copy%3B", "&amp;copy;/"),
+            ("`draft`", "%60draft%60", "`draft`/"),
+            ("_draft_", "_draft_", "_draft_/"),
+        ];
+        for (family, _, _) in cases {
+            post_write_page(
+                &router,
+                "default",
+                "scratch",
+                &format!("{family}/seed.md"),
+                "# Seed",
+            )
+            .await;
+        }
+        let response = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/admin/export-okf?workspace=default&project=scratch")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let mut archive =
+            tar::Archive::new(flate2::read::GzDecoder::new(std::io::Cursor::new(bytes)));
+        let mut index = String::new();
+        for entry in archive.entries().unwrap() {
+            let mut entry = entry.unwrap();
+            if entry.path().unwrap().as_ref() == std::path::Path::new("index.md") {
+                use std::io::Read as _;
+                entry.read_to_string(&mut index).unwrap();
+            }
+        }
+        assert!(
+            index.contains("- [notes/](notes/)\n"),
+            "ordinary listing changed: {index}"
+        );
+        let body = ai_memory_wiki::parse(&index).unwrap().body;
+        post_write_page(&router, "default", "scratch", "export-index.md", &body).await;
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .uri("/web/w/default/scratch/p/export-index.md")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let html = String::from_utf8(
+            axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap()
+                .to_vec(),
+        )
+        .unwrap();
+        for (family, encoded, label) in cases {
+            assert!(
+                html.contains(&format!(
+                    "<a href=\"w/default/scratch/p/{encoded}\">{label}</a>"
+                )),
+                "rendered directory link missing or changed: {family}: {html}"
+            );
+        }
     }
 
     /// Issue #960 item 1: strict OKF validators read §11.3 ("follows the

@@ -24,12 +24,14 @@ use ai_memory_store::{
     lookup_existing_workspace,
 };
 use ai_memory_wiki::{AdmissionContext, AdmissionOp, Wiki};
-use axum::Json;
-use axum::Router;
+use axum::body::{Body, to_bytes};
 use axum::extract::{Query, State};
-use axum::http::{HeaderMap, StatusCode};
+use axum::http::{HeaderMap, Request, StatusCode};
+use axum::middleware::{Next, from_fn};
 use axum::response::IntoResponse;
+use axum::response::Response;
 use axum::routing::{get, post};
+use axum::{Json, Router};
 use jiff::Timestamp;
 use serde::{Deserialize, Serialize};
 use tracing::{debug, info, warn};
@@ -64,6 +66,9 @@ pub const DEFAULT_INGEST_GATE_MAX_ENTRIES: usize = 4096;
 /// client drain cap so a single request cannot monopolize ingest capacity or
 /// allocate/process an unbounded vector of hook events.
 pub const MAX_HOOK_BATCH_ITEMS: usize = 256;
+
+/// Keep repair buffering at the server's global machine-route request limit.
+const MAX_HOOK_BODY_BYTES: usize = 10 * 1024 * 1024;
 
 /// Upper bound for reject-policy admission on the synchronous `/handoff`
 /// path. The shortest shipped client deadline is the shell hook's one-second
@@ -631,11 +636,40 @@ fn admission_skips(
 /// (the read-only compaction recap for a "reload context" prompt).
 pub fn hook_router(state: HookState) -> Router {
     Router::new()
-        .route("/hook", post(handle_hook))
+        .route(
+            "/hook",
+            post(handle_hook).route_layer(from_fn(repair_hook_json)),
+        )
         .route("/hook/batch", post(handle_hook_batch))
         .route("/handoff", get(handle_handoff))
         .route("/recap", get(crate::recap::handle_recap))
         .with_state(Arc::new(state))
+}
+
+/// Repair the one invalid-JSON shape first-party harnesses can produce when
+/// they truncate an escaped emoji between its UTF-16 surrogate halves. The
+/// normal `Json` extractor still owns media-type validation and all parsing;
+/// valid bodies pass through byte-for-byte.
+async fn repair_hook_json(request: Request<Body>, next: Next) -> Response {
+    let (parts, body) = request.into_parts();
+    let bytes = match to_bytes(body, MAX_HOOK_BODY_BYTES).await {
+        Ok(bytes) => bytes,
+        Err(_) => return StatusCode::PAYLOAD_TOO_LARGE.into_response(),
+    };
+    let bytes = repair_hook_json_bytes(bytes);
+    next.run(Request::from_parts(parts, Body::from(bytes)))
+        .await
+}
+
+fn repair_hook_json_bytes(bytes: axum::body::Bytes) -> axum::body::Bytes {
+    if serde_json::from_slice::<serde_json::Value>(&bytes).is_err() {
+        std::str::from_utf8(&bytes)
+            .ok()
+            .and_then(crate::replace_lone_surrogate_escapes)
+            .map_or(bytes, axum::body::Bytes::from)
+    } else {
+        bytes
+    }
 }
 
 /// Unix milliseconds for an ingest metric stamp, saturating rather than
@@ -4789,7 +4823,7 @@ fn is_acknowledgment(text: &str) -> bool {
     }
     let mut rest = trimmed;
     loop {
-        rest = rest.trim_start_matches([',', '.', ' ', '，', '。']);
+        rest = rest.trim_start_matches([',', '.', '!', ' ', '，', '。', '！']);
         if rest.is_empty() {
             return true;
         }
@@ -6449,6 +6483,16 @@ pub(crate) mod tests {
             profile: ai_memory_core::profile::ProfileSettings::default(),
             ingest_drop_list: crate::drop_list::IngestDropList::default(),
         }
+    }
+
+    #[test]
+    fn hook_ingress_repairs_lone_surrogate_before_json_extraction() {
+        let raw = axum::body::Bytes::from_static(
+            br#"{"session_id":"lone","tool_response":{"stdout":"ok \ud83d tail"}}"#,
+        );
+        let repaired = repair_hook_json_bytes(raw);
+        let value: serde_json::Value = serde_json::from_slice(&repaired).unwrap();
+        assert_eq!(value["tool_response"]["stdout"], "ok \u{FFFD} tail");
     }
 
     /// A consolidator whose provider panics if the hook path ever calls it.
@@ -20409,6 +20453,25 @@ pub(crate) mod tests {
         assert!(is_acknowledgment("谢谢"));
         assert!(!is_acknowledgment("fix the bug in main.rs"));
         assert!(!is_acknowledgment("what is the return type?"));
+    }
+
+    /// An exclamation mark is punctuation like a period: "thanks!" is the
+    /// same acknowledgment as "thanks.", not a prompt to continue from.
+    #[test]
+    fn is_acknowledgment_accepts_exclamation_marks() {
+        for ack in [
+            "thanks!",
+            "great!",
+            "ok, thanks!",
+            "perfect!!",
+            "好的！",
+            "谢谢!",
+        ] {
+            assert!(is_acknowledgment(ack), "{ack:?} is an acknowledgment");
+        }
+        for request in ["ok? now run it", "thanks! now run the tests"] {
+            assert!(!is_acknowledgment(request), "{request:?} is a request");
+        }
     }
 
     /// A compound acknowledgment is acknowledgment phrases and separators
