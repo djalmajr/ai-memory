@@ -1,12 +1,9 @@
--- Provenance and numbering: this table was introduced in the fork as
--- migration V68, renumbered to V72 after upstream 2.5.2 added V68-V71, to
--- V81 after upstream 3.0.0 took V72-V80, and to V84 after upstream 3.1.1
--- took V81-V83. The DDL is idempotent (IF NOT EXISTS) because stores that
--- applied an earlier numbering already have the table. Such a store keeps a
--- history row `81 consolidation_chunk_progress`; refinery (abort_divergent
--- = false) treats V81 as applied and skips upstream's V81 body, which V83
--- supersedes (it rebuilds `sessions` with the complete agent_kind list,
--- including `codebuddy`).
+-- Provenance: this fork-only table was introduced as migration V68 and
+-- renumbered to V72, V81 and V84 as upstream took each of those numbers. It
+-- now lives outside the refinery numbering so it never competes with an
+-- upstream version again: `migrations::run` executes this DDL after the
+-- runner on every open. Both statements are idempotent (IF NOT EXISTS)
+-- because every store that ran an earlier numbering already has the table.
 --
 -- Durable per-block progress for opt-in map-reduce consolidation so a
 -- crashed or re-run consolidation reuses LLM extractions that already

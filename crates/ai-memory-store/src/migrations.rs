@@ -17,6 +17,11 @@ const V62_NAME: &str = "page_ingestion_windows";
 /// took the version numbers it had used.
 const FORK_CHUNK_PROGRESS_NAME: &str = "consolidation_chunk_progress";
 const FORK_CHUNK_PROGRESS_VERSIONS: [u32; 2] = [72, 81];
+/// Version the fork's last numbered chunk-progress migration used; upstream
+/// 3.2.0 ships its own V84.
+const FORK_CHUNK_PROGRESS_V84: u32 = 84;
+/// Fork-only table created outside the refinery numbering, after the runner.
+const FORK_CHUNK_PROGRESS_DDL: &str = include_str!("consolidation_chunk_progress.sql");
 
 /// Run all pending migrations against an open connection.
 ///
@@ -30,11 +35,13 @@ const FORK_CHUNK_PROGRESS_VERSIONS: [u32; 2] = [72, 81];
 pub fn run(conn: &mut rusqlite::Connection) -> StoreResult<()> {
     repair_original_v62_checksum(conn)?;
     repair_fork_chunk_progress_rows(conn)?;
+    forget_fork_v84_history_row(conn)?;
     migrations::runner()
         .set_abort_divergent(true)
         .set_abort_missing(true)
         .run(conn)
         .map_err(classify_run_error)?;
+    conn.execute_batch(FORK_CHUNK_PROGRESS_DDL)?;
     Ok(())
 }
 
@@ -84,7 +91,8 @@ fn repair_original_v62_checksum(conn: &rusqlite::Connection) -> StoreResult<()> 
 /// migration of that version. Upstream's V72 and V81 only rebuild `sessions`
 /// with an `agent_kind` list that V73 and V83 rebuild again with the complete
 /// list, so marking them applied describes the real schema; the fork table
-/// itself is created by V84 with `IF NOT EXISTS`. Only that exact name is
+/// itself is created by `run()` after the runner, outside the refinery
+/// numbering, with `IF NOT EXISTS`. Only that exact name is
 /// matched, with any checksum: no other build wrote it at these versions.
 /// Every other divergence remains a hard refinery error.
 fn repair_fork_chunk_progress_rows(conn: &rusqlite::Connection) -> StoreResult<()> {
@@ -122,6 +130,34 @@ fn repair_fork_chunk_progress_rows(conn: &rusqlite::Connection) -> StoreResult<(
                 "repaired fork consolidation_chunk_progress migration history row"
             );
         }
+    }
+    Ok(())
+}
+
+/// Delete the history row `84 consolidation_chunk_progress` written by fork
+/// builds that numbered the chunk-progress table V84. No embedded migration
+/// carries that row any more, so `set_abort_missing(true)` would refuse the
+/// store; the table it created stays and `run()` keeps it current. Only that
+/// exact name is deleted: any other V84 row is left for the runner to judge.
+fn forget_fork_v84_history_row(conn: &rusqlite::Connection) -> StoreResult<()> {
+    let has_history: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master \
+         WHERE type = 'table' AND name = 'refinery_schema_history')",
+        [],
+        |row| row.get(0),
+    )?;
+    if !has_history {
+        return Ok(());
+    }
+    let forgotten = conn.execute(
+        "DELETE FROM refinery_schema_history WHERE version = ?1 AND name = ?2",
+        rusqlite::params![FORK_CHUNK_PROGRESS_V84, FORK_CHUNK_PROGRESS_NAME],
+    )?;
+    if forgotten == 1 {
+        tracing::info!(
+            version = FORK_CHUNK_PROGRESS_V84,
+            "forgot fork consolidation_chunk_progress migration history row"
+        );
     }
     Ok(())
 }
@@ -1889,68 +1925,142 @@ mod tests {
         );
     }
 
-    /// The fork migration (V84; introduced as V68, then V72, then V81) is
-    /// idempotent: a store that applied an earlier numbering already has the
-    /// `consolidation_chunk_progress` table and index, so `run()` must apply
-    /// V84 over the existing objects without failing on `table already
-    /// exists`, and the schema it leaves is the same one a fresh migration
-    /// produces.
+    /// The fork table (introduced as V68, then V72, V81 and V84, now outside
+    /// the numbering) is created idempotently: a store that ran an earlier
+    /// numbering already has the `consolidation_chunk_progress` table and
+    /// index, so `run()` must execute the DDL over the existing objects
+    /// without failing on `table already exists`, and keep their rows.
     #[test]
-    fn v84_fork_migration_is_idempotent_over_a_store_that_already_has_the_table() {
+    fn fork_table_ddl_is_idempotent_over_a_store_that_already_has_the_table() {
         let mut conn = Connection::open_in_memory().unwrap();
-
-        // A store migrated to just before the fork's migration.
         run_to(&mut conn, 83).unwrap();
+        conn.execute_batch(FORK_CHUNK_PROGRESS_DDL).unwrap();
+        insert_chunk_checkpoint(&conn);
 
-        // Simulate an earlier fork numbering having already run: the table
-        // and index exist, but there is no V84 history row. Use the exact
-        // same DDL the migration emits so the "already exists" paths are the
-        // real ones.
-        let (v84_name, v84_sql) = {
-            let runner = migrations::runner();
-            let m = runner
-                .get_migrations()
-                .iter()
-                .find(|m| m.version() == 84)
-                .expect("the fork V84 migration must be embedded");
-            (m.name().to_string(), m.sql().unwrap().to_string())
-        };
-        assert_eq!(v84_name, "consolidation_chunk_progress");
-        conn.execute_batch(&v84_sql).unwrap();
+        run(&mut conn).expect("the DDL must apply idempotently over an existing table");
 
-        // A row written under the old shape survives.
+        assert_fork_table_and_index(&conn);
+        assert_eq!(chunk_checkpoint_count(&conn), 1, "the row must survive");
+        assert_eq!(
+            applied_versions(&conn).last(),
+            Some(&i64::from(max_supported_version()))
+        );
+    }
+
+    /// A fresh store gets the fork table from `run()` even though no
+    /// embedded migration creates it.
+    #[test]
+    fn a_fresh_store_gets_the_fork_table_after_the_runner() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        run(&mut conn).unwrap();
+        assert_fork_table_and_index(&conn);
+    }
+
+    /// Regression guard: the fork table must never come back as a numbered
+    /// migration, where it competes with upstream for a version.
+    #[test]
+    fn no_embedded_migration_is_the_fork_chunk_progress_table() {
+        let runner = migrations::runner();
+        let numbered: Vec<u32> = runner
+            .get_migrations()
+            .iter()
+            .filter(|m| m.name() == FORK_CHUNK_PROGRESS_NAME)
+            .map(refinery::Migration::version)
+            .collect();
+        assert!(numbered.is_empty(), "numbered as {numbered:?}");
+    }
+
+    /// A store that ran the fork's V84 build carries the history row
+    /// `84 consolidation_chunk_progress`, which no embedded migration
+    /// describes. `run()` forgets that row, and the table it created and its
+    /// checkpoint stay.
+    #[test]
+    fn a_store_with_the_fork_v84_history_row_forgets_it_and_keeps_the_table() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        run_to(&mut conn, 83).unwrap();
+        conn.execute_batch(FORK_CHUNK_PROGRESS_DDL).unwrap();
+        insert_history_row(&conn, 84, FORK_CHUNK_PROGRESS_NAME);
+        insert_chunk_checkpoint(&conn);
+
+        run(&mut conn).expect("a store carrying the fork's V84 row must open");
+
+        let versions = applied_versions(&conn);
+        assert!(
+            !versions.contains(&84),
+            "V84 must be forgotten: {versions:?}"
+        );
+        assert_eq!(versions, (1..=83).collect::<Vec<i64>>());
+        assert_fork_table_and_index(&conn);
+        assert_eq!(chunk_checkpoint_count(&conn), 1, "the checkpoint must stay");
+    }
+
+    /// Only `84 consolidation_chunk_progress` is forgotten. A V84 row with any
+    /// other name (case variants included), or the fork's name at another
+    /// version, stays in history and the runner refuses the store; the
+    /// legitimate control is the test above.
+    #[test]
+    fn only_the_fork_v84_name_is_forgotten() {
+        for (version, name) in [
+            (84, "something_else"),
+            (84, "Consolidation_Chunk_Progress"),
+            (84, "consolidation_chunk_progress "),
+            (85, FORK_CHUNK_PROGRESS_NAME),
+        ] {
+            let mut conn = Connection::open_in_memory().unwrap();
+            run_to(&mut conn, 83).unwrap();
+            insert_history_row(&conn, version, name);
+
+            match run(&mut conn) {
+                Err(StoreError::DataSchemaAhead { applied, .. }) => {
+                    assert!(applied.contains(&format!("V{version}")), "{applied}");
+                }
+                other => panic!("V{version} {name:?} must stay fatal: {other:?}"),
+            }
+            assert_eq!(
+                history_row(&conn, version),
+                (name.to_string(), "0".to_string()),
+                "V{version} {name:?} must not be deleted"
+            );
+        }
+    }
+
+    fn insert_history_row(conn: &Connection, version: u32, name: &str) {
         conn.execute(
-            "INSERT INTO consolidation_chunk_progress              (workspace_id, project_id, session_id, chunk_fingerprint, extraction_json, created_at)              VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            "INSERT INTO refinery_schema_history (version, name, applied_on, checksum) \
+             VALUES (?1, ?2, '2026-10-20T00:00:00Z', '0')",
+            params![version, name],
+        )
+        .unwrap();
+    }
+
+    fn insert_chunk_checkpoint(conn: &Connection) {
+        conn.execute(
+            "INSERT INTO consolidation_chunk_progress \
+             (workspace_id, project_id, session_id, chunk_fingerprint, extraction_json, created_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
             params![[1u8; 16].as_slice(), [2u8; 16].as_slice(), [3u8; 16].as_slice(), "fp", "{}", 1],
         )
         .unwrap();
+    }
 
-        // The new binary's `run()` applies V84 over the existing objects.
-        run(&mut conn)
-            .expect("V84 must apply idempotently over a store that already has the table");
+    fn chunk_checkpoint_count(conn: &Connection) -> i64 {
+        conn.query_row(
+            "SELECT COUNT(*) FROM consolidation_chunk_progress",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap()
+    }
 
-        // The version is now recorded and the pre-existing row + index survive.
+    fn assert_fork_table_and_index(conn: &Connection) {
         assert_eq!(
-            schema_object_count(&conn, "table", "consolidation_chunk_progress"),
+            schema_object_count(conn, "table", "consolidation_chunk_progress"),
             1
         );
         assert_eq!(
-            schema_object_count(&conn, "index", "idx_consolidation_chunk_progress_at"),
+            schema_object_count(conn, "index", "idx_consolidation_chunk_progress_at"),
             1
         );
-        let rows: i64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM consolidation_chunk_progress",
-                [],
-                |r| r.get(0),
-            )
-            .unwrap();
-        assert_eq!(
-            rows, 1,
-            "the pre-existing row must survive the idempotent re-apply"
-        );
-        let versions = applied_versions(&conn);
-        assert!(versions.contains(&84), "V84 must be recorded: {versions:?}");
     }
 
     /// The production store of the fork recorded this table as history row
@@ -1959,22 +2069,13 @@ mod tests {
     /// that store opening: refinery treats V72 as applied and skips upstream's
     /// V72 body, and V73 rebuilds `sessions` with the complete CHECK list
     /// (grizzybot included), so nothing is lost. The fork table survives and
-    /// V73..V84 are applied.
+    /// V73..V83 are applied.
     #[test]
     fn a_store_with_the_fork_v72_history_row_migrates_to_the_current_version() {
         let mut conn = Connection::open_in_memory().unwrap();
         run_to(&mut conn, 71).unwrap();
 
-        let v84_sql = {
-            let runner = migrations::runner();
-            let m = runner
-                .get_migrations()
-                .iter()
-                .find(|m| m.version() == 84)
-                .expect("the fork V84 migration must be embedded");
-            m.sql().unwrap().to_string()
-        };
-        conn.execute_batch(&v84_sql).unwrap();
+        conn.execute_batch(FORK_CHUNK_PROGRESS_DDL).unwrap();
         conn.execute(
             "INSERT INTO refinery_schema_history (version, name, applied_on, checksum)              VALUES (72, 'consolidation_chunk_progress', '2026-09-28T00:00:00Z', '0')",
             [],
@@ -1984,7 +2085,7 @@ mod tests {
         run(&mut conn).expect("a store carrying the fork's V72 row must still open");
 
         let versions = applied_versions(&conn);
-        for version in 72..=84 {
+        for version in 72..=83 {
             assert!(
                 versions.contains(&version),
                 "V{version} must be recorded: {versions:?}"
@@ -2013,22 +2114,13 @@ mod tests {
     /// that store opening: refinery treats V81 as applied and skips
     /// upstream's V81 body, and V83 rebuilds `sessions` with the complete
     /// CHECK list (codebuddy and ibm-bob included), so nothing is lost. The
-    /// fork table survives and V82..V84 are applied.
+    /// fork table survives and V82..V83 are applied.
     #[test]
     fn a_store_with_the_fork_v81_history_row_migrates_to_the_current_version() {
         let mut conn = Connection::open_in_memory().unwrap();
         run_to(&mut conn, 80).unwrap();
 
-        let v84_sql = {
-            let runner = migrations::runner();
-            let m = runner
-                .get_migrations()
-                .iter()
-                .find(|m| m.version() == 84)
-                .expect("the fork V84 migration must be embedded");
-            m.sql().unwrap().to_string()
-        };
-        conn.execute_batch(&v84_sql).unwrap();
+        conn.execute_batch(FORK_CHUNK_PROGRESS_DDL).unwrap();
         conn.execute(
             "INSERT INTO refinery_schema_history (version, name, applied_on, checksum)              VALUES (81, 'consolidation_chunk_progress', '2026-10-15T00:00:00Z', '0')",
             [],
@@ -2038,7 +2130,7 @@ mod tests {
         run(&mut conn).expect("a store carrying the fork's V81 row must still open");
 
         let versions = applied_versions(&conn);
-        for version in 81..=84 {
+        for version in 81..=83 {
             assert!(
                 versions.contains(&version),
                 "V{version} must be recorded: {versions:?}"
@@ -2102,7 +2194,7 @@ mod tests {
     }
 
     /// The fork's production history: the chunk-progress table recorded as
-    /// both `72` and `81` with the checksums the fork binaries wrote, no 82..84,
+    /// both `72` and `81` with the checksums the fork binaries wrote, no 82..83,
     /// and the table already holding a row. The strict runner must open it,
     /// both rows end up describing the embedded migrations, and a second
     /// `run()` changes nothing.
@@ -2119,16 +2211,7 @@ mod tests {
             )
             .unwrap();
         assert_eq!(rewritten, 1);
-        let v84_sql = {
-            let runner = migrations::runner();
-            let m = runner
-                .get_migrations()
-                .iter()
-                .find(|m| m.version() == 84)
-                .expect("the fork V84 migration must be embedded");
-            m.sql().unwrap().to_string()
-        };
-        conn.execute_batch(&v84_sql).unwrap();
+        conn.execute_batch(FORK_CHUNK_PROGRESS_DDL).unwrap();
         conn.execute(
             "INSERT INTO refinery_schema_history (version, name, applied_on, checksum) \
              VALUES (81, 'consolidation_chunk_progress', '2026-10-15T00:00:00Z', \
@@ -2146,13 +2229,8 @@ mod tests {
 
         run(&mut conn).expect("the fork production history must open");
 
-        let versions = applied_versions(&conn);
-        for version in 82..=84 {
-            assert!(
-                versions.contains(&version),
-                "V{version} must be recorded: {versions:?}"
-            );
-        }
+        assert_eq!(applied_versions(&conn), (1..=83).collect::<Vec<i64>>());
+        assert_fork_table_and_index(&conn);
         for version in [72, 81] {
             assert_eq!(
                 history_row(&conn, version),
@@ -2195,6 +2273,8 @@ mod tests {
                 .unwrap()
         };
         assert_eq!(history_before, history_after);
+        assert_fork_table_and_index(&conn);
+        assert_eq!(chunk_checkpoint_count(&conn), 1);
     }
 
     /// The fork repair matches only the fork's name at V72/V81. Another name,

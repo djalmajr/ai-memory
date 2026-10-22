@@ -165,6 +165,12 @@ version in [`docs/changelog/`](docs/changelog/):
   only those two rows, matched by that exact name, are rewritten to the
   embedded migration's name and checksum before the runner starts; every
   other divergence still stops startup. (#16)
+- Moved the fork's `consolidation_chunk_progress` table out of refinery's
+  migration numbering, so it can no longer take a version upstream later uses
+  (upstream 3.2.0 ships its own V84). The table is created with `IF NOT
+  EXISTS` after the migration runner; a store whose history recorded the
+  fork's `84 consolidation_chunk_progress` row drops only that row, so
+  upstream's V84 still runs. (#16)
 - Added exact hover timestamps to `/web` page metadata, made the OKF upgrade
   dialog keyboard accessible, and added a labelled main-navigation landmark
   with current-page state and narrow-screen wrapping.
