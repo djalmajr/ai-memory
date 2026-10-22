@@ -13,6 +13,11 @@ const ORIGINAL_V62_CHECKSUM: u64 = 16_518_128_245_137_964_566;
 const V62_VERSION: u32 = 62;
 const V62_NAME: &str = "page_ingestion_windows";
 
+/// History-row name the fork gave its chunk-progress table before upstream
+/// took the version numbers it had used.
+const FORK_CHUNK_PROGRESS_NAME: &str = "consolidation_chunk_progress";
+const FORK_CHUNK_PROGRESS_VERSIONS: [u32; 2] = [72, 81];
+
 /// Run all pending migrations against an open connection.
 ///
 /// # Errors
@@ -24,6 +29,7 @@ const V62_NAME: &str = "page_ingestion_windows";
 /// migration and points the operator at the fix.
 pub fn run(conn: &mut rusqlite::Connection) -> StoreResult<()> {
     repair_original_v62_checksum(conn)?;
+    repair_fork_chunk_progress_rows(conn)?;
     migrations::runner()
         .set_abort_divergent(true)
         .set_abort_missing(true)
@@ -69,6 +75,53 @@ fn repair_original_v62_checksum(conn: &rusqlite::Connection) -> StoreResult<()> 
             version = V62_VERSION,
             "repaired known V62 migration checksum from the v2.2.1 layout"
         );
+    }
+    Ok(())
+}
+
+/// Rewrite the fork's `consolidation_chunk_progress` history rows at V72
+/// (recorded before upstream 3.0) and V81 (before 3.1.1) to the embedded
+/// migration of that version. Upstream's V72 and V81 only rebuild `sessions`
+/// with an `agent_kind` list that V73 and V83 rebuild again with the complete
+/// list, so marking them applied describes the real schema; the fork table
+/// itself is created by V84 with `IF NOT EXISTS`. Only that exact name is
+/// matched, with any checksum: no other build wrote it at these versions.
+/// Every other divergence remains a hard refinery error.
+fn repair_fork_chunk_progress_rows(conn: &rusqlite::Connection) -> StoreResult<()> {
+    let has_history: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master \
+         WHERE type = 'table' AND name = 'refinery_schema_history')",
+        [],
+        |row| row.get(0),
+    )?;
+    if !has_history {
+        return Ok(());
+    }
+    let runner = migrations::runner();
+    for version in FORK_CHUNK_PROGRESS_VERSIONS {
+        let Some(migration) = runner
+            .get_migrations()
+            .iter()
+            .find(|migration| migration.version() == version)
+        else {
+            continue;
+        };
+        let repaired = conn.execute(
+            "UPDATE refinery_schema_history SET name = ?1, checksum = ?2 \
+             WHERE version = ?3 AND name = ?4",
+            rusqlite::params![
+                migration.name(),
+                migration.checksum().to_string(),
+                version,
+                FORK_CHUNK_PROGRESS_NAME
+            ],
+        )?;
+        if repaired == 1 {
+            tracing::info!(
+                version,
+                "repaired fork consolidation_chunk_progress migration history row"
+            );
+        }
     }
     Ok(())
 }
@@ -1902,7 +1955,7 @@ mod tests {
 
     /// The production store of the fork recorded this table as history row
     /// `72 consolidation_chunk_progress`, the number upstream 3.0 gave to
-    /// `sessions_grizzybot_agent_kind`. The relaxed divergence check keeps
+    /// `sessions_grizzybot_agent_kind`. The fork history repair keeps
     /// that store opening: refinery treats V72 as applied and skips upstream's
     /// V72 body, and V73 rebuilds `sessions` with the complete CHECK list
     /// (grizzybot included), so nothing is lost. The fork table survives and
@@ -1956,7 +2009,7 @@ mod tests {
 
     /// The fork's V81-era numbering recorded this table as history row
     /// `81 consolidation_chunk_progress`, the number upstream 3.1.1 gave to
-    /// `sessions_codebuddy_agent_kind`. The relaxed divergence check keeps
+    /// `sessions_codebuddy_agent_kind`. The fork history repair keeps
     /// that store opening: refinery treats V81 as applied and skips
     /// upstream's V81 body, and V83 rebuilds `sessions` with the complete
     /// CHECK list (codebuddy and ibm-bob included), so nothing is lost. The
@@ -2013,6 +2066,185 @@ mod tests {
                 },
             )
             .unwrap_or_else(|e| panic!("{agent_kind:?} must be accepted: {e}"));
+        }
+    }
+
+    fn history_row(conn: &Connection, version: u32) -> (String, String) {
+        conn.query_row(
+            "SELECT name, checksum FROM refinery_schema_history WHERE version = ?1",
+            [version],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap()
+    }
+
+    fn embedded_name_and_checksum(version: u32) -> (String, String) {
+        let runner = migrations::runner();
+        let migration = runner
+            .get_migrations()
+            .iter()
+            .find(|migration| migration.version() == version)
+            .expect("migration must be embedded");
+        (
+            migration.name().to_string(),
+            migration.checksum().to_string(),
+        )
+    }
+
+    fn assert_divergent(result: StoreResult<()>, case: &str) {
+        match result {
+            Err(StoreError::Migration(err)) => assert!(
+                matches!(err.kind(), refinery::error::Kind::DivergentVersion(_, _)),
+                "{case}: expected DivergentVersion, got: {err:?}"
+            ),
+            other => panic!("{case}: divergence must remain fatal: {other:?}"),
+        }
+    }
+
+    /// The fork's production history: the chunk-progress table recorded as
+    /// both `72` and `81` with the checksums the fork binaries wrote, no 82..84,
+    /// and the table already holding a row. The strict runner must open it,
+    /// both rows end up describing the embedded migrations, and a second
+    /// `run()` changes nothing.
+    #[test]
+    fn the_fork_production_history_with_v72_and_v81_rows_opens_under_the_strict_runner() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        run_to(&mut conn, 80).unwrap();
+        let rewritten = conn
+            .execute(
+                "UPDATE refinery_schema_history \
+                 SET name = 'consolidation_chunk_progress', checksum = '2728718870490857001' \
+                 WHERE version = 72",
+                [],
+            )
+            .unwrap();
+        assert_eq!(rewritten, 1);
+        let v84_sql = {
+            let runner = migrations::runner();
+            let m = runner
+                .get_migrations()
+                .iter()
+                .find(|m| m.version() == 84)
+                .expect("the fork V84 migration must be embedded");
+            m.sql().unwrap().to_string()
+        };
+        conn.execute_batch(&v84_sql).unwrap();
+        conn.execute(
+            "INSERT INTO refinery_schema_history (version, name, applied_on, checksum) \
+             VALUES (81, 'consolidation_chunk_progress', '2026-10-15T00:00:00Z', \
+             '1780142640744897068')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO consolidation_chunk_progress \
+             (workspace_id, project_id, session_id, chunk_fingerprint, extraction_json, created_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![[1u8; 16].as_slice(), [2u8; 16].as_slice(), [3u8; 16].as_slice(), "fp", "{}", 1],
+        )
+        .unwrap();
+
+        run(&mut conn).expect("the fork production history must open");
+
+        let versions = applied_versions(&conn);
+        for version in 82..=84 {
+            assert!(
+                versions.contains(&version),
+                "V{version} must be recorded: {versions:?}"
+            );
+        }
+        for version in [72, 81] {
+            assert_eq!(
+                history_row(&conn, version),
+                embedded_name_and_checksum(version),
+                "V{version} must describe the embedded migration"
+            );
+        }
+        let rows: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM consolidation_chunk_progress",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(rows, 1, "the pre-existing row must survive");
+
+        let history_before: Vec<(i64, String, String, String)> = {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT version, name, applied_on, checksum \
+                     FROM refinery_schema_history ORDER BY version",
+                )
+                .unwrap();
+            stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))
+                .unwrap()
+                .collect::<Result<_, _>>()
+                .unwrap()
+        };
+        run(&mut conn).expect("a second run must be a no-op");
+        let history_after: Vec<(i64, String, String, String)> = {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT version, name, applied_on, checksum \
+                     FROM refinery_schema_history ORDER BY version",
+                )
+                .unwrap();
+            stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))
+                .unwrap()
+                .collect::<Result<_, _>>()
+                .unwrap()
+        };
+        assert_eq!(history_before, history_after);
+    }
+
+    /// The fork repair matches only the fork's name at V72/V81. Another name,
+    /// or the upstream name with a wrong checksum, still fails closed; the
+    /// fork's name is the legitimate control. Each version is checked on its
+    /// own, so a repair that ignores the name at one of them still fails.
+    #[test]
+    fn only_the_fork_chunk_progress_name_is_repaired() {
+        for version in FORK_CHUNK_PROGRESS_VERSIONS {
+            let mut conn = Connection::open_in_memory().unwrap();
+            run_to(&mut conn, 80).unwrap();
+            let (upstream_name, upstream_checksum) = embedded_name_and_checksum(version);
+            if version == 81 {
+                conn.execute(
+                    "INSERT INTO refinery_schema_history (version, name, applied_on, checksum) \
+                     VALUES (81, ?1, '2026-10-15T00:00:00Z', ?2)",
+                    params![upstream_name, upstream_checksum],
+                )
+                .unwrap();
+            }
+
+            conn.execute(
+                "UPDATE refinery_schema_history SET name = 'something_else' WHERE version = ?1",
+                [version],
+            )
+            .unwrap();
+            assert_divergent(run(&mut conn), &format!("another name at V{version}"));
+
+            conn.execute(
+                "UPDATE refinery_schema_history SET name = ?1, checksum = '0' WHERE version = ?2",
+                params![upstream_name, version],
+            )
+            .unwrap();
+            assert_divergent(
+                run(&mut conn),
+                &format!("upstream name with a wrong checksum at V{version}"),
+            );
+
+            conn.execute(
+                "UPDATE refinery_schema_history \
+                 SET name = 'consolidation_chunk_progress', checksum = '0' WHERE version = ?1",
+                [version],
+            )
+            .unwrap();
+            run(&mut conn)
+                .unwrap_or_else(|e| panic!("the fork's V{version} row must be repaired: {e}"));
+            assert_eq!(
+                history_row(&conn, version),
+                embedded_name_and_checksum(version)
+            );
         }
     }
 }

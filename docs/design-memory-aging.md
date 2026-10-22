@@ -431,6 +431,16 @@ also keeps a store *ahead* of the binary fail-closed. Future changes must never
 edit a shipped migration in place or broaden the narrow V62 repair;
 `scripts/check-migrations-immutable.sh` enforces that rule in CI.
 
+This fork carries one more repair of the same kind, `repair_fork_chunk_progress_rows`.
+The fork recorded its `consolidation_chunk_progress` table as history rows 72
+and 81, numbers upstream later gave to `sessions_grizzybot_agent_kind` and
+`sessions_codebuddy_agent_kind`. Only a row at version 72 or 81 whose name is
+exactly `consolidation_chunk_progress` is rewritten to the embedded name and
+checksum; any other divergence stays fatal. Marking those two upstream
+migrations applied matches the real schema: V72 and V81 only rebuild
+`sessions` with a longer `agent_kind` list, V73 and V83 rebuild it again with
+the complete list, and V84 creates the fork table `IF NOT EXISTS`.
+
 **Any data backfill runs on the boot path, not inside the migration
 transaction**: chunked, resumable, and WAL-checkpointed, mirroring the #776
 precedent for V62: `backfill_page_windows` / `backfill_page_windows_in_batches`
