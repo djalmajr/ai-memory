@@ -1582,6 +1582,9 @@ fn stamped_frontmatter(mut conformed: serde_json::Value, now_us: i64) -> StoreRe
     Ok(serde_json::to_string(&conformed)?)
 }
 
+/// Rows the CJK backfill indexes per transaction before it truncates the WAL.
+const CJK_BACKFILL_BATCH: i64 = 256;
+
 /// Rows added by [`backfill_cjk_indexes`] while opening an upgraded store.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct CjkBackfillSummary {
@@ -1597,20 +1600,39 @@ pub(crate) struct CjkBackfillSummary {
 /// updates remove the derived row through V87 triggers, so a crash or an
 /// offline maintenance edit converges here on the next open.
 pub(crate) fn backfill_cjk_indexes(conn: &mut Connection) -> StoreResult<CjkBackfillSummary> {
+    backfill_cjk_indexes_in_batches(conn, CJK_BACKFILL_BATCH)
+}
+
+/// [`backfill_cjk_indexes`] with an explicit batch size (tests use a tiny
+/// batch to drive the cursor across several batches).
+///
+/// Each batch resumes after the highest rowid the previous one indexed. A
+/// batch returns the missing rows in rowid order and indexes every one of
+/// them before it commits, so no row at or below the cursor is still missing
+/// and the anti-join probes each source row once. Without the cursor every
+/// batch filtered from the first rowid again and re-probed the whole indexed
+/// prefix, so the pass slowed down as it went: quadratic in the row count,
+/// hours of startup on a store with 1.6 million observations (#1652).
+pub(crate) fn backfill_cjk_indexes_in_batches(
+    conn: &mut Connection,
+    batch: i64,
+) -> StoreResult<CjkBackfillSummary> {
     type PageRow = (i64, String, String, String);
     type ObservationRow = (i64, String, String);
-    const BATCH: i64 = 256;
+    let batch = batch.max(1);
     let mut summary = CjkBackfillSummary::default();
 
+    let mut after = i64::MIN;
     loop {
         let tx = conn.transaction()?;
         let rows: Vec<PageRow> = {
             let mut stmt = tx.prepare(
                 "SELECT p.rowid, p.title, p.body, p.path_search FROM pages p \
-                 WHERE NOT EXISTS (SELECT 1 FROM pages_cjk_fts f WHERE f.rowid = p.rowid) \
-                 ORDER BY p.rowid LIMIT ?1",
+                 WHERE p.rowid > ?1 \
+                 AND NOT EXISTS (SELECT 1 FROM pages_cjk_fts f WHERE f.rowid = p.rowid) \
+                 ORDER BY p.rowid LIMIT ?2",
             )?;
-            stmt.query_map([BATCH], |row| {
+            stmt.query_map(params![after, batch], |row| {
                 Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
             })?
             .collect::<Result<_, _>>()?
@@ -1621,23 +1643,27 @@ pub(crate) fn backfill_cjk_indexes(conn: &mut Connection) -> StoreResult<CjkBack
         }
         for (rowid, title, body, path_search) in &rows {
             index_page_cjk(&tx, *rowid, title, body, path_search)?;
+            after = *rowid;
         }
         summary.pages += rows.len() as u64;
         tx.commit()?;
         conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);").ok();
     }
 
+    after = i64::MIN;
     loop {
         let tx = conn.transaction()?;
         let rows: Vec<ObservationRow> = {
             let mut stmt = tx.prepare(
                 "SELECT o.rowid, o.title, o.body FROM observations o \
-                 WHERE NOT EXISTS ( \
+                 WHERE o.rowid > ?1 AND NOT EXISTS ( \
                      SELECT 1 FROM observations_cjk_fts f WHERE f.rowid = o.rowid \
-                 ) ORDER BY o.rowid LIMIT ?1",
+                 ) ORDER BY o.rowid LIMIT ?2",
             )?;
-            stmt.query_map([BATCH], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?
-                .collect::<Result<_, _>>()?
+            stmt.query_map(params![after, batch], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+            })?
+            .collect::<Result<_, _>>()?
         };
         if rows.is_empty() {
             tx.commit()?;
@@ -1645,6 +1671,7 @@ pub(crate) fn backfill_cjk_indexes(conn: &mut Connection) -> StoreResult<CjkBack
         }
         for (rowid, title, body) in &rows {
             index_observation_cjk(&tx, *rowid, title, body)?;
+            after = *rowid;
         }
         summary.observations += rows.len() as u64;
         tx.commit()?;
