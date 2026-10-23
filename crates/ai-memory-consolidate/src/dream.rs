@@ -44,7 +44,10 @@ use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use ai_memory_core::{
     ActorContext, PageEvidence, PageEvidenceKind, PageId, ProjectId, Tier, WorkspaceId,
 };
-use ai_memory_llm::{ChatMessage, ChatRequest, LlmProvider, Role, complete_structured};
+use ai_memory_llm::{
+    ChatMessage, ChatRequest, LlmOperationId, LlmProvider, LlmWorkload, Role,
+    complete_structured_with_operation_id,
+};
 use ai_memory_store::{DecayParams, ReaderPool};
 use ai_memory_wiki::{AdmissionContext, AdmissionOp, Wiki, WritePageRequest};
 use schemars::JsonSchema;
@@ -627,7 +630,13 @@ async fn merge_one_cluster(
 
     // JSON-schema structured merge (invariant #7). A failed completion skips.
     let request = build_merge_request(&member_bodies);
-    let merged: DreamMergedPage = match complete_structured(llm, request).await {
+    let merged: DreamMergedPage = match complete_structured_with_operation_id(
+        llm,
+        request,
+        LlmOperationId::for_workload(LlmWorkload::Dream),
+    )
+    .await
+    {
         Ok(page) => page,
         Err(error) => {
             let terminal = matches!(

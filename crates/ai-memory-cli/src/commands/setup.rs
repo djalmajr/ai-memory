@@ -182,6 +182,7 @@ fn skills_for(agent: AgentChoice) -> InstallSkillsAgent {
         AgentChoice::CopilotCli => InstallSkillsAgent::CopilotCli,
         AgentChoice::Devin => InstallSkillsAgent::Devin,
         AgentChoice::Hermes => InstallSkillsAgent::Hermes,
+        AgentChoice::AntigravityCli => InstallSkillsAgent::Antigravity,
         _ => InstallSkillsAgent::Agents,
     }
 }
@@ -237,6 +238,9 @@ pub async fn run(config: &Config, args: SetupArgs, config_path: Option<&Path>) -
         }
         if let Some(dir) = ibm_bob_detected(&home) {
             found.push((AgentChoice::IbmBob, Found::ConfigDir(dir)));
+        }
+        if let Some(dir) = qwen_code_detected(&home) {
+            found.push((AgentChoice::QwenCode, Found::ConfigDir(dir)));
         }
         found
             .into_iter()
@@ -421,6 +425,13 @@ fn codebuddy_detected(home: &Path) -> Option<PathBuf> {
 /// IBM Bob's shared configuration directory, `~/.bob`, when it exists.
 fn ibm_bob_detected(home: &Path) -> Option<PathBuf> {
     Some(home.join(".bob")).filter(|dir| dir.is_dir())
+}
+
+/// Qwen Code's directory, `~/.qwen`, when it exists. Qwen has no
+/// native-session adapter, so setup finds it by that directory rather than
+/// by [`detect_agents`].
+fn qwen_code_detected(home: &Path) -> Option<PathBuf> {
+    Some(home.join(".qwen")).filter(|dir| dir.is_dir())
 }
 
 /// The binary path the service unit runs. A package manager's versioned
@@ -1081,14 +1092,10 @@ async fn self_check(config: &Config, endpoint: &ServerEndpoint) -> Vec<String> {
 async fn memory_status(config: &Config) -> Result<()> {
     use rmcp::ServiceExt as _;
     use rmcp::model::CallToolRequestParams;
-    use rmcp::transport::StreamableHttpClientTransport;
 
     let url = install_mcp::mcp_server_url_from_base(&config.server_url);
-    let transport = StreamableHttpClientTransport::from_config(super::mcp_bridge::upstream_config(
-        &url,
-        None,
-        config.auth.bearer_token.as_deref(),
-    )?);
+    let transport =
+        super::mcp_bridge::upstream_transport(&url, None, config.auth.bearer_token.as_deref())?;
     let client = ().serve(transport).await.with_context(|| format!("connecting to {url}"))?;
     let result = client
         .peer()
@@ -1156,6 +1163,25 @@ mod tests {
             InstallSkillsAgent::Agents
         );
         assert_eq!(AgentPlan::new(AgentChoice::CodeBuddy, None).mcp, None);
+    }
+
+    #[test]
+    fn qwen_code_is_detected_and_wires_hooks_mcp_and_shared_skills() {
+        let home = tempfile::tempdir().unwrap();
+        assert_eq!(qwen_code_detected(home.path()), None);
+        std::fs::create_dir_all(home.path().join(".qwen")).unwrap();
+        assert_eq!(
+            qwen_code_detected(home.path()),
+            Some(home.path().join(".qwen"))
+        );
+        assert_eq!(
+            skills_for(AgentChoice::QwenCode),
+            InstallSkillsAgent::Agents
+        );
+        assert_eq!(
+            AgentPlan::new(AgentChoice::QwenCode, None).mcp,
+            Some(McpClient::QwenCode)
+        );
     }
 
     #[test]
@@ -1571,6 +1597,11 @@ mod tests {
             InstallSkillsAgent::CopilotCli
         );
         assert_eq!(skills_for(AgentChoice::Codex), InstallSkillsAgent::Agents);
+        // Antigravity has no global `~/.agents/skills`; it reads its own roots.
+        assert_eq!(
+            skills_for(AgentChoice::AntigravityCli),
+            InstallSkillsAgent::Antigravity
+        );
         assert_eq!(
             skills_for(AgentChoice::KimiCode),
             InstallSkillsAgent::Agents

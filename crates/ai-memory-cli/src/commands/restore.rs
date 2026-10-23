@@ -49,7 +49,7 @@ const CONFIG_FILE: &str = "config.toml";
 /// data dir is non-empty without `--force`, the tarball cannot be
 /// extracted, or the restored store fails to open. In every one of those
 /// cases the live data dir is left as it was.
-pub fn run(config: &Config, args: RestoreArgs) -> Result<()> {
+pub async fn run(config: &Config, args: RestoreArgs) -> Result<()> {
     let siblings = sibling_processes();
     if !siblings.is_empty() {
         bail!(busy_message("restore", &siblings));
@@ -59,7 +59,14 @@ pub fn run(config: &Config, args: RestoreArgs) -> Result<()> {
         bail!("source tarball {} not found", args.from.display());
     }
 
-    restore_data_dir(&config.data_dir, &args.from, args.force)?;
+    restore_data_dir_with_legacy_pepper(
+        &config.data_dir,
+        &args.from,
+        args.force,
+        config.auth.token_pepper.as_deref(),
+        args.accept_legacy_api_key_pepper,
+    )
+    .await?;
     info!("restore complete");
     println!(
         "restored {} -> {}",
@@ -74,7 +81,18 @@ pub fn run(config: &Config, args: RestoreArgs) -> Result<()> {
 /// staged store has opened; the live `wiki/`, `db/` and (when the archive
 /// carries one) `config.toml` are then exchanged for the staged copies by
 /// rename and rolled back if any step of the exchange fails.
-fn restore_data_dir(data_dir: &Path, from: &Path, force: bool) -> Result<()> {
+#[cfg(test)]
+async fn restore_data_dir(data_dir: &Path, from: &Path, force: bool) -> Result<()> {
+    restore_data_dir_with_legacy_pepper(data_dir, from, force, None, false).await
+}
+
+async fn restore_data_dir_with_legacy_pepper(
+    data_dir: &Path,
+    from: &Path,
+    force: bool,
+    token_pepper: Option<&str>,
+    accept_legacy_api_key_pepper: bool,
+) -> Result<()> {
     let wiki = data_dir.join("wiki");
     let db = data_dir.join("db").join("memory.sqlite");
     let occupied = (wiki.is_dir() && std::fs::read_dir(&wiki)?.next().is_some()) || db.is_file();
@@ -96,7 +114,15 @@ fn restore_data_dir(data_dir: &Path, from: &Path, force: bool) -> Result<()> {
     let staging = data_dir.join(format!(".restore-staging-{stamp}"));
     let previous = data_dir.join(format!(".restore-previous-{stamp}"));
 
-    let outcome = stage_then_swap(data_dir, from, &staging, &previous);
+    let outcome = stage_then_swap(
+        data_dir,
+        from,
+        &staging,
+        &previous,
+        token_pepper,
+        accept_legacy_api_key_pepper,
+    )
+    .await;
     // The staging dir is scratch in every outcome: on success its contents
     // were moved into place, on failure the live data was never touched.
     if staging.exists()
@@ -111,7 +137,14 @@ fn restore_data_dir(data_dir: &Path, from: &Path, force: bool) -> Result<()> {
     outcome
 }
 
-fn stage_then_swap(data_dir: &Path, from: &Path, staging: &Path, previous: &Path) -> Result<()> {
+async fn stage_then_swap(
+    data_dir: &Path,
+    from: &Path,
+    staging: &Path,
+    previous: &Path,
+    token_pepper: Option<&str>,
+    accept_legacy_api_key_pepper: bool,
+) -> Result<()> {
     std::fs::create_dir(staging)
         .with_context(|| format!("creating staging dir {}", staging.display()))?;
 
@@ -130,7 +163,36 @@ fn stage_then_swap(data_dir: &Path, from: &Path, staging: &Path, previous: &Path
     //    live is touched. Dropping the store joins the writer thread and
     //    closes every connection, so the directory can be renamed afterwards
     //    on Windows as well.
-    drop(Store::open(staging).context("opening restored store")?);
+    let store = Store::open(staging).context("opening restored store")?;
+    let has_api_credentials = store.reader.api_credentials_exist().await?;
+    let has_pepper_verifier = store
+        .reader
+        .api_credential_pepper_verifier()
+        .await?
+        .is_some();
+    if has_api_credentials && !has_pepper_verifier {
+        if !accept_legacy_api_key_pepper {
+            bail!(
+                "the backup contains API keys but predates token-pepper verification; restore the original [auth].token_pepper and rerun with --accept-legacy-api-key-pepper to confirm it (the live data was not changed)"
+            );
+        }
+        let pepper = token_pepper
+            .filter(|value| !value.trim().is_empty())
+            .context(
+                "--accept-legacy-api-key-pepper requires the original non-blank [auth].token_pepper",
+            )?;
+        let verifier = ai_memory_store::password::hash_password(pepper.to_owned())
+            .await
+            .context("binding the confirmed legacy API-key pepper")?;
+        if !store
+            .writer
+            .bind_api_credential_pepper_verifier(verifier)
+            .await?
+        {
+            bail!("the restored API-key pepper verifier could not be bound");
+        }
+    }
+    drop(store);
 
     // 3. Exchange the live directories for the staged ones.
     swap_into_place(data_dir, staging, previous)?;
@@ -286,6 +348,7 @@ fn validate_restore_entry(path: &Path, entry_type: tar::EntryType) -> Result<()>
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ai_memory_core::{ApiCredentialId, NewUser, UserRole};
 
     fn archive_with_entry(path: &str, entry_type: tar::EntryType) -> Vec<u8> {
         let mut bytes = Vec::new();
@@ -567,6 +630,48 @@ mod tests {
         std::fs::read(tmp.path().join("db/memory.sqlite")).unwrap()
     }
 
+    async fn legacy_api_key_sqlite_bytes() -> Vec<u8> {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let user_id = store
+            .writer
+            .create_human_user(
+                NewUser {
+                    username: "legacy-restore-user".into(),
+                    name: None,
+                    email: None,
+                },
+                UserRole::User,
+                None,
+                false,
+            )
+            .await
+            .unwrap();
+        store
+            .writer
+            .create_api_credential(
+                ApiCredentialId::new(),
+                user_id,
+                "legacy-key".into(),
+                [0xA5; 32],
+                Some("...test".into()),
+            )
+            .await
+            .unwrap();
+        assert!(
+            store
+                .reader
+                .api_credential_pepper_verifier()
+                .await
+                .unwrap()
+                .is_none()
+        );
+        let snapshot = tmp.path().join("legacy-snapshot.sqlite");
+        store.reader.snapshot_to(snapshot.clone()).await.unwrap();
+        drop(store);
+        std::fs::read(snapshot).unwrap()
+    }
+
     /// A gzipped tarball holding the given regular files.
     fn gz_tarball(entries: &[(&str, &[u8])]) -> Vec<u8> {
         use std::io::Write as _;
@@ -604,14 +709,16 @@ mod tests {
         path
     }
 
-    #[test]
-    fn restore_force_keeps_live_data_when_the_tarball_is_not_a_gzip_stream() {
+    #[tokio::test]
+    async fn restore_force_keeps_live_data_when_the_tarball_is_not_a_gzip_stream() {
         let data = tempfile::TempDir::new().unwrap();
         seed_live_data(data.path());
         let scratch = tempfile::TempDir::new().unwrap();
         let from = write_tarball(scratch.path(), "bad.tar.gz", b"this is not a gzip stream");
 
-        let err = restore_data_dir(data.path(), &from, true).unwrap_err();
+        let err = restore_data_dir(data.path(), &from, true)
+            .await
+            .unwrap_err();
 
         assert!(
             format!("{err:#}").contains("extracting"),
@@ -620,15 +727,17 @@ mod tests {
         assert_live_data_untouched(data.path());
     }
 
-    #[test]
-    fn restore_force_keeps_live_data_when_the_tarball_is_truncated() {
+    #[tokio::test]
+    async fn restore_force_keeps_live_data_when_the_tarball_is_truncated() {
         let data = tempfile::TempDir::new().unwrap();
         seed_live_data(data.path());
         let scratch = tempfile::TempDir::new().unwrap();
         let whole = good_archive();
         let from = write_tarball(scratch.path(), "cut.tar.gz", &whole[..whole.len() / 2]);
 
-        let err = restore_data_dir(data.path(), &from, true).unwrap_err();
+        let err = restore_data_dir(data.path(), &from, true)
+            .await
+            .unwrap_err();
 
         assert!(
             format!("{err:#}").contains("extracting"),
@@ -637,8 +746,8 @@ mod tests {
         assert_live_data_untouched(data.path());
     }
 
-    #[test]
-    fn restore_force_keeps_live_data_when_an_entry_is_outside_the_allowed_layout() {
+    #[tokio::test]
+    async fn restore_force_keeps_live_data_when_an_entry_is_outside_the_allowed_layout() {
         let data = tempfile::TempDir::new().unwrap();
         seed_live_data(data.path());
         let scratch = tempfile::TempDir::new().unwrap();
@@ -655,7 +764,9 @@ mod tests {
             ]),
         );
 
-        let err = restore_data_dir(data.path(), &from, true).unwrap_err();
+        let err = restore_data_dir(data.path(), &from, true)
+            .await
+            .unwrap_err();
 
         assert!(
             format!("{err:#}").contains("unexpected path"),
@@ -664,8 +775,8 @@ mod tests {
         assert_live_data_untouched(data.path());
     }
 
-    #[test]
-    fn restore_force_keeps_live_data_when_the_restored_store_cannot_open() {
+    #[tokio::test]
+    async fn restore_force_keeps_live_data_when_the_restored_store_cannot_open() {
         let data = tempfile::TempDir::new().unwrap();
         seed_live_data(data.path());
         let scratch = tempfile::TempDir::new().unwrap();
@@ -678,7 +789,9 @@ mod tests {
             ]),
         );
 
-        let err = restore_data_dir(data.path(), &from, true).unwrap_err();
+        let err = restore_data_dir(data.path(), &from, true)
+            .await
+            .unwrap_err();
 
         assert!(
             format!("{err:#}").contains("opening restored store"),
@@ -687,14 +800,16 @@ mod tests {
         assert_live_data_untouched(data.path());
     }
 
-    #[test]
-    fn restore_refuses_a_populated_data_dir_without_force() {
+    #[tokio::test]
+    async fn restore_refuses_a_populated_data_dir_without_force() {
         let data = tempfile::TempDir::new().unwrap();
         seed_live_data(data.path());
         let scratch = tempfile::TempDir::new().unwrap();
         let from = write_tarball(scratch.path(), "good.tar.gz", &good_archive());
 
-        let err = restore_data_dir(data.path(), &from, false).unwrap_err();
+        let err = restore_data_dir(data.path(), &from, false)
+            .await
+            .unwrap_err();
 
         assert!(
             err.to_string().contains("pass --force"),
@@ -703,14 +818,14 @@ mod tests {
         assert_live_data_untouched(data.path());
     }
 
-    #[test]
-    fn restore_force_replaces_the_live_data_with_the_archive() {
+    #[tokio::test]
+    async fn restore_force_replaces_the_live_data_with_the_archive() {
         let data = tempfile::TempDir::new().unwrap();
         seed_live_data(data.path());
         let scratch = tempfile::TempDir::new().unwrap();
         let from = write_tarball(scratch.path(), "good.tar.gz", &good_archive());
 
-        restore_data_dir(data.path(), &from, true).unwrap();
+        restore_data_dir(data.path(), &from, true).await.unwrap();
 
         assert_eq!(
             std::fs::read(data.path().join("wiki/default/project/notes/new.md")).unwrap(),
@@ -744,8 +859,8 @@ mod tests {
         drop(Store::open(data.path()).unwrap());
     }
 
-    #[test]
-    fn restore_keeps_the_live_config_when_the_archive_carries_none() {
+    #[tokio::test]
+    async fn restore_keeps_the_live_config_when_the_archive_carries_none() {
         let data = tempfile::TempDir::new().unwrap();
         seed_live_data(data.path());
         let scratch = tempfile::TempDir::new().unwrap();
@@ -759,7 +874,7 @@ mod tests {
             ]),
         );
 
-        restore_data_dir(data.path(), &from, true).unwrap();
+        restore_data_dir(data.path(), &from, true).await.unwrap();
 
         assert_eq!(
             std::fs::read(data.path().join("config.toml")).unwrap(),
@@ -772,13 +887,13 @@ mod tests {
         assert!(restore_scratch_dirs(data.path()).is_empty());
     }
 
-    #[test]
-    fn restore_into_an_empty_data_dir_needs_no_force() {
+    #[tokio::test]
+    async fn restore_into_an_empty_data_dir_needs_no_force() {
         let data = tempfile::TempDir::new().unwrap();
         let scratch = tempfile::TempDir::new().unwrap();
         let from = write_tarball(scratch.path(), "good.tar.gz", &good_archive());
 
-        restore_data_dir(data.path(), &from, false).unwrap();
+        restore_data_dir(data.path(), &from, false).await.unwrap();
 
         assert_eq!(
             std::fs::read(data.path().join("wiki/default/project/notes/new.md")).unwrap(),
@@ -786,5 +901,57 @@ mod tests {
         );
         assert!(data.path().join("db/memory.sqlite").is_file());
         assert!(restore_scratch_dirs(data.path()).is_empty());
+    }
+
+    #[tokio::test]
+    async fn legacy_api_key_restore_requires_original_pepper_confirmation() {
+        let data = tempfile::TempDir::new().unwrap();
+        seed_live_data(data.path());
+        let scratch = tempfile::TempDir::new().unwrap();
+        let db = legacy_api_key_sqlite_bytes().await;
+        let from = write_tarball(
+            scratch.path(),
+            "legacy.tar.gz",
+            &gz_tarball(&[("db/memory.sqlite", db.as_slice())]),
+        );
+
+        let refused = restore_data_dir_with_legacy_pepper(
+            data.path(),
+            &from,
+            true,
+            Some("original-pepper"),
+            false,
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            refused
+                .to_string()
+                .contains("--accept-legacy-api-key-pepper"),
+            "unexpected error: {refused:#}"
+        );
+        assert_live_data_untouched(data.path());
+
+        restore_data_dir_with_legacy_pepper(
+            data.path(),
+            &from,
+            true,
+            Some("original-pepper"),
+            true,
+        )
+        .await
+        .unwrap();
+        let restored = Store::open(data.path()).unwrap();
+        let verifier = restored
+            .reader
+            .api_credential_pepper_verifier()
+            .await
+            .unwrap()
+            .expect("confirmed pepper must be sealed into the restored database");
+        assert!(
+            ai_memory_store::password::verify_password("original-pepper".into(), verifier)
+                .await
+                .unwrap()
+        );
     }
 }

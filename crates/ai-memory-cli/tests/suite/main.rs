@@ -20,6 +20,7 @@ mod e2e_support;
 mod external_capture;
 mod external_capture_powershell;
 mod external_capture_ts;
+mod harness_switch_e2e;
 mod hook_drain;
 mod hook_payload;
 mod install_script;

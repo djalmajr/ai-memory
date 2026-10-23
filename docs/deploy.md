@@ -138,7 +138,12 @@ install-mcp --client <name> --auth-token <token>` prints the exact
 snippet for every client in the [README Support Matrix](../README.md#support-matrix);
 run `ai-memory install-mcp --help` for the current accepted values. The agent
 CLI sends an `Authorization: Bearer <token>` header on every call; ai-memory's
-middleware validates with a constant-time comparison.
+middleware validates with a constant-time comparison. For Claude Code, prefer
+the session-aware bridge: `ai-memory install-mcp --client claude-code
+--session-aware --apply --auth-token <token>` keeps the token in
+`<data_dir>/auth-token` instead of `~/.claude.json`, and after
+`install-hooks --apply --auth-token <token>` the same command works without
+`--auth-token`, since the bridge reads the key the hooks hold.
 
 **Encrypted transport.** Plain HTTP on the LAN means anyone with a
 packet capture can read the bearer token (and native `aim_` keys once

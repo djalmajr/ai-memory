@@ -51,6 +51,9 @@ pub const DEFAULT_STOPWORDS: &[&str] = &[
 /// punctuation handling — an entry never matches a token with attached
 /// punctuation (`"de,"`, `"que?"`), the same limitation the built-in English
 /// list has always had (`"the,"` was never filtered either).
+/// The bag-of-words fallback for syntax that does not parse strips quotes
+/// and parens first, so `(the` is filtered there, while a word the user put
+/// in quotes is always kept.
 ///
 /// Cheap to clone (an `Arc`-shared set) so it can be threaded through a
 /// `'static` closure (e.g. `ReaderPool::with_conn`) without re-hashing the
@@ -135,7 +138,7 @@ pub fn prepare_fts5_query(raw: &str, stopwords: &FtsStopwords) -> String {
         // match nearly every page and BM25 term frequency lets a page
         // with five "the"s outrank the page whose CONTENT matches (seen
         // live: a release-procedure page beaten for a deploy question).
-        // Explicit-syntax queries and quoted phrases are untouched, and
+        // Explicit syntax that parses and quoted phrases are untouched, and
         // a query that is ONLY stopwords keeps them all — returning the
         // user's literal terms beats returning nothing. The active list is
         // operator-configured (`[search.fts] stopwords`, issue #953): the
@@ -168,21 +171,128 @@ pub fn prepare_fts5_query(raw: &str, stopwords: &FtsStopwords) -> String {
     if fts5_query_parses(&candidate) {
         return candidate;
     }
-    raw.split_whitespace()
-        .flat_map(|token| {
-            // Re-tokenize with every operator neutralised: strip quotes and
-            // parens, then quote what remains.
-            let cleaned: String = token
-                .chars()
-                .map(|c| if matches!(c, '"' | '(' | ')') { ' ' } else { c })
-                .collect();
-            cleaned
-                .split_whitespace()
-                .map(quote_fts5_token)
-                .collect::<Vec<_>>()
+    // Re-tokenize with every operator neutralised: strip quotes and parens,
+    // then quote what remains. The result is a bare OR-join, so it drops
+    // stopwords like the bare path above, keeping the words the user put in
+    // quotes, and keeping every word when nothing else is left.
+    let segments: Vec<&str> = raw.split('"').collect();
+    // An unclosed quote leaves an even number of segments; the text after
+    // it was never quoted, so it is filtered like the rest.
+    let unclosed = segments.len().is_multiple_of(2);
+    let last = segments.len() - 1;
+    let words: Vec<(&str, bool)> = segments
+        .into_iter()
+        .enumerate()
+        .flat_map(|(index, segment)| {
+            let quoted = index % 2 == 1 && !(unclosed && index == last);
+            segment
+                .split(['(', ')'])
+                .flat_map(str::split_whitespace)
+                .map(move |word| (word, quoted))
         })
+        .collect();
+    let content: Vec<&str> = words
+        .iter()
+        .filter(|(word, quoted)| *quoted || !stopwords.contains(&word.to_lowercase()))
+        .map(|(word, _)| *word)
+        .collect();
+    let kept = if content.is_empty() {
+        words.iter().map(|(word, _)| *word).collect()
+    } else {
+        content
+    };
+    kept.into_iter()
+        .map(quote_fts5_token)
         .collect::<Vec<_>>()
         .join(" OR ")
+}
+
+/// Terms stored in the auxiliary CJK index.
+///
+/// Each maximal Han/Kana/Hangul run contributes its scalar values and its
+/// overlapping bigrams. Splitting only those runs keeps punctuation and Latin
+/// text out of the derived index, while the bigrams retain enough adjacency
+/// to avoid the very broad matches a character-only index would produce.
+#[must_use]
+pub(crate) fn cjk_index_terms(raw: &str) -> String {
+    let mut terms = Vec::new();
+    let mut run = Vec::new();
+    for ch in raw.chars() {
+        if is_cjk(ch) {
+            run.push(ch);
+        } else {
+            append_cjk_terms(&mut terms, &mut run);
+        }
+    }
+    append_cjk_terms(&mut terms, &mut run);
+    terms.join(" ")
+}
+
+/// A MATCH expression for the CJK portion of a bounded user query.
+///
+/// `None` is the important common case: callers then execute the existing SQL
+/// byte-for-byte. A multi-scalar run becomes an exact phrase of overlapping
+/// bigrams; a single scalar uses the unigram fallback.
+#[must_use]
+pub(crate) fn prepare_cjk_fts5_query(raw: &str) -> Option<String> {
+    let bounded = bounded_query_text(raw);
+    let mut phrases = Vec::new();
+    let mut run = Vec::new();
+    for ch in bounded.chars() {
+        if is_cjk(ch) {
+            run.push(ch);
+        } else {
+            append_cjk_query(&mut phrases, &mut run);
+        }
+    }
+    append_cjk_query(&mut phrases, &mut run);
+    (!phrases.is_empty()).then(|| phrases.join(" OR "))
+}
+
+fn append_cjk_terms(terms: &mut Vec<String>, run: &mut Vec<char>) {
+    if run.is_empty() {
+        return;
+    }
+    terms.extend(run.iter().map(char::to_string));
+    terms.extend(run.windows(2).map(|pair| pair.iter().collect::<String>()));
+    run.clear();
+}
+
+fn append_cjk_query(phrases: &mut Vec<String>, run: &mut Vec<char>) {
+    if run.is_empty() {
+        return;
+    }
+    if run.len() == 1 {
+        phrases.push(format!("\"{}\"", run[0]));
+    } else {
+        let bigrams = run
+            .windows(2)
+            .map(|pair| pair.iter().collect::<String>())
+            .collect::<Vec<_>>()
+            .join(" ");
+        phrases.push(format!("\"{bigrams}\""));
+    }
+    run.clear();
+}
+
+fn is_cjk(ch: char) -> bool {
+    ch.is_alphanumeric()
+        && matches!(
+        ch as u32,
+        0x1100..=0x11ff
+            | 0x2e80..=0x2fff
+            | 0x3040..=0x30ff
+            | 0x3130..=0x318f
+            | 0x31f0..=0x31ff
+            | 0x3400..=0x4dbf
+            | 0x4e00..=0x9fff
+            | 0xa960..=0xa97f
+            | 0xac00..=0xd7af
+            | 0xd7b0..=0xd7ff
+            | 0xf900..=0xfaff
+            | 0xff66..=0xff9f
+            | 0x20000..=0x323af
+        )
 }
 
 /// Upper bound (bytes) on the untrusted search text this module tokenises.
@@ -272,11 +382,15 @@ fn prepare_fts5_token(token: &str) -> Vec<String> {
     // A known column filter keeps its column when its term needs quoting:
     // `title:ai-memory` becomes `title:("ai-memory" OR "ai memory")`, not a
     // quoted phrase that also searches for the literal word `title`.
+    // A second colon in the term (`title:10:30`) needs that same quoting:
+    // left bare, FTS5 reads the inner `10` as a column name and rejects the
+    // whole expression, so the query degrades to the bag of words — which
+    // drops the filter and searches every column for the word `title`.
     if !token.contains('"')
         && let Some((column, term)) = token.split_once(':')
         && matches!(column, "title" | "body")
         && !term.is_empty()
-        && should_quote_fts5_token(term)
+        && (should_quote_fts5_token(term) || term.contains(':'))
     {
         return vec![format!("{column}:{}", quote_fts5_token(term))];
     }
@@ -362,6 +476,43 @@ mod tests {
     /// behaviour exactly).
     fn prepare_fts5_query(raw: &str) -> String {
         super::prepare_fts5_query(raw, &FtsStopwords::default())
+    }
+
+    #[test]
+    fn cjk_index_terms_are_bounded_to_cjk_runs() {
+        assert_eq!(
+            cjk_index_terms("pay 支付服务 now"),
+            "支 付 服 务 支付 付服 服务"
+        );
+        assert_eq!(
+            cjk_index_terms("日本語・テスト"),
+            "日 本 語 日本 本語 テ ス ト テス スト"
+        );
+        assert_eq!(cjk_index_terms("plain latin"), "");
+    }
+
+    #[test]
+    fn cjk_queries_require_adjacent_bigrams() {
+        assert_eq!(
+            prepare_cjk_fts5_query("支付服务 status"),
+            Some("\"支付 付服 服务\"".to_string())
+        );
+        assert_eq!(
+            prepare_cjk_fts5_query("支 / 韓"),
+            Some("\"支\" OR \"韓\"".to_string())
+        );
+        assert_eq!(prepare_cjk_fts5_query("latin only"), None);
+    }
+
+    #[test]
+    fn cjk_query_input_is_bounded_before_expansion() {
+        let query = prepare_cjk_fts5_query(&"日".repeat(10_000)).unwrap();
+        assert!(
+            query.len() < 12_500,
+            "expanded query was {} bytes",
+            query.len()
+        );
+        assert_parses(&query);
     }
 
     /// The engine, not this module, is the judge of validity: every
@@ -692,6 +843,21 @@ mod tests {
         }
     }
 
+    /// A second colon inside a known column's term must not defeat the
+    /// filter. FTS5 reads the inner `10` as a column name and rejects the
+    /// expression, so the whole query degrades to the quoted bag of words:
+    /// that drops the column filter and searches every column for the
+    /// literal word "title", the outcome
+    /// `known_column_filter_survives_quoting_of_its_term` exists to prevent.
+    #[test]
+    fn known_column_filter_survives_a_second_colon_in_its_term() {
+        assert_eq!(
+            prepare_fts5_query("title:10:30"),
+            r#"title:("10:30" OR "10 30")"#
+        );
+        assert_parses(&prepare_fts5_query("title:10:30"));
+    }
+
     /// A column filter inside a group keeps its column: the paren attached
     /// to `title:` must not turn it into an unknown column whose name is
     /// then searched as the literal word "title".
@@ -769,6 +935,61 @@ mod tests {
     fn explicit_syntax_bypasses_custom_list_too() {
         let pt = FtsStopwords::new(["o", "de"]);
         assert_eq!(super::prepare_fts5_query("o AND de", &pt), "o AND de");
+    }
+
+    /// Text that trips the explicit-syntax path but does not parse degrades
+    /// to the quoted bag of words. That bag is a bare OR-join, so it drops
+    /// stopwords the way the bare path does, folding case: `What is the
+    /// cause of the stuck deploy` must not OR-in `What`/`is`/`the`/`of` just
+    /// because the sentence ends in `(prod)`.
+    #[test]
+    fn unparseable_syntax_fallback_drops_stopwords() {
+        let prepared = prepare_fts5_query("What is the cause of the stuck deploy (prod)");
+        assert_parses(&prepared);
+        assert_eq!(prepared, "\"cause\" OR \"stuck\" OR \"deploy\" OR \"prod\"");
+    }
+
+    /// The fallback filters through the configured list, not the built-in
+    /// English one, and `FtsStopwords::none()` keeps every word.
+    #[test]
+    fn unparseable_syntax_fallback_uses_configured_list() {
+        let pt = FtsStopwords::new(["o", "de"]);
+        assert_eq!(
+            super::prepare_fts5_query("the cause de o deploy (prod)", &pt),
+            "\"the\" OR \"cause\" OR \"deploy\" OR \"prod\""
+        );
+        assert_eq!(
+            super::prepare_fts5_query("the cause of the deploy (prod)", &FtsStopwords::none()),
+            "\"the\" OR \"cause\" OR \"of\" OR \"the\" OR \"deploy\" OR \"prod\""
+        );
+    }
+
+    /// A word the user quoted is kept in the fallback even when it is a
+    /// stopword, as a quoted phrase is on the explicit-syntax path; the same
+    /// word outside quotes is still dropped.
+    #[test]
+    fn unparseable_syntax_fallback_keeps_quoted_stopwords() {
+        let prepared = prepare_fts5_query("\"the\" deploy (prod of the");
+        assert_parses(&prepared);
+        assert_eq!(prepared, "\"the\" OR \"deploy\" OR \"prod\"");
+    }
+
+    /// An unclosed quote does not protect the words after it: they were never
+    /// quoted, so their stopwords are dropped like any others.
+    #[test]
+    fn unparseable_syntax_fallback_filters_after_an_unclosed_quote() {
+        let prepared = prepare_fts5_query("the 12\" (rack) of the server");
+        assert_parses(&prepared);
+        assert_eq!(prepared, "\"12\" OR \"rack\" OR \"server\"");
+    }
+
+    /// A fallback query made only of stopwords keeps them all, as the bare
+    /// path does: the user's literal words beat an empty search.
+    #[test]
+    fn unparseable_syntax_fallback_of_only_stopwords_keeps_its_terms() {
+        let prepared = prepare_fts5_query("what is (the)");
+        assert_parses(&prepared);
+        assert_eq!(prepared, "\"what\" OR \"is\" OR \"the\"");
     }
 
     /// Worked example from the issue / docs: a Portuguese natural-language

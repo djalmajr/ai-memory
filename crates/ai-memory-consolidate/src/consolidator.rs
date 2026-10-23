@@ -399,7 +399,7 @@ impl Consolidator {
         // new queue claim is a NEW operation with a new id; checkpoint reuse
         // and the publication reconcile never read it, so a resumed run still
         // reuses completed stages and reconciles without an LLM call.
-        let operation_id = LlmOperationId::new();
+        let operation_id = LlmOperationId::for_workload(ai_memory_llm::LlmWorkload::Consolidation);
         // Opt-in map-reduce pipeline (see `ChunkedRun`): the observation log
         // is reduced through sequential, checkpointed map/reduce stages
         // before the final single-page prompt. The single-prompt pipeline
@@ -453,11 +453,6 @@ impl Consolidator {
         let Some(projected) = projected else {
             return Err(ConsolidatorError::EmptySession(session_id));
         };
-        // One LLM operation, one identity: this fresh id (never the agent's
-        // session id) is shared by every attempt of this invocation; a
-        // re-entry after a crash or a new queue claim is a NEW operation
-        // with a new id.
-        let operation_id = LlmOperationId::new();
         let request = assemble_single_request(&plan, &projected, self.budgets);
         debug!(
             session = %session_id,
@@ -927,7 +922,7 @@ impl Consolidator {
         // fresh id is shared by every attempt of this invocation; a re-entry
         // after a crash or a new queue claim is a new operation with a new
         // id, and checkpoint reuse / the publication reconcile never read it.
-        let operation_id = LlmOperationId::new();
+        let operation_id = LlmOperationId::for_workload(ai_memory_llm::LlmWorkload::Consolidation);
         if self.chunking.is_some() {
             // Full session load for the opt-in map-reduce mode only: the
             // default path below reads bounded (#1363).
@@ -982,11 +977,6 @@ impl Consolidator {
         let Some(projected) = projected else {
             return Err(ConsolidatorError::EmptySession(session_id));
         };
-        // One LLM operation, one identity (see `consolidate_session`): the
-        // fresh id is shared by every attempt of this invocation; a
-        // re-entry after a crash or a new queue claim is a new operation
-        // with a new id.
-        let operation_id = LlmOperationId::new();
         let request = assemble_batch_request(&plan, &projected, self.budgets);
         debug!(
             session = %session_id,
@@ -6742,6 +6732,14 @@ mod tests {
             );
             assert_fresh_gateway_form(single1[0]);
             assert_fresh_gateway_form(single2[0]);
+            assert_eq!(
+                single1[0].workload(),
+                ai_memory_llm::LlmWorkload::Consolidation
+            );
+            assert_eq!(
+                single2[0].workload(),
+                ai_memory_llm::LlmWorkload::Consolidation
+            );
             assert_ne!(
                 single1[0].to_string(),
                 session.to_string(),
@@ -6804,6 +6802,14 @@ mod tests {
             );
             assert_fresh_gateway_form(multi1[0]);
             assert_fresh_gateway_form(multi2[0]);
+            assert_eq!(
+                multi1[0].workload(),
+                ai_memory_llm::LlmWorkload::Consolidation
+            );
+            assert_eq!(
+                multi2[0].workload(),
+                ai_memory_llm::LlmWorkload::Consolidation
+            );
             assert_ne!(
                 multi1[0].to_string(),
                 session.to_string(),
@@ -10340,6 +10346,79 @@ mod tests {
         assert_eq!(f, 1, "exactly one final call");
         // Published, and the checkpoints pruned after the publish.
         assert!(t.checkpoints(session).await.is_empty());
+    }
+
+    /// Workload row for the opt-in map-reduce path: every map, reduce, and
+    /// final call of a chunked `consolidate_session` and
+    /// `consolidate_session_multi` is labelled `Consolidation` in the LLM
+    /// workload telemetry, not `Unspecified`. The fixture is the coverage
+    /// test's (300+ observations, ceiling at the irreducible final), so the
+    /// reduce stage really runs on both entries.
+    #[tokio::test]
+    async fn chunked_consolidation_labels_every_stage_with_the_consolidation_workload() {
+        let mut bodies: Vec<String> = (0..300)
+            .map(|i| format!("obs {i} {}", "w1 ".repeat(40)))
+            .collect();
+        bodies.push("w1 ".repeat(3_400));
+        for multi in [false, true] {
+            let t = ChunkedTest::fresh().await;
+            let session = SessionId::new();
+            t.seed_session(session, &bodies).await;
+            let all_ids: Vec<String> = t
+                .observations(session)
+                .await
+                .iter()
+                .map(|o| o.id.to_string())
+                .collect();
+            let id_refs: Vec<&str> = all_ids.iter().map(|s| s.as_str()).collect();
+            let synthetic = vec![extraction_with(&id_refs, "fact", "t", 0.9)];
+            let irreducible = if multi {
+                let request = build_final_request_batch(
+                    session,
+                    &synthetic,
+                    &[],
+                    None,
+                    PromptBudgets::default(),
+                    &[],
+                );
+                ChatTokenCounter::load(&t.tokenizer_path)
+                    .unwrap()
+                    .count_request(&request, schema_value::<ConsolidatedBatch>().as_ref())
+                    .unwrap()
+            } else {
+                t.consolidator_base_count(session, &synthetic).unwrap()
+            };
+
+            let llm = Arc::new(StagedLlm::new("m1"));
+            let consolidator =
+                t.consolidator_with(Arc::clone(&llm), t.base + 300, irreducible + 100);
+            let actor = ai_memory_core::ActorContext::anonymous();
+            if multi {
+                consolidator
+                    .consolidate_session_multi(session, false, actor, None, None)
+                    .await
+                    .unwrap();
+            } else {
+                consolidator
+                    .consolidate_session(session, false, actor, None, None)
+                    .await
+                    .unwrap();
+            }
+
+            let (m, r, f) = llm.calls();
+            assert!(m >= 2, "multi={multi}: multiple map blocks: {m}");
+            assert!(r >= 1, "multi={multi}: the reduce stage ran: {r}");
+            assert_eq!(f, 1, "multi={multi}: exactly one final call");
+            let ids = llm.operation_ids();
+            assert_eq!(ids.len(), m + r + f, "multi={multi}: every call captured");
+            for id in &ids {
+                assert_eq!(
+                    id.workload(),
+                    ai_memory_llm::LlmWorkload::Consolidation,
+                    "multi={multi}: every chunked stage call is a consolidation workload"
+                );
+            }
+        }
     }
 
     /// The reduce loop runs multiple DEPTHS when one pass still leaves the

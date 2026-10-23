@@ -34,7 +34,10 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use ai_memory_core::{PagePath, ProjectId, Tier, WorkspaceId};
-use ai_memory_llm::{ChatMessage, ChatRequest, LlmError, LlmProvider, Role, complete_structured};
+use ai_memory_llm::{
+    ChatMessage, ChatRequest, LlmError, LlmOperationId, LlmProvider, LlmWorkload, Role,
+    complete_structured_with_operation_id,
+};
 use ai_memory_store::ReaderPool;
 use ai_memory_wiki::{Wiki, WritePageRequest};
 use jiff::Timestamp;
@@ -339,8 +342,15 @@ async fn complete_chunk_with_retry(
     retry_delay: Duration,
 ) -> Result<BootstrapBatch, LlmError> {
     let mut attempt = 1;
+    let operation_id = LlmOperationId::for_workload(LlmWorkload::Bootstrap);
     loop {
-        match complete_structured::<BootstrapBatch>(llm, request.clone()).await {
+        match complete_structured_with_operation_id::<BootstrapBatch>(
+            llm,
+            request.clone(),
+            operation_id,
+        )
+        .await
+        {
             Ok(batch) => return Ok(batch),
             Err(e) if attempt < BOOTSTRAP_CHUNK_MAX_ATTEMPTS && e.is_fast_retryable() => {
                 warn!(
@@ -666,10 +676,12 @@ impl Bootstrap {
         }
 
         let _ids = self.wiki.apply_batch(requests).await?;
-        let _ = self.wiki.commit_all(&format!(
+        if let Err(e) = self.wiki.commit_all(&format!(
             "bootstrap: {llm_chunks} LLM chunk(s), ingested {collected} sources, wrote {} pages",
             written_paths.len() + 1,
-        ));
+        )) {
+            warn!(error = %e, "bootstrap auto-commit failed");
+        }
 
         // Best-effort: the run already succeeded (pages are written), so a
         // failure here must not fail the whole run — it would just leave
@@ -1683,6 +1695,7 @@ mod tests {
     /// then returns an empty batch.
     struct FlakyLlm {
         calls: AtomicUsize,
+        ids: std::sync::Mutex<Vec<LlmOperationId>>,
         transient_failures: usize,
         permanent: bool,
     }
@@ -1718,6 +1731,16 @@ mod tests {
             }
             Ok(serde_json::json!({ "pages": [], "rationale": "ok" }))
         }
+
+        async fn complete_structured_raw_with_operation_id(
+            &self,
+            request: ChatRequest,
+            schema: serde_json::Value,
+            operation_id: LlmOperationId,
+        ) -> ai_memory_llm::LlmResult<serde_json::Value> {
+            self.ids.lock().unwrap().push(operation_id);
+            self.complete_structured_raw(request, schema).await
+        }
     }
 
     fn chunk_request() -> ChatRequest {
@@ -1733,6 +1756,7 @@ mod tests {
     async fn chunk_retry_recovers_from_transient_failures() {
         let llm = FlakyLlm {
             calls: AtomicUsize::new(0),
+            ids: std::sync::Mutex::new(Vec::new()),
             transient_failures: 2, // fails twice, succeeds on the 3rd (= MAX)
             permanent: false,
         };
@@ -1745,12 +1769,17 @@ mod tests {
             3,
             "should have retried twice"
         );
+        let ids = llm.ids.lock().unwrap();
+        assert_eq!(ids.len(), 3);
+        assert!(ids.iter().all(|id| *id == ids[0]));
+        assert_eq!(ids[0].workload(), LlmWorkload::Bootstrap);
     }
 
     #[tokio::test]
     async fn chunk_retry_gives_up_after_the_attempt_budget() {
         let llm = FlakyLlm {
             calls: AtomicUsize::new(0),
+            ids: std::sync::Mutex::new(Vec::new()),
             transient_failures: usize::MAX, // never clears
             permanent: false,
         };
@@ -1769,6 +1798,7 @@ mod tests {
     async fn chunk_retry_does_not_retry_a_deterministic_error() {
         let llm = FlakyLlm {
             calls: AtomicUsize::new(0),
+            ids: std::sync::Mutex::new(Vec::new()),
             transient_failures: 0,
             permanent: true, // returns Auth — not transient
         };

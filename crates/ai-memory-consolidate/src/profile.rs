@@ -34,7 +34,10 @@ use ai_memory_core::{
     ActorContext, AutoImproveProposalId, IdentityKey, PagePath, Tier, UserId, WorkspaceId,
     find_marker_line,
 };
-use ai_memory_llm::{ChatMessage, ChatRequest, LlmProvider, complete_structured};
+use ai_memory_llm::{
+    ChatMessage, ChatRequest, LlmOperationId, LlmProvider, LlmWorkload,
+    complete_structured_with_operation_id,
+};
 use ai_memory_store::{
     NewProfileCandidate, PROFILE_CANDIDATES_LIMIT, PROFILE_HARVEST_BATCH, ProfileCandidateRow,
     ProfileHarvestProject, ProfileLedgerEntry, ProfilePageRow, ProfileScopePage, ProjectAccess,
@@ -1716,7 +1719,12 @@ async fn classify_batch(
         max_tokens: PROFILE_LLM_MAX_TOKENS,
         temperature: Some(0.0),
     };
-    let response: ClassifyResponse = complete_structured(llm, request).await?;
+    let response: ClassifyResponse = complete_structured_with_operation_id(
+        llm,
+        request,
+        LlmOperationId::for_workload(LlmWorkload::Profile),
+    )
+    .await?;
     let mut out: Vec<Option<DetectedPreference>> = vec![None; batch.len()];
     for item in response.items {
         let Ok(index) = usize::try_from(item.index) else {
@@ -1781,7 +1789,12 @@ async fn merge_entry(
         max_tokens: PROFILE_LLM_MAX_TOKENS,
         temperature: Some(0.0),
     };
-    complete_structured(llm, request).await
+    complete_structured_with_operation_id(
+        llm,
+        request,
+        LlmOperationId::for_workload(LlmWorkload::Profile),
+    )
+    .await
 }
 
 // ---------------------------------------------------------------------------

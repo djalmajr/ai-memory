@@ -384,6 +384,7 @@ function postPreCompact(event: any, ctx: any): void {{
     // Tracked in pendingHookRequests so session_end can await a bounded
     // flush instead of letting teardown kill the in-flight fetch (#676).
     const request = fetch(url, {{
+      proxy: false,
       method: "POST",
       headers: {{ "Content-Type": "application/json", ...authHeaders() }},
       body: JSON.stringify(policy.payload),
@@ -410,6 +411,7 @@ async function fetchHandoff(event: any, ctx: any): Promise<string | undefined> {
   if (!applyMarkerParams(url, currentCwd)) return undefined;
   try {{
     const response = await fetch(url, {{
+      proxy: false,
       headers: authHeaders(),
       signal: timeoutSignal(1000),
     }});
