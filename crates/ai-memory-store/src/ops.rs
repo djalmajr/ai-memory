@@ -11860,7 +11860,8 @@ pub(crate) mod tests {
              CREATE TABLE observations (title TEXT, body TEXT);",
         )
         .unwrap();
-        conn.execute_batch(include_str!("../migrations/V87__cjk_search_indexes.sql")).unwrap();
+        conn.execute_batch(include_str!("../migrations/V87__cjk_search_indexes.sql"))
+            .unwrap();
         for i in 0..rows {
             conn.execute(
                 "INSERT INTO pages (title, body, path_search) VALUES (?1, ?2, 'notes')",
@@ -11954,7 +11955,10 @@ pub(crate) mod tests {
                 }),
             );
             let summary = backfill_cjk_indexes_in_batches(&mut conn, 1).unwrap();
-            assert_eq!((summary.pages, summary.observations), (rows as u64, rows as u64));
+            assert_eq!(
+                (summary.pages, summary.observations),
+                (rows as u64, rows as u64)
+            );
             visits.load(Ordering::Relaxed)
         };
 
