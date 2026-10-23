@@ -725,7 +725,8 @@ pub async fn run_auto_improve_review(
             // One review call is one LLM operation: a fresh identity, never
             // the agent's session id — two reviews of the same session must
             // not look like one operation on the provider side.
-            let operation_id = LlmOperationId::new();
+            let operation_id =
+                LlmOperationId::for_workload(ai_memory_llm::LlmWorkload::AutoImprove);
             let raw: AutoImproveLlmResponse =
                 complete_structured_with_operation_id(llm, request, operation_id).await?;
             let (mut proposals, mut rejected_candidates, mut warnings) =
@@ -3184,6 +3185,11 @@ mod tests {
             "two reviews of one session get distinct operation ids"
         );
         for id in &ids {
+            assert_eq!(
+                id.workload(),
+                ai_memory_llm::LlmWorkload::AutoImprove,
+                "auto-improve reviews keep their closed workload label"
+            );
             let s = id.to_string();
             assert_eq!(s.len(), 36, "the hyphenated wire form is 36 chars: {s}");
             let parsed = uuid::Uuid::parse_str(&s).expect("parses as a UUID");

@@ -109,13 +109,20 @@ foreach ($Entry in $WrapperAssets.GetEnumerator()) {
 }
 Get-ChildItem "$UserBin\ai-memory.*" | Unblock-File
 
-# Put the wrapper directory on your user PATH for future terminals.
-$UserPath = [Environment]::GetEnvironmentVariable("Path", "User")
-if (($UserPath -split ';') -notcontains $UserBin) {
+# Put the wrapper directory on your user PATH for future terminals. Read and
+# write the registry value as is: [Environment]::GetEnvironmentVariable expands
+# its %VAR% entries, and SetEnvironmentVariable would save them expanded, as
+# REG_SZ.
+$EnvKey = [Microsoft.Win32.Registry]::CurrentUser.CreateSubKey("Environment")
+$UserPath = $EnvKey.GetValue("Path", "", "DoNotExpandEnvironmentNames")
+if (($UserPath -split ';' | ForEach-Object { [Environment]::ExpandEnvironmentVariables($_) }) -notcontains $UserBin) {
     $NewUserPath = (($UserPath, $UserBin) | Where-Object { $_ }) -join ";"
-    [Environment]::SetEnvironmentVariable("Path", $NewUserPath, "User")
+    $EnvKey.SetValue("Path", $NewUserPath, "ExpandString")
+    # Removing a variable that does not exist broadcasts the change to Explorer.
+    [Environment]::SetEnvironmentVariable("ai-memory-path-notify", [NullString]::Value, "User")
     $env:Path = "$env:Path;$UserBin"
 }
+$EnvKey.Dispose()
 
 # Start the server with Docker Desktop. The image default allowlist includes
 # host.docker.internal so wrapper thin-client commands (status, search, …) are
@@ -212,12 +219,17 @@ Invoke-WebRequest `
 Expand-Archive "$env:TEMP\ai-memory.zip" -DestinationPath $Dest -Force
 Get-ChildItem "$Dest\ai-memory.exe" | Unblock-File
 
-# Put it on PATH for future terminals (optional but convenient).
-$UserPath = [Environment]::GetEnvironmentVariable("Path", "User")
-if (($UserPath -split ';') -notcontains $Dest) {
-    [Environment]::SetEnvironmentVariable("Path", "$UserPath;$Dest", "User")
+# Put it on PATH for future terminals (optional but convenient). The registry
+# value is read and written as is, so its %VAR% entries stay unexpanded.
+$EnvKey = [Microsoft.Win32.Registry]::CurrentUser.CreateSubKey("Environment")
+$UserPath = $EnvKey.GetValue("Path", "", "DoNotExpandEnvironmentNames")
+if (($UserPath -split ';' | ForEach-Object { [Environment]::ExpandEnvironmentVariables($_) }) -notcontains $Dest) {
+    $EnvKey.SetValue("Path", "$UserPath;$Dest", "ExpandString")
+    # Removing a variable that does not exist broadcasts the change to Explorer.
+    [Environment]::SetEnvironmentVariable("ai-memory-path-notify", [NullString]::Value, "User")
     $env:Path = "$env:Path;$Dest"
 }
+$EnvKey.Dispose()
 
 # Wire MCP + lifecycle hooks against your server.
 & "$Dest\ai-memory.exe" install-mcp --client claude-code --apply
@@ -711,10 +723,12 @@ large-backlog instances can raise them with whole-minute overrides. Unlike
 apply to the agent's environment (no re-`install-hooks` needed):
 
 Native hooks accept well-formed JSON with or without one leading UTF-8 BOM, as
-some PowerShell pipelines add that marker when writing to a native process. Any
-other malformed stdin is not spooled or sent; the hook prints a fixed warning
-to stderr, returns `{}` on stdout, and exits successfully so it cannot break the
-host agent. The warning never includes payload contents.
+some PowerShell pipelines add that marker when writing to a native process. The
+server's `/hook` ingress skips the same marker, so a shell-bundle hook that
+forwards it unchanged is still stored. Any other malformed stdin is not spooled
+or sent; the hook prints a fixed warning to stderr, returns `{}` on stdout, and
+exits successfully so it cannot break the host agent. The warning never
+includes payload contents.
 
 | Env var | Built-in default | Max override | What it caps |
 |---|---:|---:|---|

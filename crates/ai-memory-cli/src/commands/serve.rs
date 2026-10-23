@@ -16,7 +16,7 @@ use ai_memory_hooks::{
     CLIENT_MARKER_HEADER, DEFAULT_HOOK_INGEST_MAX_IN_FLIGHT, HookState, ProjectCacheStore,
     WorkstreamState, hook_router, workstream_router,
 };
-use ai_memory_llm::{Embedder, LlmProvider, ProviderHealth, build_embedder};
+use ai_memory_llm::{Embedder, EmbeddingCapacity, LlmProvider, ProviderHealth, build_embedder};
 use ai_memory_mcp::human_auth::{Cidr, HumanAuthRuntime, LoginLimiter};
 use ai_memory_mcp::{
     AdminState, AiMemoryServer, ScopeInvalidation, admin_router_with_sweep_tuning,
@@ -313,6 +313,58 @@ fn validate_api_credential_pepper(api_credentials_exist: bool, auth: &AuthSettin
     Ok(())
 }
 
+/// Bind native API-key hashes to the pepper that produced them.
+///
+/// The Argon2id verifier travels with SQLite backups without storing the
+/// pepper. A different pepper is safe to bind while no credentials exist;
+/// once hashes exist, a mismatch means the restored database and config do
+/// not belong together and serving would silently reject every key.
+async fn validate_api_credential_pepper_binding(
+    store: &Store,
+    api_credentials_exist: bool,
+    auth: &AuthSettings,
+) -> Result<()> {
+    validate_api_credential_pepper(api_credentials_exist, auth)?;
+    let Some(pepper) = auth
+        .token_pepper
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+    else {
+        return Ok(());
+    };
+
+    if let Some(verifier) = store.reader.api_credential_pepper_verifier().await? {
+        let matches = ai_memory_store::password::verify_password(pepper.to_owned(), verifier)
+            .await
+            .context("verifying the configured API credential pepper")?;
+        if matches {
+            return Ok(());
+        }
+        if api_credentials_exist {
+            anyhow::bail!(
+                "[auth].token_pepper does not match the pepper that hashed the restored API \
+                 credentials; restore the original external config or token_pepper before \
+                 serving (ai-memory backup does not archive config files outside the data dir)"
+            );
+        }
+    }
+
+    let verifier = ai_memory_store::password::hash_password(pepper.to_owned())
+        .await
+        .context("binding the configured API credential pepper")?;
+    let bound = store
+        .writer
+        .bind_api_credential_pepper_verifier(verifier)
+        .await?;
+    if !bound {
+        anyhow::bail!(
+            "API credentials were added while binding [auth].token_pepper; restart so the \
+             server can verify the final credential state"
+        );
+    }
+    Ok(())
+}
+
 /// Validate the credentials that keep an existing multi-user installation
 /// closed. Bootstrap installs have no user rows yet and retain their historical
 /// compatibility behavior regardless of placeholder auth values.
@@ -545,6 +597,9 @@ enum HttpExposure {
     /// Unauthenticated on a non-loopback address, allowed because the
     /// operator passed `--allow-insecure-no-auth`.
     InsecureByOverride,
+    /// Human passwords and cookies are crossing a non-loopback plain-HTTP
+    /// connection because the operator accepted that transport risk.
+    InsecureHumanAuthByOverride,
     /// Unauthenticated on a non-loopback address inside a container, where
     /// the bind address is not evidence either way. See
     /// [`validate_http_exposure`].
@@ -585,16 +640,21 @@ fn validate_http_exposure(
     human_mode: bool,
     secure_cookie: bool,
     allow_insecure_no_auth: bool,
+    allow_insecure_human_auth: bool,
     containerized: bool,
 ) -> Result<HttpExposure> {
     if local_addr.ip().is_loopback() {
         return Ok(HttpExposure::Safe);
     }
     if human_mode && !secure_cookie {
+        if auth_enabled && allow_insecure_human_auth {
+            return Ok(HttpExposure::InsecureHumanAuthByOverride);
+        }
         anyhow::bail!(
             "refusing human authentication on non-loopback plain HTTP address {local_addr}: \
              passwords and session cookies require [auth].secure_cookie=true behind a trusted \
-             HTTPS reverse proxy. Non-Secure human cookies are allowed only on loopback."
+             HTTPS reverse proxy. Non-Secure human cookies are allowed only on loopback unless \
+             --allow-insecure-human-auth explicitly accepts plaintext transport."
         );
     }
     if auth_enabled {
@@ -629,6 +689,12 @@ fn exposure_banner(exposure: HttpExposure, local_addr: SocketAddr) -> Option<Str
              --allow-insecure-no-auth was supplied. Anyone who can reach this address can call \
              destructive MCP tools."
         )),
+        HttpExposure::InsecureHumanAuthByOverride => Some(format!(
+            "WARNING: ai-memory is serving HUMAN AUTHENTICATION on plain HTTP at {local_addr} \
+             because --allow-insecure-human-auth was supplied. Passwords, API credentials, \
+             session cookies, and memory data are unencrypted; a network peer can steal or \
+             modify them. Use this only on a network whose plaintext risk you explicitly accept."
+        )),
         HttpExposure::UndeterminedInContainer => Some(format!(
             "WARNING: ai-memory is listening on {local_addr} with NO AUTHENTICATION. Inside a \
              container the bind address cannot show whether this port reaches the network - the \
@@ -647,7 +713,8 @@ fn refuse_a_missing_token_file(auth: &AuthSettings) -> Result<()> {
         anyhow::bail!(
             "[auth].bearer_token_file names {}, which is missing or empty; refusing to serve \
              without the bearer token it should hold. Run `ai-memory auth enable` to create a \
-             new one, or restore the file from backup.",
+             new one, or restore it from your separate secret backup (`ai-memory backup` \
+             intentionally excludes auth token files).",
             path.display()
         );
     }
@@ -1246,7 +1313,7 @@ pub async fn run(config: &Config, args: ServeArgs) -> Result<()> {
     }
 
     let api_credentials_exist = store.reader.api_credentials_exist().await?;
-    validate_api_credential_pepper(api_credentials_exist, &config.auth)?;
+    validate_api_credential_pepper_binding(&store, api_credentials_exist, &config.auth).await?;
     let bootstrap_completed_before_start = store.reader.bootstrap_completed().await?;
     validate_configured_secret_collisions(&store, &config.auth, !bootstrap_completed_before_start)
         .await?;
@@ -1435,10 +1502,13 @@ pub async fn run(config: &Config, args: ServeArgs) -> Result<()> {
         embedder.clone(),
         admin_llm.clone(),
         config.decay,
+        config.sessions,
         config.dream,
         activity_clock,
         config.contradiction_band_min,
         config.contradiction_band_max,
+        config.consolidate_on_session_end,
+        consolidator.is_some(),
     )
     .await;
 
@@ -1605,6 +1675,7 @@ pub async fn run(config: &Config, args: ServeArgs) -> Result<()> {
                     DEFAULT_HOOK_INGEST_MAX_IN_FLIGHT,
                 )),
                 ingest_gates: ai_memory_hooks::IngestGates::default(),
+                cwd_probes: ai_memory_hooks::CwdProbes::default(),
                 consolidate_on_session_end: config.consolidate_on_session_end,
                 session_consolidation_notify,
                 profile_notify: Some(profile_notify.clone()),
@@ -1629,7 +1700,7 @@ pub async fn run(config: &Config, args: ServeArgs) -> Result<()> {
                 trusted_proxy_identity: trusted_proxy_identity_enabled(&config.auth),
                 mid_session_routing: config.routing.mid_session,
                 profile: config.profile.clone(),
-                ingest_drop_list: config.ingest.drop_list.clone(),
+                ingest_drop_list: (*config.ingest.drop_list).clone(),
             });
             let workstreams = workstream_router(WorkstreamState {
                 writer: store.writer.clone(),
@@ -1951,6 +2022,7 @@ pub async fn run(config: &Config, args: ServeArgs) -> Result<()> {
                 human_mode,
                 config.auth.secure_cookie,
                 args.allow_insecure_no_auth,
+                args.allow_insecure_human_auth,
                 running_in_container(),
             )?;
             info!(
@@ -1970,6 +2042,13 @@ pub async fn run(config: &Config, args: ServeArgs) -> Result<()> {
                     "starting unauthenticated plain HTTP on a non-loopback address because \
                      --allow-insecure-no-auth was supplied — anyone on the network can call \
                      destructive MCP tools"
+                );
+            } else if exposure == HttpExposure::InsecureHumanAuthByOverride {
+                tracing::warn!(
+                    %local_addr,
+                    "starting human authentication on non-loopback plain HTTP because \
+                     --allow-insecure-human-auth was supplied — passwords, API credentials, \
+                     session cookies, and memory data cross the network unencrypted"
                 );
             } else if exposure == HttpExposure::UndeterminedInContainer {
                 tracing::warn!(
@@ -2104,10 +2183,13 @@ async fn start_maintenance_scheduler(
     embedder: Option<Arc<dyn Embedder>>,
     llm: Option<Arc<dyn LlmProvider>>,
     decay: crate::config::DecaySettings,
+    sessions: crate::config::SessionsSettings,
     dream: crate::config::DreamSettings,
     activity_clock: ai_memory_consolidate::ActivityClock,
     contradiction_band_min: f32,
     contradiction_band_max: f32,
+    consolidate_on_session_end: bool,
+    has_session_consolidator: bool,
 ) -> Vec<tokio::task::JoinHandle<()>> {
     let maintenance_enabled = settings.enabled;
     if !maintenance_enabled {
@@ -2479,6 +2561,92 @@ async fn start_maintenance_scheduler(
         }
     }
 
+    // Idle session auto-end: end the open sessions that never received a
+    // `SessionEnd` (crashed harness, closed terminal, timed-out hook) with
+    // the effects the hook path would have given them — summary page and
+    // consolidation job, never a handoff. Bounded batch every fixed
+    // interval; the scan is stateless and idempotent (the writer-side
+    // `ended_at IS NULL` CAS plus the conditional page write make a double
+    // end impossible), so it needs no persisted cadence state.
+    let idle_end_after_hours = sessions.idle_end_after_hours;
+    if maintenance_enabled && idle_end_after_hours > 0 {
+        let writer = writer.clone();
+        let reader = reader.clone();
+        let wiki = wiki.clone();
+        tasks.push(tokio::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(
+                ai_memory_hooks::IDLE_END_INTERVAL_SECS,
+            ));
+            // The first tick fires immediately; let the server come up and
+            // the writer settle before the first scan.
+            interval.tick().await;
+            loop {
+                interval.tick().await;
+                let now_us = jiff::Timestamp::now().as_microsecond();
+                // The config load bounds the value to a microsecond-safe
+                // range; the checked arithmetic is the runtime belt (an
+                // overflow would flip the cutoff and mass-end sessions).
+                let Some(cutoff_us) = i64::from(idle_end_after_hours)
+                    .checked_mul(3_600_000_000)
+                    .and_then(|window_us| now_us.checked_sub(window_us))
+                else {
+                    tracing::warn!(
+                        idle_end_after_hours,
+                        "idle session auto-end tick: cutoff arithmetic overflowed; skipping this pass"
+                    );
+                    continue;
+                };
+                // Over-fetch the selection past the active-run sessions:
+                // the tick excludes them (their lifecycle belongs to the
+                // run), and the exclusion must not starve the batch bound
+                // behind a backlog of persistently excluded sessions.
+                let active_runs = match reader
+                    .active_managed_run_native_session_ids()
+                    .await
+                {
+                    Ok(active_runs) => active_runs,
+                    Err(error) => {
+                        tracing::warn!(error = %error, "idle session auto-end run check failed");
+                        continue;
+                    }
+                };
+                let idle = match reader
+                    .idle_open_sessions(
+                        cutoff_us,
+                        ai_memory_hooks::IDLE_END_BATCH
+                            .saturating_add(active_runs.len()),
+                    )
+                    .await
+                {
+                    Ok(idle) => idle,
+                    Err(error) => {
+                        tracing::warn!(error = %error, "idle session auto-end selection failed");
+                        continue;
+                    }
+                };
+                if idle.is_empty() {
+                    continue;
+                }
+                match ai_memory_hooks::run_idle_end_tick(&ai_memory_hooks::IdleEndTickInput {
+                    writer: &writer,
+                    reader: &reader,
+                    wiki: &wiki,
+                    sessions: idle,
+                    now_us: jiff::Timestamp::now().as_microsecond(),
+                    consolidate_on_session_end,
+                    has_consolidator: has_session_consolidator,
+                })
+                .await
+                {
+                    // Success is the tick's own log (idle_end.rs); the
+                    // scheduler only surfaces failures.
+                    Ok(_outcome) => {}
+                    Err(error) => tracing::warn!(error = %error, "idle session auto-end tick failed"),
+                }
+            }
+        }));
+    }
+
     if tasks.is_empty() {
         info!("scheduled maintenance enabled but all intervals are disabled");
     } else {
@@ -2843,6 +3011,7 @@ async fn configure_embedder(
         return Ok((wiki, None));
     };
     let provider_name = cfg.provider.name().to_string();
+    let is_local = cfg.provider == ai_memory_llm::EmbedderChoice::Local;
     let model = cfg.model.clone();
     let dim = cfg.dim;
     let defaulted = cfg.defaulted;
@@ -2934,6 +3103,14 @@ async fn configure_embedder(
         "embedder enabled"
     );
     let embedder = provider_health.wrap_embedder(embedder, provider_name, model, dim);
+    let embedder: Arc<dyn Embedder> = if is_local {
+        // all-MiniLM inference parallelizes internally. A single background
+        // document slot plus one reserved query slot avoids CPU oversubscription
+        // while keeping interactive vector retrieval available during writes.
+        Arc::new(EmbeddingCapacity::new(embedder, 2)?)
+    } else {
+        embedder
+    };
     Ok((wiki.with_embedder(embedder.clone()), Some(embedder)))
 }
 
@@ -3751,6 +3928,50 @@ mod tests {
         assert!(validate_api_credential_pepper(false, &missing).is_ok());
     }
 
+    #[tokio::test]
+    async fn api_key_pepper_binding_refuses_a_mismatch_once_credentials_exist() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let original = AuthSettings {
+            token_pepper: Some("original-pepper-with-enough-entropy".into()),
+            ..AuthSettings::default()
+        };
+        let replacement = AuthSettings {
+            token_pepper: Some("replacement-pepper-with-enough-entropy".into()),
+            ..AuthSettings::default()
+        };
+
+        validate_api_credential_pepper_binding(&store, false, &original)
+            .await
+            .unwrap();
+        assert!(
+            store
+                .reader
+                .api_credential_pepper_verifier()
+                .await
+                .unwrap()
+                .is_some()
+        );
+        validate_api_credential_pepper_binding(&store, true, &original)
+            .await
+            .unwrap();
+
+        let mismatch = validate_api_credential_pepper_binding(&store, true, &replacement)
+            .await
+            .unwrap_err();
+        assert!(
+            mismatch.to_string().contains("does not match"),
+            "unexpected error: {mismatch:#}"
+        );
+
+        validate_api_credential_pepper_binding(&store, false, &replacement)
+            .await
+            .unwrap();
+        validate_api_credential_pepper_binding(&store, true, &replacement)
+            .await
+            .unwrap();
+    }
+
     #[test]
     fn unauthenticated_non_loopback_http_requires_explicit_override() {
         let addresses = [
@@ -3777,6 +3998,7 @@ mod tests {
                             false,
                             allow_override,
                             false,
+                            false,
                         )
                         .is_ok(),
                         allowed,
@@ -3790,16 +4012,25 @@ mod tests {
     #[test]
     fn human_auth_non_loopback_requires_secure_cookie_posture() {
         let remote: SocketAddr = "192.168.1.90:49374".parse().unwrap();
-        assert!(validate_http_exposure(remote, true, true, false, false, false).is_err());
-        assert!(validate_http_exposure(remote, true, true, false, true, true).is_err());
+        assert!(validate_http_exposure(remote, true, true, false, false, false, false).is_err());
+        assert!(validate_http_exposure(remote, true, true, false, true, false, true).is_err());
         assert_eq!(
-            validate_http_exposure(remote, true, true, true, false, false).unwrap(),
+            validate_http_exposure(remote, true, true, true, false, false, false).unwrap(),
             HttpExposure::Safe
         );
+        assert_eq!(
+            validate_http_exposure(remote, true, true, false, false, true, false).unwrap(),
+            HttpExposure::InsecureHumanAuthByOverride
+        );
+
+        // The human-auth override must not become a second way to expose a
+        // server with no authentication at all.
+        assert!(validate_http_exposure(remote, false, false, false, false, true, false).is_err());
+        assert!(validate_http_exposure(remote, false, true, false, false, true, false).is_err());
 
         let loopback: SocketAddr = "127.0.0.1:49374".parse().unwrap();
         assert_eq!(
-            validate_http_exposure(loopback, true, true, false, false, false).unwrap(),
+            validate_http_exposure(loopback, true, true, false, false, true, false).unwrap(),
             HttpExposure::Safe
         );
     }
@@ -3820,6 +4051,12 @@ mod tests {
         assert!(override_banner.contains("0.0.0.0:49374"));
         assert!(override_banner.contains("--allow-insecure-no-auth"));
 
+        let human_banner = exposure_banner(HttpExposure::InsecureHumanAuthByOverride, addr)
+            .expect("an insecure human-auth override must be announced");
+        assert!(human_banner.contains("HUMAN AUTHENTICATION"));
+        assert!(human_banner.contains("--allow-insecure-human-auth"));
+        assert!(human_banner.contains("session cookies"));
+
         let container_banner = exposure_banner(HttpExposure::UndeterminedInContainer, addr)
             .expect("an unauthenticated container bind must be announced");
         assert!(container_banner.contains("NO AUTHENTICATION"));
@@ -3836,13 +4073,13 @@ mod tests {
     fn the_quick_start_container_bind_is_announced_not_refused() {
         let quick_start: SocketAddr = "0.0.0.0:49374".parse().expect("valid test address");
 
-        let exposure = validate_http_exposure(quick_start, false, false, false, false, true)
+        let exposure = validate_http_exposure(quick_start, false, false, false, false, false, true)
             .expect("must not refuse");
         assert_eq!(exposure, HttpExposure::UndeterminedInContainer);
         assert!(exposure_banner(exposure, quick_start).is_some());
 
         // With a token configured there is nothing to announce.
-        let authed = validate_http_exposure(quick_start, true, false, false, false, true)
+        let authed = validate_http_exposure(quick_start, true, false, false, false, false, true)
             .expect("auth is fine");
         assert_eq!(exposure_banner(authed, quick_start), None);
     }
@@ -3857,19 +4094,21 @@ mod tests {
 
         // The exact Quick Start shape: no token, no override, in a container.
         assert_eq!(
-            validate_http_exposure(quick_start, false, false, false, false, true)
+            validate_http_exposure(quick_start, false, false, false, false, false, true)
                 .expect("must not refuse"),
             HttpExposure::UndeterminedInContainer,
         );
 
         // Identical inputs on a host still refuse — the carve-out is scoped
         // to the container case and does not soften the host rule.
-        assert!(validate_http_exposure(quick_start, false, false, false, false, false).is_err());
+        assert!(
+            validate_http_exposure(quick_start, false, false, false, false, false, false).is_err()
+        );
 
         // A container is not a blanket downgrade: with machine auth configured
         // the verdict is Safe, so the operator gets no spurious warning.
         assert_eq!(
-            validate_http_exposure(quick_start, true, false, false, false, true)
+            validate_http_exposure(quick_start, true, false, false, false, false, true)
                 .expect("auth is fine"),
             HttpExposure::Safe,
         );
@@ -3877,7 +4116,7 @@ mod tests {
         // An explicit override still reports as an override, not as the
         // container case, so the startup log keeps naming the real reason.
         assert_eq!(
-            validate_http_exposure(quick_start, false, false, false, true, true)
+            validate_http_exposure(quick_start, false, false, false, true, false, true)
                 .expect("override is fine"),
             HttpExposure::InsecureByOverride,
         );
@@ -3885,7 +4124,7 @@ mod tests {
         // Loopback inside a container is plain Safe.
         let loopback: SocketAddr = "127.0.0.1:49374".parse().expect("valid test address");
         assert_eq!(
-            validate_http_exposure(loopback, false, false, false, false, true)
+            validate_http_exposure(loopback, false, false, false, false, false, true)
                 .expect("loopback is fine"),
             HttpExposure::Safe,
         );
@@ -4319,10 +4558,13 @@ mod tests {
             None,
             None,
             crate::config::DecaySettings::default(),
+            crate::config::SessionsSettings::default(),
             crate::config::DreamSettings::default(),
             ai_memory_consolidate::ActivityClock::default(),
             ai_memory_consolidate::DEFAULT_CONTRADICTION_SIM_LOW,
             ai_memory_consolidate::DEFAULT_CONTRADICTION_SIM_HIGH,
+            false,
+            false,
         )
         .await;
         assert!(tasks.is_empty());
@@ -4369,10 +4611,13 @@ mod tests {
                 None,
                 None,
                 crate::config::DecaySettings::default(),
+                crate::config::SessionsSettings::default(),
                 crate::config::DreamSettings::default(),
                 ai_memory_consolidate::ActivityClock::default(),
                 ai_memory_consolidate::DEFAULT_CONTRADICTION_SIM_LOW,
                 ai_memory_consolidate::DEFAULT_CONTRADICTION_SIM_HIGH,
+                false,
+                false,
             )
             .await;
             // One enabled lint/sweep job plus the independent hollow-project job.
@@ -4380,6 +4625,245 @@ mod tests {
             for task in tasks {
                 task.abort();
             }
+        }
+    }
+
+    /// The idle auto-end task starts only with maintenance enabled AND
+    /// `idle_end_after_hours > 0`; either switch off leaves the task count
+    /// unchanged.
+    #[tokio::test]
+    async fn idle_end_tick_does_not_start_when_disabled_or_maintenance_off() {
+        let baseline = MaintenanceSettings {
+            enabled: true,
+            forget_sweep_interval_secs: 0,
+            lint_interval_secs: 60,
+            embedding_backfill_interval_secs: 0,
+            reconcile_tombstones_deleted_pages: false,
+        };
+        // Key at 0: the baseline task count (one lint job + hollow-project job).
+        let (_tmp, store, wiki, _ws, _first, _second) = two_project_wiki().await;
+        let tasks = start_maintenance_scheduler(
+            baseline.clone(),
+            AutoImproveSettings::default(),
+            store.reader.clone(),
+            store.writer.clone(),
+            wiki,
+            None,
+            None,
+            crate::config::DecaySettings::default(),
+            crate::config::SessionsSettings::default(),
+            crate::config::DreamSettings::default(),
+            ai_memory_consolidate::ActivityClock::default(),
+            ai_memory_consolidate::DEFAULT_CONTRADICTION_SIM_LOW,
+            ai_memory_consolidate::DEFAULT_CONTRADICTION_SIM_HIGH,
+            false,
+            false,
+        )
+        .await;
+        assert_eq!(tasks.len(), 2);
+        for task in tasks {
+            task.abort();
+        }
+
+        // Key on: exactly one extra task — the idle auto-end loop.
+        let (_tmp, store, wiki, _ws, _first, _second) = two_project_wiki().await;
+        let tasks = start_maintenance_scheduler(
+            baseline.clone(),
+            AutoImproveSettings::default(),
+            store.reader.clone(),
+            store.writer.clone(),
+            wiki,
+            None,
+            None,
+            crate::config::DecaySettings::default(),
+            crate::config::SessionsSettings {
+                idle_end_after_hours: 1,
+            },
+            crate::config::DreamSettings::default(),
+            ai_memory_consolidate::ActivityClock::default(),
+            ai_memory_consolidate::DEFAULT_CONTRADICTION_SIM_LOW,
+            ai_memory_consolidate::DEFAULT_CONTRADICTION_SIM_HIGH,
+            false,
+            false,
+        )
+        .await;
+        assert_eq!(tasks.len(), 3);
+        for task in tasks {
+            task.abort();
+        }
+
+        // Maintenance disabled with the key on: nothing starts.
+        let (_tmp, store, wiki, _ws, _first, _second) = two_project_wiki().await;
+        let tasks = start_maintenance_scheduler(
+            MaintenanceSettings {
+                enabled: false,
+                ..baseline
+            },
+            AutoImproveSettings::default(),
+            store.reader.clone(),
+            store.writer.clone(),
+            wiki,
+            None,
+            None,
+            crate::config::DecaySettings::default(),
+            crate::config::SessionsSettings {
+                idle_end_after_hours: 1,
+            },
+            crate::config::DreamSettings::default(),
+            ai_memory_consolidate::ActivityClock::default(),
+            ai_memory_consolidate::DEFAULT_CONTRADICTION_SIM_LOW,
+            ai_memory_consolidate::DEFAULT_CONTRADICTION_SIM_HIGH,
+            true,
+            true,
+        )
+        .await;
+        assert!(tasks.is_empty());
+    }
+
+    /// With the key on, the first real pass (one fixed interval after start,
+    /// fast-forwarded with paused `tokio::time`) ends an idle session with
+    /// the page, the watermark, the audit row and the consolidation job —
+    /// no real sleeping.
+    #[tokio::test]
+    async fn idle_end_tick_ends_an_idle_session_on_the_first_pass() {
+        let (_tmp, store, wiki, ws, proj, _second) = two_project_wiki().await;
+        tokio::time::pause();
+        let now = jiff::Timestamp::now().as_microsecond();
+        let last_activity = now - 2 * 3_600_000_000; // two hours ago.
+        let sid = SessionId::new();
+        store
+            .writer
+            .begin_session(NewSession {
+                id: sid,
+                workspace_id: ws,
+                project_id: proj,
+                agent_kind: AgentKind::Codex,
+                cwd: Some("/repo".into()),
+                actor_user: None,
+                occurred_at: Some(last_activity),
+            })
+            .await
+            .unwrap();
+        store
+            .writer
+            .insert_observation(Sanitized::new(
+                NewObservation {
+                    session_id: sid,
+                    workspace_id: ws,
+                    project_id: proj,
+                    kind: ObservationKind::UserPrompt,
+                    extension: None,
+                    source_event: None,
+                    title: "idle scheduler test".into(),
+                    body: "prompt two hours ago".into(),
+                    importance: 5,
+                    occurred_at: Some(last_activity),
+                },
+                &Sanitizer::builtin(),
+            ))
+            .await
+            .unwrap();
+
+        let tasks = start_maintenance_scheduler(
+            MaintenanceSettings {
+                enabled: true,
+                forget_sweep_interval_secs: 0,
+                lint_interval_secs: 0,
+                embedding_backfill_interval_secs: 0,
+                reconcile_tombstones_deleted_pages: false,
+            },
+            AutoImproveSettings::default(),
+            store.reader.clone(),
+            store.writer.clone(),
+            wiki,
+            None,
+            None,
+            crate::config::DecaySettings::default(),
+            crate::config::SessionsSettings {
+                idle_end_after_hours: 1,
+            },
+            crate::config::DreamSettings::default(),
+            ai_memory_consolidate::ActivityClock::default(),
+            ai_memory_consolidate::DEFAULT_CONTRADICTION_SIM_LOW,
+            ai_memory_consolidate::DEFAULT_CONTRADICTION_SIM_HIGH,
+            true,
+            true,
+        )
+        .await;
+
+        // The settle tick already fired; let the spawned task register its
+        // first real interval timer, then fast-forward one fixed interval so
+        // the first real pass runs.
+        for _ in 0..32 {
+            tokio::task::yield_now().await;
+        }
+        tokio::time::advance(std::time::Duration::from_secs(
+            ai_memory_hooks::IDLE_END_INTERVAL_SECS,
+        ))
+        .await;
+        // The writer runs on its own OS thread, which the paused clock does
+        // not pace: under a loaded test run the end-session transaction can
+        // still be in flight after any number of virtual advances, so each
+        // poll also yields a little real time, bounded by a real deadline.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let mut ended = false;
+        while std::time::Instant::now() < deadline {
+            let disp = store
+                .reader
+                .session_end_disposition(sid, ws, proj, AgentKind::Codex)
+                .await
+                .unwrap();
+            if matches!(disp, ai_memory_store::SessionEndDisposition::AlreadyEnded) {
+                ended = true;
+                break;
+            }
+            tokio::time::advance(std::time::Duration::from_millis(10)).await;
+            tokio::task::spawn_blocking(|| {
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            })
+            .await
+            .unwrap();
+        }
+        assert!(ended, "the first pass must end the idle session");
+
+        // Page written, tick-clock ended_at (last activity in the audit
+        // detail), audit row, consolidation job.
+        let page = store
+            .reader
+            .latest_page_id_by_ids(ws, proj, format!("sessions/{sid}.md"))
+            .await
+            .unwrap();
+        assert!(page.is_some());
+        let audit = store
+            .reader
+            .list_audit_events(ai_memory_store::AuditLogFilter {
+                op: Some("idle_session_end".into()),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(audit.len(), 1);
+        assert!(
+            audit[0].at >= now && audit[0].at < now + 60_000_000_000,
+            "ended_at is the tick's clock (the discovery is ordered by ended_at): {}",
+            audit[0].at
+        );
+        assert!(
+            audit[0].detail.contains(&last_activity.to_string()),
+            "the last activity survives in the audit detail: {}",
+            audit[0].detail
+        );
+        // Claim with a fresh clock: the enqueue's `requested_at` is the
+        // tick's wall time, after this test's `now`.
+        let now_after = jiff::Timestamp::now().as_microsecond();
+        let job = store
+            .writer
+            .claim_session_consolidation(now_after + 1_000, now_after - 1_000)
+            .await
+            .unwrap();
+        assert_eq!(job.map(|j| j.session_id()), Some(sid));
+        for task in tasks {
+            task.abort();
         }
     }
 

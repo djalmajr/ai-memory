@@ -104,9 +104,26 @@ cargo run --release -p ai-memory-eval -- retrieval --embeddings local
 
 - Inference is CPU, off the async runtime (`spawn_blocking`);
   first-load reads ~87 MB into memory once per server process.
+- Local inference has two process-wide slots. Background document embeddings
+  use one slot, leaving the other available to search queries. This avoids
+  page writes and administrative backfill crowding interactive recall off the
+  CPU. A query that arrives while both slots are busy falls back
+  immediately to lexical/entity/graph retrieval instead of building an
+  unbounded queue. Hosted embedding providers are not subject to this local
+  scheduler.
 - The `local-embeddings` cargo feature (default on) carries the ML
   dependency tree; a slim build can disable it and keep every other
   provider.
 - Tokenization truncates at 512 tokens, the model's positional limit.
   Longer page bodies contribute only their head, the same contract as the
   hosted embedders.
+
+The opt-in contention probe compares the raw local embedder with that capacity
+split. It needs the downloaded model and is not part of the routine test tier:
+
+```bash
+AI_MEMORY_TEST_MODELS_DIR=$PWD/evals/models \
+AI_MEMORY_EMBED_BENCH_WORKERS=8 \
+cargo test -p ai-memory-consolidate \
+  local_query_latency_under_document_load -- --ignored --nocapture
+```

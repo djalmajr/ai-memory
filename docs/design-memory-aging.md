@@ -1,5 +1,11 @@
 # Design: memory aging — decay curves, tier-down, dream pass, access-weighting (2.4)
 
+**Status: implemented in 2.4.** The zero-LLM aging set and the opt-in LLM
+dream pass shipped; ranking-affecting and lossy behavior remains default-off
+as designed. Sections labelled "Current state" and the phased PR plan preserve
+the pre-implementation baseline. Current feature status and R2 results are in
+[`competitive-parity.md`](competitive-parity.md#prior-gaps-and-current-status).
+
 Design-of-record for a 2.4 feature set that improves how ai-memory handles
 **old** memory: decay/compression/consolidation and access-weighted retention.
 It is honest about what already ships, what is dormant, and what is proposed;

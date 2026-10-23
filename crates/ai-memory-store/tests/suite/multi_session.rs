@@ -4313,6 +4313,122 @@ async fn open_feedback_findings_ignores_expired_pages() {
     assert_eq!(findings[0].reason.as_deref(), Some("live page is stale"));
 }
 
+/// A link authored by a superseded page version is not a reference.
+/// `replace_links_in_tx` deletes rows only for the new version's id, so v1's
+/// row survives an edit, and `refresh_incoming_links_for_path` repoints it at
+/// the new latest id without filtering on `is_latest` — so without a join to a
+/// live source page, a link the author removed still answers for its target.
+#[tokio::test]
+async fn memory_health_orphans_ignore_links_from_a_superseded_version() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = Store::open(tmp.path()).unwrap();
+    let (ws, proj) = scope(&store).await;
+
+    store
+        .writer
+        .upsert_page(page(ws, proj, "notes/b.md", "B", "target"))
+        .await
+        .unwrap();
+
+    // a.md v1 links b.md.
+    let mut a_v1 = page(ws, proj, "notes/a.md", "A", "see b");
+    a_v1.links = vec![ai_memory_core::LinkTarget {
+        workspace: None,
+        project: None,
+        path: PagePath::new("notes/b.md").unwrap(),
+        relation: None,
+    }];
+    store.writer.upsert_page(a_v1).await.unwrap();
+
+    // Control: while the link is live, b.md is not an orphan.
+    let (_, _, linked_orphans) = store
+        .reader
+        .memory_health_for_project(ws, proj)
+        .await
+        .unwrap();
+    assert_eq!(
+        linked_orphans, 0,
+        "with a live inbound link neither page is an orphan"
+    );
+
+    // a.md v2 drops the link; v1's row survives, repointed at b.md's latest id.
+    store
+        .writer
+        .upsert_page(page(ws, proj, "notes/a.md", "A", "no link now"))
+        .await
+        .unwrap();
+
+    let (_, _, orphans) = store
+        .reader
+        .memory_health_for_project(ws, proj)
+        .await
+        .unwrap();
+    assert_eq!(
+        orphans, 2,
+        "both pages are orphans once the only link is gone from the latest version"
+    );
+
+    let detail = store
+        .reader
+        .health_detail_for_project(ws, proj, 10)
+        .await
+        .unwrap();
+    let orphan_paths: Vec<&str> = detail.orphans.iter().map(|p| p.path.as_str()).collect();
+    assert!(
+        orphan_paths.contains(&"notes/b.md"),
+        "b.md lost its only inbound link and must be listed: {orphan_paths:?}"
+    );
+}
+
+/// A link authored by a TTL-expired page is not a reference either, and the
+/// workspace-wide health queries (which bind no project) agree with the
+/// project-scoped ones. A live link to a second target is the control.
+#[tokio::test]
+async fn memory_health_orphans_ignore_links_from_an_expired_page() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = Store::open(tmp.path()).unwrap();
+    let (ws, proj) = scope(&store).await;
+    let link_to = |path: &str| ai_memory_core::LinkTarget {
+        workspace: None,
+        project: None,
+        path: PagePath::new(path).unwrap(),
+        relation: None,
+    };
+
+    for path in ["notes/expired_target.md", "notes/live_target.md"] {
+        store
+            .writer
+            .upsert_page(page(ws, proj, path, path, "target"))
+            .await
+            .unwrap();
+    }
+    let mut expired_source = page(ws, proj, "notes/expired_source.md", "E", "see target");
+    expired_source.links = vec![link_to("notes/expired_target.md")];
+    expired_source.expires_at = Some(jiff::Timestamp::from_second(1).unwrap());
+    store.writer.upsert_page(expired_source).await.unwrap();
+    let mut live_source = page(ws, proj, "notes/live_source.md", "L", "see target");
+    live_source.links = vec![link_to("notes/live_target.md")];
+    store.writer.upsert_page(live_source).await.unwrap();
+
+    let (_, _, orphans) = store
+        .reader
+        .memory_health_for_workspace(ws, None)
+        .await
+        .unwrap();
+    assert_eq!(
+        orphans, 1,
+        "only the target of the expired page's link is an orphan"
+    );
+
+    let detail = store
+        .reader
+        .health_detail_for_workspace(ws, 10, None)
+        .await
+        .unwrap();
+    let orphan_paths: Vec<&str> = detail.orphans.iter().map(|p| p.path.as_str()).collect();
+    assert_eq!(orphan_paths, ["notes/expired_target.md"]);
+}
+
 /// Memory health counts and detail lists ignore TTL-expired pages.
 #[tokio::test]
 async fn memory_health_ignores_expired_pages() {

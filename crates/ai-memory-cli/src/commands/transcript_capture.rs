@@ -37,8 +37,8 @@ pub(crate) enum EventCapture {
     Drop,
     /// A tool the capture policy does not recognize: record that it ran,
     /// never its arguments or output. The live server stores only the family
-    /// for an unknown-family tool, whatever the policy, so an import must not
-    /// store more.
+    /// for an unknown-family tool, plus an MCP tool's validated server and
+    /// tool names, whatever the policy, so an import must not store more.
     Unrecognized,
     /// Record that the tool ran, never its arguments or output.
     MetadataOnly(CaptureDecision),

@@ -360,14 +360,25 @@ pub fn discover_assets(
                 ".gemini/antigravity-cli/mcp_config.json",
                 "antigravity/antigravity_mcp.json",
             );
+            let [app_skills, cli_skills] =
+                super::install_skills::antigravity_global_skill_roots(home);
             collect_dir_assets(
                 &mut assets,
                 AgentKind::AntigravityCli,
                 AgentAssetKind::Skill,
                 AgentAssetScope::Global,
-                &gemini_dir.join("antigravity-cli").join("skills"),
+                &app_skills,
+                ".gemini/config/skills",
+                "antigravity/app-ide-skills",
+            )?;
+            collect_dir_assets(
+                &mut assets,
+                AgentKind::AntigravityCli,
+                AgentAssetKind::Skill,
+                AgentAssetScope::Global,
+                &cli_skills,
                 ".gemini/antigravity-cli/skills",
-                "antigravity/skills",
+                "antigravity/cli-skills",
             )?;
             collect_dir_assets(
                 &mut assets,
@@ -379,15 +390,18 @@ pub fn discover_assets(
                 "antigravity/plugins",
             )?;
         }
-        if want_project {
+        // `.agents/skills` is shared with Codex. Attribute it to Codex when
+        // both agents are selected so one archive never maps two entries to
+        // the same restore target; an Antigravity-only backup still owns it.
+        if want_project && !filter_agent(AgentKind::Codex) {
             collect_dir_assets(
                 &mut assets,
                 AgentKind::AntigravityCli,
                 AgentAssetKind::Skill,
                 AgentAssetScope::Project,
-                &cwd.join(".gemini").join("skills"),
-                ".gemini/skills",
-                "project/gemini/skills",
+                &cwd.join(".agents").join("skills"),
+                ".agents/skills",
+                "project/antigravity/skills",
             )?;
         }
     }
@@ -425,6 +439,69 @@ pub fn discover_assets(
                 "GEMINI.md",
                 "project/GEMINI.md",
             );
+        }
+    }
+
+    // 4b. Qwen Code
+    if filter_agent(AgentKind::QwenCode) {
+        let qwen_dir = home.join(".qwen");
+        if want_global {
+            push_if_file(
+                &mut assets,
+                AgentKind::QwenCode,
+                AgentAssetKind::McpConfig,
+                AgentAssetScope::Global,
+                qwen_dir.join("settings.json"),
+                ".qwen/settings.json",
+                "qwen/settings.json",
+            );
+            collect_dir_assets(
+                &mut assets,
+                AgentKind::QwenCode,
+                AgentAssetKind::Skill,
+                AgentAssetScope::Global,
+                &qwen_dir.join("skills"),
+                ".qwen/skills",
+                "qwen/skills",
+            )?;
+            // `~/.agents/skills` is shared with Codex. Attribute it to Codex
+            // when both are selected; a Qwen-only backup must still preserve
+            // the shared skills Qwen documents and loads.
+            if !filter_agent(AgentKind::Codex) {
+                collect_dir_assets(
+                    &mut assets,
+                    AgentKind::QwenCode,
+                    AgentAssetKind::Skill,
+                    AgentAssetScope::Global,
+                    &home.join(".agents").join("skills"),
+                    ".agents/skills",
+                    "qwen/skills/agents",
+                )?;
+            }
+        }
+        if want_project {
+            push_if_file(
+                &mut assets,
+                AgentKind::QwenCode,
+                AgentAssetKind::Instruction,
+                AgentAssetScope::Project,
+                cwd.join("QWEN.md"),
+                "QWEN.md",
+                "project/QWEN.md",
+            );
+            // Qwen also reads AGENTS.md. Codex owns the shared file in a
+            // combined backup so the archive remains one-to-one.
+            if !filter_agent(AgentKind::Codex) {
+                push_if_file(
+                    &mut assets,
+                    AgentKind::QwenCode,
+                    AgentAssetKind::Instruction,
+                    AgentAssetScope::Project,
+                    cwd.join("AGENTS.md"),
+                    "AGENTS.md",
+                    "project/qwen/AGENTS.md",
+                );
+            }
         }
     }
 

@@ -115,6 +115,11 @@ the wrapper, while callers still receive `Option<Arc<dyn LlmProvider>>`.
 | 400 / 401 / 403 / 404 / 422 | No | Usually request, capability, model, or credential configuration. |
 | schema / response-shape / deserialize error | No | Same input would deterministically fail again. |
 
+The same rule covers the credential exchanges in front of a provider: the
+Copilot token exchange and the `openai-oauth`/OIDC refresh. A 429 or 5xx from
+those token endpoints is transient, because the grant was not rejected; any
+other non-2xx stays an auth failure with its re-login hint.
+
 Before a candidate is called, the wrapper checks an in-memory circuit keyed by
 `(provider, model)`. A transient error opens that candidate's circuit for a
 bounded cooldown; other candidates remain eligible. A successful response

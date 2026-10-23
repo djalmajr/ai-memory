@@ -11,7 +11,7 @@
 
 | | What you can do | What you can't do |
 |---|---|---|
-| `/api/v1/*` | Browse workspaces, projects, pages; read full page markdown + frontmatter + back-links; list a page's stored versions and diff two of them; search (global FTS5, or scoped through `memory_query`'s hybrid ranker, single or multi-project); aggregate "overview" snapshots; drill into stale / duplicate / orphan pages; list a project's sessions and read one session's raw observations. | Write, delete, rename, lint, consolidate, run sweeps, manage handoffs. The `/api/v1` surface is **read-only by construction**: the handlers contain zero writer calls, and `crates/ai-memory-web/clippy.toml` forbids the `Wiki` write and destructive methods anywhere in the crate, so adding one fails `cargo clippy -D warnings`. Writes still go through `/admin/*` (used by the CLI) or MCP tools. |
+| `/api/v1/*` | Browse workspaces, projects, pages; read full page markdown + frontmatter + back-links; list a page's stored versions and diff two of them; search (global FTS5, or scoped through `memory_query`'s hybrid ranker, single or multi-project); read the cross-project and in-project link graphs; aggregate "overview" snapshots; drill into stale / duplicate / orphan pages; list a project's sessions and read one session's raw observations. | Write, delete, rename, lint, consolidate, run sweeps, manage handoffs. The `/api/v1` surface is **read-only by construction**: the handlers contain zero writer calls, and `crates/ai-memory-web/clippy.toml` forbids the `Wiki` write and destructive methods anywhere in the crate, so adding one fails `cargo clippy -D warnings`. Writes still go through `/admin/*` (used by the CLI) or MCP tools. |
 | `--web-ui-dir` | Host any SPA at `/web` (or `--web-slug`), same-origin with the API, behind the same auth. The default built-in `/web` browser stays the fallback when the flag is absent. | Host the SPA on a *different* origin without a reverse proxy. Use same-origin hosting or configure CORS deliberately (see §9). |
 
 ## 2. Auth model
@@ -47,6 +47,9 @@ observations in capture order, a page at a time, through the same readers,
 visibility rule and caps as §4.11 and §4.12; `offset`, `limit` clamped
 `1..=200`, default `50`, and `at` to jump to the page holding a 1-based
 position). Both follow the same per-project read rule as the page view.
+The builtin wiki also serves `GET {web_slug}/graph` (the HTML twin of
+§4.9: a circular SVG of projects plus a table of page-level edges) and
+`GET {web_slug}/w/{workspace}/{project}/graph` (the HTML twin of §4.9.1).
 The builtin wiki also serves the root-only `GET {web_slug}/pending` page. It
 lists pending auto-improvement proposals and posts approve and reject to the
 existing `/admin/pending-writes/*` routes. A signed-in non-root user gets a
@@ -496,11 +499,17 @@ either response, `handoff` is `null` when no open handoff matches the scope:
 
 ```http
 GET /api/v1/graph
+GET /api/v1/graph?workspace={workspace}&project={project}
 ```
 
 Returns every resolved wikilink whose endpoints sit in different
 projects, with both endpoints' workspace + project + path. Useful for
-rendering a project-level dependency view in the SPA.
+rendering a project-level dependency view in the SPA. Omit the query
+string for the whole graph. `workspace` and `project` must be provided
+together and keep only edges that touch that project; passing only one
+of them is `400`. An unknown or unreadable project is the same refusal
+as the other scoped routes (`404` / `403`). With authorization on, an
+edge still requires both ends to be readable.
 
 ```json
 {
@@ -517,8 +526,32 @@ rendering a project-level dependency view in the SPA.
 }
 ```
 
-Global today (no workspace / project filter); narrower query params
-are a follow-up.
+### 4.9.1 Project link graph
+
+```http
+GET /api/v1/workspaces/{workspace}/projects/{project}/graph
+```
+
+Latest unexpired pages in that project and the resolved same-project
+wikilinks among them. Cross-project and unresolved links are omitted.
+When the project has more than 120 live pages, the response keeps the
+pages with the most same-project neighbours and then the most recently
+updated, and sets `truncated` to `true`. The same per-project read rule
+as the page list applies.
+
+```json
+{
+  "workspace": "default",
+  "project": "ai-memory",
+  "truncated": false,
+  "nodes": [
+    { "path": "decisions/0014-storage.md", "title": "Storage", "degree": 2 }
+  ],
+  "edges": [
+    { "from_path": "concepts/wiki.md", "to_path": "decisions/0014-storage.md" }
+  ]
+}
+```
 
 ### 4.10 Browser tab icon
 

@@ -195,6 +195,51 @@ async fn flag_off_never_merges() {
     assert_eq!(report.evicted.len(), 2, "both cold pages evicted as before");
 }
 
+/// The same pair with NO third page present. This is the shape the fixture
+/// above hides: `adaptive_eps` used to return `None` for `points.len() <= k`,
+/// so with the default `min_pts = 2` a cold set of exactly two near-duplicates
+/// produced an empty plan, while adding any unrelated third page made the same
+/// pair collapse.
+#[tokio::test]
+async fn flag_on_collapses_a_pair_with_no_other_cold_page() {
+    let fx = seed_fixture(true).await;
+    write(&fx, "sessions/a.md", DUP_A).await;
+    write(&fx, "sessions/b.md", DUP_B).await;
+    for p in ["sessions/a.md", "sessions/b.md"] {
+        backdate_latest(&fx, p, COLD_DAYS);
+    }
+
+    let report = run_sweep_with_hygiene(
+        &fx.store.reader,
+        &fx.store.writer,
+        Some(&fx.wiki),
+        fx.ws,
+        fx.proj,
+        &DecayParams::default(),
+        0.0,
+        ObservationRetention::default(),
+        false,
+        dedup_on(),
+        false,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(
+        report.merged.len(),
+        1,
+        "a pair is the smallest collapsible set under min_pts = 2: {:?}",
+        report.merged
+    );
+    let cluster = &report.merged[0];
+    assert!(cluster.applied, "the collapse landed");
+    assert_eq!(cluster.merged.len(), 1, "one member merged away");
+    assert_ne!(
+        cluster.survivor, cluster.merged[0],
+        "survivor and loser are distinct"
+    );
+}
+
 /// Flag ON: the two near-duplicates collapse to one survivor; the survivor keeps
 /// BOTH facts; the loser is superseded (reachable); the merge is recorded in
 /// `page_evidence`; the far page is untouched.

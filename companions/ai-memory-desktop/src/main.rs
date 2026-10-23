@@ -178,16 +178,26 @@ fn setup_command(exe: &Path) -> Command {
     command
 }
 
-/// Add the install directory to the user `PATH` the way `install.ps1` does,
-/// through .NET so open Explorer windows hear about the change. The directory
+/// Add the install directory to the user `PATH` the way `install.ps1` does.
+/// The registry value is read and written as is, so it stays `REG_EXPAND_SZ`
+/// with its `%VAR%` entries unexpanded (#1509), and removing a variable that
+/// does not exist makes .NET tell open Explorer windows about the change. Any
+/// failure stops the script, so its exit status reports it. The directory
 /// reaches the script as an environment variable, never as script text.
 fn add_to_user_path(dir: &Path) -> Result<()> {
-    const SCRIPT: &str = "$d = $env:AI_MEMORY_DESKTOP_DIR; \
-        $p = [Environment]::GetEnvironmentVariable('Path', 'User'); \
-        $e = @(); if ($p) { $e = @($p -split ';' | Where-Object { $_ }) }; \
-        $have = $e | ForEach-Object { $_.TrimEnd('\\').ToLowerInvariant() }; \
-        if ($have -notcontains $d.TrimEnd('\\').ToLowerInvariant()) { \
-          [Environment]::SetEnvironmentVariable('Path', (@($e) + $d) -join ';', 'User') }";
+    const SCRIPT: &str = "$ErrorActionPreference = 'Stop'; \
+        $d = $env:AI_MEMORY_DESKTOP_DIR; \
+        $k = [Microsoft.Win32.Registry]::CurrentUser.CreateSubKey('Environment'); \
+        try { \
+          $p = $k.GetValue('Path', '', 'DoNotExpandEnvironmentNames'); \
+          $e = @(); if ($p) { $e = @($p -split ';' | Where-Object { $_ }) }; \
+          $have = $e | ForEach-Object { \
+            [Environment]::ExpandEnvironmentVariables($_).TrimEnd('\\').ToLowerInvariant() }; \
+          if ($have -notcontains $d.TrimEnd('\\').ToLowerInvariant()) { \
+            $k.SetValue('Path', (@($e) + $d) -join ';', 'ExpandString'); \
+            $n = 'ai-memory-desktop-' + [Guid]::NewGuid().ToString('N'); \
+            [Environment]::SetEnvironmentVariable($n, [NullString]::Value, 'User') } \
+        } finally { $k.Dispose() }";
     let mut command = Command::new("powershell");
     command
         .args(["-NoProfile", "-NonInteractive", "-Command", SCRIPT])

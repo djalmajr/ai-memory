@@ -7,7 +7,7 @@ use ai_memory_core::{
     AgentKind, NewObservation, NewPage, NewSession, ObservationId, ObservationKind, PagePath,
     ProjectId, Sanitized, Sanitizer, SessionId, Tier, WorkspaceId,
 };
-use ai_memory_store::{PageHit, RetrievalTuning, SearchExplain, Store};
+use ai_memory_store::{HybridSearch, PageFilter, PageHit, RetrievalTuning, SearchExplain, Store};
 
 pub(crate) fn stream_on() -> RetrievalTuning {
     RetrievalTuning {
@@ -195,6 +195,77 @@ async fn an_observation_hit_lifts_its_own_session_page() {
     assert!(hit.snippet.contains("<mark>"), "{}", hit.snippet);
     assert!(hit.snippet.contains("quasar"), "{}", hit.snippet);
     assert!(!hit.title.is_empty());
+}
+
+#[tokio::test]
+async fn page_filtering_precedes_the_observation_candidate_cut() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut store = Store::open(tmp.path()).unwrap();
+    store.reader.set_retrieval_tuning(stream_on());
+    let (ws, proj) = scope(&store, "default", "app").await;
+    let excluded = session(&store, ws, proj).await;
+    let eligible = session(&store, ws, proj).await;
+
+    let mut excluded_page = page(
+        ws,
+        proj,
+        &format!("sessions/{excluded}.md"),
+        "excluded session",
+    );
+    excluded_page.frontmatter_json = serde_json::json!({"tags": ["excluded"]});
+    store.writer.upsert_page(excluded_page).await.unwrap();
+    let mut eligible_page = page(
+        ws,
+        proj,
+        &format!("sessions/{eligible}.md"),
+        "eligible session",
+    );
+    eligible_page.frontmatter_json = serde_json::json!({"tags": ["wanted"]});
+    store.writer.upsert_page(eligible_page).await.unwrap();
+
+    // limit=1 produces an 80-observation input window. These stronger rows
+    // would fill that window if page eligibility were checked after LIMIT.
+    for _ in 0..80 {
+        observe(
+            &store,
+            ws,
+            proj,
+            excluded,
+            "crowdneedle crowdneedle crowdneedle crowdneedle",
+        )
+        .await;
+    }
+    observe(&store, ws, proj, eligible, "crowdneedle").await;
+
+    let (hits, _) = store
+        .reader
+        .hybrid_search_scopes(
+            &[(ws, proj)],
+            HybridSearch {
+                query: "crowdneedle",
+                vector: None,
+                limit: 1,
+                expiry_cutoff_us: None,
+                include_superseded: false,
+                explain: true,
+                owner: &ai_memory_core::OwnerFilter::Any,
+                filter: PageFilter {
+                    tag: Some("wanted"),
+                    ..PageFilter::default()
+                },
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(hits.len(), 1, "the eligible page must survive the row cut");
+    assert_eq!(hits[0].0.path.as_str(), format!("sessions/{eligible}.md"));
+    assert_eq!(
+        hits[0]
+            .1
+            .as_ref()
+            .and_then(|details| details.observation_rank),
+        Some(1)
+    );
 }
 
 #[tokio::test]

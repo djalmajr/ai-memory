@@ -329,8 +329,7 @@ async fn flag_on_merges_cluster_via_llm() {
     let fx = seed_fixture(true).await;
     write(&fx, "sessions/a.md", DUP_A).await;
     write(&fx, "sessions/b.md", DUP_B).await;
-    // A third, far-away cold page: the adaptive k-distance elbow needs more than
-    // `min_pts` points to form (exactly as A3 does). It is noise, not a cluster.
+    // A third, far-away cold page: it is noise, not a cluster.
     write(&fx, "sessions/far.md", K8S_A).await;
     for p in ["sessions/a.md", "sessions/b.md", "sessions/far.md"] {
         backdate_latest(&fx, p, COLD_DAYS);
@@ -401,6 +400,50 @@ async fn flag_on_merges_cluster_via_llm() {
             .iter()
             .any(|(kind, src)| kind == "reconsolidation" && src.starts_with("b2_dream:")),
         "page_evidence records the merge sources: {evidence:?}"
+    );
+}
+
+/// B2 shares A3's `adaptive_eps`, so it shares the pair fix: a cold set of
+/// exactly two near-duplicates, with no third page to give the k-distance
+/// elbow a neighbour, still forms one cluster and reaches the LLM merge.
+#[tokio::test]
+async fn flag_on_merges_a_pair_with_no_other_cold_page() {
+    let fx = seed_fixture(true).await;
+    write(&fx, "sessions/a.md", DUP_A).await;
+    write(&fx, "sessions/b.md", DUP_B).await;
+    for p in ["sessions/a.md", "sessions/b.md"] {
+        backdate_latest(&fx, p, COLD_DAYS);
+    }
+
+    let llm = FakeMergeLlm::new();
+    let calls = llm.calls.clone();
+    let report = run_dream_pass(
+        &fx.store.reader,
+        &fx.wiki,
+        Some(&llm),
+        fx.ws,
+        fx.proj,
+        &DecayParams::default(),
+        0.0,
+        &dream_on(),
+        &DreamCancel::new(),
+        false,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(
+        report.clusters_considered, 1,
+        "the pair is a cluster: {report:?}"
+    );
+    assert_eq!(report.clusters_merged, 1, "the merge applied: {report:?}");
+    assert_eq!(report.pages_superseded, 1);
+    assert_eq!(calls.load(Ordering::SeqCst), 1, "LLM called exactly once");
+    let survivor_body = latest_body(&fx, &report.merges[0].survivor);
+    assert!(
+        survivor_body.contains("crates/ai-memory-store/src/ops.rs")
+            && survivor_body.contains("crates/ai-memory-store/src/reader.rs"),
+        "survivor keeps every source fact: {survivor_body}"
     );
 }
 

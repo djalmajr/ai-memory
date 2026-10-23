@@ -210,13 +210,15 @@ fn record_token_file(config_path: &Path) -> Result<bool> {
 }
 
 /// Clients `install-mcp --apply` writes a config file for. Pi has no MCP
-/// config (its extension reads the hook credential file) and DeepSeek
-/// Harness is print-only, so neither has an entry to re-point.
+/// config (its extension reads the hook credential file), and DeepSeek
+/// Harness and Hermes Agent are print-only, so none has an entry to
+/// re-point. Hermes' entry is a bridge carrying no token, so a new token
+/// needs no edit there either.
 fn rewirable_clients() -> impl Iterator<Item = McpClient> {
     <McpClient as clap::ValueEnum>::value_variants()
         .iter()
         .copied()
-        .filter(|client| !matches!(client, McpClient::Pi | McpClient::Dsh))
+        .filter(|client| !matches!(client, McpClient::Pi | McpClient::Dsh | McpClient::Hermes))
 }
 
 /// The endpoint without a `?flavor=` (or any) query, normalised to `/mcp`.

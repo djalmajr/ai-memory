@@ -1335,6 +1335,88 @@ fn install_skills_then_uninstall_only_skills_round_trips() {
     );
 }
 
+/// `install-skills --scope global --agent antigravity` writes the managed
+/// skills into both roots Antigravity reads, `~/.gemini/config/skills` (App
+/// and IDE) and `~/.gemini/antigravity-cli/skills` (CLI), and not into
+/// `~/.agents/skills`. A re-run changes nothing, and `uninstall --only skills`
+/// takes the skills back out of both roots while the user's own skill and
+/// Antigravity's MCP config beside them stay.
+#[test]
+fn antigravity_global_skills_install_idempotently_and_uninstall_from_both_roots() {
+    let _guard = cli_test_lock();
+    let project = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    let roots = [
+        home.path().join(".gemini/config/skills"),
+        home.path().join(".gemini/antigravity-cli/skills"),
+    ];
+    let user_skill = roots[0].join("user-skill/SKILL.md");
+    write_file(&user_skill, "---\nname: user-skill\n---\nkeep me\n");
+    let mcp_config = home.path().join(".gemini/config/mcp_config.json");
+    write_file(&mcp_config, "{}\n");
+
+    let install = || {
+        command_with_home(home.path())
+            .args([
+                "install-skills",
+                "--scope",
+                "global",
+                "--agent",
+                "antigravity",
+            ])
+            .current_dir(project.path())
+            .output()
+            .unwrap()
+    };
+    let first = install();
+    assert!(
+        first.status.success(),
+        "install-skills failed: {}",
+        String::from_utf8_lossy(&first.stderr)
+    );
+    for root in &roots {
+        for skill in MANAGED_SKILLS {
+            assert!(
+                root.join(skill.relative_path).is_file(),
+                "{}",
+                root.join(skill.relative_path).display()
+            );
+        }
+    }
+    assert!(!home.path().join(".agents/skills").exists());
+
+    let second = install();
+    assert!(
+        second.status.success(),
+        "re-run failed: {}",
+        String::from_utf8_lossy(&second.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&second.stdout);
+    assert_eq!(
+        stdout.matches("already up to date").count(),
+        roots.len() * MANAGED_SKILLS.len(),
+        "{stdout}"
+    );
+
+    let uninstall = run_uninstall(
+        project.path(),
+        home.path(),
+        &["uninstall", "--only", "skills", "--apply", "--yes"],
+    );
+    assert!(
+        uninstall.status.success(),
+        "uninstall failed: {}",
+        String::from_utf8_lossy(&uninstall.stderr)
+    );
+    for root in &roots {
+        for skill in MANAGED_SKILLS {
+            assert!(!root.join(skill.relative_path).exists());
+        }
+    }
+    assert!(user_skill.exists(), "the user's own skill must survive");
+    assert!(mcp_config.exists(), "Antigravity's MCP config must survive");
+}
+
 #[test]
 fn uninstall_only_skills_leaves_custom_target_dir_for_manual_cleanup() {
     let _guard = cli_test_lock();
@@ -2310,6 +2392,57 @@ fn uninstall_keeps_the_hook_bearer_unless_hooks_are_removed() {
             path.display()
         );
     }
+}
+
+/// `install-mcp --apply --auth-token` for Claude Code stores the key where the
+/// hooks keep theirs and writes the bridge entry without it, so the stored
+/// key is the bridge's too: `--only hooks` keeps it while that entry remains,
+/// and the full uninstall still removes it.
+#[test]
+fn an_explicit_bridge_key_is_stored_and_outlives_only_hooks_removal() {
+    const KEY: &str = "aim_bridge_key_0123456789";
+    let _guard = cli_test_lock();
+    let home = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    let run = |args: &[&str]| {
+        let output = command_with_home(home.path())
+            .args(args)
+            .current_dir(project.path())
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{args:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    };
+    run(&[
+        "install-mcp",
+        "--client",
+        "claude-code",
+        "--session-aware",
+        "--auth-token",
+        KEY,
+        "--apply",
+    ]);
+    run(&["install-hooks", "--agent", "claude-code", "--apply"]);
+    let claude = std::fs::read_to_string(home.path().join(".claude.json")).unwrap();
+    assert!(
+        !claude.contains(KEY),
+        "the key stayed in ~/.claude.json: {claude}"
+    );
+    assert!(claude.contains("mcp-bridge"), "{claude}");
+    let stored = home.path().join(".ai-memory-data").join("auth-token");
+    assert_eq!(std::fs::read_to_string(&stored).unwrap().trim(), KEY);
+
+    run(&["uninstall", "--only", "hooks", "--apply", "--yes"]);
+    assert!(
+        stored.exists(),
+        "--only hooks stranded the bridge without its key"
+    );
+
+    run(&["uninstall", "--apply", "--yes"]);
+    assert!(!stored.exists(), "the full uninstall must remove the key");
 }
 
 /// Meta Muse Code: `install-mcp` and `install-hooks` both merge into
