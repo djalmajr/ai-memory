@@ -78,6 +78,11 @@ version in [`docs/changelog/`](docs/changelog/):
   fork's `84 consolidation_chunk_progress` row drops only that row, so
   upstream's V84 still runs. (#16)
 
+### Security
+- Updated `tokio` 1.52.3 → 1.53.3 for
+  [RUSTSEC-2026-0386](https://rustsec.org/advisories/RUSTSEC-2026-0386), in
+  which `AsyncFd::new` and related constructors violate I/O safety. (#17)
+
 ## [3.2.0] - 2026-10-21
 
 ### Added
