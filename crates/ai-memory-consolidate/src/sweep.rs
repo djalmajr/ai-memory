@@ -1374,6 +1374,17 @@ async fn plan_cold_cluster_dedup(
                 MERGE_STUB_FOOTER
             );
             let mut stub_fm = frontmatter_object(&md.frontmatter);
+            // The stub's body is now a two-line merge note, so the loser's own
+            // `summary:` would describe content that moved to the survivor:
+            // `page_descriptor_expr` prefers a non-blank frontmatter summary
+            // over the body on every non-FTS retrieval path, and
+            // `abstract_bearing_page_ids` would keep re-embedding the abstract.
+            // Removing both rather than rewriting `summary` to the merge note:
+            // the descriptor then falls back to the body prefix, which already
+            // IS that note. The pre-merge frontmatter stays reachable through
+            // the supersession chain and git.
+            stub_fm.remove("summary");
+            stub_fm.remove("abstract");
             stub_fm.insert("compacted".to_string(), serde_json::Value::Bool(true));
             stub_fm.insert(
                 "merged_into".to_string(),

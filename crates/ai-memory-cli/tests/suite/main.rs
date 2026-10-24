@@ -11,6 +11,7 @@ mod backfill_dry_run;
 mod backfill_e2e;
 mod backfill_failures;
 mod backfill_member;
+mod backfill_oversized;
 mod backup_agents;
 mod backup_download;
 mod completions;
@@ -43,6 +44,7 @@ mod service_host_windows;
 mod setup_e2e;
 mod shutdown_signals;
 mod upgrade_e2e;
+mod windows_plain_paths;
 mod workstream_provenance;
 mod yolo_ai_jail;
 

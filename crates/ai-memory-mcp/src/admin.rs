@@ -1752,7 +1752,7 @@ impl From<ai_memory_store::PageHitWithMeta> for GlobalSearchHit {
             id: hit.id,
             path: hit.path,
             title: hit.title,
-            snippet: hit.snippet,
+            snippet: ai_memory_store::highlighted_snippet_html(&hit.snippet),
             rank: hit.rank,
             workspace: hit.workspace_name,
             project: hit.project_name,
@@ -11304,6 +11304,160 @@ mod tests {
                 .expect("scope dir")
         };
         uuid_dir(&uuid_dir(&data_dir.join("wiki")))
+    }
+
+    /// Restoring the pre-OKF checkpoint every migrated install carries must
+    /// not reintroduce a pre-migration file: the restore writes the page to
+    /// disk, and `export-okf` reads the disk, so a verbatim restore refuses
+    /// every later export of that project with "run the server once to
+    /// migrate" — advice the one-shot wiki migration will never act on again.
+    #[tokio::test]
+    async fn export_okf_survives_a_restore_from_a_pre_okf_checkpoint() {
+        let (tmp, router) = read_page_test_router();
+        post_write_page(&router, "default", "scratch", "notes/a.md", "fine").await;
+        // A pre-migration file, checkpointed exactly as the OKF migration's
+        // own git checkpoint captured one.
+        let proj_dir = scratch_project_dir(tmp.path());
+        let legacy = proj_dir.join("notes/legacy.md");
+        std::fs::write(&legacy, "---\ntitle: Legacy\n---\nno type here").unwrap();
+        let pre_okf_rev = post_commit(&router, "pre-okf-migration checkpoint").await;
+        // Then the migration conformed it, so the export works today.
+        std::fs::write(
+            &legacy,
+            "---\ntype: Note\ntitle: Legacy\ngenerated:\n  at: \"2026-09-01T00:00:00Z\"\n---\nno type here",
+        )
+        .unwrap();
+        post_commit(&router, "okf-migration: conform wiki to OKF v0.2").await;
+        assert_eq!(export_okf_status(&router).await, StatusCode::OK);
+
+        let resp = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/admin/restore-page")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&serde_json::json!({
+                            "workspace": "default",
+                            "project": "scratch",
+                            "path": "notes/legacy.md",
+                            "rev": pre_okf_rev,
+                        }))
+                        .unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "restore-page failed");
+
+        assert_eq!(
+            export_okf_status(&router).await,
+            StatusCode::OK,
+            "a restored page left the bundle non-conformant, permanently \
+             breaking export-okf for this project"
+        );
+    }
+
+    /// An already-conformant page restores to the same bytes it was
+    /// checkpointed with: conforming the restore must not rewrite history
+    /// that needed no rewriting.
+    #[tokio::test]
+    async fn restoring_a_conformant_page_keeps_the_checkpointed_bytes() {
+        let (tmp, router) = read_page_test_router();
+        post_write_page(&router, "default", "scratch", "notes/a.md", "first").await;
+        let proj_dir = scratch_project_dir(tmp.path());
+        let page = proj_dir.join("notes/a.md");
+        let checkpointed = std::fs::read(&page).unwrap();
+        let rev = post_commit(&router, "checkpoint").await;
+
+        post_write_page(&router, "default", "scratch", "notes/a.md", "second").await;
+        post_commit(&router, "later").await;
+        assert_ne!(std::fs::read(&page).unwrap(), checkpointed);
+
+        let resp = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/admin/restore-page")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&serde_json::json!({
+                            "workspace": "default",
+                            "project": "scratch",
+                            "path": "notes/a.md",
+                            "rev": rev,
+                        }))
+                        .unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "restore-page failed");
+
+        assert_eq!(
+            std::fs::read(&page).unwrap(),
+            checkpointed,
+            "restoring an already-conformant page rewrote its bytes"
+        );
+    }
+
+    /// `POST /admin/commit`, returning the oid of the resulting HEAD
+    /// checkpoint. A write-page already checkpoints itself, so the commit
+    /// here may legitimately have nothing left to stage.
+    async fn post_commit(router: &Router, message: &str) -> String {
+        let resp = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/admin/commit")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&serde_json::json!({ "message": message })).unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "commit setup failed");
+        let resp = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/admin/checkpoints?limit=1")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "checkpoint listing failed");
+        let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        json[0]["oid"]
+            .as_str()
+            .expect("at least one checkpoint")
+            .to_string()
+    }
+
+    /// Status of `POST /admin/export-okf` for the seeded scratch project.
+    async fn export_okf_status(router: &Router) -> StatusCode {
+        router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/admin/export-okf?workspace=default&project=scratch")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+            .status()
     }
 
     /// A bundle with a non-conformant page must fail the export rather

@@ -49,8 +49,18 @@ function Install-AiMemory {
     }
 
     $base = if ($env:AI_MEMORY_RELEASE_BASE_URL) { $env:AI_MEMORY_RELEASE_BASE_URL.TrimEnd('/') } else { $defaultBase }
-    if ($base -eq $defaultBase -or $base.StartsWith('https://github.com/', [StringComparison]::OrdinalIgnoreCase)) {
-        if (-not $base.StartsWith('https://', [StringComparison]::OrdinalIgnoreCase)) { Fail "refusing a non-https GitHub URL: $base" }
+    # The archive and its `.sha256` come from the same origin, so a plain-http
+    # GitHub base lets an on-path rewrite replace both and the checksum proves
+    # nothing. The previous guard was nested inside a condition whose two arms
+    # (the default base, or an https GitHub prefix) each already implied https,
+    # so its inner scheme test could never fire — and a plain-http GitHub base
+    # matched neither arm, so it skipped the check altogether. A non-GitHub
+    # base stays the operator's trust decision, as the header documents.
+    $baseUri = $null
+    if ([Uri]::TryCreate($base, [UriKind]::Absolute, [ref]$baseUri) -and
+        $baseUri.Scheme -eq 'http' -and
+        $baseUri.Host.TrimEnd('.') -eq 'github.com') {
+        Fail "refusing a non-https GitHub URL: $base"
     }
     $version = $env:AI_MEMORY_VERSION
     if ($version) {

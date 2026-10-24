@@ -24,7 +24,7 @@ on a homelab box where mistakes are harder to undo.
 | `restore-page --path --from` | ✅ yes | overwrites one markdown page version | yes (restore another checkpoint) | Restores one page from wiki git history, reindexes it into SQLite, and writes a post-restore checkpoint. Does not restore DB-only state. |
 | MCP `memory_restore_page` | ✅ yes | no (writes a new current version; the replaced one stays reachable) | yes (restore another checkpoint) | Lists a page's checkpoints, or writes one back through the `memory_write_page` path. Admin only, like `restore-page`. See [below](#mcp-memory_restore_page). |
 | `backup-agents --to` / `restore-agents --from <tarball>` | ✅ yes (client-side; never touches the server or its data dir) | no | yes (`restore-agents --apply` keeps timestamped copies of overwritten files) | Agent-config assets, not wiki/db: MCP configs (redacted unless `--include-secrets`), hook configs, instructions, skills, plugins. `restore-agents` is a dry run by default; `--apply` writes to disk and `--force` overwrites existing or differing targets. Non-MCP assets are restored verbatim and may contain secrets, so only `--apply` an archive whose source you trust. |
-| `restore --from <tarball>` | ❌ **stop the server first** | overwrites the data dir | no (without prior backup) | Refuses if any sibling `ai-memory` process is alive (sysinfo guard). Stages and verifies the archive before swapping it in, so a failed restore leaves `wiki/` and `db/` as they were. |
+| `restore --from <tarball>` | ❌ **stop the server first** | overwrites the data dir | no (without prior backup) | Refuses if any sibling `ai-memory` process is alive (sysinfo guard). Stages and verifies the archive before swapping it in, so a failed restore leaves `wiki/` and `db/` as they were. Keeps an existing `config.toml` and saves the backup's as `config.toml.from-backup` unless `--with-config` is passed. |
 | `reset --confirm` | ❌ **stop the server first** | yes, all data | no | Refuses if any sibling `ai-memory` process is alive (sysinfo guard). |
 | `reindex` | ❌ **stop the server first** | no wiki wipe; requires a clean DB | only with prior DB backup | Rebuilds pages/links/FTS from `wiki/` using `_meta.md` manifests. Refuses if SQLite already has rows so stale DB-only state cannot survive silently. |
 
@@ -44,7 +44,8 @@ same as with a name.
 State-touching commands route through the HTTP admin API except `reset`,
 `restore`, and `reindex`, which are direct-disk lifecycle operations that
 fundamentally cannot run while another process holds the SQLite WAL writer. See
-[CLAUDE.md §16](../CLAUDE.md) for the invariant.
+[AGENTS.md, invariant 9](../AGENTS.md#cross-cutting-invariants-do-not-violate)
+for the live-process guard.
 
 
 ## What "deleted" means (`purge-session`, `purge-project`, `delete-workspace`)
@@ -1145,7 +1146,11 @@ intentionally excludes `auth-tokens/`, the hook-side `auth-token` and
 data dir with `--config`. The included `<data_dir>/config.toml` is archived
 verbatim and may itself contain inline root/proxy/recovery credentials, the
 API-key pepper, or sensitive LLM headers. Always protect the snapshot as a
-secret-bearing artifact. Excluding the separate credential files limits the
+secret-bearing artifact. It is also code-bearing: a config can name commands
+the server runs (`[auto_improve.eval]`), send consolidated memory to another
+host (LLM provider URLs and headers, admission webhooks) and weaken redaction
+(`[sanitize]`), so `restore` adopts it only when asked (see below). Excluding
+the separate credential files limits the
 copied auth material; omitting `raw/` avoids racing the actively appended
 managed-workstream ledger. The SQLite snapshot still contains the searchable
 managed-workstream events, but loses their immutable source copy.
@@ -1193,7 +1198,7 @@ HTTP admin API).
 ### `restore`
 
 ```bash
-ai-memory restore --from <tarball> --data-dir <path> --force
+ai-memory restore --from <tarball> --data-dir <path> --force [--with-config]
 ```
 
 Direct-disk operation. Refuses if any other `ai-memory` process is
@@ -1207,12 +1212,22 @@ Order of operations:
 3. Open the staged store so pending migrations run and the SQLite
    snapshot is verified, still without touching the live data. A legacy
    database with API keys but no pepper verifier stops here unless the original
-   pepper is configured and `--accept-legacy-api-key-pepper` was passed.
-4. Swap: rename the live `wiki/` and `db/` (and `config.toml`, when the
-   archive carries one) aside, rename the staged copies into place, then
-   delete the previous data. Each move is a same-filesystem rename; if
-   one fails, the moves already made are reversed.
-5. Print a one-line summary.
+   pepper is configured and `--accept-legacy-api-key-pepper` was passed. When
+   the live config is being kept (step 4) and the database holds API keys, the
+   configured pepper must match the one the keys were hashed with, or the
+   restore stops here too.
+4. Swap: rename the live `wiki/` and `db/` aside, rename the staged copies
+   into place, then delete the previous data. Each move is a same-filesystem
+   rename; if one fails, the moves already made are reversed. The archive's
+   `config.toml`, when it carries one, replaces the live config only with
+   `--with-config` or when the data dir has none. Otherwise the live config
+   stays and the archived one is saved as `<data_dir>/config.toml.from-backup`
+   (`0600` on Unix), replacing an earlier copy there.
+5. Print a summary, including where the backup's config went.
+
+A backup's `config.toml` can run commands and redirect data. Restore it, with
+`--with-config` or by adopting `config.toml.from-backup`, only from an archive
+you trust; review it first otherwise.
 
 The live data is therefore untouched until the archive has proven usable.
 A restore that fails in steps 2–3 leaves `wiki/` and `db/` exactly as they
@@ -1229,6 +1244,14 @@ Failure modes:
   a snapshot the current binary cannot open** (for example a backup taken
   by a newer release) → exits with the error; the existing `wiki/` and
   `db/` are left as they were.
+- **Migration history has a gap** → an earlier migration is unrecorded
+  although a later one was applied. The staged store is refused, just as at
+  normal startup. Keep the backup and report the history for review;
+  `--force` does not bypass this check or repair the missing migration.
+- **The live config's pepper does not match the backup's API keys** (live
+  config kept) → rerun with `--with-config` to restore the backup's config, or
+  set the live `[auth].token_pepper` to the original. The live data is left as
+  it was.
 - **Legacy backup has API keys but no pepper verifier** → restore the original
   `[auth].token_pepper` through the current config/environment and rerun with
   `--accept-legacy-api-key-pepper`. This flag confirms provenance; it cannot

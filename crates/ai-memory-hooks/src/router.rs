@@ -642,6 +642,17 @@ pub struct HookState {
     /// subagent exclusion so a marked event still seeds its tail tracking.
     /// Empty by default.
     pub ingest_drop_list: crate::drop_list::IngestDropList,
+    /// Benchmark escape hatch (`AI_MEMORY_EVAL_SKIP_WIKI_CHECKPOINTS=1`, set
+    /// only by the retrieval-benchmark harness in `evals/`): skip the
+    /// SessionEnd auto-commits of the wiki git tree. The LongMemEval replay
+    /// ends ~24k sessions through one server, and each checkpoint walks a
+    /// tree and object database that keep growing, so commits dominate
+    /// ingest wall clock there (see `docs/benchmarks/README.md`). Retrieval
+    /// never reads git history, so skipping the commits changes no measured
+    /// number — the markdown and the index stay the source of truth. Every
+    /// other consumer keeps committing: default false, and the flag is read
+    /// once at server startup, never per event.
+    pub skip_wiki_checkpoints: bool,
 }
 
 /// The owner to stamp on the session and handoff rows this event creates
@@ -723,7 +734,10 @@ pub fn hook_router(state: HookState) -> Router {
             "/hook",
             post(handle_hook).route_layer(from_fn(repair_hook_json)),
         )
-        .route("/hook/batch", post(handle_hook_batch))
+        .route(
+            "/hook/batch",
+            post(handle_hook_batch).route_layer(from_fn(repair_hook_json)),
+        )
         .route("/handoff", get(handle_handoff))
         .route("/recap", get(crate::recap::handle_recap))
         .with_state(Arc::new(state))
@@ -1778,7 +1792,10 @@ async fn fetch_and_accept_handoff_at(
             busy_since,
         )
         .await?;
-    let handoff_md = handoff.as_ref().map(render_handoff_markdown);
+    let claude_capped = agent == AgentKind::ClaudeCode;
+    let handoff_md = handoff.as_ref().map(|handoff| {
+        render_handoff_markdown_with_budget(handoff, claude_capped.then_some(CLAUDE_HANDOFF_CHARS))
+    });
     // The brief is additive and non-destructive: unlike the handoff (a
     // single-use slot claimed below), it is recomposed on every opted-in
     // session start — exactly what a Claude Code `/clear` needs (#176).
@@ -1802,9 +1819,16 @@ async fn fetch_and_accept_handoff_at(
         }
     };
     let profile_flags = persist_profile_flags(state, &query, ws, proj, may_write_profile).await;
-    let profile_md =
-        render_requested_profile_digest(state, &query, ws, proj, viewer, profile_flags.consume)
-            .await;
+    let profile_md = render_requested_profile_digest(
+        state,
+        &query,
+        ws,
+        proj,
+        viewer,
+        profile_flags.consume,
+        claude_capped.then_some(CLAUDE_PROFILE_CHARS),
+    )
+    .await;
     // Handoff right after the profile digest: it is a short curated pointer
     // and must not be buried under a ledger that can run tens of KB. The
     // existing ledger-then-brief order is preserved. Claim both single-use inputs only after every
@@ -1984,21 +2008,15 @@ async fn fetch_and_accept_handoff_at(
     // while everything after it changes every session, so leading with it
     // keeps it in the reusable part of the harness's prompt cache (design:
     // docs/design-cross-project-profile.md §3).
-    Ok(combine_handoff_and_brief(
+    Ok(combine_startup_context(
+        agent,
         profile_md,
-        combine_handoff_and_brief(
-            handoff_md,
-            combine_handoff_and_brief(
-                handoff_notice,
-                combine_handoff_and_brief(
-                    continuity_notice,
-                    combine_handoff_and_brief(
-                        managed_md,
-                        combine_handoff_and_brief(brief_md, inbox_notice),
-                    ),
-                ),
-            ),
-        ),
+        handoff_md,
+        handoff_notice,
+        continuity_notice,
+        managed_md,
+        brief_md,
+        inbox_notice,
     ))
 }
 
@@ -2426,6 +2444,7 @@ async fn render_requested_profile_digest(
     project_id: ProjectId,
     viewer: Option<ai_memory_core::UserId>,
     consume: bool,
+    budget_cap: Option<usize>,
 ) -> Option<String> {
     if !state.profile.inject_on_session_start
         || !consume
@@ -2478,6 +2497,7 @@ async fn render_requested_profile_digest(
     } else {
         state.profile.digest_budget()
     };
+    let budget = budget_cap.map_or(budget, |cap| budget.min(cap));
     ai_memory_core::profile::render_digest(
         &inputs.entries,
         &inputs.project_tags,
@@ -2497,6 +2517,87 @@ fn combine_handoff_and_brief(
         (None, Some(b)) => Some(b),
         (None, None) => None,
     }
+}
+
+const CLAUDE_ADDITIONAL_CONTEXT_CHARS: usize = 9_800;
+const CLAUDE_PROFILE_CHARS: usize = 2_400;
+const CLAUDE_HANDOFF_CHARS: usize = 4_800;
+
+#[allow(clippy::too_many_arguments)]
+fn combine_startup_context(
+    agent: AgentKind,
+    profile: Option<String>,
+    handoff: Option<String>,
+    handoff_notice: Option<String>,
+    continuity_notice: Option<String>,
+    managed: Option<String>,
+    brief: Option<String>,
+    inbox: Option<String>,
+) -> Option<String> {
+    if agent != AgentKind::ClaudeCode {
+        return combine_handoff_and_brief(
+            profile,
+            combine_handoff_and_brief(
+                handoff,
+                combine_handoff_and_brief(
+                    handoff_notice,
+                    combine_handoff_and_brief(
+                        continuity_notice,
+                        combine_handoff_and_brief(managed, combine_handoff_and_brief(brief, inbox)),
+                    ),
+                ),
+            ),
+        );
+    }
+
+    // Mandatory signals are selected first but retain their normal display
+    // order. Optional ledger/brief material is admitted only when the whole
+    // response stays inline under Claude Code's fixed 10k hook ceiling.
+    let sections = [profile, handoff, handoff_notice, continuity_notice, inbox];
+    let mut selected = [false; 5];
+    let mut used = 0usize;
+    let mut selected_count = 0usize;
+    // Continue-work signals outrank the profile when an unusually large
+    // combination approaches Claude Code's fixed hook-response ceiling.
+    for index in [1, 2, 3, 4, 0] {
+        if let Some(section) = sections[index].as_ref() {
+            let separator = usize::from(selected_count > 0);
+            if used + separator + section.chars().count() <= CLAUDE_ADDITIONAL_CONTEXT_CHARS {
+                used += separator + section.chars().count();
+                selected[index] = true;
+                selected_count += 1;
+            }
+        }
+    }
+    let mut kept = sections
+        .into_iter()
+        .enumerate()
+        .filter_map(|(index, section)| selected[index].then_some(section).flatten())
+        .collect::<Vec<_>>();
+    for (section, omission_notice) in [
+        (
+            managed,
+            Some(
+                "ai-memory: additional managed-workstream history did not fit Claude Code's inline startup limit. Search the complete visible ledger with `ai-memory workstream-search \"<query>\"`; this managed process already carries the workstream id.",
+            ),
+        ),
+        (brief, None),
+    ] {
+        if let Some(section) = section {
+            let separator = usize::from(!kept.is_empty());
+            if used + separator + section.chars().count() <= CLAUDE_ADDITIONAL_CONTEXT_CHARS {
+                used += separator + section.chars().count();
+                kept.push(section);
+            } else if let Some(notice) = omission_notice {
+                let notice_chars = notice.chars().count();
+                if used + separator + notice_chars <= CLAUDE_ADDITIONAL_CONTEXT_CHARS {
+                    used += separator + notice_chars;
+                    kept.push(notice.to_owned());
+                }
+            }
+        }
+    }
+    (!kept.is_empty()).then(|| kept.join("\n"))
 }
 
 /// Default char budget for the session-start brief (~1k tokens at the
@@ -2928,7 +3029,7 @@ fn render_session_brief(
     Some(buf)
 }
 
-fn render_handoff_markdown(h: &Handoff) -> String {
+fn render_handoff_markdown_with_budget(h: &Handoff, budget: Option<usize>) -> String {
     // Layout goal: TUI-renderable + agent-friendly. The previous
     // shape put a paragraph-long `## Summary` first, which made the
     // hook output look like a wall of text in Codex's "completed"
@@ -2977,6 +3078,18 @@ fn render_handoff_markdown(h: &Handoff) -> String {
     buf.push_str(h.content.summary.trim());
     buf.push('\n');
     escape_untrusted_history_tail(&mut buf, history_start);
+    if let Some(budget) = budget {
+        let footer_room = UNTRUSTED_HISTORY_END.chars().count() + 520;
+        let ceiling = budget.saturating_sub(footer_room).max(history_start);
+        if buf.chars().count() > ceiling {
+            let cut = buf
+                .char_indices()
+                .nth(ceiling)
+                .map_or(buf.len(), |(at, _)| at);
+            buf.truncate(cut);
+            buf.push_str("\n[handoff detail omitted to fit this harness's startup limit]\n");
+        }
+    }
     buf.push('\n');
     buf.push_str(UNTRUSTED_HISTORY_END);
     buf.push('\n');
@@ -4276,7 +4389,11 @@ async fn process_authorized(
         HookSessionAdmission::AlreadyEnded { session } => {
             let commit_msg = format!("repair session {}", short_id(&session_id.to_string()));
             let mut recovered = false;
-            match state.wiki.commit_all(&commit_msg) {
+            match if state.skip_wiki_checkpoints {
+                Ok(None)
+            } else {
+                state.wiki.commit_all(&commit_msg)
+            } {
                 Ok(Some(oid)) => {
                     recovered = true;
                     state.ingest_metrics.record_persisted(now_unix_ms());
@@ -4518,7 +4635,11 @@ async fn process_authorized(
                         "lifecycle-only session {}",
                         short_id(&session_id.to_string()),
                     );
-                    match state.wiki.commit_all(&commit_msg) {
+                    match if state.skip_wiki_checkpoints {
+                        Ok(None)
+                    } else {
+                        state.wiki.commit_all(&commit_msg)
+                    } {
                         Ok(Some(oid)) => debug!(commit = %oid, "lifecycle-only log auto-commit"),
                         Ok(None) => debug!("wiki clean after lifecycle-only SessionEnd"),
                         Err(e) => warn!(error = %e, "lifecycle-only log auto-commit failed"),
@@ -4728,10 +4849,16 @@ async fn process_authorized(
             short_id(&session_id.to_string()),
             new_page.title.chars().take(60).collect::<String>(),
         );
-        match state.wiki.commit_all(&commit_msg) {
-            Ok(Some(oid)) => debug!(commit = %oid, "wiki auto-commit"),
-            Ok(None) => debug!("wiki clean; no auto-commit"),
-            Err(e) => warn!(error = %e, "auto-commit failed"),
+        // The benchmark escape skips the commit; everything the index and the
+        // page reader use has already landed (markdown + store transaction).
+        if !state.skip_wiki_checkpoints {
+            match state.wiki.commit_all(&commit_msg) {
+                Ok(Some(oid)) => debug!(commit = %oid, "wiki auto-commit"),
+                Ok(None) => debug!("wiki clean; no auto-commit"),
+                Err(e) => warn!(error = %e, "auto-commit failed"),
+            }
+        } else {
+            debug!(session = %session_id, "wiki auto-commit skipped (benchmark mode)");
         }
         // Persist the optional LLM work before acknowledging the hook, after
         // deterministic wiki writes are committed so the worker cannot race
@@ -5296,6 +5423,7 @@ pub(crate) mod tests {
     use ai_memory_store::{FinishWorkstreamRun, PrepareWorkstreamRun, Store, WorkstreamSelection};
     use ai_memory_wiki::Wiki;
     use tempfile::TempDir;
+    use tower::ServiceExt as _;
 
     use ai_memory_core::ObservationKind;
 
@@ -6986,6 +7114,7 @@ pub(crate) mod tests {
             mid_session_routing: MidSessionRouting::default(),
             profile: ai_memory_core::profile::ProfileSettings::default(),
             ingest_drop_list: crate::drop_list::IngestDropList::default(),
+            skip_wiki_checkpoints: false,
         }
     }
 
@@ -7403,6 +7532,50 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn claude_startup_context_stays_inline_and_keeps_must_see_notices() {
+        let output = combine_startup_context(
+            AgentKind::ClaudeCode,
+            Some("profile".repeat(300)),
+            Some("HANDOFF".repeat(500)),
+            Some("handoff notice".into()),
+            Some("continuity notice".into()),
+            Some("managed ledger".repeat(2_000)),
+            Some("project brief".repeat(2_000)),
+            Some("INBOX NOTICE".into()),
+        )
+        .unwrap();
+
+        assert!(output.chars().count() <= CLAUDE_ADDITIONAL_CONTEXT_CHARS);
+        assert!(output.contains("HANDOFF"));
+        assert!(output.contains("continuity notice"));
+        assert!(output.contains("INBOX NOTICE"));
+        assert!(!output.contains("managed ledger"));
+        assert!(!output.contains("project brief"));
+    }
+
+    #[test]
+    fn claude_startup_context_prioritizes_continuation_over_a_large_profile() {
+        let output = combine_startup_context(
+            AgentKind::ClaudeCode,
+            Some("profile".repeat(1_400)),
+            Some("HANDOFF".repeat(600)),
+            Some("HANDOFF NOTICE".repeat(40)),
+            Some("CONTINUITY NOTICE".repeat(40)),
+            None,
+            None,
+            Some("INBOX NOTICE".repeat(40)),
+        )
+        .unwrap();
+
+        assert!(output.chars().count() <= CLAUDE_ADDITIONAL_CONTEXT_CHARS);
+        assert!(output.contains("HANDOFF"));
+        assert!(output.contains("HANDOFF NOTICE"));
+        assert!(output.contains("CONTINUITY NOTICE"));
+        assert!(output.contains("INBOX NOTICE"));
+        assert!(!output.contains("profile"));
+    }
+
+    #[test]
     fn automatic_memory_blocks_mark_dynamic_content_as_untrusted() {
         let handoff = Handoff {
             scope: ai_memory_core::HandoffScope {
@@ -7434,7 +7607,7 @@ pub(crate) mod tests {
                 accepted_by_user: None,
             },
         };
-        let rendered = render_handoff_markdown(&handoff);
+        let rendered = render_handoff_markdown_with_budget(&handoff, None);
         let warning = rendered
             .find(ai_memory_core::UNTRUSTED_MEMORY_NOTICE)
             .expect("handoff must include the trust boundary");
@@ -11882,6 +12055,20 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    async fn hook_batch_route_rejects_a_body_over_the_machine_limit() {
+        let tmp = TempDir::new().unwrap();
+        let app = hook_router(make_state(&tmp).await);
+        let request = Request::builder()
+            .method("POST")
+            .uri("/hook/batch")
+            .header("content-type", "application/json")
+            .body(Body::from(vec![b' '; MAX_HOOK_BODY_BYTES + 1]))
+            .unwrap();
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    }
+
+    #[tokio::test]
     async fn handle_hook_batch_processes_sequentially_with_one_permit() {
         let tmp = TempDir::new().unwrap();
         let mut state = make_state(&tmp).await;
@@ -15753,6 +15940,103 @@ pub(crate) mod tests {
                 .unwrap()
                 .is_some(),
             "direct launches must retain the legacy SessionEnd handoff behavior"
+        );
+    }
+
+    #[tokio::test]
+    async fn benchmark_skip_wiki_checkpoints_leaves_the_page_but_no_commit() {
+        // The control: a default session end auto-commits the wiki tree.
+        // The benchmark escape must skip only that commit — the session
+        // page, the ended-session row and the store index all still land,
+        // because retrieval reads markdown + SQLite, never git history.
+        async fn replay_session(state: &Arc<HookState>, tmp: &TempDir) -> SessionId {
+            let session = SessionId::new();
+            for (event, body) in [
+                ("session-start", serde_json::json!({})),
+                (
+                    "user-prompt",
+                    serde_json::json!({ "prompt": "teach me the parser fix" }),
+                ),
+                ("session-end", serde_json::json!({ "reason": "exit" })),
+            ] {
+                let envelope = HookEnvelope::from_query_and_body(
+                    HookQuery {
+                        event: event.into(),
+                        agent: Some("claude-code".into()),
+                        cwd: Some(tmp.path().to_string_lossy().into_owned()),
+                        workspace: Some("default".into()),
+                        project: Some("scratch".into()),
+                        ..Default::default()
+                    },
+                    serde_json::json!({
+                        "session_id": session.to_string(),
+                        "cwd": tmp.path(),
+                        "body": body,
+                    }),
+                );
+                process(state, envelope, None, Vec::new()).await.unwrap();
+            }
+            session
+        }
+
+        let control_tmp = TempDir::new().unwrap();
+        let control_state = Arc::new(make_state(&control_tmp).await);
+        let control_session = replay_session(&control_state, &control_tmp).await;
+        let checkpoints = control_state.wiki.recent_checkpoints(10).unwrap();
+        assert!(
+            checkpoints.iter().any(|c| c.summary.starts_with(&format!(
+                "session {}",
+                short_id(&control_session.to_string())
+            ))),
+            "default SessionEnd must auto-commit; got {:?}",
+            checkpoints
+                .iter()
+                .map(|c| c.summary.as_str())
+                .collect::<Vec<_>>()
+        );
+
+        let skip_tmp = TempDir::new().unwrap();
+        let mut skip_state = make_state(&skip_tmp).await;
+        skip_state.skip_wiki_checkpoints = true;
+        let skip_state = Arc::new(skip_state);
+        let skip_session = replay_session(&skip_state, &skip_tmp).await;
+
+        // Everything retrieval reads still landed.
+        let pages = skip_state
+            .reader
+            .recent_pages_for_project(skip_state.workspace_id, skip_state.project_id, 20)
+            .await
+            .unwrap();
+        assert!(
+            pages
+                .iter()
+                .any(|p| p.path.as_str().starts_with("sessions/")),
+            "the session summary page must still be written with checkpoints skipped"
+        );
+        let disposition = skip_state
+            .reader
+            .session_end_disposition(
+                skip_session,
+                skip_state.workspace_id,
+                skip_state.project_id,
+                AgentKind::ClaudeCode,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            disposition,
+            ai_memory_store::SessionEndDisposition::AlreadyEnded,
+            "the session row must still be ended with checkpoints skipped"
+        );
+        // And the git tree was not committed.
+        let checkpoints = skip_state.wiki.recent_checkpoints(10).unwrap();
+        assert!(
+            checkpoints.is_empty(),
+            "the benchmark escape must leave no session checkpoint; got {:?}",
+            checkpoints
+                .iter()
+                .map(|c| c.summary.as_str())
+                .collect::<Vec<_>>()
         );
     }
 
@@ -20729,6 +21013,48 @@ pub(crate) mod tests {
             "title exceeded the 80-char display cap: {:?}",
             obs.title
         );
+    }
+
+    /// End to end through `/hook`: a credential with an invisible formatting
+    /// character inside it reaches the store redacted, in the title and the
+    /// body, and the prose around it is kept.
+    #[tokio::test]
+    async fn user_prompt_secret_split_by_an_invisible_character_is_redacted() {
+        let tmp = TempDir::new().unwrap();
+        let state = make_state(&tmp).await;
+        // FAKE shape: `sk-` plus 26 characters, split after the first 10.
+        let (head, tail) = ("sk-FAKEfakeFA", "KEfake0123456789");
+        let prompt = format!("use {head}\u{200B}{tail} for the call");
+        let sid = SessionId::new();
+        let env = HookEnvelope::from_query_and_body(
+            HookQuery {
+                event: "user-prompt".into(),
+                agent: Some("claude-code".into()),
+                ..Default::default()
+            },
+            serde_json::json!({
+                "session_id": sid.to_string(),
+                "cwd": "/repo",
+                "prompt": prompt,
+            }),
+        );
+        process(&state, env, None, Vec::new()).await.unwrap();
+
+        let observations = state.reader.observations_for_session(sid).await.unwrap();
+        let obs = observations
+            .iter()
+            .find(|o| o.kind == ObservationKind::UserPrompt)
+            .expect("user prompt observation was recorded");
+        for stored in [&obs.title, &obs.body] {
+            assert!(
+                !stored.contains(head) && !stored.contains(tail),
+                "a fragment of the split key was stored: {stored:?}"
+            );
+            assert!(
+                stored.contains("[REDACTED:api_key]") && stored.contains("for the call"),
+                "the key must be redacted and the prose kept: {stored:?}"
+            );
+        }
     }
 
     /// Shared shape for the #1114 body-side regressions: a secret straddling

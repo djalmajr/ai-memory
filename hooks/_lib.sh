@@ -287,6 +287,45 @@ ai_memory_extract_session_id() {
     done
 }
 
+# True when the payload claims to be a subagent/child session: a known marker
+# key at the TOP LEVEL holding a non-empty string. Parity with the native
+# router (`commands/hook.rs::payload_is_subagent`) and the PowerShell
+# `Test-AiMemorySubagentPayload`, both of which read keyed values. The depth
+# walk is what makes it a payload check rather than a text search: tool input
+# and tool output routinely quote these key names (reading a source file that
+# names them is enough), and a session must not lose its handoff over that.
+ai_memory_payload_is_subagent() {
+    printf '%s' "${1:-$(cat)}" | LC_ALL=C awk '
+        { buf = buf $0 "\n" }
+        END {
+            split("subagentType subagent_type agent_type agent_id parentSessionId", names, " ")
+            for (n in names) marker[names[n]] = 1
+            len = length(buf)
+            depth = 0
+            want = "key"
+            for (i = 1; i <= len; i++) {
+                c = substr(buf, i, 1)
+                if (c == "{" || c == "[") { depth++; if (depth == 1) want = "key"; continue }
+                if (c == "}" || c == "]") { depth--; continue }
+                if (c == ",") { if (depth == 1) want = "key"; continue }
+                if (c != "\"") continue
+                tok = ""
+                for (i++; i <= len; i++) {
+                    c = substr(buf, i, 1)
+                    if (c == "\\") { tok = tok substr(buf, i, 2); i++; continue }
+                    if (c == "\"") break
+                    tok = tok c
+                }
+                if (depth != 1) continue
+                if (want == "key") { key = tok; want = "value"; continue }
+                gsub(/^[ \t\r\n]+|[ \t\r\n]+$/, "", tok)
+                if (marker[key] && tok != "") exit 0
+                want = "key"
+            }
+            exit 1
+        }'
+}
+
 # Antigravity's PreInvocation hook fires before every model call. Only the
 # documented invocationNum=0 boundary represents the startup event that
 # ai-memory maps to SessionStart. Missing or malformed counters fail closed so

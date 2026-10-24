@@ -16,7 +16,9 @@ use ai_memory_hooks::{
     CLIENT_MARKER_HEADER, DEFAULT_HOOK_INGEST_MAX_IN_FLIGHT, HookState, ProjectCacheStore,
     WorkstreamState, hook_router, workstream_router,
 };
-use ai_memory_llm::{Embedder, EmbeddingCapacity, LlmProvider, ProviderHealth, build_embedder};
+use ai_memory_llm::{
+    Embedder, EmbeddingCapacity, LlmProvider, ProviderHealth, build_embedder, local_capacity,
+};
 use ai_memory_mcp::human_auth::{Cidr, HumanAuthRuntime, LoginLimiter};
 use ai_memory_mcp::{
     AdminState, AiMemoryServer, ScopeInvalidation, admin_router_with_sweep_tuning,
@@ -853,41 +855,45 @@ fn session_consolidation_retry_delay(attempt: u32) -> Duration {
 /// Failures that must terminate a SessionEnd queue job: re-sending the same
 /// expensive prompt cannot clear them.
 ///
-/// Deterministic structured-response failures — malformed JSON (`Serde`), an
-/// unexpected response shape (`UnexpectedShape`), an output-budget stop
-/// (`TruncatedResponse`), or empty content (`EmptyContent`) — reproduce on
-/// identical inputs, so the job goes terminal and the heuristic page the
-/// SessionEnd hook already wrote remains. The admission guard's pre-send
-/// input limit never fits, and for ambiguous deliveries (a timeout, 499, or
-/// 5xx after send) the admission provider already made its one delayed replay
-/// before surfacing `AmbiguousRetryExhausted`; a queue retry would be a third
-/// send of the same prompt. Pre-send connection failures and provider
-/// statuses a later attempt may plausibly clear (`429`, a `5xx` such as a
-/// capacity rejection) never reached the model yet and keep the queue's
-/// bounded, backoff-scheduled retry up to the attempt cap.
+/// An LLM failure defers to [`ai_memory_llm::LlmError::is_transient`]: a
+/// provider `429` or `5xx` (including a typed `RateLimited` or `Capacity`
+/// rejection) and an `Http` timeout/connect failure keep the queue's bounded,
+/// backoff-scheduled retry up to the attempt cap, while everything else — a
+/// malformed (`Serde`) or unexpected (`UnexpectedShape`) structured response,
+/// an output-budget stop (`TruncatedResponse`), empty content
+/// (`EmptyContent`), a rejected or expired credential (`Auth`), a missing
+/// provider configuration (`NotConfigured`), a schema failure (`Schema`), a
+/// malformed-request `4xx` — reproduces on identical inputs, so the job goes
+/// terminal and the heuristic page the SessionEnd hook already wrote remains.
+///
+/// The admission guard's errors follow the same split. Its pre-send input
+/// limit (`InputLimit`) never fits, and for ambiguous deliveries (a timeout,
+/// 499, or 5xx after send) the admission provider already made its one
+/// delayed replay before surfacing `AmbiguousRetryExhausted`; a queue retry
+/// would be a third send of the same prompt. A full admission queue
+/// (`AdmissionFull`) never reached the model and keeps the queue's retry.
+///
+/// A `ConsolidatorError::Serde` is not an `LlmError`: it is this crate's own
+/// JSON failure on an unchanged input and stays terminal on its own.
 fn is_terminal_session_consolidation_error(
     error: &ai_memory_consolidate::ConsolidatorError,
 ) -> bool {
-    matches!(
-        error,
+    match error {
+        ai_memory_consolidate::ConsolidatorError::Llm(ai_memory_llm::LlmError::AdmissionFull) => {
+            false
+        }
+        ai_memory_consolidate::ConsolidatorError::Llm(llm) => !llm.is_transient(),
         ai_memory_consolidate::ConsolidatorError::Serde(_)
-            // The map-reduce validation failures are deterministic on the
-            // same input (ungrounded stage output, an unaccounted observation
-            // id, a block that cannot fit the ceiling): re-sending the same
-            // prompt reproduces them, so the job ends terminal on the first
-            // failure and the heuristic page the hook already wrote remains.
-            | ai_memory_consolidate::ConsolidatorError::UngroundedExtractions(_)
-            | ai_memory_consolidate::ConsolidatorError::IncompleteCoverage(_)
-            | ai_memory_consolidate::ConsolidatorError::ChunkDoesNotFit
-            | ai_memory_consolidate::ConsolidatorError::Llm(
-                ai_memory_llm::LlmError::AmbiguousRetryExhausted { .. }
-                    | ai_memory_llm::LlmError::InputLimit { .. }
-                    | ai_memory_llm::LlmError::Serde(_)
-                    | ai_memory_llm::LlmError::UnexpectedShape(_)
-                    | ai_memory_llm::LlmError::TruncatedResponse { .. }
-                    | ai_memory_llm::LlmError::EmptyContent { .. }
-            )
-    )
+        // The map-reduce validation failures are deterministic on the
+        // same input (ungrounded stage output, an unaccounted observation
+        // id, a block that cannot fit the ceiling): re-sending the same
+        // prompt reproduces them, so the job ends terminal on the first
+        // failure and the heuristic page the hook already wrote remains.
+        | ai_memory_consolidate::ConsolidatorError::UngroundedExtractions(_)
+        | ai_memory_consolidate::ConsolidatorError::IncompleteCoverage(_)
+        | ai_memory_consolidate::ConsolidatorError::ChunkDoesNotFit => true,
+        _ => false,
+    }
 }
 
 fn session_consolidation_retry_at(
@@ -1701,6 +1707,9 @@ pub async fn run(config: &Config, args: ServeArgs) -> Result<()> {
                 mid_session_routing: config.routing.mid_session,
                 profile: config.profile.clone(),
                 ingest_drop_list: (*config.ingest.drop_list).clone(),
+                // Benchmark-only escape (docs/benchmarks/README.md), read once
+                // here so the hooks crate keeps making no environment reads.
+                skip_wiki_checkpoints: benchmark_skip_wiki_checkpoints(),
             });
             let workstreams = workstream_router(WorkstreamState {
                 writer: store.writer.clone(),
@@ -2996,6 +3005,20 @@ fn auto_improve_review_config_from_settings(
     }
 }
 
+/// The retrieval-benchmark escape hatch (docs/benchmarks/README.md): the
+/// LongMemEval harness replays ~24k session ends through one server, and
+/// each SessionEnd auto-commit walks a wiki tree and object database that
+/// keep growing, which dominates ingest wall clock. `retrieval` never
+/// reads git history, so the harness runs its servers with this variable
+/// set and the commits skipped. Read once at startup; nothing else may
+/// read it, and no product path sets it.
+fn benchmark_skip_wiki_checkpoints() -> bool {
+    matches!(
+        std::env::var("AI_MEMORY_EVAL_SKIP_WIKI_CHECKPOINTS").as_deref(),
+        Ok("1") | Ok("true")
+    )
+}
+
 async fn configure_embedder(
     config: &Config,
     store: &Store,
@@ -3104,10 +3127,15 @@ async fn configure_embedder(
     );
     let embedder = provider_health.wrap_embedder(embedder, provider_name, model, dim);
     let embedder: Arc<dyn Embedder> = if is_local {
-        // all-MiniLM inference parallelizes internally. A single background
-        // document slot plus one reserved query slot avoids CPU oversubscription
-        // while keeping interactive vector retrieval available during writes.
-        Arc::new(EmbeddingCapacity::new(embedder, 2)?)
+        // all-MiniLM inference parallelizes internally, so capacity bounds
+        // concurrent calls rather than threads. Sizing from the CPU count
+        // recovers the ingest throughput a single background document slot
+        // lost (#1580) while keeping one slot query-reserved; see
+        // `local_capacity` for the halve-and-clamp rationale.
+        let cores = std::thread::available_parallelism()
+            .map(|cores| cores.get())
+            .unwrap_or(4);
+        Arc::new(EmbeddingCapacity::new(embedder, local_capacity(cores))?)
     } else {
         embedder
     };
@@ -4974,6 +5002,7 @@ mod tests {
                 Err(ai_memory_llm::LlmError::Provider {
                     status: 400,
                     body: "SENTINEL_PRIVATE_BODY".into(),
+                    retry_after: None,
                 })
             })
         }
@@ -4991,6 +5020,7 @@ mod tests {
                 Err(ai_memory_llm::LlmError::Provider {
                     status: 400,
                     body: "SENTINEL_PRIVATE_BODY".into(),
+                    retry_after: None,
                 })
             })
         }
@@ -5010,6 +5040,17 @@ mod tests {
         /// A timeout/5xx after send survived the admission provider's one
         /// delayed replay — the worker must not add a third send.
         AmbiguousRetryExhausted,
+        /// The configured credential is rejected or expired: the same key
+        /// fails identically on every later attempt (deterministic).
+        ExpiredAuth,
+        /// The provider rejected the request itself with a 4xx other than
+        /// `429`, which an unchanged prompt reproduces (deterministic).
+        MalformedRequest,
+        /// The provider is rate-limiting: a later attempt may clear it.
+        RateLimited,
+        /// The shared admission queue was full: the prompt never reached the
+        /// model, so a later attempt may clear it.
+        AdmissionFull,
     }
 
     /// Structured-output failure fixture: counts calls (proving the prompt
@@ -5073,6 +5114,18 @@ mod tests {
                             status: Some(502),
                         }
                     }
+                    ConsolidationFailure::ExpiredAuth => LlmError::Auth("api key expired".into()),
+                    ConsolidationFailure::MalformedRequest => LlmError::Provider {
+                        status: 400,
+                        body: "bad request".into(),
+                        retry_after: None,
+                    },
+                    ConsolidationFailure::RateLimited => LlmError::Provider {
+                        status: 429,
+                        body: "rate limited".into(),
+                        retry_after: None,
+                    },
+                    ConsolidationFailure::AdmissionFull => LlmError::AdmissionFull,
                 };
                 Err(error)
             })
@@ -5080,7 +5133,9 @@ mod tests {
     }
 
     // The classifier decides the queue's terminal set by variant, never by
-    // message text: every deterministic structured-response failure is
+    // message text, and for an LLM failure it decides it with
+    // `LlmError::is_transient` — the predicate the in-process consolidation
+    // and bootstrap retry loops already use. Every deterministic failure is
     // terminal at any queue attempt, and every failure a later attempt may
     // plausibly clear is not.
     #[tokio::test]
@@ -5097,6 +5152,23 @@ mod tests {
             }),
             ConsolidatorError::Llm(LlmError::EmptyContent {
                 model: "test-model".into(),
+            }),
+            // Deterministic provider-side failures the queue must not re-send
+            // either: the credential, the missing configuration, the derived
+            // schema and a malformed-request 4xx all fail identically on the
+            // next attempt.
+            ConsolidatorError::Llm(LlmError::Auth("expired".into())),
+            ConsolidatorError::Llm(LlmError::NotConfigured("no key".into())),
+            ConsolidatorError::Llm(LlmError::Schema("bad".into())),
+            ConsolidatorError::Llm(LlmError::Provider {
+                status: 401,
+                body: "invalid api key".into(),
+                retry_after: None,
+            }),
+            ConsolidatorError::Llm(LlmError::Provider {
+                status: 400,
+                body: "bad request".into(),
+                retry_after: None,
             }),
         ];
         for error in &terminal {
@@ -5123,16 +5195,21 @@ mod tests {
         // clear keep the queue's bounded backoff, whatever the message says.
         let not_terminal = [
             ConsolidatorError::Llm(LlmError::Provider {
+                status: 429,
+                body: "rate limited".into(),
+                retry_after: None,
+            }),
+            ConsolidatorError::Llm(LlmError::Provider {
                 status: 503,
                 body: "capacity".into(),
+                retry_after: None,
             }),
             ConsolidatorError::Llm(LlmError::Provider {
                 status: 502,
                 body: "bad gateway".into(),
+                retry_after: None,
             }),
             ConsolidatorError::Llm(LlmError::Http(connect)),
-            ConsolidatorError::Llm(LlmError::NotConfigured("no key".into())),
-            ConsolidatorError::Llm(LlmError::Auth("expired".into())),
         ];
         for error in &not_terminal {
             assert!(
@@ -5906,8 +5983,8 @@ mod tests {
 
     // Mutation captured: persisting the error's `Display` writes the private
     // provider body into the queue row; the worker must persist only the
-    // redacted class/status summary, and a failed first attempt keeps the
-    // queue's scheduled retry instead of flipping terminal.
+    // redacted class/status summary, and a deterministic `400` settles the
+    // job terminal instead of re-sending the same prompt.
     #[tokio::test]
     async fn session_end_worker_persists_redacted_summary_not_provider_body() {
         let tmp = TempDir::new().unwrap();
@@ -5989,10 +6066,10 @@ mod tests {
         // lands.
         let db = rusqlite::Connection::open(store.db_path()).unwrap();
         let deadline = std::time::Instant::now() + Duration::from_secs(5);
-        let (state, last_error, next_attempt_at) = loop {
+        let (state, last_error, completed_at) = loop {
             let row = db
                 .query_row(
-                    "SELECT state, last_error, next_attempt_at \
+                    "SELECT state, last_error, completed_at \
                      FROM session_consolidation_jobs WHERE session_id = ?1",
                     rusqlite::params![session_id.as_bytes()],
                     |r| {
@@ -6029,13 +6106,18 @@ mod tests {
             !last_error.contains("SENTINEL_PRIVATE_BODY"),
             "provider body leaked into the queue row: {last_error}"
         );
+        // A malformed-request `400` is deterministic (`LlmError::is_transient`
+        // is false for every 4xx but `429`), so the job settles terminal on
+        // the first attempt rather than re-sending the same prompt. The
+        // terminal update stamps `completed_at` and leaves `state` out of
+        // `pending`, which is what the claim query filters on.
         assert_eq!(
-            state, "pending",
-            "a failed first attempt must keep the queue's retry"
+            state, "failed",
+            "a deterministic 4xx must settle the job terminal"
         );
         assert!(
-            next_attempt_at.is_some(),
-            "the retryable failure must keep a scheduled retry"
+            completed_at.is_some(),
+            "a terminal job must be stamped completed"
         );
     }
 
@@ -6219,16 +6301,36 @@ mod tests {
         assert!(body.contains("Durable worker completed"), "{body}");
     }
 
+    /// What the SessionEnd queue must do with a failure.
+    #[derive(Clone, Copy)]
+    enum QueueOutcome {
+        /// The job settles terminal: no later claim ever returns it again.
+        Terminal,
+        /// The job keeps the bounded backoff: a claim past the first 30s
+        /// backoff returns it as the next attempt.
+        Requeued,
+    }
+
     /// Run the real SessionEnd worker against a session whose structured LLM
-    /// call fails with `failure`, and prove the queue item goes terminal on
-    /// the first attempt: the prompt goes out exactly once (no inner replay,
-    /// no queue re-send), the job settles with no `next_attempt_at` — a claim
-    /// far enough in the future that a re-queued job (first backoff is 30s)
-    /// would be claimable finds none — and the heuristic page the SessionEnd
-    /// hook wrote before enqueuing is untouched. The settle window (5 × 100ms)
-    /// is measured: a writer round-trip is millisecond-scale, so probing past
-    /// it is deterministic for a single-row SQLite update.
-    async fn session_end_worker_terminates_on(failure: ConsolidationFailure) {
+    /// call fails with `failure`, and prove the queue settles the job as
+    /// `outcome` after exactly `expected_calls` prompts.
+    ///
+    /// For [`QueueOutcome::Terminal`] the job settles with no
+    /// `next_attempt_at` — a claim far enough in the future that a re-queued
+    /// job (first backoff is 30s) would be claimable finds none — and no
+    /// further prompt goes out. The settle window (5 × 100ms) is measured: a
+    /// writer round-trip is millisecond-scale, so probing past it is
+    /// deterministic for a single-row SQLite update. For
+    /// [`QueueOutcome::Requeued`] that same future-clock claim returns the
+    /// job as attempt 2.
+    ///
+    /// Either way the heuristic page the SessionEnd hook wrote before
+    /// enqueuing is untouched.
+    async fn session_end_worker_settles_as(
+        failure: ConsolidationFailure,
+        outcome: QueueOutcome,
+        expected_calls: usize,
+    ) {
         let tmp = TempDir::new().unwrap();
         let store = Store::open(tmp.path()).unwrap();
         let workspace_id = store
@@ -6327,35 +6429,65 @@ mod tests {
         ));
         notify.notify_one();
 
-        // The prompt must go out exactly once.
-        let deadline = std::time::Instant::now() + Duration::from_secs(5);
-        while calls.load(Ordering::SeqCst) < 1 {
+        // The prompt must go out exactly `expected_calls` times. A transient
+        // failure also spends the consolidator's own bounded inner retries
+        // (2s apart) before the queue ever sees it, so allow for those.
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        while calls.load(Ordering::SeqCst) < expected_calls {
             assert!(
                 std::time::Instant::now() < deadline,
-                "worker never called the LLM"
+                "worker never finished calling the LLM"
             );
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
         // Let the writer settle the failure row, then probe with a clock 60s
-        // ahead: a re-queued job (first backoff 30s) would be claimable, a
-        // terminal row is not.
-        for _ in 0..5 {
-            tokio::time::sleep(Duration::from_millis(100)).await;
-            let probe_now = jiff::Timestamp::now().as_microsecond() + 60 * 1_000_000;
-            assert!(
-                store
-                    .writer
-                    .claim_session_consolidation(probe_now, probe_now - 10 * 60 * 1_000_000)
-                    .await
-                    .unwrap()
-                    .is_none(),
-                "the failure must not re-queue the same prompt"
-            );
-            assert_eq!(
-                calls.load(Ordering::SeqCst),
-                1,
-                "no immediate replay or queue re-send of the same prompt"
-            );
+        // ahead: a re-queued job (first backoff 30s) is claimable there, a
+        // terminal row never is.
+        match outcome {
+            QueueOutcome::Terminal => {
+                for _ in 0..5 {
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    let probe_now = jiff::Timestamp::now().as_microsecond() + 60 * 1_000_000;
+                    assert!(
+                        store
+                            .writer
+                            .claim_session_consolidation(probe_now, probe_now - 10 * 60 * 1_000_000)
+                            .await
+                            .unwrap()
+                            .is_none(),
+                        "the failure must not re-queue the same prompt"
+                    );
+                    assert_eq!(
+                        calls.load(Ordering::SeqCst),
+                        expected_calls,
+                        "no immediate replay or queue re-send of the same prompt"
+                    );
+                }
+            }
+            QueueOutcome::Requeued => {
+                let deadline = std::time::Instant::now() + Duration::from_secs(10);
+                let requeued = loop {
+                    let probe_now = jiff::Timestamp::now().as_microsecond() + 60 * 1_000_000;
+                    if let Some(job) = store
+                        .writer
+                        .claim_session_consolidation(probe_now, probe_now - 10 * 60 * 1_000_000)
+                        .await
+                        .unwrap()
+                    {
+                        break job;
+                    }
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "a failure a later attempt may clear must stay on the queue",
+                    );
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                };
+                assert_eq!(
+                    requeued.attempts(),
+                    2,
+                    "the re-queued job must be the second attempt"
+                );
+            }
         }
         cancel.cancel();
         task.await.unwrap();
@@ -6376,16 +6508,80 @@ mod tests {
     // must settle the job terminal after the single send.
     #[tokio::test]
     async fn session_end_worker_makes_malformed_json_and_unexpected_shape_terminal() {
-        session_end_worker_terminates_on(ConsolidationFailure::MalformedJson).await;
-        session_end_worker_terminates_on(ConsolidationFailure::UnexpectedShape).await;
+        session_end_worker_settles_as(
+            ConsolidationFailure::MalformedJson,
+            QueueOutcome::Terminal,
+            1,
+        )
+        .await;
+        session_end_worker_settles_as(
+            ConsolidationFailure::UnexpectedShape,
+            QueueOutcome::Terminal,
+            1,
+        )
+        .await;
     }
 
     // Mutation captured: removing either provider error from the terminal
     // queue set causes a second claim of the same truncated or empty output.
     #[tokio::test]
     async fn session_end_worker_makes_truncated_and_empty_output_terminal() {
-        session_end_worker_terminates_on(ConsolidationFailure::TruncatedResponse).await;
-        session_end_worker_terminates_on(ConsolidationFailure::EmptyContent).await;
+        session_end_worker_settles_as(
+            ConsolidationFailure::TruncatedResponse,
+            QueueOutcome::Terminal,
+            1,
+        )
+        .await;
+        session_end_worker_settles_as(
+            ConsolidationFailure::EmptyContent,
+            QueueOutcome::Terminal,
+            1,
+        )
+        .await;
+    }
+
+    /// A rejected credential and a malformed-request 4xx are deterministic:
+    /// the identical prompt fails identically on every later attempt. Before
+    /// the queue gate consulted `LlmError::is_transient` it hand-enumerated
+    /// only the structured-response shapes, so one expired key burned the
+    /// full attempt cap (5 prompts over ~7.5 minutes) per ended session and
+    /// logged "queued for retry" four times on the way.
+    #[tokio::test]
+    async fn session_end_worker_makes_an_expired_key_and_a_4xx_terminal() {
+        session_end_worker_settles_as(ConsolidationFailure::ExpiredAuth, QueueOutcome::Terminal, 1)
+            .await;
+        session_end_worker_settles_as(
+            ConsolidationFailure::MalformedRequest,
+            QueueOutcome::Terminal,
+            1,
+        )
+        .await;
+    }
+
+    /// The other direction, which the polarity of the gate decides: a `429`
+    /// never reached the model, so the queue must keep its bounded,
+    /// backoff-scheduled retry. Unlike upstream, the fork's consolidator does
+    /// not repeat a `429` itself: its inner retry is gated on
+    /// `LlmError::is_fast_retryable`, so the prompt goes out once and the
+    /// queue re-queues the job as attempt 2, the same `Requeued` outcome.
+    #[tokio::test]
+    async fn session_end_worker_requeues_a_rate_limited_provider() {
+        session_end_worker_settles_as(ConsolidationFailure::RateLimited, QueueOutcome::Requeued, 1)
+            .await;
+    }
+
+    // Mutation captured: `AdmissionFull` is not transient, so without its own
+    // arm the upstream polarity would end the job terminal although the
+    // prompt never left the process. The expired key above is the terminal
+    // control.
+    #[tokio::test]
+    async fn session_end_worker_requeues_a_full_admission_queue() {
+        session_end_worker_settles_as(
+            ConsolidationFailure::AdmissionFull,
+            QueueOutcome::Requeued,
+            1,
+        )
+        .await;
     }
 
     // Mutation captured: a timeout/5xx after send already spent the admission
@@ -6393,7 +6589,12 @@ mod tests {
     // repetition here would duplicate a request the model may have accepted.
     #[tokio::test]
     async fn session_end_worker_makes_post_send_502_terminal_without_replay() {
-        session_end_worker_terminates_on(ConsolidationFailure::AmbiguousRetryExhausted).await;
+        session_end_worker_settles_as(
+            ConsolidationFailure::AmbiguousRetryExhausted,
+            QueueOutcome::Terminal,
+            1,
+        )
+        .await;
     }
 
     async fn two_project_wiki() -> (TempDir, Store, Wiki, WorkspaceId, ProjectId, ProjectId) {

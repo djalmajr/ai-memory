@@ -3048,32 +3048,61 @@ async fn actor_scoped_api_responses_are_never_reused_across_credentials() {
         .unwrap();
 
     let app = api_router(store.reader.clone(), wiki.clone());
-    for uri in [
-        "/workspaces/default/projects/scratch/briefing",
-        "/workspaces/default/overview",
-        "/workspaces/default/projects/scratch/overview",
-        "/workspaces/default/projects/scratch/handoffs",
+    // `/search` is listed for both of its registrations: the owner filter
+    // reaches the hybrid ranker from either verb, so both bodies are
+    // actor-scoped.
+    for (method, uri, body) in [
+        (
+            Method::GET,
+            "/workspaces/default/projects/scratch/briefing",
+            None,
+        ),
+        (Method::GET, "/workspaces/default/overview", None),
+        (
+            Method::GET,
+            "/workspaces/default/projects/scratch/overview",
+            None,
+        ),
+        (
+            Method::GET,
+            "/workspaces/default/projects/scratch/handoffs",
+            None,
+        ),
+        (
+            Method::GET,
+            "/search?q=anything&workspace=default&project=scratch",
+            None,
+        ),
+        (
+            Method::POST,
+            "/search",
+            Some(r#"{"q":"anything","workspace":"default","project":"scratch"}"#),
+        ),
     ] {
-        let resp = app
-            .clone()
-            .oneshot(api_req_actor(
-                uri,
-                Some(ai_memory_core::ActorContext {
-                    user: Some("alice".into()),
-                    ..ai_memory_core::ActorContext::default()
-                }),
-                Some(ai_memory_core::AuthLevel::User),
-            ))
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), StatusCode::OK, "{uri}");
+        let mut builder = Request::builder()
+            .method(method.clone())
+            .uri(uri)
+            .extension(ai_memory_core::ActorContext {
+                user: Some("alice".into()),
+                ..ai_memory_core::ActorContext::default()
+            })
+            .extension(ai_memory_core::AuthLevel::User);
+        let req = match body {
+            Some(json) => {
+                builder = builder.header(header::CONTENT_TYPE, "application/json");
+                builder.body(Body::from(json)).unwrap()
+            }
+            None => builder.body(Body::empty()).unwrap(),
+        };
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "{method} {uri}");
         let cache = resp
             .headers()
             .get(header::CACHE_CONTROL)
             .expect("actor-scoped responses need Cache-Control")
             .to_str()
             .unwrap();
-        assert_eq!(cache, "private, no-store", "{uri}");
+        assert_eq!(cache, "private, no-store", "{method} {uri}");
     }
 }
 

@@ -2445,6 +2445,105 @@ fn an_explicit_bridge_key_is_stored_and_outlives_only_hooks_removal() {
     assert!(!stored.exists(), "the full uninstall must remove the key");
 }
 
+/// FreeBuff's entry is always the session-less `mcp-bridge`, so
+/// `install-mcp --client freebuff --apply --auth-token` stores the key where
+/// the hooks keep theirs and writes `~/.agents/mcp.json` without an `env`
+/// token, the same redirect Claude Code's and Muse's bridge entries get.
+#[test]
+fn an_explicit_freebuff_bridge_key_is_stored_outside_the_client_config() {
+    const KEY: &str = "aim_freebuff_key_0123456789";
+    let _guard = cli_test_lock();
+    let home = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    let run = |args: &[&str]| {
+        let output = command_with_home(home.path())
+            .args(args)
+            .current_dir(project.path())
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{args:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    };
+    run(&[
+        "install-mcp",
+        "--client",
+        "freebuff",
+        "--auth-token",
+        KEY,
+        "--apply",
+    ]);
+    let config = home.path().join(".agents").join("mcp.json");
+    let written = std::fs::read_to_string(&config).unwrap();
+    assert!(
+        !written.contains(KEY),
+        "the key stayed in ~/.agents/mcp.json: {written}"
+    );
+    assert!(written.contains("mcp-bridge"), "{written}");
+    let entry: serde_json::Value = serde_json::from_str(&written).unwrap();
+    let entry = &entry["mcpServers"]["ai-memory"];
+    assert_eq!(
+        entry["env"].get("AI_MEMORY_AUTH_TOKEN"),
+        None,
+        "the entry still carries an env token: {written}"
+    );
+    let data_dir = home.path().join(".ai-memory-data");
+    let stored = data_dir.join("auth-token");
+    assert_eq!(std::fs::read_to_string(&stored).unwrap().trim(), KEY);
+    let args: Vec<&str> = entry["args"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|arg| arg.as_str().unwrap())
+        .collect();
+    let canonical = std::fs::canonicalize(&data_dir).unwrap();
+    assert!(
+        args.windows(2).any(|pair| pair[0] == "--data-dir"
+            && std::fs::canonicalize(pair[1]).is_ok_and(|named| named == canonical)),
+        "the entry does not name the data dir the key went into: {args:?}"
+    );
+}
+
+/// Without `--apply` nothing is stored: a printed FreeBuff snippet is the
+/// operator's to place, so it still carries the key inline. This is the guard
+/// that keeps the redirect above from reaching the print path.
+#[test]
+fn a_printed_freebuff_snippet_keeps_the_key_inline() {
+    const KEY: &str = "aim_freebuff_printed_0123456789";
+    let _guard = cli_test_lock();
+    let home = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    let output = command_with_home(home.path())
+        .args(["install-mcp", "--client", "freebuff", "--auth-token", KEY])
+        .current_dir(project.path())
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let snippet = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        snippet.contains(KEY),
+        "the printed snippet dropped the key the operator has to place: {snippet}"
+    );
+    assert!(
+        !home
+            .path()
+            .join(".ai-memory-data")
+            .join("auth-token")
+            .exists(),
+        "printing stored the key"
+    );
+    assert!(
+        !home.path().join(".agents").join("mcp.json").exists(),
+        "printing wrote the client config"
+    );
+}
+
 /// Meta Muse Code: `install-mcp` and `install-hooks` both merge into
 /// `$XDG_CONFIG_HOME/muse/settings.json` around the user's own server and
 /// hook, keeping `schema_version` and unknown keys, the MCP entry goes under

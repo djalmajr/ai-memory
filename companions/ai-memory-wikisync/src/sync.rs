@@ -190,8 +190,8 @@ pub fn diff_summary(disk: Option<&[u8]>, server: Option<&[u8]>) -> String {
     let Some(server) = server else {
         return "server content unchanged since the last export (revalidated by ETag)".to_string();
     };
-    let local_lines = disk.iter().filter(|byte| **byte == b'\n').count();
-    let server_lines = server.iter().filter(|byte| **byte == b'\n').count();
+    let local_lines = line_count(disk);
+    let server_lines = line_count(server);
     // Compare the first missing line too, even when the shared prefix is identical.
     let first_difference = disk
         .split(|byte| *byte == b'\n')
@@ -222,6 +222,14 @@ pub fn diff_summary(disk: Option<&[u8]>, server: Option<&[u8]>) -> String {
         preview(local_line),
         preview(server_line),
     )
+}
+
+/// Lines in a file's bytes. Content not ending in a newline still has a
+/// final line, which the first-difference position below also counts, so
+/// the two numbers in one summary cannot contradict each other.
+fn line_count(bytes: &[u8]) -> usize {
+    let newlines = bytes.iter().filter(|byte| **byte == b'\n').count();
+    newlines + usize::from(!bytes.is_empty() && !bytes.ends_with(b"\n"))
 }
 
 fn preview(line: Option<&[u8]>) -> String {
@@ -714,6 +722,41 @@ mod tests {
             );
             assert!(summary.ends_with(&expected), "{summary}");
         }
+    }
+
+    #[test]
+    fn diff_summary_counts_a_final_unterminated_line() {
+        type Case<'a> = (&'a [u8], &'a [u8], &'a str);
+        let cases: &[Case<'_>] = &[
+            (
+                b"one",
+                b"one\nextra",
+                "local 3 bytes/1 lines vs server 9 bytes/2 lines",
+            ),
+            (
+                b"one\n",
+                b"one\nextra\n",
+                "local 4 bytes/1 lines vs server 10 bytes/2 lines",
+            ),
+            // Control: an empty file has no final line to count.
+            (
+                b"",
+                b"extra",
+                "local 0 bytes/0 lines vs server 5 bytes/1 lines",
+            ),
+        ];
+        for (disk, server, expected) in cases {
+            let summary = diff_summary(Some(disk), Some(server));
+            assert!(summary.starts_with(expected), "{summary}");
+        }
+
+        // A difference inside both files must not sit past a reported count.
+        let summary = diff_summary(Some(b"---\n---\nbody"), Some(b"---\n---\nbodyX"));
+        assert!(
+            summary.starts_with("local 12 bytes/3 lines vs server 13 bytes/3 lines"),
+            "{summary}"
+        );
+        assert!(summary.contains("first difference at line 3"), "{summary}");
     }
 
     #[test]

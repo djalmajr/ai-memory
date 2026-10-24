@@ -926,7 +926,7 @@ async fn rerank_page_hits(
             |(hit, _)| ai_memory_llm::RerankCandidate {
                 id: hit.id.to_string(),
                 title: hit.title.clone(),
-                snippet: hit.snippet.clone(),
+                snippet: ai_memory_store::plain_snippet(&hit.snippet),
             },
             |(_, explain), relevance| {
                 if let Some(explain) = explain.as_mut() {
@@ -2600,31 +2600,25 @@ impl AiMemoryServer {
         workspace_id: WorkspaceId,
         project_id: ProjectId,
         options: ProjectSearchOptions<'_>,
-    ) -> ai_memory_store::StoreResult<(
-        Vec<(PageHit, Option<ai_memory_store::SearchExplain>)>,
-        Option<ai_memory_store::StreamTimings>,
-    )> {
+    ) -> ai_memory_store::StoreResult<ai_memory_store::HybridSearchOutcome> {
         self.search_scopes(&[(workspace_id, project_id)], options)
             .await
     }
 
     /// Fused hits over `scopes` through the shared hybrid ranker
-    /// ([`ai_memory_store::ReaderPool::hybrid_search_scopes`]), the same call
-    /// the web search makes.
+    /// ([`ai_memory_store::ReaderPool::hybrid_search_scopes_outcome`]), the
+    /// same ranking the web search uses.
     async fn search_scopes(
         &self,
         scopes: &[(WorkspaceId, ProjectId)],
         options: ProjectSearchOptions<'_>,
-    ) -> ai_memory_store::StoreResult<(
-        Vec<(PageHit, Option<ai_memory_store::SearchExplain>)>,
-        Option<ai_memory_store::StreamTimings>,
-    )> {
+    ) -> ai_memory_store::StoreResult<ai_memory_store::HybridSearchOutcome> {
         // `i64::MIN` as the expiry cutoff makes every stored TTL pass
         // the `expires_at > cutoff` guard, i.e. expired pages stay
         // searchable when the caller opted in.
         let expiry_cutoff = options.include_expired.then_some(i64::MIN);
         self.reader
-            .hybrid_search_scopes(
+            .hybrid_search_scopes_outcome(
                 scopes,
                 ai_memory_store::HybridSearch {
                     query: options.query,
@@ -3011,6 +3005,9 @@ impl AiMemoryServer {
         // Explain-only: per-stream timings of the primary search, summed over
         // `scopes`. `None` on the normal path, which reads no clocks for it.
         let mut timings: Option<ai_memory_store::StreamTimings> = None;
+        // Whether any page matched the query's own terms; see the
+        // raw-observation fallback below.
+        let mut lexical_match = false;
         // Session pages are shared and every operator's observations may vote
         // for them, but observation text (a hit's excerpt, explain's
         // observation ids, the raw fallback) follows the session timeline's
@@ -3040,9 +3037,10 @@ impl AiMemoryServer {
                 .await?;
             self.search_project(ws, proj, options).await
         }
-        .map(|(hits, search_timings)| {
-            timings = search_timings;
-            hits
+        .map(|outcome| {
+            timings = outcome.timings;
+            lexical_match = outcome.lexical_match;
+            outcome.hits
         });
         let hits = hits.map_err(|e| McpError::internal_error(e.to_string(), None))?;
         let rerank_started = (explain && self.rerank.is_some()).then(std::time::Instant::now);
@@ -3060,7 +3058,11 @@ impl AiMemoryServer {
         // for explicit `scopes` — the recommended scope-bleed mitigation —
         // by searching observations in each resolved (ws, proj) and
         // rank-merging, so the fallback isn't lost on the scoped path.
-        let raw_hits = if !hits.is_empty() || filtered {
+        // Hits the vector streams alone found do not count as a match: they
+        // have no similarity floor, so with an embedder they answer every
+        // query and would otherwise hide observations from sessions that
+        // have no page yet.
+        let raw_hits = if (!hits.is_empty() && lexical_match) || filtered {
             Vec::new()
         } else if let Some(scopes) = &resolved_scopes {
             let mut obs: Vec<ai_memory_store::ObservationHit> = Vec::new();
@@ -3133,7 +3135,7 @@ impl AiMemoryServer {
                     if current == scope.as_tuple() {
                         Vec::new()
                     } else {
-                        let (hits, _) = self
+                        let ai_memory_store::HybridSearchOutcome { hits, .. } = self
                             .search_project(
                                 scope.workspace_id,
                                 scope.project_id,
@@ -3204,7 +3206,7 @@ impl AiMemoryServer {
                     .await
                 {
                     Ok(Some(scope)) if scope.as_tuple() != current => {
-                        let (hits, _) = self
+                        let ai_memory_store::HybridSearchOutcome { hits, .. } = self
                             .search_project(
                                 scope.workspace_id,
                                 scope.project_id,
@@ -4911,19 +4913,37 @@ impl AiMemoryServer {
             .is_none_or(|s| s.trim().is_empty())
             && args.project.as_deref().is_none_or(|s| s.trim().is_empty());
 
-        let page_path = if let Some(p) = args.path {
+        // A blank fill is not a supplied argument: an empty/whitespace `path`
+        // would otherwise fail as "invalid path: empty path" with `query` never
+        // tried, and a blank `query` normalizes to an empty FTS expression that
+        // matches nothing. Both must fall through to the instructive
+        // exactly-one refusal below (issue #155) the same way a null does.
+        let path = args
+            .path
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty());
+        let query = args
+            .query
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty());
+        let page_path = if let Some(p) = path {
             PagePath::new(p)
                 .map_err(|e| McpError::invalid_params(format!("invalid path: {e}"), None))?
-        } else if let Some(query) = args.query {
+        } else if let Some(query) = query {
             let hits = self
                 .reader
-                .search_pages_for_project(ws, proj, query.clone(), 1, None)
+                .search_pages_for_project(ws, proj, query.to_string(), 1, None)
                 .await
                 .map_err(|e| McpError::internal_error(e.to_string(), None))?;
             match hits.into_iter().next() {
                 Some(h) => h.path,
                 None => {
-                    return Err(McpError::internal_error(
+                    // A query that matched nothing is caller-fixable input, not
+                    // a server fault: the search itself succeeded. -32603 reads
+                    // as "retry" to a client, which re-runs the same miss.
+                    return Err(McpError::invalid_params(
                         format!("no pages found for query {query:?}"),
                         None,
                     ));
@@ -5070,7 +5090,12 @@ impl AiMemoryServer {
                         } else {
                             ""
                         };
-                        Err(McpError::internal_error(
+                        // Not-found under the resolved scope is caller-fixable
+                        // too, as `memory_status` and
+                        // `memory_read_session_observations` already answer for
+                        // an unknown project or session. The `hint` below only
+                        // helps if the client treats this as its own mistake.
+                        Err(McpError::invalid_params(
                             format!(
                                 "page {} not found in resolved scope {scope}{hint}",
                                 page_path.as_str()
@@ -6056,7 +6081,13 @@ impl AiMemoryServer {
             .await
             .map_err(|e| McpError::internal_error(e.to_string(), None))?
             .ok_or_else(|| {
-                McpError::internal_error(
+                // A well-formed id that resolves to nothing is caller input,
+                // like the malformed id above: the lookup succeeded and found
+                // no row. -32603 reads as "retry" and sends a client back with
+                // the same id. The message is deliberately the same for an
+                // absent id and another operator's, so the class must not
+                // distinguish them either.
+                McpError::invalid_params(
                     "handoff not found in the resolved project or not visible to this operator",
                     None,
                 )
@@ -7315,6 +7346,27 @@ fn select_bumpable(
 }
 
 impl AiMemoryServer {
+    /// Names of the tools annotated `destructive_hint = true`, sorted.
+    /// `install-mcp` gives each a per-tool approval prompt in clients that
+    /// support one, so a new destructive tool inherits it from its
+    /// annotation.
+    #[must_use]
+    pub fn destructive_tool_names() -> Vec<String> {
+        let mut names: Vec<String> = Self::tool_router()
+            .list_all()
+            .into_iter()
+            .filter(|tool| {
+                tool.annotations
+                    .as_ref()
+                    .and_then(|annotations| annotations.destructive_hint)
+                    == Some(true)
+            })
+            .map(|tool| tool.name.to_string())
+            .collect();
+        names.sort();
+        names
+    }
+
     /// The latest version id of a page in an already-authorized scope.
     async fn latest_page_id(
         &self,
@@ -7658,7 +7710,7 @@ fn build_answer_request(
     reasoning: ReasoningTier,
 ) -> ai_memory_llm::ChatRequest {
     fn clean(snippet: &str) -> String {
-        snippet.replace("<mark>", "").replace("</mark>", "")
+        ai_memory_store::plain_snippet(snippet)
     }
     let mut user = String::new();
     user.push_str("## Question\n\n");
@@ -8049,6 +8101,7 @@ mod tests {
                 StubRerankOutcome::ProviderFail => Err(ai_memory_llm::LlmError::Provider {
                     status: 400,
                     body: "SENTINEL_PRIVATE_BODY".into(),
+                    retry_after: None,
                 }),
                 StubRerankOutcome::Panic => panic!("stub reranker task failure"),
             }
@@ -8853,6 +8906,21 @@ mod tests {
     #[tokio::test]
     async fn server_constructs_with_tool_router() {
         let (_tmp, _store, _server, _ws, _pj) = setup_server().await;
+    }
+
+    #[test]
+    fn destructive_tool_names_follow_the_annotations() {
+        let names = AiMemoryServer::destructive_tool_names();
+        for destructive in [
+            "memory_delete_page",
+            "memory_forget_sweep",
+            "memory_message_pop",
+        ] {
+            assert!(names.iter().any(|name| name == destructive), "{names:?}");
+        }
+        for read_only in ["memory_query", "memory_recent", "memory_status"] {
+            assert!(!names.iter().any(|name| name == read_only), "{names:?}");
+        }
     }
 
     #[tokio::test]
@@ -11801,6 +11869,139 @@ mod tests {
         );
     }
 
+    /// The vector stream has no similarity floor, so once any page in the
+    /// project has an embedding it answers every query, related or not. A
+    /// hit only that stream found is not a match for the query's words and
+    /// must not hide the raw-observation fallback: before this, the default
+    /// local embeddings turned `hits` non-empty and an observation from a
+    /// session with no page yet (still open, or ended without SessionEnd)
+    /// could not be found at all, while the same store without embeddings
+    /// returned it.
+    #[tokio::test]
+    async fn memory_query_returns_raw_hits_when_only_the_vector_stream_matches() {
+        let (_tmp, store, server, ws, proj) = setup_server().await;
+        let server = server.with_embedder(Arc::new(TaskAwareEmbedder));
+        let unrelated = store
+            .writer
+            .upsert_page(NewPage {
+                workspace_id: ws,
+                project_id: proj,
+                path: PagePath::new("notes/unrelated.md").unwrap(),
+                title: "Unrelated".into(),
+                body: "Nothing about marsupials here.".into(),
+                tier: Tier::Semantic,
+                frontmatter_json: serde_json::json!({}),
+                pinned: false,
+                links: Vec::new(),
+                author_id: None,
+                expires_at: None,
+                entities: Vec::new(),
+                evidence: Vec::new(),
+            })
+            .await
+            .unwrap();
+        // Nearly orthogonal to TaskAwareEmbedder's query vector [0.0, 1.0].
+        store
+            .writer
+            .store_embedding(
+                unrelated,
+                ai_memory_store::f32_vec_to_bytes(&[1.0, 0.05]),
+                "task-aware-test".into(),
+                "task-aware-test-model".into(),
+                2,
+            )
+            .await
+            .unwrap();
+        let session_id = SessionId::new();
+        store
+            .writer
+            .begin_session(NewSession {
+                occurred_at: None,
+                id: session_id,
+                workspace_id: ws,
+                project_id: proj,
+                agent_kind: AgentKind::ClaudeCode,
+                cwd: None,
+                actor_user: None,
+            })
+            .await
+            .unwrap();
+        store
+            .writer
+            .insert_observation(Sanitized::new(
+                NewObservation {
+                    occurred_at: None,
+                    session_id,
+                    workspace_id: ws,
+                    project_id: proj,
+                    kind: ObservationKind::UserPrompt,
+                    extension: None,
+                    source_event: None,
+                    title: "raw prompt".into(),
+                    body: "the api listens on quokka port 8088".into(),
+                    importance: 5,
+                },
+                &Sanitizer::builtin(),
+            ))
+            .await
+            .unwrap();
+
+        let json = tool_json(
+            &server
+                .memory_query(
+                    Parameters(query_in("scratch", "quokka")),
+                    OptionalParts(test_parts_default()),
+                )
+                .await
+                .unwrap(),
+        );
+        let hit_paths: Vec<&str> = json["hits"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|hit| hit["path"].as_str())
+            .collect();
+        assert_eq!(
+            hit_paths,
+            ["notes/unrelated.md"],
+            "the vector stream must still answer, or this test does not reach the bug: {json}"
+        );
+        let raw_hits = json["raw_hits"]
+            .as_array()
+            .unwrap_or_else(|| panic!("a vector-only hit must not suppress raw_hits: {json}"));
+        assert_eq!(raw_hits.len(), 1, "{json}");
+        assert!(
+            raw_hits[0]["snippet"]
+                .as_str()
+                .is_some_and(|snippet| snippet.contains("quokka")),
+            "{json}"
+        );
+
+        // Control: a page that matches the query's words is a real hit, so
+        // the fallback stays off exactly as before.
+        let json = tool_json(
+            &server
+                .memory_query(
+                    Parameters(query_in("scratch", "Karpathy")),
+                    OptionalParts(test_parts_default()),
+                )
+                .await
+                .unwrap(),
+        );
+        assert!(
+            json["hits"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|hit| hit["path"] == "foo.md"),
+            "{json}"
+        );
+        assert!(
+            json.get("raw_hits").is_none(),
+            "a lexical page hit keeps the fallback off: {json}"
+        );
+    }
+
     #[tokio::test]
     async fn memory_query_filters_apply_before_every_result_source() {
         let (_tmp, store, server, ws, proj) = setup_server().await;
@@ -13542,6 +13743,109 @@ mod tests {
         }
     }
 
+    // A blank fill is not a supplied argument. Without the trim, a whitespace
+    // `query` reached the store as an empty FTS expression and came back as
+    // internal_error "no pages found", and an empty `path` short-circuited the
+    // whole call with "invalid path: empty path" so the `query` beside it was
+    // never tried.
+    #[tokio::test]
+    async fn memory_read_page_reads_blank_path_or_query_as_omitted() {
+        let (tmp, store, server, ws, proj) = setup_server().await;
+        let wiki = Wiki::new(tmp.path(), store.writer.clone()).unwrap();
+        wiki.write_page(WritePageRequest {
+            workspace_id: ws,
+            project_id: proj,
+            path: PagePath::new("notes/blankfill.md").unwrap(),
+            frontmatter: serde_json::json!({"title": "Blank Fill"}),
+            body: "zonkolite reserves body".to_string(),
+            tier: Tier::Semantic,
+            pinned: false,
+            title: Some("Blank Fill".into()),
+            admission_ctx: None,
+            author_id: None,
+            actor: ai_memory_core::ActorContext::anonymous(),
+            evidence: Vec::new(),
+        })
+        .await
+        .unwrap();
+        let server = server.with_wiki(wiki);
+
+        // Whitespace-only `query`, nothing else: the instructive exactly-one
+        // refusal, not an internal_error a looping client reads as "retry".
+        let err = server
+            .memory_read_page(
+                Parameters(ReadPageArgs {
+                    query: Some("  ".into()),
+                    path: None,
+                    project: None,
+                    workspace: None,
+                    include_related: false,
+                    related_depth: None,
+                }),
+                OptionalParts(test_parts_default()),
+            )
+            .await
+            .expect_err("a blank query must fail closed");
+        assert_eq!(err.code, rmcp::model::ErrorCode::INVALID_PARAMS);
+        assert!(
+            err.to_string().contains("exactly one of"),
+            "blank query must get the instructive refusal; got {err}"
+        );
+
+        // Empty `path` beside a real `query`: the query arm actually runs.
+        let result = server
+            .memory_read_page(
+                Parameters(ReadPageArgs {
+                    query: Some("zonkolite".into()),
+                    path: Some(String::new()),
+                    project: None,
+                    workspace: None,
+                    include_related: false,
+                    related_depth: None,
+                }),
+                OptionalParts(test_parts_default()),
+            )
+            .await
+            .expect("an empty path must fall through to the query");
+        let text = result
+            .content
+            .first()
+            .and_then(|c| c.as_text())
+            .map(|t| t.text.clone())
+            .unwrap();
+        assert!(
+            text.contains("zonkolite reserves body"),
+            "expected the queried page body; got {text}"
+        );
+
+        // Control: a non-blank path still takes precedence over the query, so
+        // the trim did not turn `path` into a value the chain skips.
+        let result = server
+            .memory_read_page(
+                Parameters(ReadPageArgs {
+                    query: Some("no-such-term-anywhere".into()),
+                    path: Some("notes/blankfill.md".into()),
+                    project: None,
+                    workspace: None,
+                    include_related: false,
+                    related_depth: None,
+                }),
+                OptionalParts(test_parts_default()),
+            )
+            .await
+            .expect("an explicit path must still win over the query");
+        let text = result
+            .content
+            .first()
+            .and_then(|c| c.as_text())
+            .map(|t| t.text.clone())
+            .unwrap();
+        assert!(
+            text.contains("notes/blankfill.md"),
+            "expected the by-path read; got {text}"
+        );
+    }
+
     #[tokio::test]
     async fn memory_read_page_can_target_explicit_workspace_project() {
         let (tmp, store, server, _ws, _pj) = setup_server().await;
@@ -13743,6 +14047,92 @@ mod tests {
                 "{path}: {text}"
             );
         }
+    }
+
+    /// A page that is absent under the resolved scope, and a query that
+    /// matched nothing, are caller input: the request is wrong, not the
+    /// server. They must answer `invalid params` (-32602), as `memory_status`
+    /// does for an unknown project, instead of the -32603 a client reads as
+    /// "retry". A real disk failure on the same path stays internal.
+    #[tokio::test]
+    async fn memory_read_page_reports_a_missing_target_as_invalid_params() {
+        let (tmp, store, server, ws, proj) = setup_server().await;
+        let wiki = Wiki::new(tmp.path(), store.writer.clone()).unwrap();
+        // Captured before the move: the control below needs the real wiki root
+        // rather than a second guess at the on-disk layout.
+        let wiki_root = wiki.root().to_path_buf();
+        let server = server.with_wiki(wiki);
+
+        let err = server
+            .memory_read_page(
+                Parameters(ReadPageArgs {
+                    query: None,
+                    path: Some("notes/does-not-exist.md".into()),
+                    project: Some("scratch".into()),
+                    workspace: Some("default".into()),
+                    include_related: false,
+                    related_depth: None,
+                }),
+                OptionalParts(test_parts_default()),
+            )
+            .await
+            .expect_err("a missing page must error");
+        assert_eq!(err.code, rmcp::model::ErrorCode::INVALID_PARAMS);
+        assert!(
+            err.message.contains("not found in resolved scope"),
+            "the not-found message must not change; got {err}"
+        );
+
+        let err = server
+            .memory_read_page(
+                Parameters(ReadPageArgs {
+                    query: Some("zzzz-no-such-term".into()),
+                    path: None,
+                    project: Some("scratch".into()),
+                    workspace: Some("default".into()),
+                    include_related: false,
+                    related_depth: None,
+                }),
+                OptionalParts(test_parts_default()),
+            )
+            .await
+            .expect_err("a query that matches nothing must error");
+        assert_eq!(err.code, rmcp::model::ErrorCode::INVALID_PARAMS);
+        assert!(
+            err.message.contains("no pages found for query"),
+            "the query-miss message must not change; got {err}"
+        );
+
+        // Control: a disk error that is NOT a missing file is a server fault
+        // the caller cannot fix by changing the request, so it stays -32603.
+        // A directory where the markdown belongs reads back as IsADirectory,
+        // which `is_missing_wiki_file` rejects, so no DB fallback runs either.
+        std::fs::create_dir_all(
+            wiki_root
+                .join(ws.to_string())
+                .join(proj.to_string())
+                .join("blocked.md"),
+        )
+        .unwrap();
+        let err = server
+            .memory_read_page(
+                Parameters(ReadPageArgs {
+                    query: None,
+                    path: Some("blocked.md".into()),
+                    project: Some("scratch".into()),
+                    workspace: Some("default".into()),
+                    include_related: false,
+                    related_depth: None,
+                }),
+                OptionalParts(test_parts_default()),
+            )
+            .await
+            .expect_err("an unreadable page must error");
+        assert_eq!(
+            err.code,
+            rmcp::model::ErrorCode::INTERNAL_ERROR,
+            "a genuine disk failure must stay internal; got {err}"
+        );
     }
 
     #[tokio::test]
@@ -15569,6 +15959,7 @@ mod tests {
             Err(ai_memory_llm::LlmError::Provider {
                 status: 400,
                 body: "SENTINEL_PRIVATE_BODY".into(),
+                retry_after: None,
             })
         }
 
@@ -15580,6 +15971,7 @@ mod tests {
             Err(ai_memory_llm::LlmError::Provider {
                 status: 400,
                 body: "SENTINEL_PRIVATE_BODY".into(),
+                retry_after: None,
             })
         }
     }
@@ -20726,6 +21118,95 @@ mod tests {
         assert!(text.contains("\"cancelled\": true"), "{text}");
     }
 
+    /// A well-formed `handoff_id` that resolves to nothing is caller input,
+    /// exactly like the malformed id the same function already answers with
+    /// `invalid params` (233bd24). It must not be an internal error a client
+    /// reads as "retry" — and the class must stay identical for an id that is
+    /// merely absent and one that belongs to another operator, or the code
+    /// itself would leak what the message is careful not to say.
+    #[tokio::test]
+    async fn handoff_cancel_reports_an_unknown_id_as_invalid_params() {
+        let (_tmp, store, server, ws, proj) = setup_server().await;
+        let bob_id = store
+            .writer
+            .insert_handoff(NewHandoff {
+                workspace_id: ws,
+                project_id: proj,
+                from_session_id: None,
+                from_agent: AgentKind::Codex,
+                to_agent: None,
+                cwd: None,
+                summary: "Bob's context".into(),
+                open_questions: vec![],
+                next_steps: vec![],
+                files_touched: vec![],
+                owner_user: Some(ai_memory_core::IdentityKey::User("bob".into()).storage_key()),
+            })
+            .await
+            .unwrap();
+
+        let cancel_as_alice = |id: String| {
+            let mut alice_parts = test_parts_default();
+            alice_parts.extensions.insert(AuthLevel::User);
+            alice_parts.extensions.insert(ActorContext {
+                user: Some("alice".into()),
+                ..ActorContext::default()
+            });
+            server.memory_handoff_cancel(
+                Parameters(HandoffCancelArgs {
+                    handoff_id: id,
+                    project: None,
+                    workspace: None,
+                    any_owner: None,
+                }),
+                OptionalParts(alice_parts),
+            )
+        };
+
+        let absent = cancel_as_alice(HandoffId::new().to_string())
+            .await
+            .expect_err("an absent handoff must be refused");
+        assert_eq!(absent.code, rmcp::model::ErrorCode::INVALID_PARAMS);
+        assert!(
+            absent.message.contains("handoff not found"),
+            "the message must not change; got {absent}"
+        );
+
+        // Still indistinguishable from another operator's id — in class as
+        // well as in text.
+        let foreign = cancel_as_alice(bob_id.to_string())
+            .await
+            .expect_err("Alice must not cancel Bob's handoff");
+        assert_eq!(foreign.code, absent.code);
+        assert_eq!(foreign.message, absent.message);
+
+        // Control: a malformed id is a different caller mistake but the same
+        // class, and the two messages must stay distinct so the caller can
+        // tell "you typed nonsense" from "there is nothing there".
+        let malformed = cancel_as_alice("nope".into())
+            .await
+            .expect_err("a malformed id must be refused");
+        assert_eq!(malformed.code, rmcp::model::ErrorCode::INVALID_PARAMS);
+        assert!(
+            malformed.message.contains("invalid handoff_id"),
+            "a malformed id keeps its own message; got {malformed}"
+        );
+        assert_ne!(malformed.message, absent.message);
+
+        // Control: Bob's handoff is untouched by any of the refusals above.
+        assert_eq!(
+            store
+                .reader
+                .handoff_by_id(bob_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .lifecycle
+                .state,
+            HandoffState::Open,
+        );
+    }
+
     // ----------------------------------------------------------------
     // Error / mis-configured paths — caught at the tool boundary so the
     // agent sees a clean McpError instead of a panic.
@@ -21446,6 +21927,7 @@ mod tests {
         ai_memory_llm::LlmError::Provider {
             status: 400,
             body: "SENTINEL_PRIVATE_BODY".into(),
+            retry_after: None,
         }
     }
 

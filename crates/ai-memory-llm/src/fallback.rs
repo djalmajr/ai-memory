@@ -22,10 +22,12 @@ use crate::health::CandidateHealth;
 use crate::provider::LlmProvider;
 use crate::types::{ChatRequest, ChatResponse, LlmOperationId};
 
-/// How long a candidate's circuit stays open after a fast-retryable failure
-/// before it is eligible again. Restarting the process clears all circuit
-/// state; there is no durable or cross-process cooldown.
+/// How long a candidate's circuit stays open after a fast-retryable failure,
+/// or a failure carrying a provider retry hint, before it is eligible again.
+/// A longer hint extends the cooldown up to one hour. Restarting the process
+/// clears all circuit state; there is no durable or cross-process cooldown.
 pub const CIRCUIT_COOLDOWN: Duration = Duration::from_secs(30);
+const MAX_CIRCUIT_COOLDOWN: Duration = Duration::from_secs(60 * 60);
 
 /// One provider in an ordered fallback chain.
 ///
@@ -128,8 +130,13 @@ impl FallbackLlmProvider {
         state.last_error_at = Some(Timestamp::now());
         state.last_error_status = err.http_status();
         state.last_error_class = Some(err.class());
-        if err.is_fast_retryable() {
-            state.circuit_open_until = Some(Instant::now() + CIRCUIT_COOLDOWN);
+        if err.is_fast_retryable() || err.retry_after().is_some() {
+            let cooldown = err
+                .retry_after()
+                .unwrap_or(CIRCUIT_COOLDOWN)
+                .max(CIRCUIT_COOLDOWN)
+                .min(MAX_CIRCUIT_COOLDOWN);
+            state.circuit_open_until = Some(Instant::now() + cooldown);
         }
     }
 
@@ -416,9 +423,14 @@ mod tests {
 
     fn clone_err(err: &LlmError) -> LlmError {
         match err {
-            LlmError::Provider { status, body } => LlmError::Provider {
+            LlmError::Provider {
+                status,
+                body,
+                retry_after,
+            } => LlmError::Provider {
                 status: *status,
                 body: body.clone(),
+                retry_after: *retry_after,
             },
             LlmError::Capacity {
                 body,
@@ -494,6 +506,7 @@ mod tests {
         LlmError::Provider {
             status,
             body: "upstream body that must never leak".to_string(),
+            retry_after: None,
         }
     }
 
@@ -607,22 +620,27 @@ mod tests {
             LlmError::Provider {
                 status: 400,
                 body: String::new(),
+                retry_after: None,
             },
             LlmError::Provider {
                 status: 401,
                 body: String::new(),
+                retry_after: None,
             },
             LlmError::Provider {
                 status: 403,
                 body: String::new(),
+                retry_after: None,
             },
             LlmError::Provider {
                 status: 404,
                 body: String::new(),
+                retry_after: None,
             },
             LlmError::Provider {
                 status: 422,
                 body: String::new(),
+                retry_after: None,
             },
             LlmError::Schema("bad schema".into()),
             LlmError::Serde("deserialize failed".into()),
@@ -693,7 +711,90 @@ mod tests {
         LlmError::Provider {
             status,
             body: body.to_string(),
+            retry_after: None,
         }
+    }
+
+    #[test]
+    fn provider_retry_hints_are_clamped_to_the_circuit_bounds() {
+        let chain = FallbackLlmProvider::new(vec![Candidate::new(
+            "primary",
+            "m1",
+            Arc::new(ScriptedLlm::ok("primary", "m1", "unused")),
+        )]);
+
+        for (hint, expected) in [(5, 30), (90, 90), (7_200, 3_600)] {
+            let before = Instant::now();
+            chain.record_error(
+                0,
+                &LlmError::Provider {
+                    status: 429,
+                    body: String::new(),
+                    retry_after: Some(Duration::from_secs(hint)),
+                },
+            );
+            let until = chain.entries[0]
+                .state
+                .lock()
+                .unwrap()
+                .circuit_open_until
+                .unwrap();
+            let actual = until.duration_since(before);
+            assert!(
+                actual >= Duration::from_secs(expected)
+                    && actual < Duration::from_secs(expected + 1),
+                "hint {hint}s produced {actual:?}"
+            );
+        }
+    }
+
+    // The fork's typed rejections carry the same hint through `retry_after()`,
+    // so a long capacity hint holds the circuit open for the hint, while an
+    // unhinted 5xx (possibly delivered) still leaves the circuit closed.
+    #[test]
+    fn typed_retry_hints_drive_the_circuit_and_unhinted_5xx_does_not() {
+        let open_for = |err: LlmError| {
+            let chain = FallbackLlmProvider::new(vec![Candidate::new(
+                "primary",
+                "m1",
+                Arc::new(ScriptedLlm::ok("primary", "m1", "unused")),
+            )]);
+            let before = Instant::now();
+            chain.record_error(0, &err);
+            chain.entries[0]
+                .state
+                .lock()
+                .unwrap()
+                .circuit_open_until
+                .map(|until| until.duration_since(before))
+        };
+
+        let capacity = open_for(LlmError::Capacity {
+            body: String::new(),
+            retry_after_secs: 90,
+        })
+        .expect("a capacity hint opens the circuit");
+        assert!(
+            capacity >= Duration::from_secs(90) && capacity < Duration::from_secs(91),
+            "capacity hint produced {capacity:?}"
+        );
+
+        assert_eq!(
+            open_for(LlmError::Provider {
+                status: 500,
+                body: String::new(),
+                retry_after: None,
+            }),
+            None
+        );
+
+        // A 429 without a hint is neither fast-retryable nor hinted; the
+        // admission guard's delayed replay handles it, not the circuit.
+        let rate_limited = open_for(LlmError::RateLimited {
+            body: String::new(),
+            retry_after_secs: None,
+        });
+        assert_eq!(rate_limited, None);
     }
 
     #[tokio::test]

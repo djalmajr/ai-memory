@@ -4095,6 +4095,7 @@ mod tests {
         let error = ConsolidatorError::Llm(LlmError::Provider {
             status: 400,
             body: REDACTION_SENTINEL.into(),
+            retry_after: None,
         });
         let summary = redacted_error_summary(&error);
         assert_eq!(summary, "consolidation failed: class=provider status=400");
@@ -4109,6 +4110,7 @@ mod tests {
         let provider = ConsolidatorError::Llm(LlmError::Provider {
             status: 400,
             body: REDACTION_SENTINEL.into(),
+            retry_after: None,
         });
         let serde_error = ConsolidatorError::Serde(REDACTION_SENTINEL.into());
         let provider_summary = redacted_error_summary(&provider);

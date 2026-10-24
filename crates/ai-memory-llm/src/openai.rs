@@ -10,7 +10,7 @@ use tracing::{info, warn};
 
 use crate::error::{LlmError, LlmResult};
 use crate::provider::LlmProvider;
-use crate::response::{provider_error_body, response_json_limited};
+use crate::response::{provider_error, response_json_limited};
 use reqwest::header::{HeaderName, HeaderValue};
 
 use crate::types::{
@@ -668,39 +668,37 @@ impl OpenAiProvider {
         };
         let status = response.status();
         if !status.is_success() {
-            let retry_after_secs = response
-                .headers()
-                .get(reqwest::header::RETRY_AFTER)
-                .and_then(|value| value.to_str().ok())
-                .and_then(|value| value.parse::<u64>().ok());
-            let body = provider_error_body(response).await;
-            let error = if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
-                LlmError::RateLimited {
-                    body,
-                    retry_after_secs,
-                }
-            } else if status == reqwest::StatusCode::SERVICE_UNAVAILABLE
-                && let Some(retry_after_secs) = retry_after_secs
-                && serde_json::from_str::<serde_json::Value>(&body)
-                    .ok()
-                    .is_some_and(|value| {
-                        matches!(
-                            value
-                                .pointer("/error/type")
-                                .and_then(serde_json::Value::as_str),
-                            Some("llm_capacity" | "llm_backend_capacity")
-                        )
-                    })
-            {
-                LlmError::Capacity {
-                    body,
-                    retry_after_secs,
-                }
-            } else {
+            // `provider_error` is the one reader of the provider's retry
+            // hint; the typed rejections below only reclassify its result.
+            let error = match provider_error(response).await {
                 LlmError::Provider {
-                    status: status.as_u16(),
+                    body, retry_after, ..
+                } if status == reqwest::StatusCode::TOO_MANY_REQUESTS => LlmError::RateLimited {
                     body,
+                    retry_after_secs: retry_after.map(whole_seconds_rounded_up),
+                },
+                LlmError::Provider {
+                    body,
+                    retry_after: Some(retry_after),
+                    ..
+                } if status == reqwest::StatusCode::SERVICE_UNAVAILABLE
+                    && serde_json::from_str::<serde_json::Value>(&body)
+                        .ok()
+                        .is_some_and(|value| {
+                            matches!(
+                                value
+                                    .pointer("/error/type")
+                                    .and_then(serde_json::Value::as_str),
+                                Some("llm_capacity" | "llm_backend_capacity")
+                            )
+                        }) =>
+                {
+                    LlmError::Capacity {
+                        body,
+                        retry_after_secs: whole_seconds_rounded_up(retry_after),
+                    }
                 }
+                error => error,
             };
             warn!(
                 operation_id = %operation_id,
@@ -719,6 +717,16 @@ impl OpenAiProvider {
         );
         response_json_limited::<OpenAiResponse>(response).await
     }
+}
+
+/// A provider retry hint in the whole seconds the typed rejections carry,
+/// rounded up so a sub-second hint never becomes an immediate replay.
+/// Saturates: the hint is provider-controlled, and a wrapped sum would turn
+/// the longest possible delay into a zero-second one.
+fn whole_seconds_rounded_up(delay: Duration) -> u64 {
+    delay
+        .as_secs()
+        .saturating_add(u64::from(delay.subsec_nanos() > 0))
 }
 
 /// `true` when the engine reports the output stopped at the token budget
@@ -911,6 +919,7 @@ mod tests {
         OpenAiJsonSchema, OpenAiProvider, OpenAiResponse, OpenAiResponseFormat, REQUEST_ID_HEADER,
         RequestDialect, STRUCTURED_OUTPUT_SCHEMA_NAME, enforce_strict_object_schemas,
         is_length_truncated, model_requires_max_completion_tokens, normalize_openai_base,
+        whole_seconds_rounded_up,
     };
     use crate::provider::LlmProvider;
     use crate::types::{ChatMessage, ChatRequest, LlmOperationId, ReasoningEffort, Role};
@@ -1922,5 +1931,111 @@ mod tests {
         );
         assert!(timed_out.contains("class=\"http\""), "{timed_out}");
         assert!(timed_out.contains("duration_ms="), "{timed_out}");
+    }
+
+    #[tokio::test]
+    async fn official_structured_completion_classifies_whitespace_as_empty_content() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "model": "gpt-empty",
+                "choices": [{
+                    "message": { "content": "  \n\t" },
+                    "finish_reason": "stop"
+                }]
+            })))
+            .mount(&server)
+            .await;
+        let provider = OpenAiProvider::new(SecretString::from("sk-test"), "gpt-empty")
+            .unwrap()
+            .with_base_url(server.uri());
+
+        let error = provider
+            .complete_structured_raw(
+                ChatRequest::user_prompt("return JSON"),
+                serde_json::json!({"type": "object", "properties": {}}),
+            )
+            .await
+            .expect_err("whitespace-only output must be empty content");
+
+        assert_eq!(error.class(), "empty-content");
+        assert!(
+            matches!(error, crate::error::LlmError::EmptyContent { model } if model == "gpt-empty")
+        );
+    }
+
+    async fn compat_error_for(response: ResponseTemplate) -> crate::LlmError {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(response)
+            .mount(&server)
+            .await;
+        OpenAiProvider::new(SecretString::from("sk-test"), "model-x")
+            .unwrap()
+            .with_dialect(RequestDialect::Compat)
+            .with_base_url(server.uri())
+            .complete(ChatRequest::user_prompt("hi"))
+            .await
+            .unwrap_err()
+    }
+
+    // The shared hint parser also reads a RetryInfo delay from the body; the
+    // typed 429 rounds a fractional delay up so the replay never comes early.
+    #[tokio::test]
+    async fn a_body_retry_info_delay_reaches_the_typed_rate_limit_rounded_up() {
+        let error = compat_error_for(ResponseTemplate::new(429).set_body_json(json!({
+            "error": {
+                "details": [{
+                    "@type": "type.googleapis.com/google.rpc.RetryInfo",
+                    "retryDelay": "1.2s"
+                }]
+            }
+        })))
+        .await;
+        assert!(
+            matches!(
+                error,
+                crate::LlmError::RateLimited {
+                    retry_after_secs: Some(2),
+                    ..
+                }
+            ),
+            "{error:?}"
+        );
+    }
+
+    #[test]
+    fn retry_hint_seconds_round_up_and_saturate_at_the_largest_hint() {
+        use std::time::Duration;
+
+        assert_eq!(whole_seconds_rounded_up(Duration::ZERO), 0);
+        assert_eq!(whole_seconds_rounded_up(Duration::from_secs(1)), 1);
+        assert_eq!(whole_seconds_rounded_up(Duration::from_millis(1_200)), 2);
+        assert_eq!(
+            whole_seconds_rounded_up(Duration::new(u64::MAX, 500_000_000)),
+            u64::MAX
+        );
+    }
+
+    #[tokio::test]
+    async fn a_gateway_capacity_503_with_retry_after_is_typed_capacity() {
+        let error = compat_error_for(
+            ResponseTemplate::new(503)
+                .insert_header("Retry-After", "3")
+                .set_body_json(json!({"error": {"type": "llm_capacity"}})),
+        )
+        .await;
+        assert!(
+            matches!(
+                error,
+                crate::LlmError::Capacity {
+                    retry_after_secs: 3,
+                    ..
+                }
+            ),
+            "{error:?}"
+        );
     }
 }

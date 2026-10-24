@@ -104,13 +104,19 @@ cargo run --release -p ai-memory-eval -- retrieval --embeddings local
 
 - Inference is CPU, off the async runtime (`spawn_blocking`);
   first-load reads ~87 MB into memory once per server process.
-- Local inference has two process-wide slots. Background document embeddings
-  use one slot, leaving the other available to search queries. This avoids
-  page writes and administrative backfill crowding interactive recall off the
-  CPU. A query that arrives while both slots are busy falls back
-  immediately to lexical/entity/graph retrieval instead of building an
-  unbounded queue. Hosted embedding providers are not subject to this local
-  scheduler.
+- Local inference runs through a small process-wide scheduler sized from
+  the CPU: half the available parallelism, clamped to between 2 and 6
+  slots (`local_capacity` in `ai-memory-llm`). all-MiniLM inference
+  already parallelizes across cores inside one embed, so this bounds
+  concurrent calls while mild oversubscription keeps the CPU busy.
+  Document embeddings may use all but one slot, so page writes and
+  administrative backfill embed several documents at once instead of
+  serializing, and one slot stays reserved for search queries. A query
+  that arrives while every slot is busy waits up to 250 ms for one before
+  falling back to lexical/entity/graph retrieval, so a query that merely
+  races a document embed keeps its vector stream; only sustained
+  saturation degrades. Hosted embedding providers are not subject to
+  this local scheduler.
 - The `local-embeddings` cargo feature (default on) carries the ML
   dependency tree; a slim build can disable it and keep every other
   provider.
@@ -118,8 +124,9 @@ cargo run --release -p ai-memory-eval -- retrieval --embeddings local
   Longer page bodies contribute only their head, the same contract as the
   hosted embedders.
 
-The opt-in contention probe compares the raw local embedder with that capacity
-split. It needs the downloaded model and is not part of the routine test tier:
+The opt-in contention probe compares the raw local embedder with that
+capacity scheduler. It needs the downloaded model and is not part of the
+routine test tier:
 
 ```bash
 AI_MEMORY_TEST_MODELS_DIR=$PWD/evals/models \

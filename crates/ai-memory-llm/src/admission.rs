@@ -568,6 +568,7 @@ mod tests {
             Err(LlmError::Provider {
                 status: 502,
                 body: "client gave up".into(),
+                retry_after: None,
             }),
             response(),
         ]));
@@ -588,6 +589,7 @@ mod tests {
             Err(LlmError::Provider {
                 status: 502,
                 body: "client gave up".into(),
+                retry_after: None,
             }),
             response(),
             response(),
@@ -660,10 +662,12 @@ mod tests {
             Err(LlmError::Provider {
                 status: 499,
                 body: "cancelled".into(),
+                retry_after: None,
             }),
             Err(LlmError::Provider {
                 status: 503,
                 body: "busy".into(),
+                retry_after: None,
             }),
         ]));
         let mut guard = AdmittedLlmProvider::new(inner.clone(), None, None).unwrap();
@@ -706,6 +710,7 @@ mod tests {
             Err(LlmError::Provider {
                 status: 502,
                 body: "gateway failure".into(),
+                retry_after: None,
             }),
         ]));
         let guard = AdmittedLlmProvider::new(inner.clone(), None, None).unwrap();

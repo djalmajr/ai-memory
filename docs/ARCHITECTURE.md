@@ -197,7 +197,10 @@ from hook paths.
    the hit shows the page's own snippet. If
    compiled wiki pages miss entirely in default, explicit project, or explicit
    `scopes` mode, bounded raw observation FTS returns fallback `raw_hits`, from
-   sessions the caller may read under that same rule;
+   sessions the caller may read under that same rule. Hits only the vector
+   streams (or graph neighbours of theirs) found count as a miss here: those
+   streams have no similarity floor and answer every query once a page has an
+   embedding;
    `global=true` searches compiled wiki pages across projects only. Page hits
    bump `access_count` + `last_accessed_at`, the M8 reinforcement term, which
    `memory_feedback` complements with explicit per-page salience. Identified

@@ -233,19 +233,47 @@ pub(crate) fn cjk_index_terms(raw: &str) -> String {
 /// `None` is the important common case: callers then execute the existing SQL
 /// byte-for-byte. A multi-scalar run becomes an exact phrase of overlapping
 /// bigrams; a single scalar uses the unigram fallback.
+///
+/// `None` also covers a query carrying `AND` / `NOT` / `NEAR`. This stream is
+/// auxiliary: callers UNION it into the primary stream, so a run-based
+/// OR-join of a `東京 NOT 大阪` query fuses the excluded term's own pages back
+/// into the result set — the opposite of what the operator asked for, while
+/// the primary stream honours it verbatim. Expanding each operand and
+/// rebuilding the expression is the real fix; declining the stream meanwhile
+/// restores the pre-#1433 answer instead of an inverted one. `OR` stays,
+/// because the expander reproduces it faithfully.
+///
+/// A leading `title:` / `body:` qualifier is carried onto the run's phrase.
+/// This stream is auxiliary — callers UNION it into the primary stream — so a
+/// qualifier dropped here searches every column of `pages_cjk_fts`, including
+/// `path_search`, and the union widens a query the user deliberately narrowed.
+/// The two names are the ones [`prepare_fts5_token`] accepts; any other bare
+/// column is left alone, because the primary stream neutralises it too.
 #[must_use]
 pub(crate) fn prepare_cjk_fts5_query(raw: &str) -> Option<String> {
     let bounded = bounded_query_text(raw);
-    let mut phrases = Vec::new();
-    let mut run = Vec::new();
-    for ch in bounded.chars() {
-        if is_cjk(ch) {
-            run.push(ch);
-        } else {
-            append_cjk_query(&mut phrases, &mut run);
-        }
+    if bounded
+        .split_whitespace()
+        .any(|t| matches!(t, "AND" | "NOT" | "NEAR"))
+    {
+        return None;
     }
-    append_cjk_query(&mut phrases, &mut run);
+    let mut phrases = Vec::new();
+    for token in bounded.split_whitespace() {
+        let (column, text) = match token.split_once(':') {
+            Some((column @ ("title" | "body"), text)) => (Some(column), text),
+            _ => (None, token),
+        };
+        let mut run = Vec::new();
+        for ch in text.chars() {
+            if is_cjk(ch) {
+                run.push(ch);
+            } else {
+                append_cjk_query(&mut phrases, &mut run, column);
+            }
+        }
+        append_cjk_query(&mut phrases, &mut run, column);
+    }
     (!phrases.is_empty()).then(|| phrases.join(" OR "))
 }
 
@@ -258,19 +286,20 @@ fn append_cjk_terms(terms: &mut Vec<String>, run: &mut Vec<char>) {
     run.clear();
 }
 
-fn append_cjk_query(phrases: &mut Vec<String>, run: &mut Vec<char>) {
+fn append_cjk_query(phrases: &mut Vec<String>, run: &mut Vec<char>, column: Option<&str>) {
     if run.is_empty() {
         return;
     }
+    let prefix = column.map_or_else(String::new, |column| format!("{column}:"));
     if run.len() == 1 {
-        phrases.push(format!("\"{}\"", run[0]));
+        phrases.push(format!("{prefix}\"{}\"", run[0]));
     } else {
         let bigrams = run
             .windows(2)
             .map(|pair| pair.iter().collect::<String>())
             .collect::<Vec<_>>()
             .join(" ");
-        phrases.push(format!("\"{bigrams}\""));
+        phrases.push(format!("{prefix}\"{bigrams}\""));
     }
     run.clear();
 }
@@ -281,6 +310,16 @@ fn is_cjk(ch: char) -> bool {
         ch as u32,
         0x1100..=0x11ff
             | 0x2e80..=0x2fff
+            // CJK Symbols and Punctuation holds a handful of LETTERS among its
+            // punctuation: the iteration marks 々 〆 〻 and the kana repeat
+            // marks. 々 is how 日々, 時々, 人々, 我々 and 様々 are written, so
+            // excluding the block split those words into single scalars on both
+            // the index and the query side, leaving the character-only match
+            // the bigrams exist to prevent. The `is_alphanumeric` guard above
+            // keeps the block's actual punctuation (、 。 「) out.
+            | 0x3005..=0x3006
+            | 0x3031..=0x3035
+            | 0x303b
             | 0x3040..=0x30ff
             | 0x3130..=0x318f
             | 0x31f0..=0x31ff
@@ -489,6 +528,15 @@ mod tests {
             "日 本 語 日本 本語 テ ス ト テス スト"
         );
         assert_eq!(cjk_index_terms("plain latin"), "");
+        // The iteration mark is a letter in CJK Symbols and Punctuation and
+        // must continue a run, or 日々 is indexed as two one-char runs and is
+        // unfindable as a unit.
+        assert_eq!(
+            cjk_index_terms("日々の作業"),
+            "日 々 の 作 業 日々 々の の作 作業"
+        );
+        // Control: the punctuation sharing that block still breaks a run.
+        assert_eq!(cjk_index_terms("日、本"), "日 本");
     }
 
     #[test]
@@ -502,6 +550,56 @@ mod tests {
             Some("\"支\" OR \"韓\"".to_string())
         );
         assert_eq!(prepare_cjk_fts5_query("latin only"), None);
+    }
+
+    #[test]
+    fn cjk_stream_declines_a_query_the_expander_would_invert() {
+        assert_eq!(prepare_cjk_fts5_query("東京 NOT 大阪"), None);
+        assert_eq!(prepare_cjk_fts5_query("東京 AND 大阪"), None);
+        assert_eq!(prepare_cjk_fts5_query("東京 NEAR 大阪"), None);
+        // Control: `OR` is the one operator the run expander reproduces, so
+        // the auxiliary stream still runs for it — and a lowercase `not` is
+        // not FTS5 syntax, so it must not suppress the stream either.
+        let both = Some("\"東京\" OR \"大阪\"".to_string());
+        assert_eq!(prepare_cjk_fts5_query("東京 OR 大阪"), both);
+        assert_eq!(prepare_cjk_fts5_query("東京 not 大阪"), both);
+        assert_parses(&prepare_cjk_fts5_query("東京 OR 大阪").unwrap());
+    }
+
+    #[test]
+    fn cjk_queries_keep_a_known_column_filter() {
+        let title = prepare_cjk_fts5_query("title:支付服务").unwrap();
+        assert_eq!(title, "title:\"支付 付服 服务\"");
+        assert_parses(&title);
+        let body = prepare_cjk_fts5_query("body:支付服务").unwrap();
+        assert_eq!(body, "body:\"支付 付服 服务\"");
+        assert_parses(&body);
+        let single = prepare_cjk_fts5_query("title:支").unwrap();
+        assert_eq!(single, "title:\"支\"");
+        assert_parses(&single);
+        // Control: the bare query is untouched, and a column FTS5 does not
+        // know stays unqualified here exactly as the primary stream
+        // neutralises it, rather than being emitted as invalid syntax.
+        assert_eq!(
+            prepare_cjk_fts5_query("支付服务"),
+            Some("\"支付 付服 服务\"".to_string())
+        );
+        let unknown = prepare_cjk_fts5_query("author:支付服务").unwrap();
+        assert_eq!(unknown, "\"支付 付服 服务\"");
+        assert_parses(&unknown);
+    }
+
+    #[test]
+    fn cjk_queries_keep_the_japanese_iteration_mark() {
+        let query = prepare_cjk_fts5_query("日々").unwrap();
+        assert_eq!(query, "\"日々\"");
+        assert_parses(&query);
+        // Control: the same block's punctuation still separates two runs,
+        // so this is a widened letter range and not a widened block.
+        assert_eq!(
+            prepare_cjk_fts5_query("日、本"),
+            Some("\"日\" OR \"本\"".to_string())
+        );
     }
 
     #[test]

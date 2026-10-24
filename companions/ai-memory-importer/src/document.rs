@@ -492,7 +492,15 @@ fn extract(format: DocumentFormat, _path: &Path, bytes: &[u8]) -> Result<String>
             if bytes.len() > MAX_WORKING_TEXT_BYTES {
                 bail!("text document exceeds the {MAX_WORKING_TEXT_BYTES}-byte extraction limit");
             }
-            String::from_utf8(bytes.to_vec()).context("text and Markdown documents must be UTF-8")
+            let text = String::from_utf8(bytes.to_vec())
+                .context("text and Markdown documents must be UTF-8")?;
+            // Editors that save UTF-8 with a BOM (Notepad, VS Code's `utf8bom`
+            // encoding, Excel's "CSV UTF-8" export) put one here.
+            // `extract_transcript` already strips it; without this it reaches
+            // the page body, where `# Overview` stops being a heading. Neither
+            // `normalize_text` nor `sanitize_external_text` removes it: U+FEFF
+            // is neither whitespace nor a control character, so a trim misses it.
+            Ok(text.trim_start_matches('\u{feff}').to_owned())
         }
         DocumentFormat::Pdf => extract_pdf(bytes),
         DocumentFormat::Docx => extract_docx(bytes),
@@ -661,9 +669,12 @@ fn xlsx_sheet_order(workbook: &str, relationships: &str) -> Result<Vec<(String, 
             Event::Start(tag) | Event::Empty(tag) if tag.local_name().as_ref() == "sheet" => {
                 let name = required_attribute(&tag, "name", "XLSX sheet name")?;
                 let id = required_qualified_attribute(&tag, "r:id", "XLSX sheet id")?;
-                let target = targets
-                    .get(&id)
-                    .ok_or_else(|| anyhow!("XLSX sheet id {id:?} has no worksheet relationship"))?;
+                // `<sheets>` lists chartsheets and dialogsheets alongside worksheets;
+                // only the relationship type tells them apart, so skip the ones that
+                // carry no worksheet relationship instead of failing the whole import.
+                let Some(target) = targets.get(&id) else {
+                    continue;
+                };
                 sheets.push((name, target.clone()));
             }
             Event::Eof => break,
@@ -1013,7 +1024,10 @@ fn pptx_notes_target(relationships: &str) -> Result<Option<String>> {
 fn extract_transcript(bytes: &[u8], webvtt: bool) -> Result<String> {
     let text = std::str::from_utf8(bytes).context("transcript must be UTF-8")?;
     let mut output = String::new();
-    let normalized = text.trim_start_matches('\u{feff}').replace("\r\n", "\n");
+    let normalized = text
+        .trim_start_matches('\u{feff}')
+        .replace("\r\n", "\n")
+        .replace('\r', "\n");
     for (block_index, block) in normalized.split("\n\n").enumerate() {
         let lines = block.lines().map(str::trim).collect::<Vec<_>>();
         let Some(first) = lines.first().copied().filter(|line| !line.is_empty()) else {
@@ -1022,7 +1036,10 @@ fn extract_transcript(bytes: &[u8], webvtt: bool) -> Result<String> {
         if webvtt && block_index == 0 && first.starts_with("WEBVTT") {
             continue;
         }
-        if webvtt && (matches!(first, "STYLE" | "REGION") || first.starts_with("NOTE")) {
+        // A cue identifier may start with NOTE; only a complete NOTE token
+        // introduces a comment: https://www.w3.org/TR/webvtt1/#webvtt-comment-block
+        let comment = first == "NOTE" || first.starts_with("NOTE ") || first.starts_with("NOTE\t");
+        if webvtt && (matches!(first, "STYLE" | "REGION") || comment) {
             continue;
         }
         let timing_index = if is_timing_line(first) {
@@ -1514,6 +1531,24 @@ mod tests {
     }
 
     #[test]
+    fn text_plan_drops_a_leading_utf8_bom() {
+        let temp = TempDir::new().unwrap();
+        let file = temp.path().join("notes.md");
+        fs::write(&file, "\u{feff}# Overview\n\nBody line.\n").unwrap();
+        let plan = plan_document(&file, "w", "p", DEFAULT_DEST_PREFIX, None).unwrap();
+        assert!(
+            !plan.body.contains('\u{feff}'),
+            "BOM reached the page body: {:?}",
+            plan.body
+        );
+        assert!(
+            plan.body.contains("## Extracted content\n\n# Overview\n"),
+            "{:?}",
+            plan.body
+        );
+    }
+
+    #[test]
     fn docx_extracts_document_footnote_text_and_decodes_entities() {
         let temp = TempDir::new().unwrap();
         let file = temp.path().join("brief.docx");
@@ -1566,6 +1601,30 @@ mod tests {
         let plan = plan_document(&file, "w", "p", DEFAULT_DEST_PREFIX, None).unwrap();
         assert!(plan.body.contains("## Sheet: Totals"), "{}", plan.body);
         assert!(plan.body.contains("Item\t42"), "{}", plan.body);
+    }
+
+    #[test]
+    fn xlsx_sheet_order_skips_a_chartsheet_and_keeps_the_worksheets() {
+        let workbook = r#"<workbook xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><sheets><sheet name="Data" sheetId="1" r:id="rId1"/><sheet name="Chart1" sheetId="2" r:id="rId2"/></sheets></workbook>"#;
+        let relationships = r#"<Relationships><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/><Relationship Id="rId2" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/chartsheet" Target="chartsheets/sheet1.xml"/></Relationships>"#;
+        let sheets = xlsx_sheet_order(workbook, relationships).unwrap();
+        assert_eq!(
+            sheets,
+            vec![("Data".to_owned(), "xl/worksheets/sheet1.xml".to_owned())]
+        );
+    }
+
+    #[test]
+    fn xlsx_sheet_order_still_reports_a_workbook_of_only_chartsheets() {
+        let workbook = r#"<workbook xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><sheets><sheet name="Chart1" sheetId="1" r:id="rId1"/></sheets></workbook>"#;
+        let relationships = r#"<Relationships><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/chartsheet" Target="chartsheets/sheet1.xml"/></Relationships>"#;
+        let error = xlsx_sheet_order(workbook, relationships).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("XLSX workbook contains no worksheets"),
+            "{error}"
+        );
     }
 
     #[test]
@@ -1666,6 +1725,50 @@ mod tests {
         let srt = b"1\n00:00:01,000 --> 00:00:02,000\n12345\n\n2\n00:00:03,000 --> 00:00:04,000\nSecond line\n";
         let text = extract_transcript(srt, false).unwrap();
         assert_eq!(text.trim(), "12345\n\nSecond line");
+    }
+
+    #[test]
+    fn webvtt_keeps_cues_whose_identifiers_only_start_with_note() {
+        let vtt = b"WEBVTT\n\nNOTE an actual comment\nNot spoken\n\nNOTEworthy\n00:00:01.000 --> 00:00:02.000\nKeep this fact\n\nNOTE123\n00:00:03.000 --> 00:00:04.000\nKeep this too\n\nNOTE\tanother comment\nNot spoken either\n\nNOTE\nNot spoken at all\n";
+        assert_eq!(
+            extract_transcript(vtt, true).unwrap().trim(),
+            "Keep this fact\n\nKeep this too"
+        );
+    }
+
+    #[test]
+    fn transcripts_accept_each_supported_line_terminator() {
+        let vtt = "WEBVTT\n\n00:00:01.000 --> 00:00:02.000\nFirst fact\n\n00:00:03.000 --> 00:00:04.000\nSecond fact\n";
+        let srt = "1\n00:00:01,000 --> 00:00:02,000\nFirst fact\n\n2\n00:00:03,000 --> 00:00:04,000\nSecond fact\n";
+        for newline in ["\n", "\r\n", "\r"] {
+            for (input, webvtt) in [(vtt, true), (srt, false)] {
+                let input = input.replace('\n', newline);
+                assert_eq!(
+                    extract_transcript(input.as_bytes(), webvtt).unwrap().trim(),
+                    "First fact\n\nSecond fact",
+                    "line terminator {newline:?}, WebVTT={webvtt}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn subtitle_cues_are_sanitized_before_the_document_plan() {
+        let temp = TempDir::new().unwrap();
+        let file = temp.path().join("captions.vtt");
+        for identifier in ["NOTE123", "ordinary-cue"] {
+            for newline in ["\n", "\r\n", "\r"] {
+                let input = format!(
+                    "WEBVTT\n\nNOTE annotation\nCOMMENT_SENTINEL\n\n{identifier}\n00:00:01.000 --> 00:00:02.000\nKeep this fact token=abcdefghijklmnop\n"
+                )
+                .replace('\n', newline);
+                fs::write(&file, input).unwrap();
+                let plan = plan_document(&file, "w", "p", DEFAULT_DEST_PREFIX, None).unwrap();
+                assert!(plan.body.contains("Keep this fact token=[REDACTED]"));
+                assert!(!plan.body.contains("abcdefghijklmnop"));
+                assert!(!plan.body.contains("COMMENT_SENTINEL"));
+            }
+        }
     }
 
     #[test]
