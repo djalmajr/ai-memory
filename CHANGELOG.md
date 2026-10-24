@@ -64,8 +64,10 @@ version in [`docs/changelog/`](docs/changelog/):
   in the body); the OpenAI-compatible client maps its result to the fork's
   typed `RateLimited` and `Capacity` errors. A 429 whose body carries
   `RetryInfo` now has its delay, rounded up to whole seconds, for the
-  admission guard's delayed replay, and `LlmError::retry_after()` reports the
-  hint for `RateLimited` and `Capacity` too. The fallback circuit opens on a
+  admission guard's delayed replay, a gateway capacity 503 whose hint is only
+  in the body is now typed `Capacity` (fast retry) instead of an ambiguous
+  delivery, and `LlmError::retry_after()` reports the hint for `RateLimited`
+  and `Capacity` too. The fallback circuit opens on a
   fast-retryable failure or on any failure carrying a provider hint, and
   stays open for the hint clamped to between 30 seconds and one hour instead
   of a flat 30 seconds; an ambiguous 5xx or timeout without a hint, and a 429
