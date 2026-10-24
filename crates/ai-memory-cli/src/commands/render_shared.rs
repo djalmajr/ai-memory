@@ -2602,6 +2602,22 @@ pub(crate) fn shell_quote(s: &str) -> String {
     format!("'{escaped}'")
 }
 
+/// Quote one argument for the native shell used by copy-pasteable commands.
+pub(crate) fn native_shell_quote(s: &str) -> String {
+    if cfg!(windows) {
+        if s.chars().all(|c| {
+            c.is_ascii_alphanumeric()
+                || matches!(c, '-' | '_' | '.' | '/' | ':' | '%' | '+' | '=' | ',')
+        }) {
+            s.to_owned()
+        } else {
+            powershell_quote(s)
+        }
+    } else {
+        shell_quote(s)
+    }
+}
+
 fn powershell_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', "''"))
 }

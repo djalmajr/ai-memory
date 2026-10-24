@@ -42,8 +42,8 @@ use serde::{Deserialize, Serialize};
 use ai_memory_core::{NewWorkstreamEvent, WorkstreamEventKind};
 use ai_memory_hooks::capture_policy::metadata_only_body;
 use ai_memory_workstream::{
-    LaunchRoots, ManagedHarness, build_launch_plan_with_env, export_transcript,
-    export_transcript_delta, export_transcript_range, list_native_sessions,
+    LaunchRoots, ManagedHarness, OVERSIZED_RECORD_LOSS, build_launch_plan_with_env,
+    export_transcript, export_transcript_delta, export_transcript_range, list_native_sessions,
     wait_for_transcript_flush,
 };
 
@@ -890,6 +890,20 @@ async fn import_exported_transcript(
     )?);
 
     post_hook_items(endpoint, &items).await?;
+    // The import is partial by design here, so it is reported on stderr even
+    // under `--quiet`: the automatic worker's stderr is the operator's log.
+    let skipped = transcript
+        .losses
+        .iter()
+        .filter(|loss| loss.starts_with(OVERSIZED_RECORD_LOSS))
+        .count();
+    if skipped > 0 {
+        eprintln!(
+            "ai-memory: {} session {}: skipped {skipped} oversized transcript record(s); the rest was imported",
+            harness.as_str(),
+            run::display_session_id(display_id(sid))
+        );
+    }
     Ok(content)
 }
 
@@ -1848,6 +1862,7 @@ mod tests {
             mid_session_routing: ai_memory_core::MidSessionRouting::default(),
             profile: ai_memory_core::profile::ProfileSettings::default(),
             ingest_drop_list: ai_memory_hooks::IngestDropList::default(),
+            skip_wiki_checkpoints: false,
         };
         let endpoint = ServerEndpoint::for_hook_target("http://localhost".into(), None);
         let sid = "native-session-with-a-very-long-identifier-that-would-break-the-old-key";
@@ -2049,6 +2064,7 @@ mod tests {
             mid_session_routing: ai_memory_core::MidSessionRouting::default(),
             profile: ai_memory_core::profile::ProfileSettings::default(),
             ingest_drop_list: ai_memory_hooks::IngestDropList::default(),
+            skip_wiki_checkpoints: false,
         };
         let endpoint = ServerEndpoint::for_hook_target("http://localhost".into(), None);
         let sid = "native-session-resumed-across-two-offline-intervals";

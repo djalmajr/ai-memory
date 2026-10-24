@@ -85,6 +85,7 @@ async fn harness() -> (TempDir, Store, Wiki, HookState) {
         mid_session_routing: ai_memory_core::MidSessionRouting::default(),
         profile: ai_memory_core::profile::ProfileSettings::default(),
         ingest_drop_list: crate::drop_list::IngestDropList::default(),
+        skip_wiki_checkpoints: false,
     };
     (tmp, store, wiki, state)
 }

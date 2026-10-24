@@ -5290,7 +5290,12 @@ export const AiMemoryHooks: Plugin = async ({{ directory }}) => {{
       if (event?.type === "session.deleted") {{
         const info = properties.info ?? {{}};
         const id = properties.sessionID ?? info.id;
-        endSession(id, directory, info.directory);
+        // The marker has to ride the end event too: the router refuses to hand
+        // a baton to the next session only when a child session's `session-end`
+        // identifies itself, and it reads the top-level key alone (#755).
+        endSession(id, directory, info.directory, typeof info.parentID === "string" && info.parentID
+          ? {{ agent_id: info.parentID }}
+          : {{}});
       }}
       if (event?.type === "session.compacted") {{
         const id = properties.sessionID;
@@ -11425,6 +11430,48 @@ model = "gpt-5"
         assert!(inferred.is_none());
     }
 
+    /// A `session-start.sh` that wraps the handoff in Claude Code's
+    /// `hookSpecificOutput` envelope must have a PowerShell peer that asks for
+    /// the same envelope. Bare text does not start with "{", so the harness
+    /// logs "Hook output does not start with {, treating as plain text" and the
+    /// handoff arrives unstructured — the exact failure the POSIX half was
+    /// written to avoid. Enumerated rather than listed, so the next bundle
+    /// cannot ship uncovered.
+    #[test]
+    fn a_posix_session_start_envelope_has_a_powershell_peer() {
+        let hooks_root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("..")
+            .join("hooks");
+        let mut checked = 0usize;
+        for entry in fs::read_dir(&hooks_root).expect("hooks dir") {
+            let dir = entry.expect("hooks entry").path();
+            if !dir.is_dir() || dir.file_name().and_then(|n| n.to_str()) == Some("lib") {
+                continue;
+            }
+            let posix = dir.join("session-start.sh");
+            let shell = dir.join("session-start.ps1");
+            if !posix.is_file() || !shell.is_file() {
+                continue;
+            }
+            let posix_src = fs::read_to_string(&posix).expect("read session-start.sh");
+            if !posix_src.contains("hookSpecificOutput") {
+                continue;
+            }
+            let shell_src = fs::read_to_string(&shell).expect("read session-start.ps1");
+            assert!(
+                shell_src.contains("-SessionStartEnvelope"),
+                "{} emits a hookSpecificOutput envelope but its PowerShell peer does not request one",
+                posix.display()
+            );
+            checked += 1;
+        }
+        assert!(
+            checked >= 3,
+            "expected at least the claude-code, command-code and devin bundles to emit the envelope, found {checked}"
+        );
+    }
+
     #[test]
     fn bundled_posix_and_powershell_hooks_stay_in_parity() {
         let hooks_root = Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -12951,6 +12998,41 @@ model = "gpt-5"
         );
         assert!(plugin.contains("project = repoProject;"));
         assert!(plugin.contains("projectSource = \"repo-root\";"));
+    }
+
+    #[test]
+    fn opencode_plugin_marks_a_subagent_session_end() {
+        let plugin = build_opencode_plugin("http://127.0.0.1:49374", None, None, "denylist");
+        // Slice a single `event?.type === "..."` branch so an assertion cannot
+        // be satisfied by a marker that lives in a neighbouring branch.
+        let branch = |event: &str| {
+            let needle = format!("event?.type === \"{event}\"");
+            let start = plugin
+                .find(&needle)
+                .unwrap_or_else(|| panic!("{event} branch missing"));
+            let rest = &plugin[start..];
+            let end = rest[needle.len()..]
+                .find("event?.type ===")
+                .map(|offset| offset + needle.len())
+                .unwrap_or(rest.len());
+            &rest[..end]
+        };
+        // #755: the router refuses to hand the next session a sub-task baton
+        // only when a child session's `session-end` carries the marker, so the
+        // end event must forward parentID just like `session.created` does.
+        assert!(
+            branch("session.deleted").contains("agent_id: info.parentID"),
+            "session.deleted must forward the subagent marker"
+        );
+        assert!(
+            branch("session.deleted").contains("typeof info.parentID === \"string\""),
+            "a root session has no parentID and must stay unmarked"
+        );
+        // Controls: `session.created` already forwards the marker (so the
+        // branch slicer resolves real branches) and `session.idle` carries no
+        // marker (so the slicer is not silently returning the whole plugin).
+        assert!(branch("session.created").contains("agent_id: info.parentID"));
+        assert!(!branch("session.idle").contains("agent_id"));
     }
 
     #[test]

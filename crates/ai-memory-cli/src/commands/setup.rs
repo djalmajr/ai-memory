@@ -515,7 +515,7 @@ fn plan_service(
                 .to_owned(),
         );
     };
-    if !super::hook_spool::is_loopback_url(server_url) {
+    if !crate::http_client::is_loopback_url(server_url) {
         return ServicePlan::Skip(format!(
             "the configured server {server_url} is not on this machine; no local service"
         ));

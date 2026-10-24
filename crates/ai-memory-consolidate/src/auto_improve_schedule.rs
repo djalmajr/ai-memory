@@ -787,6 +787,7 @@ mod tests {
                 Err(LlmError::Provider {
                     status: 400,
                     body: "SENTINEL_PRIVATE_BODY".into(),
+                    retry_after: None,
                 })
             })
         }
@@ -806,6 +807,7 @@ mod tests {
                 Err(LlmError::Provider {
                     status: 400,
                     body: "SENTINEL_PRIVATE_BODY".into(),
+                    retry_after: None,
                 })
             })
         }
@@ -854,6 +856,7 @@ mod tests {
                 Err(LlmError::Provider {
                     status: 400,
                     body: "SENTINEL_PRIVATE_BODY".into(),
+                    retry_after: None,
                 })
             })
         }
@@ -1128,6 +1131,7 @@ mod tests {
         let provider_400 = anyhow::Error::new(AutoImproveError::Llm(LlmError::Provider {
             status: 400,
             body: "SENTINEL_PRIVATE_BODY".into(),
+            retry_after: None,
         }));
         assert_eq!(
             redacted_scheduler_error_summary(&provider_400),
@@ -1138,6 +1142,7 @@ mod tests {
         let bare = anyhow::Error::new(LlmError::Provider {
             status: 400,
             body: "SENTINEL_PRIVATE_BODY".into(),
+            retry_after: None,
         });
         assert_eq!(
             redacted_scheduler_error_summary(&bare),

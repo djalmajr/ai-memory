@@ -163,7 +163,11 @@ pub(crate) fn run_with_opencode_dialect(
     // different key already stored belongs to the hooks, the store failed, or
     // this is the Docker helper, whose data dir the host-side bridge cannot
     // open.
-    let bridge_carries_token = matches!(args.client, McpClient::Muse)
+    // FreeBuff belongs here for the same reason Muse does: its entry is always
+    // the session-less bridge (`build_json_mcp_entry` routes the client to
+    // `stdio_bridge_entry` unconditionally), and it already gets the
+    // `--data-dir` above, so the bridge reads the file the key goes into.
+    let bridge_carries_token = matches!(args.client, McpClient::Muse | McpClient::Freebuff)
         || (args.client == McpClient::ClaudeCode && args.session_aware);
     let may_store_bridge_key = args.apply
         && token_given
@@ -199,7 +203,7 @@ pub(crate) fn run_with_opencode_dialect(
     }
     let snippet = match args.client {
         McpClient::ClaudeCode => render_claude_code(&args, &resolve_config_file(&args)?)?,
-        McpClient::Codex => render_codex(&args),
+        McpClient::Codex => render_codex(&args)?,
         McpClient::Grok => render_grok(&args)?,
         McpClient::OpenCode => render_opencode(&args)?,
         McpClient::OpenCode2 => render_opencode2(&args)?,
@@ -1952,7 +1956,11 @@ fn build_mcp_entry(args: &InstallMcpArgs) -> Result<serde_json::Value> {
 
 fn build_mcp_entry_opencode(args: &InstallMcpArgs) -> Result<serde_json::Value> {
     let bearer = bearer_header_value(args.auth_token.as_deref());
-    let server_url = args.server_url.as_deref().unwrap_or(DEFAULT_MCP_URL);
+    let base_url = args.server_url.as_deref().unwrap_or(DEFAULT_MCP_URL);
+    // `--flavor` is a `tools/list` concern, so it rides on the URL OpenCode
+    // fetches schemas from — the same place `build_mcp_entry` puts it. The
+    // flag's own documentation names an OpenCode install routed to Vertex.
+    let server_url = flavored_url_for(args, base_url);
     let mut entry = serde_json::Map::new();
     entry.insert("type".into(), json!("remote"));
     entry.insert("url".into(), json!(server_url));
@@ -1987,7 +1995,8 @@ fn build_mcp_entry_cline(args: &InstallMcpArgs) -> Result<serde_json::Value> {
 /// (https://opencode.ai/v2/docs/mcp-servers).
 fn build_mcp_entry_opencode2(args: &InstallMcpArgs) -> Result<serde_json::Value> {
     let bearer = bearer_header_value(args.auth_token.as_deref());
-    let server_url = args.server_url.as_deref().unwrap_or(DEFAULT_MCP_URL);
+    let base_url = args.server_url.as_deref().unwrap_or(DEFAULT_MCP_URL);
+    let server_url = flavored_url_for(args, base_url);
     let mut entry = serde_json::Map::new();
     entry.insert("type".into(), json!("remote"));
     entry.insert("url".into(), json!(server_url));
@@ -2163,20 +2172,27 @@ fn codex_upsert_mcp_server(
     //   - v3 (this): `[mcp_servers.X.http_headers]` with
     //     `Authorization = "Bearer ..."`. Codex schema-validates
     //     and uses it as a static auth header.
+    // Read before the server table is replaced: per-tool approval
+    // overrides the user already chose survive a re-install.
+    let tools = codex_tool_approvals(
+        doc.get("mcp_servers")
+            .and_then(|servers| servers.get(&args.name))
+            .and_then(|server| server.get("tools")),
+    );
     let mut server = Table::new();
     server["url"] = value(args.server_url.as_deref().unwrap_or(DEFAULT_MCP_URL));
     // Auto-approve ai-memory's tool calls. Without this, Codex
     // prompts on EVERY tool invocation ("approve memory_query?"
     // "approve memory_briefing?" …) which makes the MCP unusable
-    // for an auto-capture workflow. The valid TOML values per
-    // Codex's `AppToolApproval` enum are "auto" / "prompt" /
-    // "approve" — `approve` means "no prompt, just run it". ai-
-    // memory's surface is dominantly read-only (query, recent,
-    // status, briefing, explore); the few writes (consolidate,
-    // forget_sweep) are tagged `destructiveHint: true` upstream
-    // so any agent that wants to gate THOSE specifically can
-    // override per-tool — see Codex's `[mcp_servers.X.tools]`
-    // map.
+    // for an auto-capture workflow. The valid values per Codex's
+    // config reference are "auto" / "prompt" / "writes" /
+    // "approve" — `approve` means "no prompt, just run it". The
+    // tools annotated destructive get a per-tool
+    // `[mcp_servers.X.tools.<tool>] approval_mode = "prompt"`
+    // override below (`codex_tool_approvals`).
+    // https://developers.openai.com/codex/config-reference
+    // (`mcp_servers.<id>.default_tools_approval_mode`,
+    // `mcp_servers.<id>.tools.<tool>.approval_mode`).
     server["default_tools_approval_mode"] = value("approve");
     if args.token_env_var {
         server["bearer_token_env_var"] = value(PRIME_AGENT_TOKEN_ENV);
@@ -2185,9 +2201,47 @@ fn codex_upsert_mcp_server(
         headers["Authorization"] = value(b);
         server["http_headers"] = Item::Table(headers);
     }
+    server.insert("tools", Item::Table(tools));
 
     upsert_toml_mcp_server(doc, &args.name, server);
     Ok(())
+}
+
+/// Codex `[mcp_servers.<name>.tools]`: the user's existing per-tool entries,
+/// copied as plain keys, plus `approval_mode = "prompt"` for every tool
+/// annotated destructive that has no approval mode yet. The server-wide
+/// default stays `approve`, so the read tools never prompt, while every tool
+/// annotated destructive asks first.
+fn codex_tool_approvals(existing: Option<&toml_edit::Item>) -> toml_edit::Table {
+    use toml_edit::{Item, Table, value};
+
+    let mut tools = Table::new();
+    tools.set_implicit(true);
+    if let Some(existing) = existing.and_then(Item::as_table_like) {
+        for (tool, entry) in existing.iter() {
+            let Some(entry) = entry.as_table_like() else {
+                continue;
+            };
+            let mut copy = Table::new();
+            for (key, item) in entry.iter() {
+                if let Some(value) = item.as_value() {
+                    copy.insert(key, Item::Value(value.clone()));
+                }
+            }
+            tools.insert(tool, Item::Table(copy));
+        }
+    }
+    for tool in ai_memory_mcp::AiMemoryServer::destructive_tool_names() {
+        if !tools.contains_key(&tool) {
+            tools.insert(&tool, Item::Table(Table::new()));
+        }
+        if let Some(entry) = tools.get_mut(&tool).and_then(Item::as_table_mut)
+            && !entry.contains_key("approval_mode")
+        {
+            entry.insert("approval_mode", value("prompt"));
+        }
+    }
+    tools
 }
 
 /// Insert / replace `[mcp_servers.<name>]` in a Grok `config.toml`.
@@ -2309,9 +2363,20 @@ fn render_claude_code(args: &InstallMcpArgs, config_path: &Path) -> Result<Strin
     ))
 }
 
-fn render_codex(args: &InstallMcpArgs) -> String {
-    // Codex uses TOML, not JSON. Hand-render the snippet so the
-    // table headers stay deterministic.
+fn render_codex(args: &InstallMcpArgs) -> Result<String> {
+    // Codex uses TOML, not JSON. Build the printed table with the very
+    // writer `--apply` uses (`codex_upsert_mcp_server`) so the snippet and
+    // the file can never disagree. Hand-interpolating `[mcp_servers.{name}]`
+    // made them disagree for any name TOML has to quote: `--name ai.memory`
+    // printed a header that reads as `mcp_servers` -> `ai` -> `memory`, and
+    // `--name "my memory"` printed an unparseable header that breaks the
+    // whole `config.toml` it is pasted into -- while `--apply` wrote
+    // `[mcp_servers."ai.memory"]` correctly all along. `render_grok` was
+    // moved onto its writer for exactly this reason; Codex is the other
+    // TOML client and was missed.
+    //
+    // The explanatory comments ride along as `toml_edit` decor, so the
+    // snippet for an ordinary name is byte-for-byte what it always was.
     //
     // Schema: Codex's MCP `streamable_http` transport accepts
     //   - `bearer_token_env_var = "NAME"` (env-var indirection)
@@ -2320,35 +2385,44 @@ fn render_codex(args: &InstallMcpArgs) -> String {
     // — NOT a literal `bearer_token = "..."` (that's stdio-only)
     // and NOT a `[mcp_servers.<name>.headers]` sub-table (the key
     // is `http_headers`, with the `http_` prefix).
-    let mut out = format!(
-        "# Codex CLI — append to $CODEX_HOME/config.toml (default ~/.codex/config.toml)\n\
-         #\n\
-         [mcp_servers.{name}]\n\
-         url = \"{url}\"\n\
-         # Skip per-call approval prompts on ai-memory's tools.\n\
-         # ai-memory is read-mostly + writes are auto-capture; the\n\
-         # approval friction makes it unusable otherwise.\n\
-         default_tools_approval_mode = \"approve\"\n",
-        name = args.name,
-        url = args.server_url.as_deref().unwrap_or(DEFAULT_MCP_URL),
+    let mut doc = toml_edit::DocumentMut::new();
+    codex_upsert_mcp_server(&mut doc, args)?;
+    let server = doc
+        .get_mut("mcp_servers")
+        .and_then(toml_edit::Item::as_table_mut)
+        .and_then(|servers| servers.get_mut(&args.name))
+        .and_then(toml_edit::Item::as_table_mut)
+        .context("internal: generated Codex TOML table missing")?;
+    if let Some(mut key) = server.key_mut("default_tools_approval_mode") {
+        key.leaf_decor_mut().set_prefix(
+            "# Skip per-call approval prompts on ai-memory's read tools;\n\
+             # the destructive ones below still ask first.\n",
+        );
+    }
+    if let Some(headers) = server
+        .get_mut("http_headers")
+        .and_then(toml_edit::Item::as_table_mut)
+    {
+        headers.decor_mut().set_prefix("\n");
+    }
+    let mut out = String::from(
+        "# Codex CLI — append to $CODEX_HOME/config.toml (default ~/.codex/config.toml)\n#\n",
     );
+    out.push_str(&doc.to_string());
+    // Trailing prose: `toml_edit` 0.22 has no document-trailer setter, and a
+    // comment after the last key carries no TOML structure either way.
     if args.token_env_var {
         out.push_str(&format!(
-            "bearer_token_env_var = \"{PRIME_AGENT_TOKEN_ENV}\"\n\
-             # The token is read from ${PRIME_AGENT_TOKEN_ENV}; export it where you launch codex.\n"
+            "# The token is read from ${PRIME_AGENT_TOKEN_ENV}; export it where you launch codex.\n"
         ));
-    } else if let Some(b) = bearer_header_value(args.auth_token.as_deref()) {
-        out.push_str(&format!(
-            "\n[mcp_servers.{name}.http_headers]\n\
-             Authorization = \"{b}\"\n\
-             # Alternative (avoids embedding the literal token):\n\
+    } else if bearer_header_value(args.auth_token.as_deref()).is_some() {
+        out.push_str(
+            "# Alternative (avoids embedding the literal token):\n\
              # bearer_token_env_var = \"AI_MEMORY_AUTH_TOKEN\"\n\
              # — and export AI_MEMORY_AUTH_TOKEN in your shell init.\n",
-            name = args.name,
-            b = b,
-        ));
+        );
     }
-    out
+    Ok(out)
 }
 
 fn render_grok(args: &InstallMcpArgs) -> Result<String> {
@@ -4102,7 +4176,7 @@ mod tests {
     /// rendered inside the Docker image, whose paths mean nothing on the host.
     #[test]
     fn codex_render_names_codex_home() {
-        let out = render_codex(&args_for(McpClient::Codex));
+        let out = render_codex(&args_for(McpClient::Codex)).unwrap();
         assert!(
             out.contains("$CODEX_HOME/config.toml"),
             "render must point a relocated Codex at its config home:\n{out}"
@@ -4509,7 +4583,7 @@ mod tests {
             McpClient::ClaudeCode => {
                 render_claude_code(&args, Path::new("/home/alice/.claude.json")).unwrap()
             }
-            McpClient::Codex => render_codex(&args),
+            McpClient::Codex => render_codex(&args).unwrap(),
             McpClient::Grok => render_grok(&args).unwrap(),
             McpClient::OpenCode => render_opencode(&args).unwrap(),
             McpClient::OpenCode2 => render_opencode2(&args).unwrap(),
@@ -4643,7 +4717,7 @@ mod tests {
             McpClient::ClaudeCode => {
                 render_claude_code(&args, Path::new("/home/alice/.claude.json")).unwrap()
             }
-            McpClient::Codex => render_codex(&args),
+            McpClient::Codex => render_codex(&args).unwrap(),
             McpClient::Grok => render_grok(&args).unwrap(),
             McpClient::OpenCode => render_opencode(&args).unwrap(),
             McpClient::OpenCode2 => render_opencode2(&args).unwrap(),
@@ -5422,6 +5496,50 @@ mod tests {
         );
     }
 
+    /// OpenCode is the other client `--flavor`'s documentation names, and it
+    /// has its own entry builders. They read `server_url` directly, so the
+    /// flag was silently dropped and Vertex 400'd every `tools/list`.
+    #[test]
+    fn an_explicit_flavor_reaches_the_opencode_entry_builders() {
+        for client in [McpClient::OpenCode, McpClient::OpenCode2] {
+            let mut args = args_for(client);
+            args.server_url = Some("https://memory.example/mcp".into());
+            args.flavor = Some(SchemaFlavor::Gemini);
+
+            let entry = match client {
+                McpClient::OpenCode => build_mcp_entry_opencode(&args).unwrap(),
+                _ => build_mcp_entry_opencode2(&args).unwrap(),
+            };
+
+            assert_eq!(
+                entry["url"].as_str().unwrap(),
+                "https://memory.example/mcp?flavor=gemini",
+                "{client:?}"
+            );
+        }
+    }
+
+    /// Control: OpenCode has no built-in dialect, so an install that did not
+    /// ask for one must still get the bare endpoint.
+    #[test]
+    fn opencode_stays_unflavored_without_the_flag() {
+        for client in [McpClient::OpenCode, McpClient::OpenCode2] {
+            let mut args = args_for(client);
+            args.server_url = Some("https://memory.example/mcp".into());
+
+            let entry = match client {
+                McpClient::OpenCode => build_mcp_entry_opencode(&args).unwrap(),
+                _ => build_mcp_entry_opencode2(&args).unwrap(),
+            };
+
+            assert_eq!(
+                entry["url"].as_str().unwrap(),
+                "https://memory.example/mcp",
+                "{client:?}"
+            );
+        }
+    }
+
     #[test]
     fn a_client_without_a_fixed_upstream_stays_unflavored_by_default() {
         let mut args = args_for(McpClient::CommandCode);
@@ -5876,6 +5994,77 @@ mod tests {
         );
     }
 
+    /// Codex keeps auto-approving the read tools, but every tool annotated
+    /// destructive gets a per-tool prompt.
+    #[test]
+    fn codex_apply_prompts_for_every_destructive_tool() {
+        let destructive = ai_memory_mcp::AiMemoryServer::destructive_tool_names();
+        assert!(
+            destructive.iter().any(|tool| tool == "memory_delete_page"),
+            "{destructive:?}"
+        );
+        let mut doc: toml_edit::DocumentMut = "".parse().unwrap();
+        codex_upsert_mcp_server(&mut doc, &args_for(McpClient::Codex)).unwrap();
+        let out = doc.to_string();
+        assert!(
+            out.contains("default_tools_approval_mode = \"approve\""),
+            "{out}"
+        );
+        let server = &doc["mcp_servers"]["ai-memory"];
+        for tool in &destructive {
+            assert_eq!(
+                server["tools"][tool.as_str()]["approval_mode"].as_str(),
+                Some("prompt"),
+                "{tool} must prompt:\n{out}"
+            );
+        }
+        for read_tool in ["memory_query", "memory_recent", "memory_briefing"] {
+            assert!(
+                server["tools"].get(read_tool).is_none(),
+                "{read_tool} keeps the approve default:\n{out}"
+            );
+        }
+
+        let rendered = render_codex(&args_for(McpClient::Codex)).unwrap();
+        for tool in &destructive {
+            assert!(
+                rendered.contains(&format!(
+                    "[mcp_servers.ai-memory.tools.{tool}]\napproval_mode = \"prompt\""
+                )),
+                "{tool} missing from the printed snippet:\n{rendered}"
+            );
+        }
+        rendered.parse::<toml_edit::DocumentMut>().unwrap();
+    }
+
+    /// A re-install keeps the per-tool choices the user already made.
+    #[test]
+    fn codex_apply_keeps_existing_per_tool_overrides() {
+        let original = "[mcp_servers.ai-memory]\n\
+                        url = \"http://old\"\n\
+                        \n\
+                        [mcp_servers.ai-memory.tools.memory_delete_page]\n\
+                        approval_mode = \"approve\"\n\
+                        \n\
+                        [mcp_servers.ai-memory.tools.memory_query]\n\
+                        approval_mode = \"prompt\"\n";
+        let mut doc: toml_edit::DocumentMut = original.parse().unwrap();
+        codex_upsert_mcp_server(&mut doc, &args_for(McpClient::Codex)).unwrap();
+        let tools = &doc["mcp_servers"]["ai-memory"]["tools"];
+        assert_eq!(
+            tools["memory_delete_page"]["approval_mode"].as_str(),
+            Some("approve")
+        );
+        assert_eq!(
+            tools["memory_query"]["approval_mode"].as_str(),
+            Some("prompt")
+        );
+        assert_eq!(
+            tools["memory_forget_sweep"]["approval_mode"].as_str(),
+            Some("prompt")
+        );
+    }
+
     /// Sibling `[mcp_servers.<other>]` entries the user has configured
     /// (e.g. a different MCP server) must survive an --apply.
     #[test]
@@ -6117,6 +6306,200 @@ mod tests {
         assert_eq!(
             swival_project_root(&plain),
             fs::canonicalize(&plain).unwrap()
+        );
+    }
+
+    #[test]
+    fn codex_print_uses_apply_toml_builder_for_dotted_names_and_quotes() {
+        let mut args = args_with_token(McpClient::Codex);
+        args.name = "ai.memory".into();
+        args.server_url = Some("https://memory.example/mcp?note=\"quoted\"".into());
+
+        let printed = render_codex(&args).unwrap();
+        let mut applied = toml_edit::DocumentMut::new();
+        codex_upsert_mcp_server(&mut applied, &args).unwrap();
+
+        // The print path and the --apply path must agree on the table name.
+        let parsed: toml_edit::DocumentMut = printed
+            .lines()
+            .filter(|line| !line.starts_with('#'))
+            .collect::<Vec<_>>()
+            .join("\n")
+            .parse()
+            .unwrap_or_else(|error| {
+                panic!("printed snippet is not valid TOML: {error}\n{printed}")
+            });
+        let servers = parsed.get("mcp_servers").unwrap().as_table().unwrap();
+        assert_eq!(servers.len(), 1, "print output:\n{printed}");
+        assert!(
+            servers.get("ai.memory").is_some(),
+            "print output:\n{printed}"
+        );
+        assert_eq!(
+            servers
+                .get("ai.memory")
+                .and_then(|server| server.get("url"))
+                .and_then(|url| url.as_str()),
+            Some("https://memory.example/mcp?note=\"quoted\""),
+            "print output:\n{printed}"
+        );
+        assert!(
+            printed.contains(&format!("[mcp_servers.{:?}]", "ai.memory")),
+            "print output:\n{printed}"
+        );
+        assert!(
+            applied
+                .to_string()
+                .contains(&format!("[mcp_servers.{:?}]", "ai.memory")),
+            "applied output:\n{applied}"
+        );
+    }
+
+    #[test]
+    fn codex_print_quotes_a_table_name_containing_a_space() {
+        let mut args = args_for(McpClient::Codex);
+        args.name = "my memory".into();
+
+        let printed = render_codex(&args).unwrap();
+        let parsed: toml_edit::DocumentMut = printed
+            .lines()
+            .filter(|line| !line.starts_with('#'))
+            .collect::<Vec<_>>()
+            .join("\n")
+            .parse()
+            .unwrap_or_else(|error| {
+                panic!("printed snippet is not valid TOML: {error}\n{printed}")
+            });
+        let servers = parsed.get("mcp_servers").unwrap().as_table().unwrap();
+        assert_eq!(servers.len(), 1, "print output:\n{printed}");
+        assert!(
+            servers.get("my memory").is_some(),
+            "print output:\n{printed}"
+        );
+    }
+
+    #[test]
+    fn codex_print_is_byte_identical_for_an_ordinary_name() {
+        let mut plain = args_for(McpClient::Codex);
+        plain.server_url = Some("http://127.0.0.1:49374/mcp".into());
+        assert_eq!(
+            render_codex(&plain).unwrap(),
+            "# Codex CLI — append to $CODEX_HOME/config.toml (default ~/.codex/config.toml)\n\
+             #\n\
+             [mcp_servers.ai-memory]\n\
+             url = \"http://127.0.0.1:49374/mcp\"\n\
+             # Skip per-call approval prompts on ai-memory's read tools;\n\
+             # the destructive ones below still ask first.\n\
+             default_tools_approval_mode = \"approve\"\n\
+             \n\
+             [mcp_servers.ai-memory.tools.memory_delete_page]\n\
+             approval_mode = \"prompt\"\n\
+             \n\
+             [mcp_servers.ai-memory.tools.memory_feedback]\n\
+             approval_mode = \"prompt\"\n\
+             \n\
+             [mcp_servers.ai-memory.tools.memory_forget_sweep]\n\
+             approval_mode = \"prompt\"\n\
+             \n\
+             [mcp_servers.ai-memory.tools.memory_handoff_accept]\n\
+             approval_mode = \"prompt\"\n\
+             \n\
+             [mcp_servers.ai-memory.tools.memory_handoff_cancel]\n\
+             approval_mode = \"prompt\"\n\
+             \n\
+             [mcp_servers.ai-memory.tools.memory_message_cancel]\n\
+             approval_mode = \"prompt\"\n\
+             \n\
+             [mcp_servers.ai-memory.tools.memory_message_pop]\n\
+             approval_mode = \"prompt\"\n\
+             \n\
+             [mcp_servers.ai-memory.tools.memory_restore_page]\n\
+             approval_mode = \"prompt\"\n"
+        );
+
+        let mut with_token = args_with_token(McpClient::Codex);
+        with_token.server_url = Some("http://127.0.0.1:49374/mcp".into());
+        assert_eq!(
+            render_codex(&with_token).unwrap(),
+            "# Codex CLI — append to $CODEX_HOME/config.toml (default ~/.codex/config.toml)\n\
+             #\n\
+             [mcp_servers.ai-memory]\n\
+             url = \"http://127.0.0.1:49374/mcp\"\n\
+             # Skip per-call approval prompts on ai-memory's read tools;\n\
+             # the destructive ones below still ask first.\n\
+             default_tools_approval_mode = \"approve\"\n\
+             \n\
+             [mcp_servers.ai-memory.http_headers]\n\
+             Authorization = \"Bearer test-token-deadbeef\"\n\
+             \n\
+             [mcp_servers.ai-memory.tools.memory_delete_page]\n\
+             approval_mode = \"prompt\"\n\
+             \n\
+             [mcp_servers.ai-memory.tools.memory_feedback]\n\
+             approval_mode = \"prompt\"\n\
+             \n\
+             [mcp_servers.ai-memory.tools.memory_forget_sweep]\n\
+             approval_mode = \"prompt\"\n\
+             \n\
+             [mcp_servers.ai-memory.tools.memory_handoff_accept]\n\
+             approval_mode = \"prompt\"\n\
+             \n\
+             [mcp_servers.ai-memory.tools.memory_handoff_cancel]\n\
+             approval_mode = \"prompt\"\n\
+             \n\
+             [mcp_servers.ai-memory.tools.memory_message_cancel]\n\
+             approval_mode = \"prompt\"\n\
+             \n\
+             [mcp_servers.ai-memory.tools.memory_message_pop]\n\
+             approval_mode = \"prompt\"\n\
+             \n\
+             [mcp_servers.ai-memory.tools.memory_restore_page]\n\
+             approval_mode = \"prompt\"\n\
+             # Alternative (avoids embedding the literal token):\n\
+             # bearer_token_env_var = \"AI_MEMORY_AUTH_TOKEN\"\n\
+             # — and export AI_MEMORY_AUTH_TOKEN in your shell init.\n"
+        );
+
+        let mut env_var = args_for(McpClient::Codex);
+        env_var.server_url = Some("http://127.0.0.1:49374/mcp".into());
+        env_var.token_env_var = true;
+        assert_eq!(
+            render_codex(&env_var).unwrap(),
+            format!(
+                "# Codex CLI — append to $CODEX_HOME/config.toml (default ~/.codex/config.toml)\n\
+                 #\n\
+                 [mcp_servers.ai-memory]\n\
+                 url = \"http://127.0.0.1:49374/mcp\"\n\
+                 # Skip per-call approval prompts on ai-memory's read tools;\n\
+                 # the destructive ones below still ask first.\n\
+                 default_tools_approval_mode = \"approve\"\n\
+                 bearer_token_env_var = \"{PRIME_AGENT_TOKEN_ENV}\"\n\
+                 \n\
+                 [mcp_servers.ai-memory.tools.memory_delete_page]\n\
+                 approval_mode = \"prompt\"\n\
+                 \n\
+                 [mcp_servers.ai-memory.tools.memory_feedback]\n\
+                 approval_mode = \"prompt\"\n\
+                 \n\
+                 [mcp_servers.ai-memory.tools.memory_forget_sweep]\n\
+                 approval_mode = \"prompt\"\n\
+                 \n\
+                 [mcp_servers.ai-memory.tools.memory_handoff_accept]\n\
+                 approval_mode = \"prompt\"\n\
+                 \n\
+                 [mcp_servers.ai-memory.tools.memory_handoff_cancel]\n\
+                 approval_mode = \"prompt\"\n\
+                 \n\
+                 [mcp_servers.ai-memory.tools.memory_message_cancel]\n\
+                 approval_mode = \"prompt\"\n\
+                 \n\
+                 [mcp_servers.ai-memory.tools.memory_message_pop]\n\
+                 approval_mode = \"prompt\"\n\
+                 \n\
+                 [mcp_servers.ai-memory.tools.memory_restore_page]\n\
+                 approval_mode = \"prompt\"\n\
+                 # The token is read from ${PRIME_AGENT_TOKEN_ENV}; export it where you launch codex.\n"
+            )
         );
     }
 

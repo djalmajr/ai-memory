@@ -318,7 +318,7 @@ fn bridge_bearer(config: &Config, server_url: &str) -> Result<Option<String>> {
         }
     }
 
-    if crate::commands::hook_spool::is_loopback_url(server_url) {
+    if crate::http_client::is_loopback_url(server_url) {
         return Ok(config
             .auth
             .bearer_token
@@ -781,11 +781,15 @@ mod tests {
             discovered: true,
         });
 
-        // Adversarial: a remote --server-url never receives the root key.
-        assert_eq!(
-            bridge_bearer(&config, "https://remote.example/mcp").unwrap(),
-            None
-        );
+        // Adversarial: a remote --server-url never receives the root key,
+        // including one whose user information spells a loopback address.
+        for remote in [
+            "https://remote.example/mcp",
+            "http://localhost:80@remote.example/mcp",
+            "http://127.0.0.1:49374@remote.example/mcp",
+        ] {
+            assert_eq!(bridge_bearer(&config, remote).unwrap(), None, "{remote}");
+        }
         // Control: a loopback server the config does not name (a packaged
         // install whose config lives outside the data dir) still gets it.
         assert_eq!(

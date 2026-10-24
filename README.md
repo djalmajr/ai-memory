@@ -403,7 +403,9 @@ ai-memory install-hooks --agent  claude-code --apply
 ```
 
 On Linux and macOS, the Docker wrapper runs `install-hooks` through its
-checksum-verified native host client. The installed hooks therefore enforce
+checksum-verified native host client. Global options may precede the command,
+for example `ai-memory --config /path/to/config.toml run codex`; the native
+client receives the complete argument list. The installed hooks therefore enforce
 client-side capture controls such as `[capture] ignore_paths` and allowlist
 mode before an event reaches the spool or network. Set
 `AI_MEMORY_HOOK_PLATFORM=posix` explicitly only when you need the legacy shell

@@ -633,7 +633,9 @@ contract.
   empty store) so it isn't starting from nothing. It runs automatically in the
   background; you can trigger or preview it yourself with `ai-memory backfill`
   (`--dry-run` to see what it would import), or turn it off with
-  `AI_MEMORY_BACKFILL_ON_START=false`.
+  `AI_MEMORY_BACKFILL_ON_START=false`. A single transcript record over 1 MiB
+  (usually a screenshot in a tool result) is skipped and counted on stderr;
+  the rest of that session is still imported.
 - **A search misses something you saved**: confirm the scope. Memory is
   per-project; a page saved in project A is not returned in project B unless it
   was written to the global scope or you query with an explicit scope.

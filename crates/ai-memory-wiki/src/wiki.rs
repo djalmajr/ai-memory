@@ -974,7 +974,24 @@ impl Wiki {
                 path.as_str()
             )))
         })?;
-        let md = parse(&raw)?;
+        let mut md = parse(&raw)?;
+        // Conform like the three sibling write paths (`write_page_inner`,
+        // `apply_batch`, `approve_auto_improve_proposal`) do: the row this
+        // upserts is conformed at the store's write choke point either way,
+        // so writing the historical bytes verbatim left the file behind the
+        // row. Restoring the pre-OKF checkpoint every migrated install
+        // carries then failed `export-okf` for the whole project with "run
+        // the server once to migrate" — which the one-shot wiki migration
+        // never does again — and made each `serve` boot re-archive the data
+        // dir once the migration archive was deleted. Conformance is
+        // idempotent modulo `generated.at`, which it inherits from the file
+        // on disk, so an already-conformant page still restores byte-exact.
+        conform_frontmatter_for_disk(
+            &self.abs_path(workspace_id, project_id, &path),
+            path.as_str(),
+            &mut md,
+        );
+        let raw = emit(&md)?;
         let title = derive_title(&md.frontmatter, &md.body, &path);
         let links = crate::markdown::extract_all_links(&md.frontmatter, &md.body, &path);
         let meta = derive_index_metadata(&path, &md.frontmatter)?;

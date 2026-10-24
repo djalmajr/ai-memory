@@ -120,12 +120,14 @@ Copilot token exchange and the `openai-oauth`/OIDC refresh. A 429 or 5xx from
 those token endpoints is transient, because the grant was not rejected; any
 other non-2xx stays an auth failure with its re-login hint.
 
-Before a candidate is called, the wrapper checks an in-memory circuit keyed by
-`(provider, model)`. A transient error opens that candidate's circuit for a
-bounded cooldown; other candidates remain eligible. A successful response
-closes that candidate's circuit. Restarting the server clears circuits. The
-initial implementation uses no durable circuit state and no separate forced
-request deadline.
+Before a candidate is called, the wrapper checks that chain entry's in-memory
+circuit. Two entries with the same provider and model but different credentials
+therefore rotate independently. A transient error opens only that entry's
+circuit. The default cooldown is 30 seconds; a delta-seconds `Retry-After`
+header or Google `RetryInfo.retryDelay` response detail extends it, clamped to
+one hour. Other candidates remain eligible. A successful response closes that
+candidate's circuit. Restarting the server clears circuits. The implementation
+uses no durable circuit state and no separate forced request deadline.
 
 If every eligible candidate fails, the wrapper returns a bounded aggregate
 error containing provider/model labels and error classes, never response bodies

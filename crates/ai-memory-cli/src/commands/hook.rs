@@ -1133,6 +1133,10 @@ where
         // pre_llm_call to the upcoming turn.
         || (hook_event == HookEvent::UserPrompt
             && agent_kind.json_context_user_prompt_injects_handoff())
+        // Claude Code, Codex and Qwen Code answer a "reload context" prompt
+        // with the compaction recap in a `UserPromptSubmit` context envelope;
+        // that path is context delivery too.
+        || (hook_event == HookEvent::UserPrompt && agent_kind.user_prompt_injects_context())
         // Grok delivers the handoff on the first PostToolUse (its SessionStart /
         // UserPromptSubmit stdout is discarded); that path is context delivery
         // too, so external capture must not suppress it.

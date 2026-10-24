@@ -437,8 +437,9 @@ but it does not guarantee that content is unrecoverable. See
 ```bash
 ssh "$SERVER" "cd $DEPLOY_DIR && \
                docker tag $IMAGE $IMAGE-rollback && \
-               docker pull $IMAGE@sha256:<old-digest>"
-ssh "$SERVER" "cd $DEPLOY_DIR && docker compose up -d"
+               docker pull $IMAGE@sha256:<old-digest> && \
+               docker tag $IMAGE@sha256:<old-digest> $IMAGE && \
+               docker compose up -d --pull never --force-recreate ai-memory"
 ```
 
 The simplest rollback is to bring back an older image by digest. We

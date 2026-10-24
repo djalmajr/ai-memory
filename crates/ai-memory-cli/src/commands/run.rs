@@ -3501,10 +3501,24 @@ fn ensure_executable_available(
         return Ok(());
     }
     Err(anyhow!(
-        "managed {} executable `{}` was not found in the host PATH; install it or pass `--executable`. Docker users should run `ai-memory upgrade` to refresh the host wrapper",
+        "managed {} executable `{}` was not found in the host PATH; install it or pass `--executable`. {}",
         harness.as_str(),
-        program.to_string_lossy()
+        program.to_string_lossy(),
+        docker_host_client_hint(),
     ))
+}
+
+/// The Docker-wrapper advice appended to a missing-harness error, split by OS
+/// because the two wrappers upgrade differently (#1545): the POSIX wrapper's
+/// `upgrade` re-downloads its checksum-verified native host client, while the
+/// PowerShell wrapper's `upgrade` only pulls the image, so a Windows Docker
+/// user needs the native client's installer instead.
+fn docker_host_client_hint() -> &'static str {
+    if cfg!(windows) {
+        "Docker Desktop users: managed launches run through the native Windows client, not the container; install it with `irm https://github.com/akitaonrails/ai-memory/releases/latest/download/install.ps1 | iex` (docs/windows.md)"
+    } else {
+        "Docker users should run `ai-memory upgrade` to refresh the host wrapper"
+    }
 }
 
 /// Whether this harness's default executable resolves through `PATH`.
@@ -4595,6 +4609,7 @@ pub(crate) fn harness_from_journal_name(name: &str) -> Option<ManagedHarness> {
         "kiro-v3" => Some(ManagedHarness::KiroV3),
         "grok" => Some(ManagedHarness::Grok),
         "antigravity" => Some(ManagedHarness::Antigravity),
+        "copilot" => Some(ManagedHarness::Copilot),
         _ => None,
     }
 }
@@ -4620,6 +4635,65 @@ mod tests {
 
     fn plan(warn: bool, mode: JailMode) -> JailPlan {
         JailPlan { warn, mode }
+    }
+
+    /// Every harness a journal entry can name.
+    const EVERY_MANAGED_HARNESS: &[ManagedHarness] = &[
+        ManagedHarness::Claude,
+        ManagedHarness::Codex,
+        ManagedHarness::OpenCode,
+        ManagedHarness::OpenCode2,
+        ManagedHarness::Pi,
+        ManagedHarness::Crush,
+        ManagedHarness::Omp,
+        ManagedHarness::Kimi,
+        ManagedHarness::CommandCode,
+        ManagedHarness::Kiro,
+        ManagedHarness::KiroV3,
+        ManagedHarness::Grok,
+        ManagedHarness::Antigravity,
+        ManagedHarness::Copilot,
+    ];
+
+    /// The exact spelling `append_journal_entry` records for each harness,
+    /// pinned here so a rename cannot silently orphan existing journals. This
+    /// match is also the compile-time lever: a new `ManagedHarness` variant
+    /// fails to build until it is given a journal name and listed in
+    /// `EVERY_MANAGED_HARNESS` above, which drags it into the round trip.
+    const fn journal_name(harness: ManagedHarness) -> &'static str {
+        match harness {
+            ManagedHarness::Claude => "claude",
+            ManagedHarness::Codex => "codex",
+            ManagedHarness::OpenCode => "opencode",
+            ManagedHarness::OpenCode2 => "opencode2",
+            ManagedHarness::Pi => "pi",
+            ManagedHarness::Crush => "crush",
+            ManagedHarness::Omp => "omp",
+            ManagedHarness::Kimi => "kimi",
+            ManagedHarness::CommandCode => "command-code",
+            ManagedHarness::Kiro => "kiro",
+            ManagedHarness::KiroV3 => "kiro-v3",
+            ManagedHarness::Grok => "grok",
+            ManagedHarness::Antigravity => "antigravity",
+            ManagedHarness::Copilot => "copilot",
+        }
+    }
+
+    #[test]
+    fn the_journal_round_trips_every_managed_harness_name() {
+        for &harness in EVERY_MANAGED_HARNESS {
+            let name = journal_name(harness);
+            assert_eq!(
+                harness.as_str(),
+                name,
+                "{harness:?} no longer writes {name:?} into the recovery journal"
+            );
+            assert_eq!(
+                harness_from_journal_name(name),
+                Some(harness),
+                "the recovery journal writes {name:?} for {harness:?} but cannot parse it back"
+            );
+        }
     }
 
     #[test]

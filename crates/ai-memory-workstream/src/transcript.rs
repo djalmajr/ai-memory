@@ -39,6 +39,15 @@ const LEGACY_MANAGED_WORKSTREAM_PACKET_PREFIX: &str = "> **ai-memory managed wor
 /// Event metadata key holding the working directory the event's own record
 /// was written in, when the harness records one per record.
 pub const RECORD_CWD_KEY: &str = "cwd";
+/// Prefix of the loss recorded for each JSONL record skipped for exceeding
+/// the per-record byte cap, so importers can count and report them.
+pub const OVERSIZED_RECORD_LOSS: &str = "oversized JSONL record skipped";
+/// Metadata flag on the annotation event that stands in for a skipped
+/// record, so the import's capture policy can tell its turn has a gap.
+pub const SKIPPED_RECORD_KEY: &str = "skipped_record";
+/// Part of the marker's event id seed: rewording it gives a replayed journal's
+/// markers new ids, so keep it stable.
+const SKIPPED_RECORD_NOTE: &str = "a transcript record over the per-record size cap was skipped";
 
 /// Checkout-local native session that can seed an otherwise-empty workstream.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -548,21 +557,47 @@ fn transcript_baseline_blocking(
                         "native transcript baseline exceeds the {MAX_SOURCE_RECORDS} source-record limit"
                     ));
                 }
+                let mut record_bytes = read as u64;
+                let mut complete = line.ends_with(b"\n");
+                // An oversized record is consumed exactly as `export_jsonl_range`
+                // skips it, so this cursor lands where an export would resume.
+                // Only harnesses that rewrite in place carry the prefix hash,
+                // so the others skip hashing a record that can reach 64 MiB.
+                let mut oversized_hasher = None;
                 if read > MAX_SOURCE_RECORD_BYTES {
-                    return Err(anyhow!(
-                        "native transcript baseline record exceeds the {MAX_SOURCE_RECORD_BYTES} byte limit"
-                    ));
+                    let rewrites = journal_rewrites_in_place(harness);
+                    let mut record_hasher = prefix_hasher.clone();
+                    let mut feed = |chunk: &[u8]| {
+                        if rewrites {
+                            record_hasher.update(chunk);
+                        }
+                    };
+                    feed(&line);
+                    if !complete {
+                        let budget = (MAX_SOURCE_BYTES as u64)
+                            .saturating_sub(offset.saturating_add(record_bytes));
+                        let (tail, newline) = discard_through_newline(
+                            &mut std::io::Read::by_ref(&mut reader).take(budget + 1),
+                            &mut feed,
+                        )?;
+                        record_bytes += tail;
+                        complete = newline;
+                    }
+                    oversized_hasher = Some(record_hasher);
                 }
-                offset = offset.saturating_add(read as u64);
+                offset = offset.saturating_add(record_bytes);
                 if offset > MAX_SOURCE_BYTES as u64 {
                     return Err(anyhow!(
                         "native transcript baseline exceeds the {MAX_SOURCE_BYTES} source-byte limit"
                     ));
                 }
-                if !line.ends_with(b"\n") {
+                if !complete {
                     break;
                 }
-                prefix_hasher.update(&line);
+                match oversized_hasher {
+                    Some(record_hasher) => prefix_hasher = record_hasher,
+                    None => prefix_hasher.update(&line),
+                }
                 committed_offset = offset;
             }
             Ok(serde_json::to_string(&FileCursor {
@@ -1162,9 +1197,81 @@ fn export_jsonl_range(
             ));
         }
         if read > MAX_SOURCE_RECORD_BYTES {
-            return Err(anyhow!(
-                "native transcript record exceeds the {MAX_SOURCE_RECORD_BYTES} byte limit"
+            // One record over the cap (an image in a Claude Code tool result
+            // is the usual one) is skipped as a loss rather than failing the
+            // whole session. Its tail is discarded in bounded chunks and still
+            // counts toward the source-byte cap, and only a complete record
+            // moves the cursor: one still being written is read again, from
+            // its start, by the next export.
+            let record_start = offset;
+            let rewrites = journal_rewrites_in_place(harness);
+            let mut record_hasher = prefix_hasher.clone();
+            let mut raw_hasher = Sha256::new();
+            let mut feed = |chunk: &[u8]| {
+                if rewrites {
+                    record_hasher.update(chunk);
+                    raw_hasher.update(chunk.strip_suffix(b"\n").unwrap_or(chunk));
+                }
+            };
+            feed(&line);
+            let (tail, complete) = if line.ends_with(b"\n") {
+                (0, true)
+            } else {
+                let budget = MAX_SOURCE_BYTES.saturating_sub(source_bytes.saturating_add(read));
+                let limit = (remaining - read as u64).min(budget as u64 + 1);
+                discard_through_newline(
+                    &mut std::io::Read::by_ref(&mut reader).take(limit),
+                    &mut feed,
+                )?
+            };
+            let record_bytes = read as u64 + tail;
+            enforce_parse_bounds(
+                &events,
+                &mut checked_events,
+                &mut event_bytes,
+                &mut source_bytes,
+                usize::try_from(record_bytes).unwrap_or(usize::MAX),
+            )?;
+            offset += record_bytes;
+            if !complete {
+                break;
+            }
+            // The same record id rule as a parsed record, so the marker keeps
+            // its event id across a journal rewrite.
+            let record_id = if rewrites {
+                prefix_hasher = record_hasher;
+                format!("{:x}", raw_hasher.finalize())
+            } else {
+                format!("byte-{record_start}")
+            };
+            committed_offset = offset;
+            losses.push(format!(
+                "{OVERSIZED_RECORD_LOSS} at byte {record_start} ({record_bytes} bytes, over the {MAX_SOURCE_RECORD_BYTES} byte cap)"
             ));
+            // The skipped record may have been a tool call. Its result can
+            // carry no id (Kimi, Grok), and the capture policy judges such a
+            // result by the calls of its turn, so the gap is marked for it to
+            // fail closed on instead of lending the result a sibling's keep.
+            push_event(
+                &mut events,
+                harness.agent_kind(),
+                native_session_id,
+                &record_id,
+                0,
+                WorkstreamEventKind::Annotation,
+                None,
+                SKIPPED_RECORD_NOTE,
+                None,
+                json!({ SKIPPED_RECORD_KEY: true, "bytes": record_bytes }),
+            );
+            enforce_parse_bounds(
+                &events,
+                &mut checked_events,
+                &mut event_bytes,
+                &mut source_bytes,
+                0,
+            )?;
+            continue;
         }
         enforce_parse_bounds(
             &events,
@@ -1358,6 +1465,33 @@ fn hash_file_prefix(file: &mut File, len: u64) -> Result<Option<Sha256>> {
         remaining -= read as u64;
     }
     Ok(Some(hasher))
+}
+
+/// Consume the rest of an oversized record through its newline, holding at
+/// most 64 KiB of it at a time and handing every chunk to `feed`; only the
+/// last chunk can end with the newline. Returns the bytes consumed and
+/// whether the newline was reached before `reader` ran out.
+fn discard_through_newline(
+    reader: &mut impl BufRead,
+    feed: &mut impl FnMut(&[u8]),
+) -> std::io::Result<(u64, bool)> {
+    const CHUNK: u64 = 64 * 1024;
+    let mut chunk = Vec::new();
+    let mut consumed = 0_u64;
+    loop {
+        chunk.clear();
+        let read = std::io::Read::by_ref(reader)
+            .take(CHUNK)
+            .read_until(b'\n', &mut chunk)?;
+        if read == 0 {
+            return Ok((consumed, false));
+        }
+        feed(&chunk);
+        consumed += read as u64;
+        if chunk.ends_with(b"\n") {
+            return Ok((consumed, true));
+        }
+    }
 }
 
 fn parse_claude(
@@ -3682,6 +3816,45 @@ fn read_bounded_file(path: &Path, limit: u64) -> std::io::Result<Vec<u8>> {
     Ok(bytes)
 }
 
+/// One line read under a byte cap.
+enum CappedLine {
+    /// The reader was already at end of file.
+    Eof,
+    /// The line fits the cap and is valid UTF-8.
+    Line(String),
+    /// The line is longer than the cap, so the caller skips the record.
+    Oversized,
+}
+
+/// Read one newline-terminated line, buffering at most `cap + 1` bytes so an
+/// oversized record can be recognised without reading it.
+///
+/// `BufRead::read_line` validates UTF-8 over exactly the bytes it read, so a
+/// `Take` boundary landing inside a multi-byte character makes it fail with
+/// `InvalidData` before the caller can compare the byte count against its cap
+/// — which turns a record meant to be skipped into an error. Reading bytes and
+/// decoding only a line that fits keeps the cap decidable wherever the
+/// boundary falls, while a line within the cap is still rejected when it is
+/// not valid UTF-8. This matches the byte-safe `read_until` the transcript
+/// readers already use.
+fn read_capped_line<R: BufRead>(reader: &mut R, cap: usize) -> std::io::Result<CappedLine> {
+    let mut bytes = Vec::new();
+    let read =
+        std::io::Read::take(reader.by_ref(), (cap + 1) as u64).read_until(b'\n', &mut bytes)?;
+    if read == 0 {
+        return Ok(CappedLine::Eof);
+    }
+    if read > cap {
+        return Ok(CappedLine::Oversized);
+    }
+    String::from_utf8(bytes).map(CappedLine::Line).map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "stream did not contain valid UTF-8",
+        )
+    })
+}
+
 fn session_header(harness: ManagedHarness, path: &Path) -> Result<Option<(String, PathBuf)>> {
     if harness == ManagedHarness::Kimi {
         return kimi_session_header(path);
@@ -3702,17 +3875,12 @@ fn session_header(harness: ManagedHarness, path: &Path) -> Result<Option<(String
         return copilot_session_header(path);
     }
     let mut reader = BufReader::new(File::open(path)?);
-    let mut line = String::new();
     for _ in 0..64 {
-        line.clear();
-        let read = std::io::Read::take(&mut reader, (MAX_SESSION_HEADER_BYTES + 1) as u64)
-            .read_line(&mut line)?;
-        if read == 0 {
-            break;
-        }
-        if read > MAX_SESSION_HEADER_BYTES {
-            return Ok(None);
-        }
+        let line = match read_capped_line(&mut reader, MAX_SESSION_HEADER_BYTES)? {
+            CappedLine::Eof => break,
+            CappedLine::Oversized => return Ok(None),
+            CappedLine::Line(line) => line,
+        };
         let Ok(value) = serde_json::from_str::<Value>(&line) else {
             continue;
         };
@@ -3761,12 +3929,9 @@ fn command_code_session_header(path: &Path) -> Result<Option<(String, PathBuf)>>
         return Ok(None);
     }
     let mut reader = BufReader::new(File::open(path)?);
-    let mut line = String::new();
-    let read =
-        std::io::Read::take(&mut reader, (MAX_EVENT_BYTES + 1) as u64).read_line(&mut line)?;
-    if read == 0 || read > MAX_EVENT_BYTES {
+    let CappedLine::Line(line) = read_capped_line(&mut reader, MAX_EVENT_BYTES)? else {
         return Ok(None);
-    }
+    };
     let Ok(header) = serde_json::from_str::<Value>(&line) else {
         return Ok(None);
     };
@@ -3805,12 +3970,9 @@ fn copilot_session_header(path: &Path) -> Result<Option<(String, PathBuf)>> {
         return Ok(None);
     };
     let mut reader = BufReader::new(File::open(path)?);
-    let mut line = String::new();
-    let read =
-        std::io::Read::take(&mut reader, (MAX_EVENT_BYTES + 1) as u64).read_line(&mut line)?;
-    if read == 0 || read > MAX_EVENT_BYTES {
+    let CappedLine::Line(line) = read_capped_line(&mut reader, MAX_EVENT_BYTES)? else {
         return Ok(None);
-    }
+    };
     let Ok(header) = serde_json::from_str::<Value>(&line) else {
         return Ok(None);
     };
@@ -4027,15 +4189,18 @@ fn export_antigravity(
         Some((path, file, len))
     });
     let Some((history, mut file, len)) = opened else {
-        losses.push(
-            "Antigravity history.jsonl is missing or unreadable; no user prompts were imported"
-                .into(),
-        );
+        let events = antigravity_brain_prompt_events(home, session_dir, session, &mut losses);
+        if events.is_empty() {
+            losses.push(
+                "Antigravity history.jsonl and brain transcript are missing or unreadable; no user prompts were imported"
+                    .into(),
+            );
+        }
         losses.push(ANTIGRAVITY_PROMPTS_ONLY.into());
         return Ok(ExportedTranscript {
             native_session_id: session.to_string(),
             source_cursor: None,
-            events: Vec::new(),
+            events,
             losses,
         });
     };
@@ -4065,6 +4230,7 @@ fn export_antigravity(
     let mut offset = start;
     let mut line = Vec::new();
     let mut prompts: Vec<HistoryPrompt> = Vec::new();
+    let mut saw_session_prompt = false;
     // Unlabelled prompts from this checkout that could have opened it.
     let mut openers: Vec<HistoryPrompt> = Vec::new();
     loop {
@@ -4132,6 +4298,7 @@ fn export_antigravity(
                 losses.push("Antigravity shell commands were intentionally excluded".into());
             }
             (Some(_), AntigravityHistoryKind::Prompt) => {
+                saw_session_prompt = true;
                 if in_checkout(entry.workspace) {
                     prompts.push(prompt());
                 } else {
@@ -4181,6 +4348,17 @@ fn export_antigravity(
             prompt.metadata,
         );
     }
+    // A prompt explicitly attributed to this conversation but typed in a
+    // different checkout is authoritative scope evidence. Falling back to
+    // the conversation-wide brain log here would re-admit the rejected text.
+    if events.is_empty() && !saw_session_prompt {
+        events.extend(antigravity_brain_prompt_events(
+            home,
+            session_dir,
+            session,
+            &mut losses,
+        ));
+    }
     losses.push(ANTIGRAVITY_PROMPTS_ONLY.into());
     Ok(ExportedTranscript {
         native_session_id: session.to_string(),
@@ -4195,7 +4373,182 @@ fn export_antigravity(
     })
 }
 
-const ANTIGRAVITY_PROMPTS_ONLY: &str = "Antigravity assistant and tool steps are not decodable; only user prompts from history.jsonl were imported";
+const ANTIGRAVITY_PROMPTS_ONLY: &str = "Antigravity assistant and tool steps are not decodable; only explicit user prompts were imported";
+
+const MAX_ANTIGRAVITY_BRAIN_BYTES: u64 = 8 * 1024 * 1024;
+const MAX_ANTIGRAVITY_BRAIN_LINE_BYTES: usize = 1024 * 1024;
+
+fn antigravity_brain_prompt_events(
+    home: &Path,
+    session_dir: Option<&Path>,
+    session: &str,
+    losses: &mut Vec<String>,
+) -> Vec<NewWorkstreamEvent> {
+    let session_root = session_root(ManagedHarness::Antigravity, home, session_dir);
+    let Some(root) = session_root.parent() else {
+        return Vec::new();
+    };
+    let Ok(root) = root.canonicalize() else {
+        return Vec::new();
+    };
+    let logs = root
+        .join("brain")
+        .join(session)
+        .join(".system_generated")
+        .join("logs");
+    let opened = ["transcript.jsonl", "transcript_full.jsonl"]
+        .into_iter()
+        .map(|name| logs.join(name))
+        .find_map(|candidate| open_contained_antigravity_transcript(&root, &candidate));
+    let Some(file) = opened else {
+        return Vec::new();
+    };
+    let mut events = Vec::new();
+    let mut reader = BufReader::new(file);
+    let mut line = Vec::new();
+    let mut offset = 0u64;
+    loop {
+        let start = offset;
+        let read = match read_bounded_line(
+            &mut reader,
+            MAX_ANTIGRAVITY_BRAIN_LINE_BYTES,
+            b"USER_INPUT",
+            &mut line,
+            &mut Sha256::new(),
+        ) {
+            Ok(BoundedLine::Line(read)) => read,
+            Ok(BoundedLine::Oversized { read, mentions }) => {
+                offset += read;
+                if mentions {
+                    losses.push("oversized Antigravity brain prompt records were skipped".into());
+                }
+                continue;
+            }
+            Ok(BoundedLine::Eof | BoundedLine::Partial) => break,
+            Err(_) => {
+                losses.push("Antigravity brain transcript became unreadable".into());
+                break;
+            }
+        };
+        offset += read;
+        let raw = line.strip_suffix(b"\n").unwrap_or(&line);
+        let Some((text, step, created_at)) = antigravity_brain_prompt(raw) else {
+            continue;
+        };
+        let hash = format!("{:x}", Sha256::digest(raw));
+        let record = format!("brain-{}-{}", step.unwrap_or(start), &hash[..16]);
+        push_event(
+            &mut events,
+            AgentKind::AntigravityCli,
+            session,
+            &record,
+            0,
+            WorkstreamEventKind::Message,
+            Some("user"),
+            &text,
+            created_at,
+            json!({"source": "brain-transcript"}),
+        );
+    }
+    events
+}
+
+fn open_contained_antigravity_transcript(root: &Path, path: &Path) -> Option<File> {
+    let canonical = path.canonicalize().ok()?;
+    if !canonical.starts_with(root) || fs::symlink_metadata(path).ok()?.file_type().is_symlink() {
+        return None;
+    }
+    #[cfg(unix)]
+    let file = {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+            .open(&canonical)
+            .ok()?
+    };
+    #[cfg(not(unix))]
+    let file = File::open(&canonical).ok()?;
+    let metadata = file.metadata().ok()?;
+    if !metadata.is_file() || metadata.len() > MAX_ANTIGRAVITY_BRAIN_BYTES {
+        return None;
+    }
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::fd::AsRawFd as _;
+        let descriptor = fs::read_link(format!("/proc/self/fd/{}", file.as_raw_fd())).ok()?;
+        if descriptor != canonical {
+            return None;
+        }
+    }
+    Some(file)
+}
+
+fn antigravity_brain_prompt(raw: &[u8]) -> Option<(String, Option<u64>, Option<String>)> {
+    if !raw
+        .windows(b"USER_INPUT".len())
+        .any(|window| window.eq_ignore_ascii_case(b"USER_INPUT"))
+    {
+        return None;
+    }
+    let value: Value = serde_json::from_slice(raw).ok()?;
+    let step = value.as_object()?;
+    let kind = step.get("type")?.as_str()?.trim().to_ascii_uppercase();
+    if kind != "USER_INPUT" && !kind.ends_with("_USER_INPUT") {
+        return None;
+    }
+    if let Some(source) = step.get("source") {
+        let source = source.as_str()?.trim().to_ascii_uppercase();
+        if source != "USER_EXPLICIT" && !source.ends_with("_USER_EXPLICIT") {
+            return None;
+        }
+    }
+    let content = antigravity_content_text(step.get("content")?)?;
+    let text = antigravity_user_request_text(&content).trim().to_owned();
+    if text.is_empty() {
+        return None;
+    }
+    let index = step.get("step_index").and_then(|value| {
+        value
+            .as_u64()
+            .or_else(|| value.as_str().and_then(|text| text.trim().parse().ok()))
+    });
+    let created_at = step
+        .get("created_at")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| value.parse::<jiff::Timestamp>().is_ok())
+        .map(str::to_owned);
+    Some((text, index, created_at))
+}
+
+fn antigravity_content_text(content: &Value) -> Option<String> {
+    match content {
+        Value::String(text) => Some(text.clone()),
+        Value::Object(part) => part.get("text").and_then(Value::as_str).map(str::to_owned),
+        Value::Array(parts) => {
+            let text: Vec<&str> = parts
+                .iter()
+                .filter_map(|part| {
+                    part.as_str()
+                        .or_else(|| part.get("text").and_then(Value::as_str))
+                })
+                .collect();
+            (!text.is_empty()).then(|| text.join("\n"))
+        }
+        _ => None,
+    }
+}
+
+fn antigravity_user_request_text(content: &str) -> &str {
+    const OPEN: &str = "<USER_REQUEST>";
+    const CLOSE: &str = "</USER_REQUEST>";
+    let Some(start) = content.find(OPEN) else {
+        return content;
+    };
+    let inner = &content[start + OPEN.len()..];
+    inner.find(CLOSE).map_or(inner, |end| &inner[..end])
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum AntigravityHistoryKind {
@@ -5720,12 +6073,346 @@ mod tests {
         );
     }
 
+    fn file_cursor_offset(cursor: &str) -> u64 {
+        serde_json::from_str::<FileCursor>(cursor).unwrap().offset
+    }
+
+    fn oversized_losses(transcript: &ExportedTranscript) -> usize {
+        transcript
+            .losses
+            .iter()
+            .filter(|loss| loss.starts_with(OVERSIZED_RECORD_LOSS))
+            .count()
+    }
+
+    fn skip_loss(start: usize, bytes: usize) -> String {
+        format!(
+            "{OVERSIZED_RECORD_LOSS} at byte {start} ({bytes} bytes, over the {MAX_SOURCE_RECORD_BYTES} byte cap)"
+        )
+    }
+
+    fn kinds_and_contents(transcript: &ExportedTranscript) -> Vec<(&str, &str)> {
+        transcript
+            .events
+            .iter()
+            .map(|event| (event.kind.as_str(), event.content.as_str()))
+            .collect()
+    }
+
+    /// An oversized record still being written is neither an error nor
+    /// committed: the baseline stops before it, and once its newline lands the
+    /// baseline, the delta export and the exact range all step over it to the
+    /// same byte and agree on the events after it.
     #[tokio::test]
-    async fn transcript_baseline_refuses_oversized_records_before_unbounded_growth() {
+    async fn an_oversized_record_is_skipped_only_once_it_is_complete() {
         let temp = tempfile::tempdir().unwrap();
         let cwd = temp.path().join("repo");
         fs::create_dir_all(&cwd).unwrap();
         let session = "7c1d5698-204a-4c0f-ae9c-43db7fc4e41f";
+        let store = temp.path().join("command-code");
+        let bucket = store.join("bucket");
+        fs::create_dir_all(&bucket).unwrap();
+        let path = bucket.join(format!("{session}.jsonl"));
+        let header = format!(
+            "{}\n",
+            json!({"type":"session","version":3,"id":session,"timestamp":"2026-08-07T17:00:00Z","cwd":cwd})
+        );
+        let mut bytes = header.clone().into_bytes();
+        bytes.extend(std::iter::repeat_n(b'x', MAX_SOURCE_RECORD_BYTES + 2));
+        fs::write(&path, bytes).unwrap();
+        let unfinished = transcript_baseline(
+            ManagedHarness::CommandCode,
+            temp.path(),
+            &cwd,
+            Some(&store),
+            session,
+        )
+        .await
+        .unwrap();
+        assert_eq!(file_cursor_offset(&unfinished), header.len() as u64);
+        let early = export_transcript(
+            ManagedHarness::CommandCode,
+            temp.path(),
+            &cwd,
+            Some(&store),
+            session,
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(
+            early.losses.iter().all(|loss| {
+                !loss.starts_with(OVERSIZED_RECORD_LOSS) && !loss.starts_with("malformed")
+            }),
+            "an unfinished record is neither skipped nor parsed: {:?}",
+            early.losses
+        );
+        assert_eq!(
+            file_cursor_offset(early.source_cursor.as_deref().unwrap()),
+            header.len() as u64
+        );
+
+        use std::io::Write as _;
+        let mut file = fs::OpenOptions::new().append(true).open(&path).unwrap();
+        writeln!(file).unwrap();
+        writeln!(
+            file,
+            "{}",
+            json!({"type":"message","id":"after","timestamp":"2026-08-07T17:00:02Z","message":{"role":"user","content":[{"type":"text","text":"after the image"}],"meta":{"source":"user"}}})
+        )
+        .unwrap();
+        let file_len = fs::metadata(&path).unwrap().len();
+        let finished = transcript_baseline(
+            ManagedHarness::CommandCode,
+            temp.path(),
+            &cwd,
+            Some(&store),
+            session,
+        )
+        .await
+        .unwrap();
+        assert_eq!(file_cursor_offset(&finished), file_len);
+        let delta = export_transcript_delta(
+            ManagedHarness::CommandCode,
+            temp.path(),
+            &cwd,
+            Some(&store),
+            session,
+            &unfinished,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            kinds_and_contents(&delta),
+            [
+                ("annotation", SKIPPED_RECORD_NOTE),
+                ("message", "after the image")
+            ]
+        );
+        assert_eq!(
+            delta.losses,
+            [skip_loss(header.len(), MAX_SOURCE_RECORD_BYTES + 3)]
+        );
+        assert_eq!(
+            file_cursor_offset(delta.source_cursor.as_deref().unwrap()),
+            file_len
+        );
+        let exact = export_transcript_range(
+            ManagedHarness::CommandCode,
+            temp.path(),
+            &cwd,
+            Some(&store),
+            session,
+            Some(&unfinished),
+            &finished,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            transcript_interval_digests(&exact.events),
+            transcript_interval_digests(&delta.events)
+        );
+    }
+
+    #[test]
+    fn claude_export_skips_an_oversized_record_and_keeps_its_neighbours() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("session.jsonl");
+        let prompt = |uuid: &str, text: &str| json!({"type":"user","uuid":uuid,"timestamp":"2026-10-22T12:00:00Z","message":{"role":"user","content":[{"type":"text","text":text}]}});
+        let screenshot = json!({"type":"user","uuid":"image","timestamp":"2026-10-22T12:00:01Z","message":{"role":"user","content":[
+            {"type":"tool_result","tool_use_id":"tool","content":[
+                {"type":"image","source":{"type":"base64","media_type":"image/png","data":"A".repeat(MAX_SOURCE_RECORD_BYTES)}}
+            ]}
+        ]}});
+        let records = [
+            prompt("before", "before the screenshot"),
+            screenshot,
+            prompt("after", "after the screenshot"),
+        ];
+        fs::write(
+            &path,
+            records
+                .iter()
+                .map(|record| format!("{record}\n"))
+                .collect::<String>(),
+        )
+        .unwrap();
+
+        let exported = export_jsonl(ManagedHarness::Claude, &path, "session", None).unwrap();
+        assert_eq!(
+            kinds_and_contents(&exported),
+            [
+                ("message", "before the screenshot"),
+                ("annotation", SKIPPED_RECORD_NOTE),
+                ("message", "after the screenshot"),
+            ]
+        );
+        assert_eq!(exported.events[1].metadata[SKIPPED_RECORD_KEY], true);
+        let first = records[0].to_string().len() + 1;
+        assert_eq!(
+            exported.losses,
+            [skip_loss(first, records[1].to_string().len() + 1)]
+        );
+        assert_eq!(
+            file_cursor_offset(exported.source_cursor.as_deref().unwrap()),
+            fs::metadata(&path).unwrap().len()
+        );
+    }
+
+    /// Kimi validates its cursor by a hash of every committed byte, so the
+    /// skipped record must be hashed whole: otherwise the next export would
+    /// distrust the cursor and replay the journal from the start.
+    #[test]
+    fn a_skipped_record_stays_inside_the_rewrite_prefix_identity() {
+        let temp = tempfile::tempdir().unwrap();
+        let wire = temp
+            .path()
+            .join("store/bucket/session_x/agents/main/wire.jsonl");
+        fs::create_dir_all(wire.parent().unwrap()).unwrap();
+        let message = |role: &str, text: &str| {
+            json!({"type":"context.append_message","message":{"role":role,"content":[{"type":"text","text":text}]}})
+                .to_string()
+        };
+        let oversized = message("user", &"x".repeat(MAX_SOURCE_RECORD_BYTES));
+        let journal = format!(
+            "{}\n{oversized}\n{}\n",
+            message("user", "one"),
+            message("assistant", "two")
+        );
+        fs::write(&wire, &journal).unwrap();
+
+        let initial = export_jsonl(ManagedHarness::Kimi, &wire, "session_x", None).unwrap();
+        assert_eq!(
+            kinds_and_contents(&initial),
+            [
+                ("message", "one"),
+                ("annotation", SKIPPED_RECORD_NOTE),
+                ("message", "two"),
+            ]
+        );
+        assert_eq!(
+            initial.losses,
+            [skip_loss(
+                message("user", "one").len() + 1,
+                oversized.len() + 1
+            )]
+        );
+        let cursor: FileCursor =
+            serde_json::from_str(initial.source_cursor.as_deref().unwrap()).unwrap();
+        assert_eq!(cursor.offset, journal.len() as u64);
+        assert_eq!(
+            cursor.prefix_sha256.as_deref(),
+            Some(format!("{:x}", Sha256::digest(journal.as_bytes())).as_str())
+        );
+
+        fs::write(&wire, format!("{journal}{}\n", message("user", "three"))).unwrap();
+        let incremental = export_jsonl(
+            ManagedHarness::Kimi,
+            &wire,
+            "session_x",
+            initial.source_cursor.as_deref(),
+        )
+        .unwrap();
+        assert_eq!(
+            incremental
+                .events
+                .iter()
+                .map(|event| event.content.as_str())
+                .collect::<Vec<_>>(),
+            ["three"]
+        );
+        assert_eq!(oversized_losses(&incremental), 0);
+
+        // A rewrite that shifts every byte offset keeps the marker's event id,
+        // as it keeps a parsed record's.
+        fs::write(
+            &wire,
+            format!("{}\n{journal}", message("user", "a rewritten prefix")),
+        )
+        .unwrap();
+        let rewritten = export_jsonl(
+            ManagedHarness::Kimi,
+            &wire,
+            "session_x",
+            initial.source_cursor.as_deref(),
+        )
+        .unwrap();
+        assert_eq!(rewritten.events.len(), 4);
+        assert_eq!(rewritten.events[2].event_id, initial.events[1].event_id);
+    }
+
+    /// For a journal validated by its prefix hash, the baseline hashes a
+    /// skipped record exactly as the export does, and leaves an unfinished one
+    /// out of the hash: a delta from either cursor trusts it and resumes there.
+    #[tokio::test]
+    async fn kimi_baseline_and_export_agree_on_the_prefix_across_a_skipped_record() {
+        let temp = tempfile::tempdir().unwrap();
+        let cwd = temp.path().join("repo");
+        let other = temp.path().join("other");
+        fs::create_dir_all(&cwd).unwrap();
+        fs::create_dir_all(&other).unwrap();
+        let (root, wire) = kimi_store_fixture(&cwd, &other);
+        let message = |role: &str, text: &str| {
+            json!({"type":"context.append_message","message":{"role":role,"content":[{"type":"text","text":text}]}})
+                .to_string()
+        };
+        let first = format!("{}\n", message("user", "one"));
+        let oversized = message("user", &"x".repeat(MAX_SOURCE_RECORD_BYTES));
+        fs::write(&wire, format!("{first}{oversized}")).unwrap();
+        let baseline = || {
+            transcript_baseline(
+                ManagedHarness::Kimi,
+                temp.path(),
+                &cwd,
+                Some(root.path()),
+                "session_aaa",
+            )
+        };
+        let unfinished: FileCursor = serde_json::from_str(&baseline().await.unwrap()).unwrap();
+        assert_eq!(unfinished.offset, first.len() as u64);
+        assert_eq!(
+            unfinished.prefix_sha256.as_deref(),
+            Some(format!("{:x}", Sha256::digest(first.as_bytes())).as_str())
+        );
+
+        let journal = format!("{first}{oversized}\n{}\n", message("assistant", "two"));
+        fs::write(&wire, &journal).unwrap();
+        let finished = baseline().await.unwrap();
+        let exported = export_transcript(
+            ManagedHarness::Kimi,
+            temp.path(),
+            &cwd,
+            Some(root.path()),
+            "session_aaa",
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(exported.source_cursor.as_deref(), Some(finished.as_str()));
+        let delta = export_transcript_delta(
+            ManagedHarness::Kimi,
+            temp.path(),
+            &cwd,
+            Some(root.path()),
+            "session_aaa",
+            &serde_json::to_string(&unfinished).unwrap(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            kinds_and_contents(&delta),
+            [("annotation", SKIPPED_RECORD_NOTE), ("message", "two")]
+        );
+    }
+
+    /// Discarding never reads past the source-byte cap: one record larger than
+    /// the whole budget still fails both readers instead of being skipped.
+    #[tokio::test]
+    async fn discarding_an_oversized_record_counts_toward_the_source_byte_cap() {
+        let temp = tempfile::tempdir().unwrap();
+        let cwd = temp.path().join("repo");
+        fs::create_dir_all(&cwd).unwrap();
+        let session = "7c1d5698-204a-4c0f-ae9c-43db7fc4e420";
         let store = temp.path().join("command-code");
         let bucket = store.join("bucket");
         fs::create_dir_all(&bucket).unwrap();
@@ -5735,8 +6422,21 @@ mod tests {
             json!({"type":"session","version":3,"id":session,"timestamp":"2026-08-07T17:00:00Z","cwd":cwd})
         )
         .into_bytes();
-        bytes.extend(std::iter::repeat_n(b'x', MAX_SOURCE_RECORD_BYTES + 2));
+        bytes.extend(std::iter::repeat_n(b'x', MAX_SOURCE_BYTES));
+        bytes.push(b'\n');
         fs::write(&path, bytes).unwrap();
+
+        let error = export_transcript(
+            ManagedHarness::CommandCode,
+            temp.path(),
+            &cwd,
+            Some(&store),
+            session,
+            None,
+        )
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("source-byte limit"), "{error:#}");
         let error = transcript_baseline(
             ManagedHarness::CommandCode,
             temp.path(),
@@ -5746,7 +6446,7 @@ mod tests {
         )
         .await
         .unwrap_err();
-        assert!(error.to_string().contains("record exceeds"), "{error:#}");
+        assert!(error.to_string().contains("source-byte limit"), "{error:#}");
     }
 
     /// An oversized FIRST JSONL record is rejected by the byte caps before any
@@ -5816,6 +6516,172 @@ mod tests {
             .is_empty(),
             "the tighter first-line cap rejects before the source-record cap is even reached"
         );
+    }
+
+    /// An oversized JSONL record whose padding places a three-byte character
+    /// so that the header reader's `cap + 1` boundary falls inside it. The
+    /// character begins at `char_offset`, so `char_offset` of `cap - 1` and
+    /// `cap` leave a truncated character in the bytes that were read while
+    /// `cap + 1` leaves the character out of them entirely.
+    fn oversized_header_cut_mid_character(
+        session: &str,
+        cwd: &Path,
+        cap: usize,
+        char_offset: usize,
+    ) -> Vec<u8> {
+        let head = format!(
+            "{{\"sessionId\":\"{session}\",\"cwd\":\"{}\",\"padding\":\"",
+            cwd.display()
+        );
+        let mut bytes = head.into_bytes();
+        assert!(
+            bytes.len() < char_offset,
+            "the padding has to start before the cut"
+        );
+        bytes.resize(char_offset, b'x');
+        bytes.extend("\u{65e5}".repeat(16).as_bytes());
+        bytes.extend(b"\"}\n");
+        assert!(bytes.len() > cap + 1, "the record has to be oversized");
+        bytes
+    }
+
+    /// The size cap's skip guard has to hold for non-ASCII input.
+    /// `BufRead::read_line` validates UTF-8 over exactly the bytes the `Take`
+    /// let through, so a boundary landing inside a multi-byte character fails
+    /// the read with `InvalidData` and the `read > cap` guard below it is
+    /// never reached. Two of every three byte alignments of the cut character
+    /// hit that; the maintainer's own cap test pads with ASCII only, where
+    /// none of them do.
+    #[test]
+    fn an_oversized_session_header_cut_mid_character_is_skipped() {
+        for offset in 0..3 {
+            let temp = tempfile::tempdir().unwrap();
+            let cwd = temp.path().join("repo");
+            fs::create_dir_all(&cwd).unwrap();
+            let session = "1f8c0f4c-26f9-4c21-9f85-3d1dcb9aa0f1";
+            let path = cwd.join(format!("{session}.jsonl"));
+            fs::write(
+                &path,
+                oversized_header_cut_mid_character(
+                    session,
+                    &cwd,
+                    MAX_SESSION_HEADER_BYTES,
+                    MAX_SESSION_HEADER_BYTES - 1 + offset,
+                ),
+            )
+            .unwrap();
+            assert!(
+                session_header(ManagedHarness::Claude, &path)
+                    .unwrap()
+                    .is_none(),
+                "an oversized header is skipped with the cut character at offset \
+                 MAX_SESSION_HEADER_BYTES - 1 + {offset}"
+            );
+        }
+    }
+
+    /// The same cut in the two single-record header readers, which cap on
+    /// `MAX_EVENT_BYTES`.
+    #[test]
+    fn an_oversized_event_header_cut_mid_character_is_skipped() {
+        for offset in 0..3 {
+            let temp = tempfile::tempdir().unwrap();
+            let cwd = temp.path().join("repo");
+            fs::create_dir_all(&cwd).unwrap();
+            let session = "3b6d2f70-5a3c-41a8-9a4e-7c0b2d9e4f11";
+            let record = oversized_header_cut_mid_character(
+                session,
+                &cwd,
+                MAX_EVENT_BYTES,
+                MAX_EVENT_BYTES - 1 + offset,
+            );
+
+            let command_code = cwd.join(format!("{session}.jsonl"));
+            fs::write(&command_code, &record).unwrap();
+            assert!(
+                command_code_session_header(&command_code)
+                    .unwrap()
+                    .is_none(),
+                "command code: cut character at offset MAX_EVENT_BYTES - 1 + {offset}"
+            );
+
+            let copilot_dir = cwd.join(session);
+            fs::create_dir_all(&copilot_dir).unwrap();
+            let copilot = copilot_dir.join("events.jsonl");
+            fs::write(&copilot, &record).unwrap();
+            assert!(
+                copilot_session_header(&copilot).unwrap().is_none(),
+                "copilot: cut character at offset MAX_EVENT_BYTES - 1 + {offset}"
+            );
+        }
+    }
+
+    /// A header that is NOT oversized and is not valid UTF-8 keeps failing the
+    /// read, so the cap's skip guard does not widen into accepting malformed
+    /// transcripts.
+    #[test]
+    fn a_malformed_utf8_header_within_the_cap_still_fails() {
+        let temp = tempfile::tempdir().unwrap();
+        let cwd = temp.path().join("repo");
+        fs::create_dir_all(&cwd).unwrap();
+        let path = cwd.join("1a1f2d3c-4b5a-6978-8a9b-0c1d2e3f4a5b.jsonl");
+        fs::write(&path, b"{\"sessionId\":\"\xff\xfe\"}\n").unwrap();
+        let error = session_header(ManagedHarness::Claude, &path).unwrap_err();
+        assert!(
+            error.to_string().contains("valid UTF-8"),
+            "a short malformed header still errors: {error:#}"
+        );
+        let error = command_code_session_header(&path).unwrap_err();
+        assert!(
+            error.to_string().contains("valid UTF-8"),
+            "a short malformed header still errors: {error:#}"
+        );
+    }
+
+    /// The consequence of the lost skip: `discover_native_session` propagates
+    /// the header read's error, so one oversized non-ASCII record in Claude
+    /// Code's shared `~/.claude/projects` tree aborts discovery for every
+    /// other session recorded beside it.
+    #[tokio::test]
+    async fn an_oversized_non_ascii_record_does_not_abort_discovery_of_another_session() {
+        let temp = tempfile::tempdir().unwrap();
+        let cwd = temp.path().join("repo");
+        fs::create_dir_all(&cwd).unwrap();
+        let transcripts = temp
+            .path()
+            .join(".claude/projects")
+            .join(cwd.to_string_lossy().replace('/', "-"));
+        fs::create_dir_all(&transcripts).unwrap();
+        // Sorted ahead of the session we are looking for, so discovery reads
+        // it first whether or not the two share a modification time.
+        let poisoned = "0aaaaaaa-0000-4000-8000-000000000000";
+        let wanted = "fbbbbbbb-0000-4000-8000-000000000000";
+        fs::write(
+            transcripts.join(format!("{wanted}.jsonl")),
+            format!("{}\n", json!({"sessionId": wanted, "cwd": cwd})),
+        )
+        .unwrap();
+        fs::write(
+            transcripts.join(format!("{poisoned}.jsonl")),
+            oversized_header_cut_mid_character(
+                poisoned,
+                &cwd,
+                MAX_SESSION_HEADER_BYTES,
+                MAX_SESSION_HEADER_BYTES,
+            ),
+        )
+        .unwrap();
+        let discovered = discover_native_session(
+            ManagedHarness::Claude,
+            temp.path(),
+            &cwd,
+            None,
+            SystemTime::now() - Duration::from_secs(60),
+            true,
+        )
+        .await
+        .unwrap();
+        assert_eq!(discovered.as_deref(), Some(wanted));
     }
 
     #[tokio::test]
@@ -8480,6 +9346,23 @@ mod tests {
         fs::write(root.parent().unwrap().join("history.jsonl"), body).unwrap();
     }
 
+    fn write_antigravity_brain(root: &Path, lines: &[Value]) {
+        let logs = root
+            .parent()
+            .unwrap()
+            .join("brain")
+            .join(AG_MINE)
+            .join(".system_generated/logs");
+        fs::create_dir_all(&logs).unwrap();
+        let mut body = lines
+            .iter()
+            .map(Value::to_string)
+            .collect::<Vec<_>>()
+            .join("\n");
+        body.push('\n');
+        fs::write(logs.join("transcript.jsonl"), body).unwrap();
+    }
+
     async fn export_antigravity_fixture(
         fixture: &AntigravityFixture,
         cursor: Option<&str>,
@@ -8541,6 +9424,107 @@ mod tests {
             "other conversations are not this session's losses: {:?}",
             exported.losses
         );
+    }
+
+    #[tokio::test]
+    async fn antigravity_print_mode_falls_back_to_explicit_brain_prompts() {
+        let fixture = antigravity_fixture();
+        write_antigravity_brain(
+            &fixture.root,
+            &[
+                json!({
+                    "step_index": 1,
+                    "type": "USER_INPUT",
+                    "source": "USER_EXPLICIT",
+                    "content": "print-mode prompt",
+                    "created_at": "2026-10-22T12:00:00Z"
+                }),
+                json!({
+                    "step_index": 2,
+                    "type": "USER_INPUT",
+                    "source": "HOOK",
+                    "content": "injected canary"
+                }),
+                json!({
+                    "step_index": 3,
+                    "type": "TOOL_OUTPUT",
+                    "content": "USER_INPUT canary in tool output"
+                }),
+            ],
+        );
+
+        let exported = export_antigravity_fixture(&fixture, None).await;
+
+        assert_eq!(prompts(&exported), ["print-mode prompt"]);
+        assert_eq!(
+            exported.events[0].metadata,
+            json!({"source": "brain-transcript"})
+        );
+    }
+
+    #[tokio::test]
+    async fn antigravity_brain_fallback_does_not_re_admit_foreign_workspace_prompts() {
+        let fixture = antigravity_fixture();
+        write_antigravity_history(
+            &fixture.root,
+            &[history_line(
+                Some(AG_MINE),
+                &fixture.other,
+                "foreign history prompt",
+                AG_PAST,
+            )],
+        );
+        write_antigravity_brain(
+            &fixture.root,
+            &[json!({
+                "step_index": 1,
+                "type": "USER_INPUT",
+                "source": "USER_EXPLICIT",
+                "content": "foreign brain prompt"
+            })],
+        );
+
+        let exported = export_antigravity_fixture(&fixture, None).await;
+
+        assert!(exported.events.is_empty(), "{:?}", exported.events);
+        assert!(
+            exported
+                .losses
+                .iter()
+                .any(|loss| loss.contains("another workspace")),
+            "{:?}",
+            exported.losses
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn antigravity_brain_fallback_refuses_a_symlink_escape() {
+        use std::os::unix::fs::symlink;
+
+        let fixture = antigravity_fixture();
+        let outside = fixture.temp.path().join("outside");
+        fs::create_dir_all(outside.join(".system_generated/logs")).unwrap();
+        fs::write(
+            outside.join(".system_generated/logs/transcript.jsonl"),
+            format!(
+                "{}\n",
+                json!({
+                    "step_index": 1,
+                    "type": "USER_INPUT",
+                    "source": "USER_EXPLICIT",
+                    "content": "escape canary"
+                })
+            ),
+        )
+        .unwrap();
+        let brain = fixture.root.parent().unwrap().join("brain");
+        fs::create_dir_all(&brain).unwrap();
+        symlink(&outside, brain.join(AG_MINE)).unwrap();
+
+        let exported = export_antigravity_fixture(&fixture, None).await;
+
+        assert!(exported.events.is_empty(), "{:?}", exported.events);
     }
 
     /// `agy --conversation=<id>` run from another directory keeps the id but
@@ -8739,7 +9723,7 @@ mod tests {
             exported
                 .losses
                 .iter()
-                .any(|loss| loss.contains("history.jsonl is missing")),
+                .any(|loss| loss.contains("history.jsonl and brain transcript are missing")),
             "{:?}",
             exported.losses
         );

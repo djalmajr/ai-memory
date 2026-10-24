@@ -27,11 +27,10 @@ const FORK_CHUNK_PROGRESS_DDL: &str = include_str!("consolidation_chunk_progress
 ///
 /// # Errors
 /// Propagates the underlying refinery error if a migration fails. When the
-/// store is *ahead* of this binary — an applied migration is absent from the
-/// compiled-in set, which refinery reports as `MissingVersion` with the
-/// misleading text "migration V… is missing from the filesystem" — the error
-/// is remapped to [`StoreError::DataSchemaAhead`], which names the offending
-/// migration and points the operator at the fix.
+/// store is *ahead* of this binary, the error is remapped to
+/// [`StoreError::DataSchemaAhead`]. An earlier embedded migration missing from
+/// the store's history instead reports [`StoreError::MigrationHistoryGap`].
+/// refinery reports both conditions as `MissingVersion`.
 pub fn run(conn: &mut rusqlite::Connection) -> StoreResult<()> {
     repair_known_migration_checksums(conn)?;
     repair_fork_chunk_progress_rows(conn)?;
@@ -217,15 +216,23 @@ fn max_supported_version() -> u32 {
         .unwrap_or(0)
 }
 
-/// Translate refinery's raw error into a store-domain error. The only variant
-/// reshaped is `MissingVersion` (the store's schema is ahead of this binary);
-/// every other refinery failure passes through as [`StoreError::Migration`].
+/// Translate refinery's two `MissingVersion` cases without confusing a
+/// skipped migration with a downgrade. Every other failure passes through.
 fn classify_run_error(err: refinery::Error) -> StoreError {
-    if let refinery::error::Kind::MissingVersion(applied) = err.kind() {
-        return StoreError::DataSchemaAhead {
-            applied: format!("V{} ({})", applied.version(), applied.name()),
-            supported: max_supported_version(),
-        };
+    if let refinery::error::Kind::MissingVersion(migration) = err.kind() {
+        let identity = format!("V{} ({})", migration.version(), migration.name());
+        // refinery returns the embedded (unapplied) migration when an older
+        // version was skipped, and the history row when a build lacks it.
+        if migration.applied_on().is_none() {
+            return StoreError::MigrationHistoryGap { missing: identity };
+        }
+        let supported = max_supported_version();
+        if migration.version() > supported {
+            return StoreError::DataSchemaAhead {
+                applied: identity,
+                supported,
+            };
+        }
     }
     StoreError::Migration(err)
 }
@@ -280,6 +287,55 @@ mod tests {
             }
             other => panic!("expected DataSchemaAhead, got: {other:?}"),
         }
+    }
+
+    #[test]
+    fn missing_earlier_migration_reports_a_history_gap_without_applying_anything() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        // Between v2.3.2 and v2.4, main briefly contained V66 before it
+        // received V65 from release/2.4 (#1612).
+        let historical: Vec<_> = migrations::runner()
+            .get_migrations()
+            .iter()
+            .filter(|migration| migration.version() <= 66 && migration.version() != 65)
+            .cloned()
+            .collect();
+        refinery::Runner::new(&historical).run(&mut conn).unwrap();
+        let before = applied_versions(&conn);
+        assert_eq!(before.last(), Some(&66));
+        assert!(!before.contains(&65));
+
+        let err = run(&mut conn).unwrap_err();
+        let rendered = err.to_string();
+        assert!(
+            rendered.contains("migration history has a gap"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("V65 (page_compacted_marker)"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("not recorded"), "{rendered}");
+        assert!(!rendered.contains("newer than"), "{rendered}");
+        assert_eq!(applied_versions(&conn), before);
+        let compacted_column: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('pages') WHERE name = 'compacted_at'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(compacted_column, 0, "a refused open must not apply V65");
+    }
+
+    #[test]
+    fn an_ordinary_older_store_migrates_without_a_history_gap() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        run_to(&mut conn, 64).unwrap();
+        run(&mut conn).unwrap();
+        let applied = applied_versions(&conn);
+        assert!(applied.contains(&65) && applied.contains(&66));
+        assert_eq!(applied.last(), Some(&i64::from(max_supported_version())));
     }
 
     /// The rendered message must drop refinery's misleading phrasing and carry

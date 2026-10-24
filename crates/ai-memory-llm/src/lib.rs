@@ -124,7 +124,7 @@ pub use embedding::{
     Embedder, OpenAiCompatEmbedder, OpenAiEmbedder, QueryVector, SyntheticEmbedder, VoyageEmbedder,
     cosine, embed_search_query,
 };
-pub use embedding_capacity::EmbeddingCapacity;
+pub use embedding_capacity::{EmbeddingCapacity, local_capacity};
 pub use error::{LlmError, LlmResult};
 pub use factory::{
     EmbedderChoice, EmbedderConfig, ProviderChoice, ProviderConfig, build_embedder, build_provider,
@@ -156,7 +156,7 @@ pub use opencode::{
 };
 pub use provider::{LlmProvider, complete_structured, complete_structured_with_operation_id};
 pub use reranker::{LlmReranker, RerankCandidate, RerankScore, RerankStage, Reranker};
-pub use response::provider_error_body;
+pub use response::{provider_error, provider_error_body};
 pub use stored_token::StoredOAuthToken;
 pub use types::{
     ChatMessage, ChatRequest, ChatResponse, ExtraHeaders, LlmOperationId, LlmWorkload,

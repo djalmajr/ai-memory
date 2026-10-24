@@ -47,7 +47,7 @@ None of the competitors below has more than one or two of these; none has all.
   #16), self-hosted, with no paid tier.
 - **Reproducible retrieval benchmarks**: LongMemEval-S hit@5 0.815 local and
   0.666 zero-LLM through the shipped 2.6 pipeline, 0.951 zero-LLM and 0.945 local with the 3.0
-  observation stream, and a published pipeline-vs-component decomposition
+  observation stream (3.2.1: 0.951 and 0.949, the 3.2.0 local drop recovered — it was boundary-question noise, see the 3.2.1 report), and a published pipeline-vs-component decomposition
   ([`benchmarks/`](benchmarks/README.md)). Others publish numbers too (Mem0,
   Zep, Hindsight, EverOS, MemPalace, agentmemory), mostly end-to-end QA with
   their own reader and judge models. The edge is reproducibility; we claim no

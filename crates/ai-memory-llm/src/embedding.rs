@@ -23,7 +23,7 @@ use tracing::debug;
 
 use crate::error::{LlmError, LlmResult};
 use crate::openai::normalize_openai_base;
-use crate::response::{provider_error_body, response_json_limited, response_text_limited};
+use crate::response::{provider_error, response_json_limited, response_text_limited};
 use crate::text::{truncate_for_embedding, truncate_with_ellipsis};
 
 /// Conservative per-request input cap for OpenAI-compatible embedding APIs
@@ -124,7 +124,8 @@ pub async fn embed_search_query(embedder: &dyn Embedder, query: &str) -> Option<
             debug!(
                 provider = embedder.provider(),
                 model = embedder.model(),
-                "embedding capacity busy; degrading search to FTS5 + entity + graph"
+                "embedding capacity stayed busy past the bounded query wait; \
+                 degrading search to FTS5 + entity + graph"
             );
             None
         }
@@ -221,6 +222,7 @@ pub(crate) fn parse_openai_embedding_values(body: &str, status: u16) -> LlmResul
     let v: serde_json::Value = serde_json::from_str(body).map_err(|e| LlmError::Provider {
         status,
         body: truncate_with_ellipsis(&format!("openai embeddings json: {e}; body={body}"), 1024),
+        retry_after: None,
     })?;
     if let Some(err) = v.get("error") {
         let msg = err
@@ -231,6 +233,7 @@ pub(crate) fn parse_openai_embedding_values(body: &str, status: u16) -> LlmResul
         return Err(LlmError::Provider {
             status,
             body: truncate_with_ellipsis(msg, 1024),
+            retry_after: None,
         });
     }
     if let Some(data) = v.get("data").and_then(|d| d.as_array()) {
@@ -240,6 +243,7 @@ pub(crate) fn parse_openai_embedding_values(body: &str, status: u16) -> LlmResul
                 &format!("openai embeddings data[] empty; body={body}"),
                 512,
             ),
+            retry_after: None,
         })?;
         let emb = first
             .get("embedding")
@@ -250,6 +254,7 @@ pub(crate) fn parse_openai_embedding_values(body: &str, status: u16) -> LlmResul
                     &format!("missing embedding array in data[0]; body={body}"),
                     512,
                 ),
+                retry_after: None,
             })?;
         let mut out = Vec::with_capacity(emb.len());
         for n in emb {
@@ -259,6 +264,7 @@ pub(crate) fn parse_openai_embedding_values(body: &str, status: u16) -> LlmResul
                     &format!("non-numeric embedding value in data[0]; body={body}"),
                     512,
                 ),
+                retry_after: None,
             })?;
             out.push(f as f32);
         }
@@ -274,6 +280,7 @@ pub(crate) fn parse_openai_embedding_values(body: &str, status: u16) -> LlmResul
                 &format!("openai embeddings shape: {e}; body={body}"),
                 1024,
             ),
+            retry_after: None,
         })?;
     let first = parsed.data.into_iter().next().ok_or_else(|| {
         LlmError::UnexpectedShape(format!(
@@ -385,18 +392,10 @@ async fn openai_style_embed(
         }
         // Client errors (e.g. input > 8192 tokens) are not retried.
         if status.as_u16() == 400 {
-            let body = provider_error_body(resp).await;
-            return Err(LlmError::Provider {
-                status: status.as_u16(),
-                body,
-            });
+            return Err(provider_error(resp).await);
         }
         if !status.is_success() {
-            let body = provider_error_body(resp).await;
-            return Err(LlmError::Provider {
-                status: status.as_u16(),
-                body,
-            });
+            return Err(provider_error(resp).await);
         }
         let body = response_text_limited(resp).await?;
         let values = parse_openai_embedding_values(&body, status.as_u16())?;
@@ -712,11 +711,7 @@ impl Embedder for VoyageEmbedder {
         };
         let status = resp.status();
         if !status.is_success() {
-            let body = provider_error_body(resp).await;
-            return Err(LlmError::Provider {
-                status: status.as_u16(),
-                body,
-            });
+            return Err(provider_error(resp).await);
         }
         let parsed: VoyageResponse = response_json_limited(resp).await?;
         let first =

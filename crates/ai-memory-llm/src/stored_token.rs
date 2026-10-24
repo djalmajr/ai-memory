@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
 use crate::auth_file::{load_entry, now_ms, save_entry};
 use crate::error::{LlmError, LlmResult};
-use crate::response::{provider_error_body, response_json_limited};
+use crate::response::{provider_error, response_json_limited};
 
 /// A credential-bearing HTTP endpoint validated as TLS-protected, except for
 /// explicit loopback development servers. Keeping the parsed URL behind this
@@ -176,7 +176,13 @@ where
         .map_err(LlmError::from)?;
     let status = resp.status();
     if !status.is_success() {
-        let body = provider_error_body(resp).await;
+        let error = provider_error(resp).await;
+        let LlmError::Provider {
+            body, retry_after, ..
+        } = error
+        else {
+            return Err(error);
+        };
         // A rate-limited or overloaded token endpoint has not rejected the
         // grant, so it must stay transient and must not print a re-login hint
         // for a refresh token that is still valid.
@@ -184,6 +190,7 @@ where
             return Err(LlmError::Provider {
                 status: status.as_u16(),
                 body: format!("{failure_label}: {body}"),
+                retry_after,
             });
         }
         return Err(LlmError::Auth(format!(

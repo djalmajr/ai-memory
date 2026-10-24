@@ -187,6 +187,28 @@ assert_eq "antigravity initial invocation after a 256 KB field" "yes" \
 assert_eq "extract session id after a 256 KB field" "agy" \
     "$(ai_memory_extract_session_id "$PAYLOAD_AGY_BIG")"
 
+# A subagent marker only counts as a top-level key with a non-empty string
+# value, so a tool result that quotes the key name is still a root payload.
+subagent_payload() {
+    if ai_memory_payload_is_subagent "$1"; then printf 'yes'; else printf 'no'; fi
+}
+assert_eq "top-level agent_id marks a subagent" "yes" \
+    "$(subagent_payload '{"session_id":"s","agent_id":"planner"}')"
+assert_eq "top-level parentSessionId marks a subagent" "yes" \
+    "$(subagent_payload '{"parentSessionId":"p","session_id":"s"}')"
+assert_eq "blank marker value is not a subagent" "no" \
+    "$(subagent_payload '{"session_id":"s","agent_id":"  "}')"
+assert_eq "marker key quoted in a tool result is not a subagent" "no" \
+    "$(subagent_payload '{"session_id":"s","tool_response":"keys = [\"subagentType\", \"agent_id\"]"}')"
+assert_eq "marker key and value quoted in a tool result is not a subagent" "no" \
+    "$(subagent_payload '{"session_id":"s","tool_response":"{\"agent_id\": \"x\"}"}')"
+assert_eq "marker nested in tool input is not a subagent" "no" \
+    "$(subagent_payload '{"session_id":"s","tool_input":{"agent_id":"x"}}')"
+assert_eq "marker nested after a non-string field is not a subagent" "no" \
+    "$(subagent_payload '{"session_id":"s","tool_input":{"timeout":30,"agent_id":"x"}}')"
+assert_eq "no marker at all is not a subagent" "no" \
+    "$(subagent_payload '{"session_id":"s","tool_name":"read_file"}')"
+
 FAKE_CURL_BIN="$TMP/fake-curl-bin"
 FAKE_CURL_LOG="$TMP/fake-curl.log"
 mkdir -p "$FAKE_CURL_BIN"
@@ -968,6 +990,36 @@ for key in subagentType subagent_type agent_type agent_id parentSessionId; do
     assert_eq "grok: $key payload does not fetch the handoff" "{}" "$OUT"
     assert_eq "grok: $key payload sent zero GETs" "0" "$(grok_gets)"
 done
+
+# 3b. A marker key nested in a tool's arguments or result is data, not a
+# claim about the session: a root payload like this still fetches.
+grok_case nested-marker
+NESTED='{"session_id":"g-nested","cwd":"'"$GROK_CASE_DIR"'","tool_name":"bash","tool_input":{"timeout":30,"agent_id":"planner-a"}}'
+OUT=$(grok_run "$NESTED")
+case "$OUT" in
+    *'"additionalContext":"HANDOFF BODY"'*)
+        PASS=$((PASS + 1))
+        printf '  ok  %s\n' "grok: a marker nested in tool input still fetches" ;;
+    *)
+        FAIL=$((FAIL + 1))
+        printf '  FAIL grok: a marker nested in tool input still fetches\n    got =%s\n' "$OUT" ;;
+esac
+assert_eq "grok: nested marker payload GETs the handoff once" "1" "$(grok_gets)"
+
+# 3c. A blank top-level marker is not a child session either — parity with
+# `payload_is_subagent`, which requires a non-empty string.
+grok_case blank-marker
+BLANK='{"session_id":"g-blank","cwd":"'"$GROK_CASE_DIR"'","tool_name":"read_file","agent_id":"   "}'
+OUT=$(grok_run "$BLANK")
+case "$OUT" in
+    *'"additionalContext":"HANDOFF BODY"'*)
+        PASS=$((PASS + 1))
+        printf '  ok  %s\n' "grok: a blank marker value still fetches" ;;
+    *)
+        FAIL=$((FAIL + 1))
+        printf '  FAIL grok: a blank marker value still fetches\n    got =%s\n' "$OUT" ;;
+esac
+assert_eq "grok: blank marker payload GETs the handoff once" "1" "$(grok_gets)"
 
 unset AI_MEMORY_DATA_DIR GROK_LOG
 PATH=${PATH#"$TMP/bin:"}

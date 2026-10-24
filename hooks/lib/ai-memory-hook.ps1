@@ -991,6 +991,12 @@ function Invoke-AiMemoryHook {
         # `injectSteps` system message. With -AntigravityPreInvocation the
         # payload is a PreInvocation, a start boundary only at invocation 0.
         [switch] $AntigravityStartOutput,
+        # Claude Code prepends a SessionStart hook's stdout to the resuming
+        # session. Bare text does not start with "{", so it logs every start as
+        # "Hook output does not start with {, treating as plain text" and the
+        # handoff lands unstructured. The POSIX peers of these bundles already
+        # emit the envelope; this is their PowerShell half.
+        [switch] $SessionStartEnvelope,
         [switch] $AntigravityPreInvocation,
         # Deliver the `[briefing]` compiled project brief on the FIRST
         # handoff fetch of a session only (kimi-code's user-prompt path:
@@ -1216,14 +1222,22 @@ function Invoke-AiMemoryHook {
                         injectSteps = @(@{ systemMessage = @{ systemMessage = $Response.Content } })
                     }
                     [Console]::Out.Write(($Payload | ConvertTo-Json -Depth 5 -Compress))
+                } elseif ($SessionStartEnvelope) {
+                    $Payload = @{
+                        hookSpecificOutput = @{
+                            hookEventName = "SessionStart"
+                            additionalContext = [string]$Response.Content
+                        }
+                    }
+                    [Console]::Out.Write(($Payload | ConvertTo-Json -Depth 5 -Compress))
                 } else {
                     [Console]::Out.Write($Response.Content)
                 }
-            } elseif ($AntigravityStartOutput -or $GrokPostTool -or $CopilotCliSessionStartOutput) {
+            } elseif ($AntigravityStartOutput -or $GrokPostTool -or $CopilotCliSessionStartOutput -or $SessionStartEnvelope) {
                 [Console]::Out.Write("{}")
             }
         } catch {
-            if ($AntigravityStartOutput -or $GrokPostTool -or $CopilotCliSessionStartOutput) {
+            if ($AntigravityStartOutput -or $GrokPostTool -or $CopilotCliSessionStartOutput -or $SessionStartEnvelope) {
                 [Console]::Out.Write("{}")
             }
         }

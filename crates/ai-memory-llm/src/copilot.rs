@@ -23,7 +23,7 @@ use crate::error::{LlmError, LlmResult};
 use crate::openai::{STRUCTURED_OUTPUT_SCHEMA_NAME, enforce_strict_object_schemas};
 use crate::openai_oauth::model_uses_default_temperature;
 use crate::provider::LlmProvider;
-use crate::response::{provider_error_body, response_json_limited, response_text_limited};
+use crate::response::{provider_error, response_json_limited, response_text_limited};
 use crate::text::truncate_for_embedding;
 use crate::types::{ChatRequest, ChatResponse, ExtraHeaders, Usage};
 
@@ -391,13 +391,8 @@ impl CopilotProvider {
                 .headers(copilot_runtime_headers()),
         );
         let resp = request.json(body).send().await.map_err(LlmError::from)?;
-        let status = resp.status();
-        if !status.is_success() {
-            let body = provider_error_body(resp).await;
-            return Err(LlmError::Provider {
-                status: status.as_u16(),
-                body,
-            });
+        if !resp.status().is_success() {
+            return Err(provider_error(resp).await);
         }
         response_json_limited::<CopilotChatResponse>(resp).await
     }
@@ -418,12 +413,8 @@ impl CopilotProvider {
                 .headers(copilot_runtime_headers()),
         );
         let resp = request.json(body).send().await.map_err(LlmError::from)?;
-        let status = resp.status();
-        if !status.is_success() {
-            return Err(LlmError::Provider {
-                status: status.as_u16(),
-                body: provider_error_body(resp).await,
-            });
+        if !resp.status().is_success() {
+            return Err(provider_error(resp).await);
         }
         response_json_limited::<CopilotResponsesResponse>(resp).await
     }
@@ -452,6 +443,7 @@ impl LlmProvider for CopilotProvider {
                     &build_responses_request(&self.model, &request, None),
                 )
                 .await?,
+                &self.model,
             )?),
         }
     }
@@ -497,6 +489,7 @@ impl LlmProvider for CopilotProvider {
                         &build_responses_request(&self.model, &request, Some(schema)),
                     )
                     .await?,
+                &self.model,
             )?,
         };
         serde_json::from_str::<serde_json::Value>(&text).map_err(LlmError::from)
@@ -615,18 +608,10 @@ impl Embedder for CopilotEmbedder {
             }
             // Client errors (e.g. input too long) are not retried.
             if status.as_u16() == 400 {
-                let body = provider_error_body(resp).await;
-                return Err(LlmError::Provider {
-                    status: status.as_u16(),
-                    body,
-                });
+                return Err(provider_error(resp).await);
             }
             if !status.is_success() {
-                let body = provider_error_body(resp).await;
-                return Err(LlmError::Provider {
-                    status: status.as_u16(),
-                    body,
-                });
+                return Err(provider_error(resp).await);
             }
             let body = response_text_limited(resp).await?;
             let values = parse_openai_embedding_values(&body, status.as_u16())?;
@@ -664,7 +649,13 @@ async fn exchange_copilot_token(
         .map_err(LlmError::from)?;
     let status = resp.status();
     if !status.is_success() {
-        let body = provider_error_body(resp).await;
+        let error = provider_error(resp).await;
+        let LlmError::Provider {
+            body, retry_after, ..
+        } = error
+        else {
+            return Err(error);
+        };
         // GitHub rate-limits this endpoint per account. A 429/5xx here says
         // nothing about the credential, and `LlmError::Auth` is not transient,
         // so classifying it as auth stops the fallback chain and tells the
@@ -673,6 +664,7 @@ async fn exchange_copilot_token(
             return Err(LlmError::Provider {
                 status: status.as_u16(),
                 body: format!("copilot token exchange: {body}"),
+                retry_after,
             });
         }
         return Err(LlmError::Auth(format!(
@@ -881,6 +873,8 @@ struct CopilotResponsesResponse {
     #[serde(default)]
     status: Option<String>,
     #[serde(default)]
+    incomplete_details: Option<CopilotIncompleteDetails>,
+    #[serde(default)]
     error: Option<CopilotResponsesError>,
 }
 
@@ -910,6 +904,14 @@ struct CopilotResponsesUsage {
     output_tokens: u32,
 }
 
+/// Why a `/responses` answer stopped short. `error` is null on an incomplete
+/// response, so this is the only field that explains one.
+#[derive(Debug, Deserialize)]
+struct CopilotIncompleteDetails {
+    #[serde(default)]
+    reason: Option<String>,
+}
+
 #[derive(Debug, Deserialize)]
 struct CopilotResponsesError {
     #[serde(default)]
@@ -918,12 +920,26 @@ struct CopilotResponsesError {
     message: Option<String>,
 }
 
-fn response_text(response: &CopilotResponsesResponse) -> LlmResult<String> {
+fn response_text(response: &CopilotResponsesResponse, model: &str) -> LlmResult<String> {
     if response
         .status
         .as_deref()
         .is_some_and(|status| status != "completed")
     {
+        // `max_output_tokens` is the one non-completed status the operator can
+        // act on, and it is not an unexpected shape: raising `max_tokens` fixes
+        // it. The OpenAI path reports the same stop as `TruncatedResponse`.
+        if response
+            .incomplete_details
+            .as_ref()
+            .and_then(|details| details.reason.as_deref())
+            == Some("max_output_tokens")
+        {
+            return Err(LlmError::TruncatedResponse {
+                model: model.to_owned(),
+                completion_tokens: response.usage.as_ref().map(|usage| usage.output_tokens),
+            });
+        }
         let detail = response
             .error
             .as_ref()
@@ -964,8 +980,11 @@ fn response_text(response: &CopilotResponsesResponse) -> LlmResult<String> {
     ))
 }
 
-fn to_responses_chat_response(response: CopilotResponsesResponse) -> LlmResult<ChatResponse> {
-    let text = response_text(&response)?;
+fn to_responses_chat_response(
+    response: CopilotResponsesResponse,
+    model: &str,
+) -> LlmResult<ChatResponse> {
+    let text = response_text(&response, model)?;
     Ok(ChatResponse {
         text,
         usage: response.usage.map(|usage| Usage {

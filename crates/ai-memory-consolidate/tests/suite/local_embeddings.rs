@@ -359,7 +359,11 @@ async fn local_query_latency_under_document_load() {
         DOCUMENTS_PER_WORKER,
     )
     .await;
-    let bounded: Arc<dyn Embedder> = Arc::new(EmbeddingCapacity::new(embedder, 2).unwrap());
+    let cores = std::thread::available_parallelism()
+        .map(usize::from)
+        .unwrap_or(4);
+    let bounded: Arc<dyn Embedder> =
+        Arc::new(EmbeddingCapacity::new(embedder, ai_memory_llm::local_capacity(cores)).unwrap());
     let bounded_loaded = measure_queries_under_document_load(
         &bounded,
         workers,

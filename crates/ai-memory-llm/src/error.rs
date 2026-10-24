@@ -1,5 +1,7 @@
 //! LLM error type.
 
+use std::time::Duration;
+
 use thiserror::Error;
 
 /// Result alias used throughout the LLM crate.
@@ -20,6 +22,8 @@ pub enum LlmError {
         status: u16,
         /// Response body (truncated).
         body: String,
+        /// Provider-requested delay before another equivalent request.
+        retry_after: Option<Duration>,
     },
 
     /// Rate limit carrying the server's delta-seconds Retry-After value.
@@ -200,6 +204,26 @@ impl LlmError {
         }
     }
 
+    /// Provider-requested delay before another equivalent request, when the
+    /// failed HTTP response carried a trustworthy, boundedly parsed hint.
+    /// A typed `RateLimited` or `Capacity` rejection carries the same hint,
+    /// read by the same parser, in whole seconds.
+    #[must_use]
+    pub const fn retry_after(&self) -> Option<Duration> {
+        match self {
+            Self::Provider { retry_after, .. } => *retry_after,
+            Self::RateLimited {
+                retry_after_secs: Some(secs),
+                ..
+            }
+            | Self::Capacity {
+                retry_after_secs: secs,
+                ..
+            } => Some(Duration::from_secs(*secs)),
+            _ => None,
+        }
+    }
+
     /// Redacted error category used for health reporting and the fallback
     /// chain's aggregate error — never a response body or secret.
     #[must_use]
@@ -240,7 +264,8 @@ mod tests {
         assert!(
             LlmError::Provider {
                 status: 429,
-                body: String::new()
+                body: String::new(),
+                retry_after: None,
             }
             .is_transient()
         );
@@ -248,7 +273,8 @@ mod tests {
             assert!(
                 LlmError::Provider {
                     status,
-                    body: String::new()
+                    body: String::new(),
+                    retry_after: None,
                 }
                 .is_transient(),
                 "status {status} should be transient"
@@ -259,7 +285,8 @@ mod tests {
             assert!(
                 !LlmError::Provider {
                     status,
-                    body: String::new()
+                    body: String::new(),
+                    retry_after: None,
                 }
                 .is_transient(),
                 "status {status} must not be treated as transient"
@@ -282,6 +309,7 @@ mod tests {
             let error = LlmError::Provider {
                 status,
                 body: String::new(),
+                retry_after: None,
             };
             assert!(!error.is_fast_retryable(), "status {status}");
             assert!(error.is_ambiguous_delivery(), "status {status}");
@@ -293,6 +321,39 @@ mod tests {
             }
             .is_fast_retryable()
         );
+    }
+
+    // The circuit and the admission replay read one hint whichever variant
+    // carried it; the typed rejections must not hide it from `retry_after()`.
+    #[test]
+    fn retry_after_reads_the_hint_from_typed_and_provider_rejections() {
+        let rate_limited = |retry_after_secs| LlmError::RateLimited {
+            body: String::new(),
+            retry_after_secs,
+        };
+        assert_eq!(
+            rate_limited(Some(7)).retry_after(),
+            Some(Duration::from_secs(7))
+        );
+        assert_eq!(rate_limited(None).retry_after(), None);
+        assert_eq!(
+            LlmError::Capacity {
+                body: String::new(),
+                retry_after_secs: 90,
+            }
+            .retry_after(),
+            Some(Duration::from_secs(90))
+        );
+        assert_eq!(
+            LlmError::Provider {
+                status: 429,
+                body: String::new(),
+                retry_after: Some(Duration::from_millis(1_200)),
+            }
+            .retry_after(),
+            Some(Duration::from_millis(1_200))
+        );
+        assert_eq!(LlmError::Auth("expired".into()).retry_after(), None);
     }
 
     #[test]
@@ -364,7 +425,8 @@ mod tests {
         assert_eq!(
             LlmError::Provider {
                 status: 503,
-                body: "boom".into()
+                body: "boom".into(),
+                retry_after: None,
             }
             .http_status(),
             Some(503)
@@ -379,6 +441,7 @@ mod tests {
                 LlmError::Provider {
                     status: 500,
                     body: "secret upstream body".into(),
+                    retry_after: None,
                 },
                 "provider",
             ),
@@ -423,7 +486,8 @@ mod tests {
             assert!(
                 LlmError::Provider {
                     status,
-                    body: String::new()
+                    body: String::new(),
+                    retry_after: None,
                 }
                 .is_transient(),
                 "{status} must agree with is_transient"
@@ -434,7 +498,8 @@ mod tests {
             assert!(
                 !LlmError::Provider {
                     status,
-                    body: String::new()
+                    body: String::new(),
+                    retry_after: None,
                 }
                 .is_transient(),
                 "{status} must agree with is_transient"

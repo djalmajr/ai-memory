@@ -1333,6 +1333,15 @@ docker run --rm akitaonrails/ai-memory:latest \
         --auth-token "$TOKEN"
 ```
 
+The Codex entry `install-mcp` writes sets `default_tools_approval_mode =
+"approve"`, so ai-memory's read tools run without a prompt, and adds
+`[mcp_servers.<name>.tools.<tool>]` with `approval_mode = "prompt"` for every
+tool annotated destructive (`memory_delete_page`, `memory_forget_sweep`,
+`memory_restore_page`, the handoff accept and cancel tools, the message pop and
+cancel tools, and `memory_feedback`), so Codex asks before running them. A
+re-install keeps any per-tool `approval_mode` you set yourself. Both keys are in
+Codex's [configuration reference](https://developers.openai.com/codex/config-reference).
+
 Native Codex tool hooks use top-level `tool_name`, `tool_input`, `tool_response`,
 and `tool_use_id` fields (verified against CLI 0.154.0). ai-memory records the
 tool family and call ID on `PreToolUse` and `PostToolUse`; recognized tools such
@@ -1430,8 +1439,10 @@ handoff are built with them. Each prompt is keyed as `backfill` keys it, so a
 re-close stores it once and a prompt typed after the first finalize arrives
 with the next. A checkout the capture allowlist does not admit sends none,
 `--all-owners` replays none (other users' prompts are not in this machine's
-history), and a missing or unreadable `history.jsonl` only prints a warning.
-`agy -p` runs write no `history.jsonl` line, so they have no prompt to replay.
+history). When history is missing or yields no prompt, export falls back to
+the selected conversation's bounded, containment-checked brain transcript and
+keeps only explicit user-input steps. `agy -p` writes no `history.jsonl` line,
+so this fallback supplies its prompt.
 
 Rerun `ai-memory install-hooks --agent antigravity-cli --apply` after
 upgrading. An install from an earlier release runs its `session-start` handler
@@ -3853,6 +3864,13 @@ forward-only: after a newer version has applied its schema, an older binary
 will refuse to open that data dir (it fails closed rather than risk
 corruption), so take a `ai-memory backup` before upgrading if you might need
 to roll back to the previous version.
+
+If startup instead reports that the **migration history has a gap**, an
+earlier migration is missing even though a later one is recorded. This can
+occur with a development build whose migration sequence differed from the
+released sequence. Keep a backup and report the missing migration and the
+build used to create the store for review; startup does not automatically
+repair the history or apply the skipped migration.
 
 ### Upgrading to 3.0
 

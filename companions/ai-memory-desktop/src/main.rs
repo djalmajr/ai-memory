@@ -5,14 +5,13 @@
 
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
-use std::io::{BufRead as _, BufReader, Read as _};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex, PoisonError};
 
 use ai_memory_desktop::{
     Choice, EXE_NAME, Layout, choose, early_exit_message, find_on_path, install_bundled,
-    package_manager_dirs, setup_url,
+    package_manager_dirs, read_output, setup_url,
 };
 use anyhow::{Context as _, Result};
 use tauri::{AppHandle, Manager as _, RunEvent, WebviewWindow};
@@ -110,24 +109,25 @@ fn run(app: &AppHandle, window: &WebviewWindow, running: &Running) -> Result<()>
         .spawn()
         .with_context(|| format!("starting {} setup --web", exe.display()))?;
     let stdout = child.stdout.take().context("no output from setup")?;
-    let mut stderr = child.stderr.take().context("no error output from setup")?;
+    let stderr = child.stderr.take().context("no error output from setup")?;
     *running.lock().unwrap_or_else(PoisonError::into_inner) = Some(child);
 
+    // Both of the child's pipes are read at once: it logs to stderr for as
+    // long as it serves the page, and a stderr pipe left unread until stdout
+    // ends fills and blocks the child for good (see `read_output`).
     let mut navigated = false;
-    for line in BufReader::new(stdout).lines() {
-        let Ok(line) = line else { break };
+    let errors = read_output(stdout, stderr, |line| {
         if navigated {
-            continue;
+            return Ok(());
         }
-        if let Some(url) = setup_url(&line) {
+        if let Some(url) = setup_url(line) {
             window
                 .navigate(url.parse().context("reading the setup page address")?)
                 .context("opening the setup page")?;
             navigated = true;
         }
-    }
-    let mut errors = String::new();
-    let _ = stderr.read_to_string(&mut errors);
+        Ok(())
+    })?;
     let status = running
         .lock()
         .unwrap_or_else(PoisonError::into_inner)
