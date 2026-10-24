@@ -721,8 +721,12 @@ impl OpenAiProvider {
 
 /// A provider retry hint in the whole seconds the typed rejections carry,
 /// rounded up so a sub-second hint never becomes an immediate replay.
+/// Saturates: the hint is provider-controlled, and a wrapped sum would turn
+/// the longest possible delay into a zero-second one.
 fn whole_seconds_rounded_up(delay: Duration) -> u64 {
-    delay.as_secs() + u64::from(delay.subsec_nanos() > 0)
+    delay
+        .as_secs()
+        .saturating_add(u64::from(delay.subsec_nanos() > 0))
 }
 
 /// `true` when the engine reports the output stopped at the token budget
@@ -915,6 +919,7 @@ mod tests {
         OpenAiJsonSchema, OpenAiProvider, OpenAiResponse, OpenAiResponseFormat, REQUEST_ID_HEADER,
         RequestDialect, STRUCTURED_OUTPUT_SCHEMA_NAME, enforce_strict_object_schemas,
         is_length_truncated, model_requires_max_completion_tokens, normalize_openai_base,
+        whole_seconds_rounded_up,
     };
     use crate::provider::LlmProvider;
     use crate::types::{ChatMessage, ChatRequest, LlmOperationId, ReasoningEffort, Role};
@@ -1998,6 +2003,19 @@ mod tests {
                 }
             ),
             "{error:?}"
+        );
+    }
+
+    #[test]
+    fn retry_hint_seconds_round_up_and_saturate_at_the_largest_hint() {
+        use std::time::Duration;
+
+        assert_eq!(whole_seconds_rounded_up(Duration::ZERO), 0);
+        assert_eq!(whole_seconds_rounded_up(Duration::from_secs(1)), 1);
+        assert_eq!(whole_seconds_rounded_up(Duration::from_millis(1_200)), 2);
+        assert_eq!(
+            whole_seconds_rounded_up(Duration::new(u64::MAX, 500_000_000)),
+            u64::MAX
         );
     }
 
