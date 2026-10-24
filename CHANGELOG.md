@@ -58,6 +58,27 @@ version in [`docs/changelog/`](docs/changelog/):
   `llm_tokenizer_path` and rejects fallback chains until their tokenizers can
   be checked independently. (#2)
 
+### Changed
+- Made upstream's `provider_error` the only parser of provider retry hints
+  (the `Retry-After` delta-seconds header and a Google `RetryInfo.retryDelay`
+  in the body); the OpenAI-compatible client maps its result to the fork's
+  typed `RateLimited` and `Capacity` errors. A 429 whose body carries
+  `RetryInfo` now has its delay, rounded up to whole seconds, for the
+  admission guard's delayed replay, and `LlmError::retry_after()` reports the
+  hint for `RateLimited` and `Capacity` too. The fallback circuit opens on a
+  fast-retryable failure or on any failure carrying a provider hint, and
+  stays open for the hint clamped to between 30 seconds and one hour instead
+  of a flat 30 seconds; an ambiguous 5xx or timeout without a hint, and a 429
+  without a hint, still leave it closed. (#18)
+- Adopted upstream's rule for the SessionEnd consolidation queue: an LLM
+  failure is terminal unless it is transient. Expired or invalid
+  credentials, a missing provider configuration, schema errors and 4xx
+  rejections other than 429 now end the job at once and keep the heuristic
+  page, where the fork used to retry them. A full admission queue keeps the
+  queue's retry, because the prompt never reached the model, and the fork's
+  consolidator still sends a 429'd prompt once before the queue re-queues the
+  job. (#18)
+
 ### Fixed
 - Timeout and ambiguous 499/5xx LLM failures now receive at most one replay
   after a 60-second cooldown plus jitter. Fast retries remain for connection
