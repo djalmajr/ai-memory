@@ -208,6 +208,10 @@ pub(crate) enum WriteCmd {
         pages: Vec<NewPage>,
         reply: oneshot::Sender<StoreResult<Vec<PageId>>>,
     },
+    UpsertPageBatchIf {
+        pages: Vec<(NewPage, ops::PagePrecondition)>,
+        reply: oneshot::Sender<StoreResult<ops::ConditionalBatchUpsert>>,
+    },
     DeletePage {
         workspace_id: WorkspaceId,
         project_id: ProjectId,
@@ -882,8 +886,10 @@ pub struct WriterHandle {
 }
 
 struct WriterInner {
-    tx: mpsc::Sender<WriteCmd>,
+    tx: Option<mpsc::Sender<WriteCmd>>,
     join: Mutex<Option<JoinHandle<()>>>,
+    #[cfg(test)]
+    before_join: Option<Box<dyn FnOnce() + Send + Sync>>,
 }
 
 impl WriterHandle {
@@ -897,8 +903,10 @@ impl WriterHandle {
 
         Self {
             inner: Arc::new(WriterInner {
-                tx,
+                tx: Some(tx),
                 join: Mutex::new(Some(handle)),
+                #[cfg(test)]
+                before_join: None,
             }),
         }
     }
@@ -2826,8 +2834,11 @@ impl WriterHandle {
     /// wedged-writer signal `status` surfaces (2.0 item 7).
     #[must_use]
     pub fn queue_depth(&self) -> (usize, usize) {
-        let max = self.inner.tx.max_capacity();
-        (max.saturating_sub(self.inner.tx.capacity()), max)
+        let Some(tx) = self.inner.tx.as_ref() else {
+            return (0, 0);
+        };
+        let max = tx.max_capacity();
+        (max.saturating_sub(tx.capacity()), max)
     }
 
     /// Record a completed cross-session ("experience") pass for a scope.
@@ -2927,6 +2938,18 @@ impl WriterHandle {
     pub async fn upsert_pages_batch(&self, pages: Vec<NewPage>) -> StoreResult<Vec<PageId>> {
         let (tx, rx) = oneshot::channel();
         self.send(WriteCmd::UpsertPageBatch { pages, reply: tx })
+            .await?;
+        rx.await.map_err(|_| StoreError::WriterClosed)?
+    }
+
+    /// Atomically upsert a batch only when every latest-version precondition
+    /// still holds in the write transaction.
+    pub async fn upsert_pages_batch_if(
+        &self,
+        pages: Vec<(NewPage, ops::PagePrecondition)>,
+    ) -> StoreResult<ops::ConditionalBatchUpsert> {
+        let (tx, rx) = oneshot::channel();
+        self.send(WriteCmd::UpsertPageBatchIf { pages, reply: tx })
             .await?;
         rx.await.map_err(|_| StoreError::WriterClosed)?
     }
@@ -3775,6 +3798,8 @@ impl WriterHandle {
     async fn send(&self, cmd: WriteCmd) -> StoreResult<()> {
         self.inner
             .tx
+            .as_ref()
+            .ok_or(StoreError::WriterClosed)?
             .send(cmd)
             .await
             .map_err(|_| StoreError::WriterClosed)
@@ -3783,7 +3808,17 @@ impl WriterHandle {
 
 impl Drop for WriterInner {
     fn drop(&mut self) {
-        let _ = self.tx.try_send(WriteCmd::Shutdown);
+        // A full mailbox cannot accept Shutdown. Drop the last sender before
+        // joining so the worker still exits after draining accepted commands.
+        // Keeping the sender alive here would leave it waiting for more work
+        // forever while this thread waits for it to finish.
+        if let Some(tx) = self.tx.take() {
+            let _ = tx.try_send(WriteCmd::Shutdown);
+        }
+        #[cfg(test)]
+        if let Some(before_join) = self.before_join.take() {
+            before_join();
+        }
         if let Some(handle) = self.join.lock().expect("writer join mutex poisoned").take() {
             let _ = handle.join();
         }
@@ -4156,6 +4191,10 @@ fn worker_loop(mut conn: Connection, mut rx: mpsc::Receiver<WriteCmd>) {
             WriteCmd::UpsertPageBatch { pages, reply } => {
                 let result = ops::upsert_pages_batch(&mut conn, &pages);
                 send_or_warn(reply, result, "upsert_pages_batch");
+            }
+            WriteCmd::UpsertPageBatchIf { pages, reply } => {
+                let result = ops::upsert_pages_batch_if(&mut conn, &pages);
+                send_or_warn(reply, result, "upsert_pages_batch_if");
             }
             WriteCmd::BeginSession { session, reply } => {
                 let result = ops::begin_session(&mut conn, &session);
@@ -5283,6 +5322,8 @@ mod tests {
         writer
             .inner
             .tx
+            .as_ref()
+            .unwrap()
             .send(WriteCmd::GetOrCreateWorkspace {
                 name: name.to_owned(),
                 reply: tx,
@@ -5446,6 +5487,103 @@ mod tests {
         }
     }
 
+    #[test]
+    fn drop_with_a_full_queue_completes_pending_commands_and_joins() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let mut writer = store.writer.clone();
+        let db_path = store.db_path().to_owned();
+        drop(store);
+
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (resume_tx, resume_rx) = std::sync::mpsc::channel();
+        let (reply, blocker) = oneshot::channel();
+        let blocked =
+            writer
+                .inner
+                .tx
+                .as_ref()
+                .unwrap()
+                .try_send(WriteCmd::EndIdleSessionsPreStamp {
+                    candidates: vec![IdleEndCandidate {
+                        session_id: SessionId::new(),
+                        workspace_id: WorkspaceId::new(),
+                        project_id: ProjectId::new(),
+                        agent_kind: AgentKind::Codex,
+                        action: ops::IdleEndAction::LifecycleOnly {
+                            now_us: 0,
+                            last_activity_us: 0,
+                        },
+                    }],
+                    enqueue_consolidation: false,
+                    pre_stamp: Box::new(move |_| {
+                        entered_tx.send(()).unwrap();
+                        resume_rx.recv().unwrap();
+                    }),
+                    reply,
+                });
+        assert!(blocked.is_ok());
+        entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+
+        let mut pending = Vec::new();
+        let capacity = writer.queue_depth().1;
+        for i in 0..capacity {
+            let (reply, rx) = oneshot::channel();
+            assert!(
+                writer
+                    .inner
+                    .tx
+                    .as_ref()
+                    .unwrap()
+                    .try_send(WriteCmd::GetOrCreateWorkspace {
+                        name: format!("full-drain-{i}"),
+                        reply,
+                    })
+                    .is_ok()
+            );
+            pending.push(rx);
+        }
+        assert_eq!(writer.queue_depth(), (capacity, capacity));
+        let rescue = writer.inner.tx.as_ref().unwrap().downgrade();
+        let (joining_tx, joining_rx) = std::sync::mpsc::channel();
+        Arc::get_mut(&mut writer.inner).unwrap().before_join = Some(Box::new(move || {
+            joining_tx.send(()).unwrap();
+        }));
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let dropper = thread::spawn(move || {
+            drop(writer);
+            let _ = done_tx.send(());
+        });
+        // The writer cannot consume a queued command until Drop has attempted
+        // shutdown against the full queue. No scheduling sleeps are needed.
+        joining_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        resume_tx.send(()).unwrap();
+        let completed = done_rx.recv_timeout(Duration::from_secs(5)).is_ok();
+        if !completed {
+            // Rescue the old deadlock before failing, so a regression never
+            // leaves the test suite waiting on a stuck writer thread.
+            if let Some(sender) = rescue.upgrade() {
+                let _ = sender.try_send(WriteCmd::Shutdown);
+            }
+            assert!(done_rx.recv_timeout(Duration::from_secs(5)).is_ok());
+        }
+        dropper.join().unwrap();
+        blocker.blocking_recv().unwrap().unwrap();
+        for rx in pending {
+            rx.blocking_recv().unwrap().unwrap();
+        }
+        let conn = Connection::open(db_path).unwrap();
+        let committed: usize = conn
+            .query_row(
+                "SELECT COUNT(*) FROM workspaces WHERE name LIKE 'full-drain-%'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(committed, capacity, "accepted commands must all commit");
+        assert!(completed, "dropping a full writer queue must finish");
+    }
+
     /// The dry run and the real move both go through the actor; only the
     /// latter changes the session row a reader sees.
     #[tokio::test]
@@ -5529,6 +5667,8 @@ mod tests {
             writer
                 .inner
                 .tx
+                .as_ref()
+                .unwrap()
                 .send(WriteCmd::Shutdown)
                 .await
                 .expect("writer channel closed before Shutdown");
@@ -5557,6 +5697,8 @@ mod tests {
         writer
             .inner
             .tx
+            .as_ref()
+            .unwrap()
             .send(WriteCmd::Shutdown)
             .await
             .expect("writer channel closed before Shutdown");

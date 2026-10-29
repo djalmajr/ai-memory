@@ -41,6 +41,14 @@ commands do: the `.ai-memory.toml` marker's `project`, then the git remote, then
 the directory name. `--confirm`, the preview and every other guard behave the
 same as with a name.
 
+That derived target is a deprecation, not a promise: `purge-project --confirm`
+without `--project`/`--project-id` prints the project it resolved and the
+command that names it, and it will be refused in 4.0, because the one thing a
+purge must not do is guess between "the checkout I am standing in" and "the
+project I meant" (#1642). An explicitly empty flag is already refused: `--project
+""` used to pass the "was it named" check and then resolve as if it had not been
+passed, which is how an unset variable in a script reached a real delete.
+
 State-touching commands route through the HTTP admin API except `reset`,
 `restore`, and `reindex`, which are direct-disk lifecycle operations that
 fundamentally cannot run while another process holds the SQLite WAL writer. See
@@ -1009,6 +1017,11 @@ ai-memory restore-page --workspace default --project my-project \
   --path notes/foo.md --from <checkpoint>
 ```
 
+Each omitted scope flag is resolved from the current directory; a non-empty
+explicit value takes precedence over that default. An explicitly empty or
+whitespace-only flag is refused before any request, so an unset shell variable
+cannot restore a page in the checkout's project by accident.
+
 What happens:
 
 1. Server resolves `(workspace, project)` without auto-creating anything.
@@ -1018,6 +1031,8 @@ What happens:
 4. Server reads the exact markdown blob for that project/page from git at
    `--from`, parses it, writes it back to the live wiki tree, and upserts a new
    latest page row in SQLite so search, links, and `/web` agree with disk.
+   It shares the same-path lock with writes and watcher reindexing, including
+   the read of current frontmatter used to preserve `generated.at`.
 5. Server writes a post-restore checkpoint (`restore-page ...`) when the live
    tree changed.
 
@@ -1029,6 +1044,10 @@ Failure modes:
   pre-restore checkpoint remains as an audit breadcrumb.
 - **Historical markdown is malformed or non-UTF-8** → 500, live file is not
   replaced.
+- **SQLite rejects the restored version** (for example, the historical path
+  collides with a current page under case folding) → 500, the previous file is
+  restored or a newly created file is removed. If that rollback also fails,
+  the error explicitly reports an inconsistent state requiring repair.
 
 What it does not recover:
 
@@ -1208,14 +1227,20 @@ Order of operations:
 
 1. Check the data dir is empty (or the user passed `--force`).
 2. Extract the tarball into a staging directory beside the live data
-   (`<data_dir>/.restore-staging-<stamp>/`), validating every entry.
-3. Open the staged store so pending migrations run and the SQLite
-   snapshot is verified, still without touching the live data. A legacy
-   database with API keys but no pepper verifier stops here unless the original
-   pepper is configured and `--accept-legacy-api-key-pepper` was passed. When
+   (`<data_dir>/.restore-staging-<stamp>/`), validating every entry and
+   reading the gzip stream through its checksum and size trailer. A missing
+   or invalid trailer fails here even when every tar entry was readable.
+3. Require an existing `db/memory.sqlite` snapshot with applied ai-memory
+   migration history, then open the staged store so pending migrations run
+   and the SQLite snapshot is checked, still without touching the live data.
+   A database with no pages is valid; an absent, zero-byte or uninitialized
+   database is refused rather than initialized into an empty replacement.
+   A legacy database with API keys but no pepper verifier stops here unless
+   the original pepper is configured and `--accept-legacy-api-key-pepper` was passed. When
    the live config is being kept (step 4) and the database holds API keys, the
    configured pepper must match the one the keys were hashed with, or the
-   restore stops here too.
+   restore stops here too. This also applies when the archive has no
+   `config.toml`, even with `--with-config`.
 4. Swap: rename the live `wiki/` and `db/` aside, rename the staged copies
    into place, then delete the previous data. Each move is a same-filesystem
    rename; if one fails, the moves already made are reversed. The archive's
@@ -1244,14 +1269,18 @@ Failure modes:
   a snapshot the current binary cannot open** (for example a backup taken
   by a newer release) → exits with the error; the existing `wiki/` and
   `db/` are left as they were.
+- **Missing, empty or uninitialized database snapshot** → exits before the
+  swap. A restore requires the archive's `db/memory.sqlite` and its applied
+  migration history; it never initializes a new store to fill in missing data.
 - **Migration history has a gap** → an earlier migration is unrecorded
   although a later one was applied. The staged store is refused, just as at
   normal startup. Keep the backup and report the history for review;
   `--force` does not bypass this check or repair the missing migration.
-- **The live config's pepper does not match the backup's API keys** (live
-  config kept) → rerun with `--with-config` to restore the backup's config, or
-  set the live `[auth].token_pepper` to the original. The live data is left as
-  it was.
+- **The live config's pepper is missing or does not match the backup's API
+  keys** (live config kept) → set the live `[auth].token_pepper` to the
+  original. If the backup contains `config.toml`, restoring it with
+  `--with-config` is another option. Without that file in the archive, carry
+  the original config separately. The live data is left as it was.
 - **Legacy backup has API keys but no pepper verifier** → restore the original
   `[auth].token_pepper` through the current config/environment and rerun with
   `--accept-legacy-api-key-pepper`. This flag confirms provenance; it cannot

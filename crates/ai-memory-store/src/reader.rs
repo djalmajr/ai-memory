@@ -13293,9 +13293,9 @@ impl ReaderPool {
 
     /// Resolve the per-project authorization state (#708) from the read pool.
     ///
-    /// An `open` project short-circuits without a grant lookup; a `restricted`
-    /// project whose grants cannot be read degrades to `open` (never fail
-    /// closed). See [`crate::project_authz`].
+    /// An `open` project short-circuits without a grant lookup. Store failures
+    /// while resolving an existing restricted project propagate so callers
+    /// fail closed. See [`crate::project_authz`].
     pub async fn resolve_project_authz(
         &self,
         workspace_id: WorkspaceId,

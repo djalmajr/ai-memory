@@ -3623,15 +3623,15 @@ pub struct ServeArgs {
     /// --enable-web is set.
     #[arg(long, env = "AI_MEMORY_WEB_UI_DIR")]
     pub web_ui_dir: Option<PathBuf>,
-    /// Base path the whole HTTP surface is served under. Empty (default)
-    /// keeps every route at the host root — byte-identical to previous
-    /// behaviour. Set e.g. `/wiki` to host ai-memory under a URL subpath
+    /// Base path the whole HTTP surface is served under (default: from config).
+    /// Empty (the configuration default) keeps every route at the host root.
+    /// Set e.g. `/wiki` to host ai-memory under a URL subpath
     /// behind a reverse proxy that preserves the prefix; then `/mcp`,
     /// `/api/v1`, `/hook` and the web UI all live under it (`/wiki/mcp`,
     /// `/wiki/api/v1`, …). The value is normalised to `/<core>` (leading
     /// slash, no trailing); `/` and `` both mean root.
-    #[arg(long, env = "AI_MEMORY_BASE_PATH", default_value = "")]
-    pub base_path: String,
+    #[arg(long, env = "AI_MEMORY_BASE_PATH")]
+    pub base_path: Option<String>,
     /// Slug the web UI is mounted at, WITHIN `--base-path`. Default `/web`
     /// (the read-only `/api/v1` API always stays at `<base>/api/v1`). Set
     /// `/` to serve the UI at the base root itself (e.g. `/wiki` instead of

@@ -38,6 +38,7 @@ mod repo_layout;
 mod routing_instructions;
 mod routing_skills;
 mod run_offline;
+mod serve_config;
 mod serve_shutdown;
 mod server_profiles;
 mod service_host_windows;

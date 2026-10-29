@@ -22,6 +22,9 @@ ever sees mail addressed **to** it (its inbox) or sent **from** it (its outbox).
 - **Claim-once queue.** A message is `pending` until a session in the recipient
   project pops it (→ `claimed`, exactly once) or the sender cancels it
   (→ `cancelled`). A second pop of the same message returns nothing.
+  Claimed and cancelled messages remain for audit. Scheduled empty-project
+  cleanup preserves both the sender and recipient while any message remains;
+  an explicit project or workspace purge still removes its messages.
 - **Fail closed on an unknown recipient.** The recipient project must already
   exist (an agent must have run there at least once). A typo is rejected, not
   turned into a dead inbox nobody reads.

@@ -18,8 +18,8 @@ use ai_memory_workstream::{
     LaunchPlan, LaunchRoots, ManagedHarness, NativeSessionCandidate, ai_jail_support,
     allows_native_session_adoption, apply_claude_true_yolo, apply_yolo, build_ai_jail_invocation,
     build_launch_plan, build_launch_plan_with_env_lookup, claude_continued_session,
-    claude_live_background_attach_id, claude_session_ran_in_background, clean_path,
-    crush_global_config_path, discover_native_session, export_transcript,
+    claude_continued_sessions, claude_live_background_attach_id, claude_session_ran_in_background,
+    clean_path, crush_global_config_path, discover_native_session, export_transcript,
     has_native_session_selector, inside_ai_jail_here, inspect_repository,
     is_interactive_session_invocation, jail_checklist, jail_toggle, kiro_explicit_session_id,
     kiro_harness_from_source_cursor, kiro_selects_non_default_engine, kiro_selects_v2_engine,
@@ -1123,7 +1123,14 @@ async fn run_once_with_wiring(
         plan.args = vec![OsString::from("attach"), OsString::from(attach_id)];
     }
 
-    let previous_history = match prepared.previous_native_session.as_ref() {
+    let previous_session = previous_session_for_history(
+        prepared.previous_native_session.as_ref(),
+        prepared.native_session_id.as_deref(),
+        force_fresh,
+        plan.mode,
+        harness,
+    );
+    let previous_history = match previous_session.as_ref() {
         Some(previous) => match prepare_previous_session_history(
             config,
             &endpoint,
@@ -1336,7 +1343,55 @@ async fn run_once_with_wiring(
         } else {
             None
         };
-    let (transcript, exact_export_available) = if plan.mode == LaunchMode::Session
+    let left_behind_session_ids = if let (Some(own), Some(followed)) =
+        (own_session_id.as_deref(), native_session_id.as_deref())
+    {
+        match claude_left_behind_session_ids(
+            harness,
+            &home,
+            &repository.cwd,
+            plan.session_dir.as_deref(),
+            own,
+            followed,
+            started_at,
+        ) {
+            Ok(ids) => ids,
+            Err(error) => {
+                eprintln!(
+                    "ai-memory: could not enumerate Claude sessions left behind by continuation ({error:#}); only the followed session will be imported"
+                );
+                Vec::new()
+            }
+        }
+    } else {
+        Vec::new()
+    };
+    let mut left_behind_transcripts = Vec::new();
+    let mut left_behind_losses = Vec::new();
+    for session_id in &left_behind_session_ids {
+        let source_cursor = (prepared.native_session_id.as_deref() == Some(session_id.as_str()))
+            .then_some(prepared.source_cursor.as_deref())
+            .flatten();
+        let mut exported = export_after_flush(
+            harness,
+            &home,
+            &repository.cwd,
+            plan.session_dir.as_deref(),
+            Some(session_id),
+            source_cursor,
+        )
+        .await;
+        left_behind_losses.extend(exported.losses.drain(..).map(|loss| {
+            format!(
+                "Claude session {} was left behind before continuation: {loss}",
+                display_session_id(session_id)
+            )
+        }));
+        if !exported.events.is_empty() {
+            left_behind_transcripts.push(exported);
+        }
+    }
+    let (mut transcript, exact_export_available) = if plan.mode == LaunchMode::Session
         && harness.transcript_capability() == ai_memory_workstream::TranscriptCapability::Export
     {
         let exported = export_after_flush(
@@ -1362,6 +1417,7 @@ async fn run_once_with_wiring(
             false,
         )
     };
+    transcript.losses.extend(left_behind_losses);
     let recovery_event_digests =
         exact_export_available.then(|| transcript_interval_digests(&transcript.events));
     let recovery_cursor = exact_export_available
@@ -1370,17 +1426,42 @@ async fn run_once_with_wiring(
     let checkpoint = inspect_repository(&repository.cwd)
         .map(|identity| identity.checkpoint)
         .unwrap_or(repository.checkpoint);
-    let imported = match import_batches(
-        &endpoint,
-        &run_path,
-        transcript,
-        checkpoint,
-        Some(exit_code),
-        &privacy,
-        &TranscriptCapture::for_checkout(&config.data_dir, &repository.cwd),
-    )
-    .await
-    {
+    let capture = TranscriptCapture::for_checkout(&config.data_dir, &repository.cwd);
+    let mut preliminary_imported = 0;
+    let mut preliminary_error = None;
+    for abandoned in left_behind_transcripts {
+        match import_incomplete_batches(
+            &endpoint,
+            &run_path,
+            abandoned,
+            checkpoint.clone(),
+            &privacy,
+            &capture,
+        )
+        .await
+        {
+            Ok(imported) => preliminary_imported += imported,
+            Err(error) => {
+                preliminary_error = Some(error);
+                break;
+            }
+        }
+    }
+    let import_result = match preliminary_error {
+        Some(error) => Err(error),
+        None => import_batches(
+            &endpoint,
+            &run_path,
+            transcript,
+            checkpoint,
+            Some(exit_code),
+            &privacy,
+            &capture,
+        )
+        .await
+        .map(|imported| preliminary_imported + imported),
+    };
+    let imported = match import_result {
         Ok(imported) => imported,
         // The child has already exited; an unreachable server must not turn
         // its exit code into an error. The transcript is not recorded, so say
@@ -1398,6 +1479,16 @@ async fn run_once_with_wiring(
                     &error,
                 )
             );
+            if !left_behind_session_ids.is_empty() {
+                eprintln!(
+                    "ai-memory: offline recovery records only the followed session; verify the left-behind Claude session(s) {} after the server returns",
+                    left_behind_session_ids
+                        .iter()
+                        .map(|id| display_session_id(id))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                );
+            }
             journal_finish_failed_run(
                 config,
                 &endpoint,
@@ -1442,7 +1533,8 @@ async fn run_once_with_wiring(
         && attached_background.is_none()
     {
         eprintln!(
-            "ai-memory: this harness did not acknowledge its managed context packet; refresh its ai-memory hooks before the next run"
+            "{}",
+            missing_context_warning(harness, resumes_linked_session)
         );
     }
     eprintln!(
@@ -2847,6 +2939,37 @@ fn follow_claude_continued_session(
 }
 
 #[allow(clippy::too_many_arguments)]
+fn claude_left_behind_session_ids(
+    harness: ManagedHarness,
+    home: &Path,
+    cwd: &Path,
+    session_dir: Option<&Path>,
+    own_session_id: &str,
+    followed_session_id: &str,
+    started_at: SystemTime,
+) -> Result<Vec<String>> {
+    if harness != ManagedHarness::Claude || own_session_id == followed_session_id {
+        return Ok(Vec::new());
+    }
+    let continuations =
+        claude_continued_sessions(home, cwd, session_dir, own_session_id, started_at)?;
+    let mut sessions = vec![own_session_id.to_owned()];
+    for continuation in continuations {
+        let id = continuation.session_id();
+        if id == followed_session_id {
+            return Ok(sessions);
+        }
+        if !sessions.iter().any(|known| known == id) {
+            sessions.push(id.to_owned());
+        }
+    }
+    Err(anyhow!(
+        "followed Claude session {} was absent from its continuation chain",
+        display_session_id(followed_session_id)
+    ))
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn resolve_native_session_after_run(
     plan: &LaunchPlan,
     harness: ManagedHarness,
@@ -3291,6 +3414,33 @@ fn blank_home_overrides(
             value.is_some() && ai_memory_workstream::env_dir_override(value).is_none()
         })
         .collect()
+}
+
+fn previous_session_for_history(
+    previous: Option<&ManagedNativeSessionReference>,
+    linked_session_id: Option<&str>,
+    force_fresh: bool,
+    launch_mode: LaunchMode,
+    harness: ManagedHarness,
+) -> Option<ManagedNativeSessionReference> {
+    previous.cloned().or_else(|| {
+        (force_fresh && launch_mode == LaunchMode::Session)
+            .then(|| {
+                linked_session_id.map(|native_session_id| ManagedNativeSessionReference {
+                    agent: harness.agent_kind(),
+                    native_session_id: native_session_id.to_owned(),
+                })
+            })
+            .flatten()
+    })
+}
+
+fn missing_context_warning(harness: ManagedHarness, resumes_linked_session: bool) -> &'static str {
+    if harness == ManagedHarness::Codex && resumes_linked_session {
+        "ai-memory: Codex did not acknowledge the managed context in the linked thread; if you used `/new`, that new thread was not adopted because Codex exposes no trustworthy parent link. Resume the intended thread explicitly on the next managed run; otherwise refresh the ai-memory hooks"
+    } else {
+        "ai-memory: this harness did not acknowledge its managed context packet; refresh its ai-memory hooks before the next run"
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -4207,6 +4357,40 @@ pub(crate) async fn import_batches(
                 Vec::new()
             },
             exit_code: complete.then_some(exit_code).flatten(),
+        };
+        imported += finish_with_retry(endpoint, run_path, &request)
+            .await?
+            .imported_events;
+    }
+    Ok(imported)
+}
+
+async fn import_incomplete_batches(
+    endpoint: &ServerEndpoint,
+    run_path: &str,
+    transcript: ExportedTranscript,
+    checkpoint: ai_memory_core::WorkstreamCheckpoint,
+    sanitizer: &Sanitizer,
+    capture: &TranscriptCapture,
+) -> Result<usize> {
+    let native_identity = NativeSessionIdentity::parse(&transcript.native_session_id, sanitizer)?;
+    for event in &transcript.events {
+        NativeSessionIdentity::parse(&event.native_session_id, sanitizer)?;
+    }
+    let events = capture.filter_ledger_events(transcript.events);
+    if events.is_empty() {
+        return Ok(0);
+    }
+    let mut imported = 0;
+    for batch in event_batches(events) {
+        let request = FinishManagedRunRequest {
+            native_session_id: Some(native_identity.as_str().to_owned()),
+            source_cursor: None,
+            events: batch,
+            complete: false,
+            checkpoint: checkpoint.clone(),
+            losses: Vec::new(),
+            exit_code: None,
         };
         imported += finish_with_retry(endpoint, run_path, &request)
             .await?
@@ -8306,6 +8490,52 @@ mod tests {
         assert_eq!(explicit.expected_session_id.as_deref(), Some("chosen"));
     }
 
+    /// Codex compresses a rollout idle for a week to `.jsonl.zst`. The launch
+    /// still resumes that linked session instead of treating it as missing.
+    #[test]
+    fn compressed_codex_rollout_is_resumed_not_orphaned() {
+        let temp = tempfile::tempdir().unwrap();
+        let cwd = temp.path().join("repo");
+        let day = temp.path().join(".codex/sessions/2026/10/05");
+        std::fs::create_dir_all(&cwd).unwrap();
+        std::fs::create_dir_all(&day).unwrap();
+        let id = "01a10e73-0053-7f73-8dbd-5c76bcb2f5e5";
+        let record = serde_json::json!({"type":"session_meta","payload":{"id":id,"cwd":cwd}});
+        let compressed = day.join(format!("rollout-2026-10-05T20-43-00-{id}.jsonl.zst"));
+        std::fs::write(
+            &compressed,
+            ruzstd::encoding::compress_to_vec(
+                format!("{record}\n").as_bytes(),
+                ruzstd::encoding::CompressionLevel::Fastest,
+            ),
+        )
+        .unwrap();
+        let env = EffectiveChildEnv::default();
+        let plan = || {
+            build_preflighted_launch_plan(
+                ManagedHarness::Codex,
+                None,
+                Vec::new(),
+                Some(id),
+                false,
+                temp.path(),
+                &cwd,
+                &env,
+            )
+            .unwrap()
+        };
+
+        let (resumed, orphaned) = plan();
+        assert!(orphaned.is_none());
+        assert!(resumed.args.iter().any(|arg| arg == "resume"));
+        assert_eq!(resumed.expected_session_id.as_deref(), Some(id));
+
+        std::fs::remove_file(&compressed).unwrap();
+        let (fresh, orphaned) = plan();
+        assert_eq!(orphaned.as_deref(), Some(id));
+        assert!(!fresh.args.iter().any(|arg| arg == "resume"));
+    }
+
     /// A linked session missing from this launch's store is only replaced
     /// when it was linked under the same store (or nothing was recorded).
     #[test]
@@ -8485,6 +8715,59 @@ mod tests {
         )
         .unwrap_err();
         assert!(error.to_string().contains("--fresh cannot be combined"));
+    }
+
+    #[test]
+    fn fresh_session_uses_the_linked_session_as_local_history_fallback() {
+        let linked = previous_session_for_history(
+            None,
+            Some("linked-claude-session"),
+            true,
+            LaunchMode::Session,
+            ManagedHarness::Claude,
+        )
+        .unwrap();
+        assert_eq!(linked.agent, AgentKind::ClaudeCode);
+        assert_eq!(linked.native_session_id, "linked-claude-session");
+
+        assert!(
+            previous_session_for_history(
+                None,
+                Some("linked-claude-session"),
+                true,
+                LaunchMode::Passthrough,
+                ManagedHarness::Claude,
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn cross_harness_history_precedes_the_fresh_session_fallback() {
+        let previous = ManagedNativeSessionReference {
+            agent: AgentKind::OpenCode,
+            native_session_id: "previous-opencode-session".into(),
+        };
+        assert_eq!(
+            previous_session_for_history(
+                Some(&previous),
+                Some("linked-claude-session"),
+                true,
+                LaunchMode::Session,
+                ManagedHarness::Claude,
+            ),
+            Some(previous)
+        );
+    }
+
+    #[test]
+    fn linked_codex_context_warning_explains_unowned_new_threads() {
+        let warning = missing_context_warning(ManagedHarness::Codex, true);
+        assert!(warning.contains("if you used `/new`"));
+        assert!(warning.contains("no trustworthy parent link"));
+
+        assert!(!missing_context_warning(ManagedHarness::Codex, false).contains("`/new`"));
+        assert!(!missing_context_warning(ManagedHarness::Claude, true).contains("`/new`"));
     }
 
     #[tokio::test]
@@ -10248,6 +10531,71 @@ mod tests {
             requests.lock().unwrap()[0].source_cursor.as_deref(),
             Some("cursor")
         );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn abandoned_session_batches_do_not_finalize_the_followed_run() {
+        let requests = Arc::new(std::sync::Mutex::new(Vec::<FinishManagedRunRequest>::new()));
+        let captured = requests.clone();
+        let app = Router::new().route(
+            "/workstream/runs/{id}/finish",
+            post(
+                move |axum::Json(request): axum::Json<FinishManagedRunRequest>| {
+                    let captured = captured.clone();
+                    async move {
+                        let imported_events = request.events.len();
+                        captured.lock().unwrap().push(request);
+                        axum::Json(FinishManagedRunResponse {
+                            imported_events,
+                            latest_sequence: 1,
+                        })
+                    }
+                },
+            ),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let home = tempfile::tempdir().unwrap();
+        let config = launch_config(home.path(), home.path(), address);
+        let endpoint = ServerEndpoint::from_config_resolving_auth(&config).await;
+        let transcript = ExportedTranscript {
+            native_session_id: "abandoned".into(),
+            source_cursor: Some("must-not-advance".into()),
+            events: vec![ai_memory_core::NewWorkstreamEvent {
+                event_id: "abandoned-event".into(),
+                agent: AgentKind::ClaudeCode,
+                native_session_id: "abandoned".into(),
+                source_record_id: None,
+                kind: ai_memory_core::WorkstreamEventKind::Message,
+                role: Some("user".into()),
+                content: "before clear".into(),
+                occurred_at: None,
+                metadata: serde_json::json!({}),
+            }],
+            losses: vec!["reported on the final transcript".into()],
+        };
+
+        assert_eq!(
+            import_incomplete_batches(
+                &endpoint,
+                "/workstream/runs/test",
+                transcript,
+                Default::default(),
+                &Sanitizer::builtin(),
+                &TranscriptCapture::for_checkout(home.path(), home.path()),
+            )
+            .await
+            .unwrap(),
+            1
+        );
+        let request = &requests.lock().unwrap()[0];
+        assert_eq!(request.native_session_id.as_deref(), Some("abandoned"));
+        assert!(!request.complete);
+        assert!(request.source_cursor.is_none());
+        assert!(request.losses.is_empty());
+        assert!(request.exit_code.is_none());
         server.abort();
     }
 

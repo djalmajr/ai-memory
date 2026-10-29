@@ -435,6 +435,9 @@ fn extract_release_tar_gz(bytes: &[u8], dest: &Path) -> Result<()> {
 fn extract_release_zip(bytes: &[u8], dest: &Path) -> Result<()> {
     let cursor = Cursor::new(bytes);
     let mut archive = zip::ZipArchive::new(cursor).context("opening release zip")?;
+    archive
+        .validate_header_consistency()
+        .context("validating release zip headers")?;
     let mut budget = ReleaseArchiveBudget::default();
     for i in 0..archive.len() {
         let mut file = archive
@@ -1542,6 +1545,23 @@ mod tests {
                 "{err}"
             ),
         }
+        Ok(())
+    }
+
+    #[test]
+    fn zip_extract_rejects_inconsistent_local_and_central_names() -> Result<()> {
+        let mut bytes = build_test_zip(&[("ai-memory.exe", b"binary")])?;
+        let local_name = bytes
+            .windows(b"ai-memory.exe".len())
+            .position(|window| window == b"ai-memory.exe")
+            .expect("local header filename");
+        bytes[local_name..local_name + b"ai-memory.exe".len()].copy_from_slice(b"bad-memory.ex");
+
+        let dest = tempfile::tempdir()?;
+        let error = extract_release_archive(&bytes, dest.path(), "ai-memory-windows-x86_64.zip")
+            .expect_err("dual-header archive must be rejected");
+        assert!(error.to_string().contains("validating release zip headers"));
+        assert!(!dest.path().join("ai-memory.exe").exists());
         Ok(())
     }
 

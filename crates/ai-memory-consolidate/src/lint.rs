@@ -956,6 +956,13 @@ mod tests {
     }
 
     #[test]
+    fn lint_prompt_mirrors_wiki_language_but_keeps_enums() {
+        assert!(LINT_SYSTEM_PROMPT.contains("## OUTPUT LANGUAGE"));
+        assert!(LINT_SYSTEM_PROMPT.contains("dominant natural language of\nthe page previews"));
+        assert!(LINT_SYSTEM_PROMPT.contains("`kind`, `severity`, and JSON keys stay"));
+    }
+
+    #[test]
     fn rule_pass_flags_stale_episodic() {
         let very_old = Timestamp::now().as_microsecond() - (90 * 86_400_000_000i64);
         let candidates = vec![DecayCandidate {

@@ -1,5 +1,6 @@
 //! `GET /w/:workspace/:project/p/*path` — rendered markdown page.
 
+use std::cmp::Reverse;
 use std::sync::Arc;
 
 use ai_memory_core::PagePath;
@@ -219,20 +220,16 @@ async fn namespace_or_not_found(
     }
     let sort_title = query.sort.as_deref() == Some("title");
     // Titles repeat (session pages), so ties fall back to recency, then path.
-    let newest_first = |a: &PageSummary, b: &PageSummary| {
-        b.updated_at
-            .cmp(&a.updated_at)
-            .then_with(|| a.path.cmp(&b.path))
+    let newest_first = |page: &PageSummary| {
+        (
+            Reverse(page.updated_at.parse::<jiff::Timestamp>().ok()),
+            page.path.clone(),
+        )
     };
     if sort_title {
-        under.sort_by(|a, b| {
-            a.title
-                .to_lowercase()
-                .cmp(&b.title.to_lowercase())
-                .then_with(|| newest_first(a, b))
-        });
+        under.sort_by_cached_key(|page| (page.title.to_lowercase(), newest_first(page)));
     } else {
-        under.sort_by(newest_first);
+        under.sort_by_cached_key(newest_first);
     }
     let total = under.len();
     let last_page = total.div_ceil(NAMESPACE_PAGE_SIZE);

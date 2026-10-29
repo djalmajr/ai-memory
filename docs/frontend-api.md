@@ -314,7 +314,9 @@ GET /api/v1/workspaces/{workspace}/projects/{project}/recent?limit=20
 ```
 
 `is_latest = 1` pages whose `expires_at` TTL has not passed, ordered by
-`updated_at` DESC. `limit` clamped `1..=100`, default `10`.
+`updated_at` DESC by instant, with path ascending for equal timestamps.
+Fractional-second precision in the serialized timestamps does not change this
+order. `limit` clamped `1..=100`, default `10`.
 
 Every reader surface uses the same `kind` contract. An explicit frontmatter
 `kind` wins; otherwise the path families `_rules/`, `_slots/`, `sessions/`,

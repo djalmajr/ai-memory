@@ -188,7 +188,16 @@ is new since the last one.
   `<task-notification>` blocks), the instruction files Codex injects as a user
   message, and ai-memory's own routing snippet or recalled-history digest
   pasted into a prompt (only that block; your sentences around it still
-  count). Your verbatim words are kept as evidence.
+  count). A prompt written by a program driving the agent through its SDK is
+  skipped whole: one that wraps a transcript ("Here is a conversation between
+  a user and a coding agent…") or asks for a verbatim reply ("Reply with
+  exactly…") is a summarizer or a demo, and its instructions are the program's,
+  not yours. A sentence that switches off one of the agent's own capabilities
+  (*do not use tools*, *never call browser_close*, *do not use the browser*)
+  only counts when you scoped it across projects, because as a default it
+  stops every project's agent from working. Affirmative preferences such as
+  "Always use tools to verify facts" still qualify under the normal project
+  threshold. Your verbatim words are kept as evidence.
 - **Curated pages** of the project: `_rules/`, `decisions/`, `gotchas/` and
   `procedures/`. A page contributes its `summary`, or else its first line of
   prose; metadata fields such as `**Status:** Accepted` or `**Date:**` at the

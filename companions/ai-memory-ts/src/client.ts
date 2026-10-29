@@ -895,7 +895,8 @@ export class AiMemoryClient {
    * Call any MCP tool by name with wire-format arguments and return its
    * decoded JSON as `unknown`. No feature checks and no scope handling:
    * pass `workspace` and `project` yourself. For tools without a wrapper
-   * and for servers newer than the SDK.
+   * and for servers newer than the SDK. Initializes the MCP session without
+   * listing tools.
    */
   async callTool(
     name: string,

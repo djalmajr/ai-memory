@@ -862,7 +862,7 @@ pub fn discover_main_repo_root(start: &Path) -> Result<PathBuf, BootstrapError> 
 
 #[cfg(windows)]
 fn discover_main_repo_root_fallback(start: &Path) -> Result<PathBuf, BootstrapError> {
-    let is_bare = std::process::Command::new("git")
+    let is_bare = git_command()
         .arg("-C")
         .arg(start)
         .args(["rev-parse", "--is-bare-repository"])
@@ -873,7 +873,7 @@ fn discover_main_repo_root_fallback(start: &Path) -> Result<PathBuf, BootstrapEr
     }
     let is_bare = String::from_utf8_lossy(&is_bare.stdout).trim() == "true";
 
-    let output = std::process::Command::new("git")
+    let output = git_command()
         .arg("-C")
         .arg(start)
         .args(["rev-parse", "--path-format=absolute", "--git-common-dir"])
@@ -1035,7 +1035,7 @@ fn collect_git_commits_fallback(
         path = %repo_path.display(),
         "git2 failed to open repository; falling back to git CLI"
     );
-    let output = std::process::Command::new("git")
+    let output = git_command()
         .arg("-C")
         .arg(repo_path)
         .args([
@@ -1092,6 +1092,16 @@ fn collect_git_commits_fallback(
     Ok(out)
 }
 
+#[cfg(windows)]
+fn git_command() -> std::process::Command {
+    use std::os::windows::process::CommandExt as _;
+
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    let mut command = std::process::Command::new("git");
+    command.creation_flags(CREATE_NO_WINDOW);
+    command
+}
+
 #[cfg(not(windows))]
 fn collect_git_commits_fallback(
     _repo_path: &Path,
@@ -1103,26 +1113,32 @@ fn collect_git_commits_fallback(
 
 /// Parse a `git log --since=<x>` value into a unix epoch. Supports
 /// the simplest formats we expect operators to type:
-/// "30 days ago", "180 days ago", "1 year ago", or an absolute YYYY-MM-DD.
+/// "30 days ago", "1 day ago", "2 weeks ago", "1 month ago", "1 year ago",
+/// or an absolute YYYY-MM-DD.
 fn parse_since_to_epoch(since: &str) -> Option<i64> {
-    let lower = since.to_lowercase();
+    let lower = since.trim().to_lowercase();
     let now = Timestamp::now().as_second();
-    if let Some(rest) = lower.strip_suffix(" days ago") {
-        let n: i64 = rest.trim().parse().ok()?;
-        return Some(now - n * 86_400);
+
+    const UNITS: &[(&[&str], i64)] = &[
+        (&[" days ago", " day ago"], 86_400),
+        (&[" weeks ago", " week ago"], 7 * 86_400),
+        (&[" months ago", " month ago"], 30 * 86_400),
+        (&[" years ago", " year ago"], 365 * 86_400),
+    ];
+
+    for (suffixes, unit_seconds) in UNITS {
+        for suffix in *suffixes {
+            if let Some(rest) = lower.strip_suffix(suffix) {
+                let n: i64 = rest.trim().parse().ok()?;
+                if n < 0 {
+                    return None;
+                }
+                let seconds = n.checked_mul(*unit_seconds)?;
+                return now.checked_sub(seconds);
+            }
+        }
     }
-    if let Some(rest) = lower.strip_suffix(" months ago") {
-        let n: i64 = rest.trim().parse().ok()?;
-        return Some(now - n * 30 * 86_400);
-    }
-    if let Some(rest) = lower.strip_suffix(" year ago") {
-        let n: i64 = rest.trim().parse().ok()?;
-        return Some(now - n * 365 * 86_400);
-    }
-    if let Some(rest) = lower.strip_suffix(" years ago") {
-        let n: i64 = rest.trim().parse().ok()?;
-        return Some(now - n * 365 * 86_400);
-    }
+
     // YYYY-MM-DD fallback.
     if let Ok(date) = jiff::civil::Date::strptime("%Y-%m-%d", &lower)
         && let Ok(zoned) = date.to_zoned(jiff::tz::TimeZone::UTC)
@@ -1856,9 +1872,35 @@ mod tests {
         let now = Timestamp::now().as_second();
         assert!(now - n_days > 29 * 86_400);
         assert!(now - n_days < 31 * 86_400);
+
+        let day1 = parse_since_to_epoch("1 day ago").unwrap();
+        let day2 = parse_since_to_epoch("2 days ago").unwrap();
+        assert!(day1 > day2);
+
+        let week1 = parse_since_to_epoch("1 week ago").unwrap();
+        let week2 = parse_since_to_epoch("2 weeks ago").unwrap();
+        assert!(week1 > week2);
+
+        let month1 = parse_since_to_epoch("1 month ago").unwrap();
+        let month2 = parse_since_to_epoch("2 months ago").unwrap();
+        assert!(month1 > month2);
+
+        assert!(day1 > week1);
+        assert!(week1 > month1);
+
         assert!(parse_since_to_epoch("1 year ago").is_some());
+        assert!(parse_since_to_epoch("2 years ago").is_some());
+        assert!(parse_since_to_epoch("  30 days ago  ").is_some());
         assert!(parse_since_to_epoch("2026-01-01").is_some());
+
+        // Negative intervals and malformed expressions are rejected.
+        assert!(parse_since_to_epoch("-5 days ago").is_none());
+        assert!(parse_since_to_epoch("-1 month ago").is_none());
         assert!(parse_since_to_epoch("garbage").is_none());
+        assert!(parse_since_to_epoch("days ago").is_none());
+
+        // Overflow is safely rejected without panicking.
+        assert!(parse_since_to_epoch("999999999999999999 days ago").is_none());
     }
 
     #[test]

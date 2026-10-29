@@ -381,6 +381,12 @@ also set `COPILOT_GITHUB_TOKEN`, `GH_TOKEN`, or `GITHUB_TOKEN` on the server.
 > endpoint explicitly rejects that field or returns a malformed shape. Set
 > `AI_MEMORY_LLM_COMPAT_STRICT=false` only for an incompatible endpoint.
 
+The tolerant parser removes `<think>`, `<thinking>`, `<analysis>` and
+`<reasoning>` wrappers outside the JSON answer and unwraps Markdown fences.
+Literal tags inside JSON strings remain intact, so summaries can quote prompt
+templates or other tagged text. Anthropic's structured text replies use the
+same parsing rules when the provider uses automatic tool choice.
+
 > [!TIP]
 > **Thinking-capable local engines (vLLM / SGLang serving Qwen3-class
 > models).** Such engines spend the output budget on a reasoning pass before

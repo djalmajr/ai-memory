@@ -1877,11 +1877,12 @@ pub async fn run(config: &Config, args: ServeArgs) -> Result<()> {
                     auth_state.clone(),
                     require_dual_auth,
                 ));
-            let base_path = normalize_prefix(&args.base_path);
-            if base_path.is_empty() && !args.base_path.trim_matches('/').trim().is_empty() {
+            let configured_base_path = args.base_path.as_deref().unwrap_or(&config.base_path);
+            let base_path = normalize_prefix(configured_base_path);
+            if base_path.is_empty() && !configured_base_path.trim_matches('/').trim().is_empty() {
                 tracing::warn!(
-                    raw = %args.base_path,
-                    "AI_MEMORY_BASE_PATH is not a safe path prefix; serving at root instead",
+                    raw = %configured_base_path,
+                    "configured base path is not a safe path prefix; serving at root instead",
                 );
             }
             // Symmetric warning for `--web-slug` / `AI_MEMORY_WEB_SLUG`. The
@@ -1896,7 +1897,7 @@ pub async fn run(config: &Config, args: ServeArgs) -> Result<()> {
                     "AI_MEMORY_WEB_SLUG is not a safe path prefix; serving the web UI at the base-path root instead",
                 );
             }
-            let base_href = web_base_href(&args.base_path, &args.web_slug);
+            let base_href = web_base_href(configured_base_path, &args.web_slug);
             let web = split_web_routers(
                 args.enable_web,
                 store.reader.clone(),
@@ -2296,7 +2297,8 @@ async fn start_maintenance_scheduler(
     }
 
     // Hollow-project sweep: deletes project rows with no pages, sessions,
-    // observations, handoffs, managed workstreams, or auto-improvement data
+    // observations, handoffs, managed workstreams, agent messages (sent or
+    // received, in any state), or auto-improvement data
     // once they are older than HOLLOW_PROJECT_MIN_AGE_DAYS. Safe by
     // construction — nothing exists to lose — which is why it runs
     // unconditionally under the maintenance flag with no extra config. Runs

@@ -4,6 +4,7 @@ import { describe, it } from "node:test";
 import { AiMemoryClient } from "../../src/client.js";
 import { TOOL_COVERAGE } from "../../src/coverage.js";
 import {
+  AbortError,
   ArgumentError,
   PreconditionFailedError,
   ProtocolError,
@@ -437,6 +438,66 @@ describe("reads", () => {
 });
 
 describe("capability gating", () => {
+  it("cancels concurrent capability waits independently", async () => {
+    for (const heldMethod of ["initialize", "tools/list"] as const) {
+      for (const cancelled of ["first", "second"] as const) {
+      const server = new FakeServer();
+      let announce!: () => void;
+      let release!: () => void;
+      const started = new Promise<void>((resolve) => { announce = resolve; });
+      const held = new Promise<void>((resolve) => { release = resolve; });
+      server.mcp = async (request) => {
+        const body = request.body as { id?: number; method: string };
+        const reply = (result: unknown) => json({ jsonrpc: "2.0", id: body.id, result });
+        if (body.method === "initialize") {
+          if (heldMethod === "initialize") {
+            announce();
+            await held;
+          }
+          return reply({
+            protocolVersion: "2025-03-26",
+            serverInfo: { name: "ai-memory", version: "3.2.10" },
+            capabilities: {},
+          });
+        }
+        if (body.method === "tools/list") {
+          if (heldMethod === "tools/list") {
+            announce();
+            await held;
+          }
+          return reply({
+            tools: [{
+              name: "memory_status",
+              inputSchema: { properties: { workspace: {}, project: {} } },
+            }],
+          });
+        }
+        if (body.method === "tools/call") {
+          return reply({ content: [{ type: "text", text: JSON.stringify(payloads.status) }] });
+        }
+        throw new Error(`unexpected method ${body.method}`);
+      };
+      const memory = new AiMemoryClient({
+        serverUrl: "http://127.0.0.1:49374",
+        scope: SCOPE,
+        fetch: server.fetch,
+      });
+      const firstController = new AbortController();
+      const secondController = new AbortController();
+      const first = memory.status({}, { signal: firstController.signal });
+      await started;
+      const second = memory.status({}, { signal: secondController.signal });
+
+      (cancelled === "first" ? firstController : secondController).abort();
+      const cancelledCall = cancelled === "first" ? first : second;
+      await assert.rejects(cancelledCall, AbortError);
+      release();
+      const survivingCall = cancelled === "first" ? second : first;
+      assert.equal((await survivingCall).scope.project, "app");
+      }
+    }
+  });
+
   it("a server without expected_page_id refuses a conditional write before tools/call", async () => {
     const { server, memory } = setup();
     const write = server.schemas["memory_write_page"];
@@ -492,13 +553,14 @@ describe("capability gating", () => {
     assert.equal(caps.identity, null);
   });
 
-  it("callTool skips probing and returns the decoded JSON", async () => {
+  it("callTool initializes without schema probing and returns the decoded JSON", async () => {
     const { server, memory } = setup();
+    delete server.schemas["memory_lint"];
     server.tools.set("memory_lint", () => ({ report: "ok" }));
     assert.deepEqual(await memory.callTool("memory_lint", { dry_run: true }), { report: "ok" });
     assert.deepEqual(
       server.requests.map((r) => (r.body as { method: string }).method),
-      ["tools/call"],
+      ["initialize", "tools/call"],
     );
   });
 });

@@ -294,8 +294,10 @@ falsy (`false` / `0` / `no` / `off`, quoted or bare). A marker that sets only
 `[profile]` keys is a settings boundary, like one with `[briefing]` keys.
 
 `[recall] default_global` applies to an agent's unscoped `memory_query` and
-`memory_recent` calls. A `memory_query` with `as_of` is not broadened: it
-reads the current project as it stood at that instant, and an explicit
+`memory_recent` calls. On `memory_query`, an explicit `global: false` keeps
+the resolved project, even when the marker enables global recall. Explicit
+`workspace` + `project` or `scopes` also override the marker. A query with
+`as_of` reads the current project as it stood at that instant, and an explicit
 `global=true` with `as_of` is refused. The `ai-memory search` and
 `ai-memory recent` terminal commands do not read it: those commands stay
 scoped to the current project and cover every project only when you pass
@@ -328,7 +330,10 @@ always stored regardless, including Claude Code sessions launched with
 parent's `session_id`, so only the events carrying `agent_id` (plus
 `SubagentStart`/`SubagentStop`) are dropped and the parent session's own
 prompts, Stop, SessionEnd and summary are kept. Grok's `subagentType` marker
-still identifies subagent captures. This is per-project on purpose: there is no server-global
+still identifies subagent captures. The OMP extension posts every event of a
+subagent session with `agent_id`, so the whole subagent session is dropped,
+while an advisor's tool calls stay with the session they advise. This is
+per-project on purpose: there is no server-global
 switch, so opting one noisy project in never sheds subagent captures for the
 others on a shared instance.
 
@@ -429,7 +434,8 @@ Re-running `ai-memory server add` for an existing profile keeps its roots when
 `--root` is omitted, so rotating a token cannot lift the restriction. Changing
 a profile's `--url` without a new token discards the old token first: a token
 belongs to the server it was issued for, so the profile refuses events until
-you add one for the new URL.
+you add one for the new URL. Both `[servers.<name>]` tables and an inline
+`servers = { ... }` table can be read and updated by these commands.
 
 Check the decision for a directory without sending anything:
 

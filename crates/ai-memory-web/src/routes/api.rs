@@ -1,5 +1,6 @@
 //! JSON routes for third-party read-only frontends.
 
+use std::cmp::Reverse;
 use std::sync::Arc;
 
 use ai_memory_core::{ObservationKind, PagePath, ProjectId, SessionId, WorkspaceId};
@@ -642,7 +643,14 @@ async fn recent_handler(
             .list_unexpired_pages(&workspace, &project)
             .await
             .map_err(internal_error)?;
-        pages.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+        // RFC3339's variable fractional precision is not lexically ordered.
+        // The reader's empty fallback for an invalid timestamp stays last.
+        pages.sort_by_cached_key(|page| {
+            (
+                Reverse(page.updated_at.parse::<jiff::Timestamp>().ok()),
+                page.path.clone(),
+            )
+        });
         pages.truncate(limit);
         return Ok(with_cache(Json(pages).into_response(), LIST_CACHE_MAX_AGE));
     }

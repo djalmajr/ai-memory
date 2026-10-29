@@ -69,6 +69,10 @@ fn confirm_command(from_workspace: &str, target_flag: &str, args: &MoveProjectAr
 /// Returns an error when `--confirm` is absent, the server is unreachable,
 /// or the server returns a non-2xx response.
 pub async fn run(config: &Config, args: MoveProjectArgs) -> Result<()> {
+    super::refuse_empty_explicit(args.from_workspace.as_deref(), "--from-workspace")?;
+    super::refuse_empty_explicit(Some(args.to_workspace.as_str()), "--to-workspace")?;
+    super::refuse_empty_explicit(args.project.as_deref(), "--project")?;
+    super::refuse_empty_explicit(args.project_id.as_deref(), "--project-id")?;
     let (from_workspace, project, project_id) = match &args.project_id {
         Some(id) => (
             super::resolve_workspace(config, args.from_workspace.as_deref())?,

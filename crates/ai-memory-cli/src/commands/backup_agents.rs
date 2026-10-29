@@ -18,6 +18,7 @@ use tar::{Builder, Header};
 use tracing::info;
 
 use crate::cli::{AgentBackupScope, BackupAgentsArgs, McpClient};
+use crate::commands::backup::human_bytes;
 use crate::commands::path_util::{claude_config_dir, home_dir};
 use crate::config::Config;
 
@@ -986,21 +987,6 @@ fn portable_mode(path: &Path) -> Result<Option<u32>> {
     {
         let _ = path;
         Ok(None)
-    }
-}
-
-fn human_bytes(n: u64) -> String {
-    const UNITS: &[&str] = &["B", "KiB", "MiB", "GiB"];
-    let mut value = n as f64;
-    let mut unit = 0;
-    while value >= 1024.0 && unit + 1 < UNITS.len() {
-        value /= 1024.0;
-        unit += 1;
-    }
-    if unit == 0 {
-        format!("{n} {}", UNITS[0])
-    } else {
-        format!("{value:.2} {}", UNITS[unit])
     }
 }
 

@@ -458,9 +458,23 @@ linked id in the harness's native store without modifying it. If the transcript
 was deleted, cleared, or lost with a sandbox overlay, ai-memory starts a fresh
 native session and repoints the same workstream when that session is observed.
 An unreadable or malformed store is reported but is not mistaken for a missing
-session. Use `ai-memory run --fresh <harness>` to deliberately skip the linked
+session. Codex compresses a rollout it has not written for a week to
+`rollout-*.jsonl.zst` and restores the plain file when `codex resume` reopens
+it. The compressed copy counts as the linked session, so the launch resumes it
+and the transcript import reads it like the plain file. Use
+`ai-memory run --fresh <harness>` to deliberately skip the linked
 session and the adoption chooser. `--fresh` cannot be combined with a native
-resume, continue, session, or fork selector.
+resume, continue, session, or fork selector. A fresh interactive launch still
+exports the linked session as `AI_MEMORY_PREVIOUS_SESSION_HISTORY` when it is
+available locally. This matters when Claude's new session uses a different
+configuration home: the harness can read the bounded, checkout-validated old
+session without ai-memory copying it into the server.
+
+Codex's in-session `/new` command does not expose a trustworthy parent-thread
+relationship. ai-memory therefore never guesses that the new thread owns the
+managed workstream. If the linked thread exits without acknowledging its
+context after `/new`, the wrapper explains that the intended thread must be
+selected explicitly on the next managed run.
 
 ## What happens on each run
 
@@ -527,7 +541,15 @@ resume, continue, session, or fork selector.
    result whose call was imported by an earlier run is dropped under a
    policy. Messages are unaffected. Under allowlist capture mode a checkout
    without a marker uploads no events at all, as the live hook emits none
-   there; the run still finishes. Each delivered
+   there; the run still finishes.
+
+   Claude process can write one run across several native transcripts when
+   `/clear` starts a new conversation. The launcher enumerates those
+   continuations, imports each abandoned transcript oldest first as a
+   non-final ledger segment, and only then finalizes the run on the newest
+   session. Thus pre-clear turns keep their original native-session identity,
+   while the next managed launch still resumes the conversation after the last
+   `/clear`. Each delivered
    workstream packet begins with a versioned origin marker. If Claude Code
    persists that packet and its `Read` tool returns it, the Claude transcript
    normalizer excludes the marked result instead of feeding delivered history
@@ -557,6 +579,24 @@ ai-memory workstream-search --limit 50 --json "failed migration"
 another shell, pass `--workstream-id <uuid>` explicitly. Search results preserve
 the source harness, role, event sequence, and content. Historical tool activity
 is labelled completed evidence and must never be replayed as a pending call.
+
+OpenCode V1 tool failures contribute their visible `state.error` text as a
+result, with `status: "error"` and `is_error: true` in the ledger metadata.
+Successful calls keep their ordinary `state.output` result.
+
+OpenCode 2 tool failures contribute their visible error text as a result, with
+`status: "error"` and `is_error: true` in the ledger metadata. Successful calls
+keep their ordinary `state.content` text parts.
+
+OpenCode 2 compaction messages import their `summary` as a compaction event
+(and, when a failed compaction has no summary, `error.message`). The V1 adapter
+already imported compaction parts the same way.
+
+Crush cursors fingerprint every message revision in the newest one-second
+timestamp bucket. This preserves inserts whose UUID sorts below the prior
+cursor and edits whose native timestamp did not advance. Exact recovery ranges
+also retain the captured endpoint fingerprints, so a revision written later in
+that second is not pulled backward into an earlier interval.
 
 Search and tail also return optional `source_record_id` and `metadata` fields.
 The text CLI prints the source record and correlation metadata as escaped JSON;
@@ -728,7 +768,7 @@ change does not add an atomic disk/SQL seal or change lease/retry policy.
 | Harness | Fresh native session | Returning native session | Read-only source |
 |---|---|---|---|
 | Claude Code | generated `--session-id` | `--resume <id>` | `~/.claude/projects/**/*.jsonl` |
-| Codex | native default creation | `resume <id>` | `~/.codex/sessions/**/rollout-*.jsonl` |
+| Codex | native default creation | `resume <id>` | `~/.codex/sessions/**/rollout-*.jsonl`, or the `rollout-*.jsonl.zst` copy Codex keeps of a rollout idle for a week (the plain file wins when both exist) |
 | OpenCode V1 | native default creation | `--session <id>` | `~/.local/share/opencode/opencode.db` opened read-only; selected when the exact launch executable reports major 1 |
 | OpenCode V2 | native default creation | `--session <id>` | same `opencode.db` filename, using the `session_v2`/`session_message` tables; selected when the exact launch executable reports major 2 |
 | Pi | generated `--session-id` | `--session <id>` | `~/.pi/agent/sessions/**/*.jsonl` |

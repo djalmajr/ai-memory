@@ -192,20 +192,26 @@ Everything in A works with no provider and does not require ranking changes.
   mcp-memory-service ship extractive compression with no LLM. Tier-down beats
   eviction because the durable facts survive.
 - *Mechanism:* a new sweep pass, before the decay-eviction pass, that rewrites the
-  page through `Wiki::write_page`/`apply_batch` (supersession + git preserve the
+  page through the wiki's conditional batch write (supersession + git preserve the
   original, so it is **reversible**: the full body stays in the version chain and git
-  history). Regex keep-token miner lives beside the sanitizer's patterns. Needs a
+  history). Every replacement is conditional on the selected source `PageId`, and
+  the writer validates the whole batch in the same SQLite transaction: one page
+  changed by a concurrent user leaves every replacement unwritten for the next
+  sweep. Regex keep-token miner lives beside the sanitizer's patterns. Needs a
   **`tier_state`/`compacted` marker** (frontmatter flag + a `pages` column, V65) so
   the sweep and `curator.rs` distinguish a *deliberately short* page from a *cold*
   one and never re-compact or misread it as cold.
 - *Schema delta:* V65 `pages.compacted_at` (nullable) + frontmatter mirror.
 - *Invariants:* mutation through the wiki layer only (#16 supersession keeps the
-  loser reachable); zero-LLM (#13).
+  loser reachable); one conditional writer transaction for the batch (#2 and #3);
+  zero-LLM (#13).
 - *R2 bar:* compaction must not drop recall on R2 vs. the pre-compaction corpus
   (the keep-token set is the hypothesis: facts survive, prose doesn't matter).
 - *Failure modes:* keep-token miner drops a load-bearing sentence → the original is
   one supersession-restore away; `restore-page` covers it. Re-compaction loop →
-  the `compacted_at` marker blocks it.
+  the `compacted_at` marker blocks it. Concurrent user correction → the selected
+  source id no longer matches and the full batch is retried later rather than
+  replacing the correction.
 
 **A3. Cold-cluster dedup (DBSCAN, adaptive eps).**
 - *What:* cluster near-duplicate cold pages by embedding and collapse each cluster
@@ -216,7 +222,10 @@ Everything in A works with no provider and does not require ranking changes.
   (bounded, not the whole corpus). Adaptive eps from the k-distance elbow. Collapse
   = write one survivor, supersede the rest with a merge note pointing at the
   survivor. Zero-LLM: the survivor is the highest-retention member, body chosen by
-  A2's extractive rules; the *LLM* rewrite of a cluster is B2, opt-in.
+  A2's extractive rules; the *LLM* rewrite of a cluster is B2, opt-in. Every
+  replacement is conditional on its selected source version. If any source
+  changed before the write, the whole dedup batch stays unapplied in the report;
+  those selected pages are not evicted or compacted by the same sweep.
 - *Schema delta:* none beyond A2's marker; merge provenance goes in `page_evidence`
   (`source_kind`) and supersession.
 - *Invariants:* #2 (cluster on the already-materialized cold set, one batch write);
@@ -252,6 +261,36 @@ Everything in A works with no provider and does not require ranking changes.
   `design-hindsight-borrowings.md` §4) that step is R2-gated separately.
 - *Failure modes:* false-positive band → advisory-only output; the operator/lint
   decides.
+
+**Classification fixtures ([RFC #1685](https://github.com/akitaonrails/ai-memory/issues/1685)).**
+The existing `contradiction_lint` suite also runs
+[`contradiction_evidence.json`](../crates/ai-memory-consolidate/tests/fixtures/contradiction_evidence.json),
+a small manually labeled English, Portuguese and Chinese corpus. Its vectors
+are controlled inputs, not outputs from an embedding model. The fixtures record
+current classification, including compatible pairs inside the band and a
+conflicting pair above it; they do not estimate production precision or propose
+a new response contract.
+
+A prediction is any `contradiction` finding, including an advisory similarity
+candidate. Positives contain incompatible simultaneous values for the same
+setting and scope; compatible active pairs are negatives. Superseded, expired
+and foreign-project pairs test eligibility separately and do not enter the
+classification metrics. The declared-edge control contains conflicting
+prose and has no embeddings. Expected counts document the current behavior;
+labels should remain independent when an approved classifier change updates
+those counts.
+
+```bash
+cargo test -p ai-memory-consolidate labeled_evidence_pairs_record_current_classification -- --nocapture
+cargo test -p ai-memory-consolidate labeled_evidence_pairs_timing_receipt -- --ignored --nocapture
+```
+
+The first command reports the confusion counts, precision, recall, F1 and
+false-positive/false-negative rates and checks repeated classification parity.
+The optional second command reports lint p50/p95 over 20 runs per isolated pair after a
+warm-up, excluding fixture creation. Both run offline without an LLM. Timing has
+no pass threshold and is not a benchmark of a full store. Neither changes lint's
+public classification; that decision remains in the RFC.
 
 ### Bucket B — LLM "dream" pass (opt-in, OFF by default, R2-gated)
 
@@ -489,7 +528,10 @@ in a boot migration.
   before it may default on. An existing user sees no ranking change until they opt in.
 - **B2 dream rewrite/merge: never deletes a source.** Originals live in git and
   the supersession chain; `dry_run` first; R2-gated; opt-in LLM. The zero-LLM
-  default path (#13) is untouched; a provider-less store never runs B2.
+  default path (#13) is untouched; a provider-less store never runs B2. Each
+  merge checks that every selected source version is still current when the
+  batch writes. If any member changed, the whole cluster is skipped and counted
+  in the report; newer edits and unchanged peers stay intact for a later pass.
 - **C1 access reinforcement on more read paths: strictly non-destructive.** It
   only raises retention scores (keeps memory a little longer); it can never lower a
   score or delete anything, and it still cannot block TTL cleanup (the TTL pass

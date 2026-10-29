@@ -1,5 +1,6 @@
 //! `GET /w/:workspace/:project` — page tree + recent activity.
 
+use std::cmp::Reverse;
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
@@ -7,6 +8,7 @@ use askama::Template;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::response::{Html, IntoResponse, Response};
+use jiff::Timestamp;
 
 use ai_memory_store::ResolvedScope;
 
@@ -75,8 +77,8 @@ async fn render(
     // bundle indexes) than curated knowledge; listing them as peers
     // buried the concepts/decisions/rules a human actually opens this
     // UI for.
-    let mut knowledge_map: BTreeMap<String, Vec<(String, PageRow)>> = BTreeMap::new();
-    let mut system_map: BTreeMap<String, Vec<(String, PageRow)>> = BTreeMap::new();
+    let mut knowledge_map: BTreeMap<String, Vec<(Option<Timestamp>, PageRow)>> = BTreeMap::new();
+    let mut system_map: BTreeMap<String, Vec<(Option<Timestamp>, PageRow)>> = BTreeMap::new();
     for p in &pages {
         let folder = p
             .path
@@ -97,7 +99,7 @@ async fn render(
             &mut knowledge_map
         };
         map.entry(folder).or_default().push((
-            p.updated_at.clone(),
+            p.updated_at.parse::<Timestamp>().ok(),
             PageRow {
                 path: p.path.clone(),
                 href: page_href(&workspace, &project, &p.path),
@@ -119,7 +121,12 @@ async fn render(
         .filter(|p| !is_system_page(&p.path))
         .cloned()
         .collect();
-    sorted.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+    sorted.sort_by_cached_key(|page| {
+        (
+            Reverse(page.updated_at.parse::<Timestamp>().ok()),
+            page.path.clone(),
+        )
+    });
     sorted.truncate(20);
     let recent: Vec<PageRow> = sorted
         .into_iter()
@@ -154,7 +161,7 @@ async fn render(
 /// Turn grouped pages into sidebar folders: newest first, capped at
 /// `FOLDER_PREVIEW`, each linked to its namespace listing.
 fn to_folders(
-    map: BTreeMap<String, Vec<(String, PageRow)>>,
+    map: BTreeMap<String, Vec<(Option<Timestamp>, PageRow)>>,
     workspace: &str,
     project: &str,
 ) -> Vec<Folder> {

@@ -29,7 +29,8 @@ pub use repository_identity::{MARKER_FILENAME, MARKER_FILENAMES};
 pub mod routing_skills;
 pub mod scaffolding;
 pub use scaffolding::{
-    looks_like_codex_instructions, looks_like_markup_block, looks_like_scaffolding,
+    is_codex_memory_agent_cwd, looks_like_codex_instructions, looks_like_codex_memory_agent_prompt,
+    looks_like_markup_block, looks_like_scaffolding,
 };
 pub mod routing_snippet;
 pub mod sanitize;

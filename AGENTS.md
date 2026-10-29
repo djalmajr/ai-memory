@@ -415,7 +415,8 @@ covers the same tests, slower, no tiers.
 - **Windows runs in its own workflow** (`.github/workflows/windows.yml`):
   nightly, on dispatch, and automatically on any PR touching the
   platform-sensitive paths in its `changes` filter (the wiki, store and
-  hooks crates, `install_hooks.rs`, `hooks/`, `tests/hooks/`). It is the only
+  hooks crates, `install_hooks.rs`, `hooks/`, `tests/hooks/`, `bin/ai-memory.ps1`
+  and the packaging fixtures that run it). It is the only
   place `#[cfg(windows)]` tests run, and it is ~4x slower than the same tests
   on Linux — keeping it out of `ci.yml` is what holds PR feedback near the
   eight minutes the gating jobs take. **Add the `windows` label** to force a
@@ -787,11 +788,14 @@ Additional boundary rules:
   dormant. A PR's base branch follows its semver bucket: fixes → `main`,
   features → `release/X.Y`.
 - Keep `CLAUDE.md` as a pointer to this file.
+- **A new config key is documented in the same change, in two places.** Any key ai-memory accepts from `config.toml` (a `Config` field or a settings struct, whichever crate owns it) lands with (1) a commented entry in `crates/ai-memory-cli/templates/config.default.toml`, following the template's grammar (top-level keys above the first table, indented examples for credential or Option-typed keys, `[auth]` last; the two `the_shipped_default_config*` tests must pass), and (2) a row in `docs/config-properties.md`: key, default, env equivalent, one-line purpose. Env-only settings stay out of both; the `[auth]` keys `ai-memory init` appends itself stay out of the template and appear in `docs/config-properties.md` marked as init-managed. A config change that skips either file is incomplete.
 
 ## Documentation map
 
 - [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) — operational map: data
   flow, crate breakdown, schema, invariants, config reference.
+- [`docs/config-properties.md`](docs/config-properties.md) — every TOML key
+  with its default, env equivalent, and a one-line purpose.
 - [`docs/design-decisions.md`](docs/design-decisions.md) — full v1 spec
   and milestone plan.
 - [`docs/install.md`](docs/install.md) — installation cookbook for every

@@ -274,6 +274,20 @@ pub enum ConditionalUpsert {
     },
 }
 
+/// The outcome of an atomic conditional page batch.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ConditionalBatchUpsert {
+    /// Every precondition held and all pages were written.
+    Upserted(Vec<PageId>),
+    /// One precondition did not hold, so no page was written.
+    Mismatch {
+        /// Index of the refused page in the caller's batch.
+        index: usize,
+        /// The latest version at that path, if one exists.
+        current: Option<PageId>,
+    },
+}
+
 /// [`upsert_page`] only when `precondition` holds, checked in the same
 /// transaction as the write so no other writer can land in between.
 pub fn upsert_page_if(
@@ -294,6 +308,32 @@ pub fn upsert_page_if(
     let id = upsert_page_in_tx(&tx, page, now)?;
     tx.commit()?;
     Ok(ConditionalUpsert::Upserted(id))
+}
+
+/// Upsert a batch only when every page precondition holds in the batch's
+/// transaction. A single mismatch writes nothing.
+pub fn upsert_pages_batch_if(
+    conn: &mut Connection,
+    pages: &[(NewPage, PagePrecondition)],
+) -> StoreResult<ConditionalBatchUpsert> {
+    let now = Timestamp::now().as_microsecond();
+    let tx = conn.transaction()?;
+    for (index, (page, precondition)) in pages.iter().enumerate() {
+        let current = latest_page_id_in_tx(&tx, page)?;
+        let holds = match precondition {
+            PagePrecondition::Absent => current.is_none(),
+            PagePrecondition::Latest(expected) => current == Some(*expected),
+        };
+        if !holds {
+            return Ok(ConditionalBatchUpsert::Mismatch { index, current });
+        }
+    }
+    let mut ids = Vec::with_capacity(pages.len());
+    for (page, _) in pages {
+        ids.push(upsert_page_in_tx(&tx, page, now)?);
+    }
+    tx.commit()?;
+    Ok(ConditionalBatchUpsert::Upserted(ids))
 }
 
 fn latest_page_id_in_tx(tx: &Transaction<'_>, page: &NewPage) -> StoreResult<Option<PageId>> {
@@ -455,35 +495,56 @@ pub fn get_or_create_project_as(
     let id = if let Some(bytes) = existing {
         ai_memory_core::ProjectId::from_slice(&bytes)?
     } else {
-        also_in = project_name_in_other_workspaces(&tx, workspace_id, name)?;
-        let id = ai_memory_core::ProjectId::new();
-        tx.execute(
-            "INSERT INTO projects (id, workspace_id, name, repo_path, created_at) \
-             VALUES (?1, ?2, ?3, ?4, ?5)",
-            params![
-                id.as_bytes(),
-                workspace_id.as_bytes(),
-                name,
-                repo_path.as_deref(),
-                Timestamp::now().as_microsecond()
-            ],
-        )?;
-        // `open` and no creator are the column defaults, so the insert above
-        // is the one upstream always ran; only what differs needs a write.
-        if initial_access_mode(name, new_project_mode) == crate::AccessMode::Restricted {
-            tx.execute(
-                "UPDATE projects SET access_mode = 'restricted' WHERE id = ?1",
-                params![id.as_bytes()],
-            )?;
+        // A name that a promoted project still answers to (its `legacy_name`
+        // or `canonical_name`) is not a new project. Inserting a row under it
+        // splits one project in two — the capture lands in an empty twin while
+        // every read keeps resolving the promoted project — and the name then
+        // resolves ambiguously for both paths until someone purges the twin
+        // (#1657). Reuse the row the read path already picks, and let the
+        // authorization choke point decide whether the caller may write there;
+        // an ambiguous name is an error, never another twin. The exact-name
+        // lookup above still runs first, so a name that is only a name behaves
+        // exactly as before.
+        let coordinate = if crate::project_coordinates::supports_coordinates(&tx)? {
+            crate::project_coordinates::resolve(&tx, *workspace_id, name)?
+        } else {
+            None
+        };
+        match coordinate {
+            Some(coordinate) => coordinate.id,
+            None => {
+                also_in = project_name_in_other_workspaces(&tx, workspace_id, name)?;
+                let id = ai_memory_core::ProjectId::new();
+                tx.execute(
+                    "INSERT INTO projects (id, workspace_id, name, repo_path, created_at) \
+                     VALUES (?1, ?2, ?3, ?4, ?5)",
+                    params![
+                        id.as_bytes(),
+                        workspace_id.as_bytes(),
+                        name,
+                        repo_path.as_deref(),
+                        Timestamp::now().as_microsecond()
+                    ],
+                )?;
+                // `open` and no creator are the column defaults, so the insert
+                // above is the one upstream always ran; only what differs needs
+                // a write.
+                if initial_access_mode(name, new_project_mode) == crate::AccessMode::Restricted {
+                    tx.execute(
+                        "UPDATE projects SET access_mode = 'restricted' WHERE id = ?1",
+                        params![id.as_bytes()],
+                    )?;
+                }
+                if let Some(creator) = creator {
+                    tx.execute(
+                        "UPDATE projects SET created_by = ?1 WHERE id = ?2",
+                        params![creator.as_bytes(), id.as_bytes()],
+                    )?;
+                }
+                created = true;
+                id
+            }
         }
-        if let Some(creator) = creator {
-            tx.execute(
-                "UPDATE projects SET created_by = ?1 WHERE id = ?2",
-                params![creator.as_bytes(), id.as_bytes()],
-            )?;
-        }
-        created = true;
-        id
     };
     tx.commit()?;
     if scheduler_state_table_exists(conn)? {
@@ -1010,8 +1071,10 @@ fn insert_project_with_identity(
 }
 
 /// Delete "hollow" project rows: zero pages (any version), zero sessions,
-/// zero observations, zero handoffs, zero managed workstreams, zero
-/// auto-improve runs/proposals/rejections, and older than `min_age_days`.
+/// zero observations, zero handoffs, zero managed workstreams, zero sent or
+/// received agent messages (including claimed/cancelled history), zero
+/// auto-improve runs/proposals/rejections, zero purge tombstones, and older
+/// than `min_age_days`.
 /// (The per-project scheduler-state row is bookkeeping created for every
 /// project and does not count as data.) These are pure bookkeeping noise left
 /// behind by probes, renames, and failed first events — nothing exists to lose,
@@ -1027,6 +1090,9 @@ pub fn sweep_hollow_projects(conn: &mut Connection, min_age_days: u32) -> StoreR
     let cutoff =
         Timestamp::now().as_microsecond() - i64::from(min_age_days) * 24 * 60 * 60 * 1_000_000;
     let tx = conn.transaction()?;
+    // Both message endpoints are NOT NULL. Build their project-id set once
+    // per statement: the pending-only mailbox indexes cannot cover retained
+    // claimed/cancelled history for a correlated lookup per project.
     let names: Vec<String> = {
         let mut stmt = tx.prepare(
             "SELECT name FROM projects
@@ -1038,6 +1104,11 @@ pub fn sweep_hollow_projects(conn: &mut Connection, min_age_days: u32) -> StoreR
                AND NOT EXISTS (SELECT 1 FROM observations WHERE project_id = projects.id)
                AND NOT EXISTS (SELECT 1 FROM handoffs     WHERE project_id = projects.id)
                AND NOT EXISTS (SELECT 1 FROM workstreams  WHERE project_id = projects.id)
+               AND NOT EXISTS (SELECT 1 FROM purged_sessions WHERE project_id = projects.id)
+               AND id NOT IN (
+                   SELECT from_project_id FROM agent_messages
+                   UNION SELECT to_project_id FROM agent_messages
+               )
                AND NOT EXISTS (SELECT 1 FROM auto_improve_runs      WHERE project_id = projects.id)
                AND NOT EXISTS (SELECT 1 FROM auto_improve_proposals WHERE project_id = projects.id)
                AND NOT EXISTS (SELECT 1 FROM auto_improve_rejections WHERE project_id = projects.id)",
@@ -1059,6 +1130,11 @@ pub fn sweep_hollow_projects(conn: &mut Connection, min_age_days: u32) -> StoreR
                AND NOT EXISTS (SELECT 1 FROM observations WHERE project_id = projects.id)
                AND NOT EXISTS (SELECT 1 FROM handoffs     WHERE project_id = projects.id)
                AND NOT EXISTS (SELECT 1 FROM workstreams  WHERE project_id = projects.id)
+               AND NOT EXISTS (SELECT 1 FROM purged_sessions WHERE project_id = projects.id)
+               AND id NOT IN (
+                   SELECT from_project_id FROM agent_messages
+                   UNION SELECT to_project_id FROM agent_messages
+               )
                AND NOT EXISTS (SELECT 1 FROM auto_improve_runs      WHERE project_id = projects.id)
                AND NOT EXISTS (SELECT 1 FROM auto_improve_proposals WHERE project_id = projects.id)
                AND NOT EXISTS (SELECT 1 FROM auto_improve_rejections WHERE project_id = projects.id)",
@@ -11541,6 +11617,64 @@ pub(crate) mod tests {
         }
     }
 
+    #[test]
+    fn conditional_page_batch_is_all_or_nothing() {
+        let (_tmp, mut conn, ws, proj) = fresh_db();
+        let first_path = "notes/first.md";
+        let second_path = "notes/second.md";
+        let first_id = upsert_page(&mut conn, &page(ws, proj, first_path, "first-v1")).unwrap();
+        let second_id = upsert_page(&mut conn, &page(ws, proj, second_path, "second-v1")).unwrap();
+        let concurrent = upsert_page(&mut conn, &page(ws, proj, second_path, "second-v2")).unwrap();
+
+        let stale = vec![
+            (
+                page(ws, proj, first_path, "first-stale-batch"),
+                PagePrecondition::Latest(first_id),
+            ),
+            (
+                page(ws, proj, second_path, "second-stale-batch"),
+                PagePrecondition::Latest(second_id),
+            ),
+        ];
+        assert_eq!(
+            upsert_pages_batch_if(&mut conn, &stale).unwrap(),
+            ConditionalBatchUpsert::Mismatch {
+                index: 1,
+                current: Some(concurrent),
+            }
+        );
+        fn latest_body(conn: &Connection, ws: WorkspaceId, proj: ProjectId, path: &str) -> String {
+            conn.query_row(
+                "SELECT body FROM pages WHERE workspace_id = ?1 AND project_id = ?2 \
+                 AND path = ?3 AND is_latest = 1",
+                params![ws.as_bytes(), proj.as_bytes(), path],
+                |row| row.get(0),
+            )
+            .unwrap()
+        }
+        assert_eq!(latest_body(&conn, ws, proj, first_path), "first-v1");
+        assert_eq!(latest_body(&conn, ws, proj, second_path), "second-v2");
+
+        let fresh = vec![
+            (
+                page(ws, proj, first_path, "first-v2"),
+                PagePrecondition::Latest(first_id),
+            ),
+            (
+                page(ws, proj, second_path, "second-v3"),
+                PagePrecondition::Latest(concurrent),
+            ),
+        ];
+        let ConditionalBatchUpsert::Upserted(ids) =
+            upsert_pages_batch_if(&mut conn, &fresh).unwrap()
+        else {
+            panic!("current preconditions must admit the whole batch");
+        };
+        assert_eq!(ids.len(), 2);
+        assert_eq!(latest_body(&conn, ws, proj, first_path), "first-v2");
+        assert_eq!(latest_body(&conn, ws, proj, second_path), "second-v3");
+    }
+
     /// The V65 A2 marker is derived from the `compacted: true` frontmatter
     /// mirror at the single write choke point, in the same transaction as the
     /// body — a normal write leaves it NULL, so every pre-A2 path is unchanged.
@@ -11942,12 +12076,14 @@ pub(crate) mod tests {
         let mut conn = unindexed_cjk_fixture(0);
         for rowid in [i64::MIN, i64::MAX] {
             conn.execute(
-                "INSERT INTO pages (rowid, title, body, path_search)                  VALUES (?1, 'edge', '支付服务', 'notes')",
+                "INSERT INTO pages (rowid, title, body, path_search) \
+                 VALUES (?1, 'edge', '支付服务', 'notes')",
                 [rowid],
             )
             .unwrap();
             conn.execute(
-                "INSERT INTO observations (rowid, title, body)                  VALUES (?1, 'prompt', '需要恢复索引')",
+                "INSERT INTO observations (rowid, title, body) \
+                 VALUES (?1, 'prompt', '需要恢复索引')",
                 [rowid],
             )
             .unwrap();
@@ -16350,6 +16486,158 @@ pub(crate) mod tests {
 
         // Idempotent: a second pass deletes nothing.
         assert!(sweep_hollow_projects(&mut conn, 7).unwrap().is_empty());
+    }
+
+    #[test]
+    fn sweep_hollow_projects_preserves_purged_session_tombstones() {
+        use ai_memory_core::{AgentKind, NewSession, SessionId};
+
+        let (_tmp, mut conn, workspace_id, _scratch) = fresh_db();
+        let project_id = get_or_create_project(&mut conn, &workspace_id, "purged", None).unwrap();
+        conn.execute(
+            "UPDATE projects SET created_at = created_at - ?1 WHERE id = ?2",
+            params![8 * 24 * 60 * 60 * 1_000_000_i64, project_id.as_bytes()],
+        )
+        .unwrap();
+        let session_id = SessionId::new();
+        begin_session(
+            &mut conn,
+            &NewSession {
+                occurred_at: None,
+                id: session_id,
+                workspace_id,
+                project_id,
+                agent_kind: AgentKind::Codex,
+                cwd: None,
+                actor_user: None,
+            },
+        )
+        .unwrap();
+        purge_session(
+            &mut conn,
+            workspace_id,
+            project_id,
+            session_id,
+            None,
+            Compaction::Skip,
+            PurgeMode::Commit,
+        )
+        .unwrap();
+
+        assert!(sweep_hollow_projects(&mut conn, 7).unwrap().is_empty());
+        let retained: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM purged_sessions WHERE session_id = ?1 AND project_id = ?2",
+                params![session_id.as_bytes(), project_id.as_bytes()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(retained, 1, "purge replay protection must outlive cleanup");
+    }
+
+    #[test]
+    fn sweep_hollow_projects_preserves_message_senders_recipients_and_history() {
+        let mut failures = Vec::new();
+        for state in ["pending", "claimed", "cancelled"] {
+            for old_sender in [true, false] {
+                let (_tmp, mut conn, from_ws, _) = fresh_db();
+                let to_ws = get_or_create_workspace(&mut conn, "recipient-workspace").unwrap();
+                let from = get_or_create_project(&mut conn, &from_ws, "sender", None).unwrap();
+                let to = get_or_create_project(&mut conn, &to_ws, "recipient", None).unwrap();
+                let empty = get_or_create_project(&mut conn, &from_ws, "empty", None).unwrap();
+                let old = if old_sender { from } else { to };
+                conn.execute(
+                    "UPDATE projects SET created_at = created_at - ?1 WHERE id IN (?2, ?3)",
+                    params![
+                        8 * 24 * 60 * 60 * 1_000_000_i64,
+                        old.as_bytes(),
+                        empty.as_bytes()
+                    ],
+                )
+                .unwrap();
+
+                // The message is fresh even though one project is old. No
+                // lifecycle session or page otherwise protects either end.
+                let id = insert_message(
+                    &mut conn,
+                    &NewAgentMessage {
+                        from_workspace_id: from_ws,
+                        from_project_id: from,
+                        from_agent: AgentKind::Codex,
+                        from_session_id: None,
+                        from_owner_user: None,
+                        to_workspace_id: to_ws,
+                        to_project_id: to,
+                        subject: Some("Retained message".into()),
+                        body: "Keep the request and its history".into(),
+                    },
+                )
+                .unwrap();
+                match state {
+                    "claimed" => {
+                        let claimed = pop_message(
+                            &mut conn,
+                            &MessageClaim {
+                                workspace_id: to_ws,
+                                project_id: to,
+                                claiming_agent: AgentKind::Codex,
+                                claiming_session: None,
+                                claiming_user: None,
+                            },
+                            Some(id),
+                        )
+                        .unwrap();
+                        assert!(claimed.is_some());
+                    }
+                    "cancelled" => {
+                        assert_eq!(
+                            cancel_messages(&mut conn, &from_ws, &from, Some(id)).unwrap(),
+                            1
+                        );
+                    }
+                    _ => {}
+                }
+
+                let deleted = sweep_hollow_projects(&mut conn, 7).unwrap();
+                let empty_count: i64 = conn
+                    .query_row(
+                        "SELECT COUNT(*) FROM projects WHERE id = ?1",
+                        [empty.as_bytes()],
+                        |r| r.get(0),
+                    )
+                    .unwrap();
+                assert_eq!(
+                    empty_count, 0,
+                    "genuinely hollow projects must still be removed"
+                );
+                let endpoints: i64 = conn
+                    .query_row(
+                        "SELECT COUNT(*) FROM projects WHERE id IN (?1, ?2)",
+                        params![from.as_bytes(), to.as_bytes()],
+                        |r| r.get(0),
+                    )
+                    .unwrap();
+                let retained: Option<(String, String)> = conn
+                    .query_row(
+                        "SELECT state, body FROM agent_messages WHERE id = ?1",
+                        [id.as_bytes()],
+                        |r| Ok((r.get(0)?, r.get(1)?)),
+                    )
+                    .optional()
+                    .unwrap();
+                if deleted != ["empty"]
+                    || endpoints != 2
+                    || retained != Some((state.into(), "Keep the request and its history".into()))
+                {
+                    failures.push(format!("{state}, old_sender={old_sender}: deleted={deleted:?}, endpoints={endpoints}, message={retained:?}"));
+                }
+                assert!(sweep_hollow_projects(&mut conn, 7).unwrap().is_empty());
+            }
+        }
+        assert!(
+            failures.is_empty(),
+            "message-bearing projects were swept: {failures:#?}"
+        );
     }
 
     /// Insert a `sessions` row using only the columns that have existed since

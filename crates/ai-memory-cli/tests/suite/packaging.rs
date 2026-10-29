@@ -1407,6 +1407,10 @@ fn run_powershell_wrapper_with_server_url(args: &[&str], server_url: Option<&str
         .args(args)
         .env("AI_MEMORY_DOCKER", &docker)
         .env("AI_MEMORY_TEST_DOCKER_ARGS", &docker_args)
+        // This helper asserts container argv. `install-hooks` defaults to the
+        // native host client now; opt into the documented script fallback so
+        // that subcommand still exercises the container-routing contract.
+        .env("AI_MEMORY_HOOK_PLATFORM", "windows")
         .env("AI_MEMORY_DATA_VOLUME", "test-ai-memory-data")
         .env_remove("AI_MEMORY_DATA_DIR");
     match server_url {
@@ -1416,7 +1420,7 @@ fn run_powershell_wrapper_with_server_url(args: &[&str], server_url: Option<&str
     let output = command.output().unwrap();
     assert!(
         output.status.success(),
-        "PowerShell wrapper failed: stdout={} stderr={}",
+        "PowerShell wrapper failed for {args:?}: stdout={} stderr={}",
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
@@ -1853,8 +1857,13 @@ impl PrePushFixture {
             fixture_toplevel: String::new(),
             _guard: guard,
         };
-        fixture.git(&fixture.hook_repo, &["init", "-q"]);
-        fixture.git(&fixture.fixture_repo, &["init", "-q"]);
+        // Do not depend on installed Git templates: relocatable Git binaries
+        // can lose their template path through the fixture's tool symlink.
+        // Tests that seed a user hook need its directory before installation.
+        // https://git-scm.com/docs/git-init#_template_directory
+        fixture.git(&fixture.hook_repo, &["init", "-q", "--template="]);
+        fixture.git(&fixture.fixture_repo, &["init", "-q", "--template="]);
+        std::fs::create_dir_all(fixture.hook.parent().unwrap()).unwrap();
         // Compare Git's own answers rather than Rust path strings: Git Bash
         // reports `C:/...` where Rust reports `C:\...`.
         fixture.hook_toplevel = fixture.git(&fixture.hook_repo, &["rev-parse", "--show-toplevel"]);
@@ -3576,6 +3585,68 @@ mod slow {
         assert!(
             args.contains("-e AI_MEMORY_SERVER_URL"),
             "an explicit AI_MEMORY_SERVER_URL must still be forwarded by name; got {args}"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_wrapper_upgrades_after_valid_global_options_only() {
+        for args in [
+            &["upgrade"][..],
+            &["--config", "C:\\tmp\\config with spaces.toml", "upgrade"],
+            &["--config=C:\\tmp\\config.toml", "upgrade"],
+            &["--data-dir", "C:\\tmp\\data", "upgrade"],
+            &["--data-dir=C:\\tmp\\data", "upgrade"],
+        ] {
+            let docker = run_powershell_wrapper(args);
+            assert!(
+                docker.starts_with("pull "),
+                "valid global options must not hide the wrapper-only upgrade; args={args:?}, docker={docker}"
+            );
+        }
+
+        for args in [
+            &["--unknown", "upgrade"][..],
+            &["--help", "upgrade"],
+            &["--config", "--help", "upgrade"],
+            &["--data-dir=", "upgrade"],
+            &["--CONFIG", "C:\\tmp\\config.toml", "upgrade"],
+            &["--DATA-DIR=C:\\tmp\\data", "upgrade"],
+            &["--config", "C:\\tmp\\config.toml", "UPGRADE"],
+        ] {
+            let docker = run_powershell_wrapper(args);
+            assert!(
+                docker.starts_with("run "),
+                "invalid or help options must not trigger an image pull; args={args:?}, docker={docker}"
+            );
+        }
+
+        // `powershell.exe -File` consumes a bare `-` before the script sees it,
+        // so exercise this valid config value through a PowerShell command.
+        let script = repo_root()
+            .join("bin/ai-memory.ps1")
+            .display()
+            .to_string()
+            .replace('\'', "''");
+        let output = Command::new(ai_memory_test_support::powershell_exe())
+            .args([
+                "-NoLogo",
+                "-NoProfile",
+                "-NonInteractive",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-Command",
+            ])
+            .arg(format!("& '{script}' --config '-' upgrade"))
+            .env("AI_MEMORY_DOCKER", "Write-Output")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success() && String::from_utf8_lossy(&output.stdout).starts_with("pull"),
+            "a single dash is a valid config value: status={:?}, stdout={}, stderr={}",
+            output.status.code(),
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
         );
     }
 

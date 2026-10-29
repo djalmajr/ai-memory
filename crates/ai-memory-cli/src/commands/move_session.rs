@@ -42,6 +42,11 @@ struct MoveSessionRequest {
 /// unknown session/target, 409 guard or page collision, 422 batch source
 /// equal to the destination).
 pub async fn run(config: &Config, args: MoveSessionArgs) -> Result<()> {
+    super::refuse_empty_explicit(args.from_workspace.as_deref(), "--from-workspace")?;
+    super::refuse_empty_explicit(args.from_project.as_deref(), "--from-project")?;
+    super::refuse_empty_explicit(args.to_workspace.as_deref(), "--to-workspace")?;
+    super::refuse_empty_explicit(Some(args.to.as_str()), "--to")?;
+
     let endpoint = ServerEndpoint::from_config_resolving_auth(config).await;
 
     // The batch source is a scope like any other command's: marker, else
@@ -341,6 +346,59 @@ mod tests {
             apply_command(&a),
             "ai-memory move-session --from-project ghost --from-workspace default --to target \
              --force --create --confirm"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_empty_from_project_flag_is_refused_before_any_request() {
+        let config = Config::default();
+        let a = args(None, Some("   "));
+        let error = run(&config, a).await.unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("--from-project was passed empty"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_empty_from_workspace_flag_is_refused_before_any_request() {
+        let config = Config::default();
+        let mut a = args(None, Some("src"));
+        a.from_workspace = Some("".into());
+        let error = run(&config, a).await.unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("--from-workspace was passed empty"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_empty_to_flag_is_refused_before_any_request() {
+        let config = Config::default();
+        let mut a = args(None, Some("src"));
+        a.to = "   ".into();
+        let error = run(&config, a).await.unwrap_err();
+        assert!(
+            error.to_string().contains("--to was passed empty"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_empty_to_workspace_flag_is_refused_before_any_request() {
+        let config = Config::default();
+        let mut a = args(None, Some("src"));
+        a.to_workspace = Some("   ".into());
+        let error = run(&config, a).await.unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("--to-workspace was passed empty"),
+            "unexpected error: {error}"
         );
     }
 }

@@ -12,8 +12,8 @@ use std::time::Duration;
 
 use crate::commands::path_util::home_dir;
 use crate::marker::{
-    RoutingSelection, RoutingSource, find_marker, find_settings_marker, is_truthy, parse_toml_flag,
-    parse_toml_key, repo_root_project, routing_selection,
+    RoutingSelection, RoutingSource, find_marker, is_truthy, parse_toml_flag, parse_toml_key,
+    repo_root_project, routing_selection,
 };
 use ai_memory_hooks::capture_policy::MAX_MARKER_BYTES;
 use ai_memory_hooks::{
@@ -309,16 +309,26 @@ pub fn marker_query_suffix_without_briefing(cwd: &str, default_strategy: Option<
     marker_query_suffix_impl(cwd, default_strategy, false)
 }
 
-/// Whether the nearest settings-declaring marker explicitly enables the
-/// compiled project brief (see [`find_settings_marker`]: a nested
-/// capture-only marker does not shadow an outer marker's `[briefing]`
-/// opt-in, #668).
+/// Whether the marker that routes `cwd` explicitly enables the compiled
+/// project brief. It is the selection [`marker_query_suffix`] reads its
+/// `&briefing` params from, so the Kimi gate agrees with the query it gates:
+/// the nearest settings-declaring marker (a nested capture-only marker does
+/// not shadow an outer marker's `[briefing]` opt-in, #668), else the
+/// operator-home marker, whether `cwd` is inside `$HOME` or not (#1665).
 ///
 /// Kimi Code uses this before creating its local once-per-session marker so
 /// repositories that did not opt in do not accumulate marker files.
 pub fn marker_requests_briefing(cwd: &str) -> bool {
-    find_settings_marker(cwd)
-        .and_then(|marker| parse_toml_flag(&marker, "inject_on_session_start"))
+    marker_requests_briefing_with_home(cwd, home_dir().as_deref())
+}
+
+/// [`marker_requests_briefing`] resolved against `home` instead of the
+/// operator's home directory.
+fn marker_requests_briefing_with_home(cwd: &str, home: Option<&Path>) -> bool {
+    crate::marker::routing_selection_with_home(cwd, cwd, home, false)
+        .ok()
+        .flatten()
+        .and_then(|selection| parse_toml_flag(&selection.path, "inject_on_session_start"))
         .is_some_and(|value| is_truthy(&value))
 }
 
@@ -764,12 +774,15 @@ const NATIVE_HOOK_CLIENT_KIND: &str = "hook";
 /// ignores `HTTP_PROXY`, `HTTPS_PROXY` and `ALL_PROXY`, which have no
 /// business on a loopback/LAN POST; reqwest is built without its
 /// `system-proxy` feature, so no OS proxy setting is read either way.
+/// Redirects are disabled so a 3xx from an SSO portal or proxy never drops
+/// spooled events, replays payloads, or injects foreign HTML into context.
 /// Built once per invocation and reused for both the event POST and the
 /// handoff GET. Default root certs are kept so HTTPS targets (e.g. a TLS
 /// proxy) still work.
 pub fn build_client() -> reqwest::Client {
     reqwest::Client::builder()
         .no_proxy()
+        .redirect(reqwest::redirect::Policy::none())
         .build()
         .unwrap_or_else(|_| reqwest::Client::new())
 }
@@ -1080,6 +1093,13 @@ mod tests {
         hook_scope_with_home(cwd, default_strategy, Some(home.path()))
     }
 
+    /// Shadows [`super::marker_requests_briefing`] the same way, for the same
+    /// reason.
+    fn marker_requests_briefing(cwd: &str) -> bool {
+        let home = tempfile::TempDir::new().unwrap();
+        marker_requests_briefing_with_home(cwd, Some(home.path()))
+    }
+
     async fn serve_once(status: &'static str, body: &'static str) -> String {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -1260,6 +1280,100 @@ mod tests {
         let url = serve_once("401 Unauthorized", "unauthorized").await;
         let got = get_handoff(&build_client(), &url, None, Duration::from_secs(1)).await;
         assert!(got.is_none(), "non-2xx body must not become context");
+    }
+
+    async fn redirect_server(status: &'static str, target_url: &str) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let target = target_url.to_owned();
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut buf = [0_u8; 1024];
+            let _ = stream.read(&mut buf).await;
+            let response = format!(
+                "HTTP/1.1 {status}\r\nLocation: {target}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+            );
+            let _ = stream.write_all(response.as_bytes()).await;
+        });
+        format!("http://{addr}/redirect")
+    }
+
+    #[tokio::test]
+    async fn build_client_refuses_redirects() {
+        let target = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let target_url = format!("http://{}/target", target.local_addr().unwrap());
+        let source_url = redirect_server("307 Temporary Redirect", &target_url).await;
+
+        let response = build_client().get(&source_url).send().await.unwrap();
+        assert_eq!(response.status(), reqwest::StatusCode::TEMPORARY_REDIRECT);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), target.accept())
+                .await
+                .is_err(),
+            "redirect target must never be contacted"
+        );
+    }
+
+    #[tokio::test]
+    async fn post_hook_does_not_follow_redirect() {
+        let target = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let target_url = format!("http://{}/target", target.local_addr().unwrap());
+        let source_url = redirect_server("307 Temporary Redirect", &target_url).await;
+
+        let outcome = post_hook(
+            &build_client(),
+            &source_url,
+            "{}",
+            None,
+            Duration::from_secs(1),
+        )
+        .await;
+        assert_eq!(outcome, PostOutcome::Failed);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), target.accept())
+                .await
+                .is_err(),
+            "redirect target must never be contacted"
+        );
+    }
+
+    #[tokio::test]
+    async fn post_batch_does_not_follow_redirect() {
+        let target = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let target_url = format!("http://{}/target", target.local_addr().unwrap());
+        let source_url = redirect_server("307 Temporary Redirect", &target_url).await;
+
+        let outcome = post_batch(
+            &build_client(),
+            &source_url,
+            "[]",
+            None,
+            Duration::from_secs(1),
+        )
+        .await;
+        assert_eq!(outcome, BatchOutcome::Failed);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), target.accept())
+                .await
+                .is_err(),
+            "redirect target must never be contacted"
+        );
+    }
+
+    #[tokio::test]
+    async fn get_handoff_does_not_follow_redirect() {
+        let target = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let target_url = format!("http://{}/login", target.local_addr().unwrap());
+        let source_url = redirect_server("302 Found", &target_url).await;
+
+        let got = get_handoff(&build_client(), &source_url, None, Duration::from_secs(1)).await;
+        assert!(got.is_none(), "redirect must not inject target content");
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), target.accept())
+                .await
+                .is_err(),
+            "redirect target must never be contacted"
+        );
     }
 
     /// Like `serve_once`, but answers 200 and hands back the raw request.
@@ -1918,6 +2032,42 @@ drop_subagent_captures = "true"
         )
         .unwrap();
         assert!(marker_requests_briefing(cwd));
+    }
+
+    /// The Kimi once-per-session gate reads the marker the query it gates
+    /// reads. A home marker's `[briefing]` applies to every cwd, so a checkout
+    /// outside the home with no marker of its own opens the gate too;
+    /// otherwise no brief marker is written and every prompt asks for the
+    /// brief again (#1665).
+    #[test]
+    fn briefing_gate_and_query_agree_on_the_home_marker_outside_the_home() {
+        let home = tempfile::TempDir::new().unwrap();
+        std::fs::write(
+            home.path().join(".ai-memory.toml"),
+            "[briefing]\ninject_on_session_start = true\nmax_chars = 4000\n",
+        )
+        .unwrap();
+        let repo = tempfile::TempDir::new().unwrap();
+        let cwd = repo.path().to_str().unwrap();
+        let query = || {
+            let selection = super::super::super::marker::routing_selection_with_home(
+                cwd,
+                cwd,
+                Some(home.path()),
+                false,
+            );
+            marker_query_suffix_impl_from_selection(cwd, None, true, selection.unwrap())
+        };
+
+        let qs = query();
+        assert!(qs.contains("&briefing=true"), "{qs}");
+        assert!(marker_requests_briefing_with_home(cwd, Some(home.path())));
+
+        // The repo's own settings marker wins over the home marker for both.
+        std::fs::write(repo.path().join(".ai-memory.toml"), "project = \"repo\"\n").unwrap();
+        let qs = query();
+        assert!(!qs.contains("briefing"), "{qs}");
+        assert!(!marker_requests_briefing_with_home(cwd, Some(home.path())));
     }
 
     #[test]

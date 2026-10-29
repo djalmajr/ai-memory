@@ -655,6 +655,29 @@ assert_eq "url_encode encodes an accented macOS path" \
     "$(ai_memory_url_encode '/Users/me/Área de Trabalho')"
 
 # --- offline spool ----------------------------------------------------
+# Without an explicit data-dir, the script fallback must agree with the
+# native client's platform default. In particular, macOS setup stores state
+# under Application Support rather than a shadow ~/.local/share tree.
+MAC_HOME="$TMP/mac-home"
+mkdir -p "$MAC_HOME/Library/Application Support/ai-memory"
+: > "$MAC_HOME/Library/Application Support/ai-memory/auth-header"
+MAC_STATE=$(
+    HOME="$MAC_HOME"; export HOME
+    unset AI_MEMORY_DATA_DIR XDG_DATA_HOME
+    uname() { printf 'Darwin\n'; }
+    ai_memory_state_dir
+)
+assert_eq "state_dir uses the macOS data directory" \
+    "$MAC_HOME/Library/Application Support/ai-memory" "$MAC_STATE"
+MAC_AUTH=$(
+    HOME="$MAC_HOME"; export HOME
+    unset AI_MEMORY_DATA_DIR XDG_DATA_HOME
+    uname() { printf 'Darwin\n'; }
+    ai_memory_auth_header_file
+)
+assert_eq "auth header follows the macOS state directory" \
+    "$MAC_HOME/Library/Application Support/ai-memory/auth-header" "$MAC_AUTH"
+
 # The spool dir follows the data dir, which the harness pins inside $TMP.
 AI_MEMORY_DATA_DIR="$TMP/spool-data"
 export AI_MEMORY_DATA_DIR
@@ -766,6 +789,53 @@ ai_memory_drain_spool 64 >/dev/null 2>&1
 assert_eq "drain keeps entry queued on 429 saturation" "1" \
     "$(ls "$TMP/spool-data/hook-spool/"*.json 2>/dev/null | wc -l | tr -d ' ')"
 unset -f curl
+
+# Native OIDC entries carry no inline token: only the native drain can resolve
+# auth.json. Script drains must leave them byte-identical and continue with
+# entries they can deliver, even if an anonymous POST would return 200.
+for OIDC_STATUS in 200 401; do
+    AI_MEMORY_DATA_DIR="$TMP/oidc-drain-$OIDC_STATUS"
+    export AI_MEMORY_DATA_DIR
+    OIDC_DIR="$AI_MEMORY_DATA_DIR/hook-spool"
+    mkdir -p "$OIDC_DIR"
+    OIDC_ENTRY="$OIDC_DIR/0000000000000-1-0000000000000000.json"
+    OIDC_CREATED=$(ai_memory_now_ms)
+    printf '{"url":"http://127.0.0.1:49374/hook?event=oidc","body":"{\\"e\\":\\"native-oidc\\"}","created_ms":%s,"auth_mode":"oidc","attempts":0}' "$OIDC_CREATED" >"$OIDC_ENTRY"
+    cp "$OIDC_ENTRY" "$AI_MEMORY_DATA_DIR/expected.json"
+    OIDC_LOG="$AI_MEMORY_DATA_DIR/requests.log"
+    : >"$OIDC_LOG"
+    curl() {
+        _oidc_url=''
+        while [ "$#" -gt 0 ]; do
+            case "$1" in http://*) _oidc_url="$1" ;; esac
+            shift
+        done
+        cat >/dev/null
+        printf '%s\n' "$_oidc_url" >>"$OIDC_LOG"
+        case "$_oidc_url" in
+            *event=oidc) printf '%s' "$OIDC_STATUS" ;;
+            *) printf '200' ;;
+        esac
+    }
+    AI_MEMORY_AUTH_TOKEN=static-probe
+    export AI_MEMORY_AUTH_TOKEN
+    ai_memory_spool_event 'http://127.0.0.1:49374/hook?event=static' '{"auth_mode":"oidc","e":"static"}'
+    unset AI_MEMORY_AUTH_TOKEN
+    ai_memory_spool_event 'http://127.0.0.1:49374/hook?event=none' '{"auth_mode":"oidc","e":"anonymous"}'
+    printf '{"url":"http://127.0.0.1:49374/hook?event=legacy","body":"{\\"auth_mode\\":\\"oidc\\"}","created_ms":%s,"attempts":0}' "$OIDC_CREATED" >"$OIDC_DIR/9999999999999-1-0000000000000000.json"
+    ai_memory_drain_spool 64 >/dev/null 2>&1
+    assert_eq "OIDC drain ($OIDC_STATUS): native entry is untouched" yes \
+        "$(cmp -s "$OIDC_ENTRY" "$AI_MEMORY_DATA_DIR/expected.json" && printf yes || printf no)"
+    assert_eq "OIDC drain ($OIDC_STATUS): native entry is never posted" 0 \
+        "$(grep -c 'event=oidc$' "$OIDC_LOG" || true)"
+    for OIDC_CONTROL in static none legacy; do
+        assert_eq "OIDC drain ($OIDC_STATUS): $OIDC_CONTROL control delivers" 1 \
+            "$(grep -Ec "event=$OIDC_CONTROL(&|\$)" "$OIDC_LOG" || true)"
+    done
+    assert_eq "OIDC drain ($OIDC_STATUS): only the native entry stays queued" 1 \
+        "$(find "$OIDC_DIR" -name '*.json' | wc -l | tr -d ' ')"
+    unset -f curl
+done
 
 unset AI_MEMORY_DATA_DIR
 
@@ -1147,42 +1217,41 @@ mkdir -p "$BRIEF_REPO" "$PLAIN_REPO"
 printf '[briefing]\ninject_on_session_start = true\nmax_chars = 6000\n' >"$BRIEF_REPO/.ai-memory.toml"
 printf '[briefing]\ninject_on_session_start = false\nmax_chars = 6000\n' >"$PLAIN_REPO/.ai-memory.toml"
 
-# Runs bundle "$1" from repository "$2" with a fresh state dir and prints the
+# Runs script "$1" from repository "$2" with a fresh state dir and prints the
 # handoff GET it sent. The payload carries every cwd and session field the
 # bundles read, plus Antigravity's first-invocation marker.
-session_start_handoff_get() {
+briefing_handoff_get() {
     rm -rf "$TMP/brief-data" "$FAKE_CURL_LOG"
-    printf '{"cwd":"%s","workspacePaths":["%s"],"invocationNum":0,"session_id":"brief-s","conversationId":"brief-s"}' "$2" "$2" \
+    printf '{"cwd":"%s","workspacePaths":["%s"],"invocationNum":0,"session_id":"brief-s","conversationId":"brief-s","prompt":"continue","tool_name":"read_file","tool_input":{}}' "$2" "$2" \
         | PATH="$FAKE_CURL_BIN:$PATH" AI_MEMORY_CURL_LOG="$FAKE_CURL_LOG" \
             AI_MEMORY_DATA_DIR="$TMP/brief-data" AI_MEMORY_HOOK_URL='http://memory.test' \
-            sh "$(dirname "$0")/../../hooks/$1/session-start.sh" >/dev/null 2>&1
+            sh "$1" >/dev/null 2>&1
     grep '/handoff?' "$FAKE_CURL_LOG" 2>/dev/null || true
 }
 
-BRIEF_BUNDLES=0
-for script in "$(dirname "$0")"/../../hooks/*/session-start.sh; do
-    grep -q 'ai_memory_get_handoff' "$script" || continue
-    bundle=$(basename "$(dirname "$script")")
-    BRIEF_BUNDLES=$((BRIEF_BUNDLES + 1))
-    GET=$(session_start_handoff_get "$bundle" "$BRIEF_REPO")
+BRIEF_SCRIPTS=0
+for script in "$(dirname "$0")"/../../hooks/*/*.sh; do
+    grep -q 'ai_memory_get_handoff "' "$script" || continue
+    name="$(basename "$(dirname "$script")")/$(basename "$script")"
+    BRIEF_SCRIPTS=$((BRIEF_SCRIPTS + 1))
+    GET=$(briefing_handoff_get "$script" "$BRIEF_REPO")
     case "$GET" in
         *'&briefing=true&briefing_budget=6000'*)
-            PASS=$((PASS + 1)); printf '  ok  %s\n' "$bundle: opted-in handoff GET carries the briefing keys" ;;
-        *) FAIL=$((FAIL + 1)); printf '  FAIL %s: opted-in handoff GET carries the briefing keys\n    got =%s\n' "$bundle" "$GET" ;;
+            PASS=$((PASS + 1)); printf '  ok  %s\n' "$name: opted-in handoff GET carries the briefing keys" ;;
+        *) FAIL=$((FAIL + 1)); printf '  FAIL %s: opted-in handoff GET carries the briefing keys\n    got =%s\n' "$name" "$GET" ;;
     esac
-    GET=$(session_start_handoff_get "$bundle" "$PLAIN_REPO")
+    GET=$(briefing_handoff_get "$script" "$PLAIN_REPO")
     case "$GET" in
         *'/handoff?'*briefing*)
-            FAIL=$((FAIL + 1)); printf '  FAIL %s: opted-out handoff GET omits the briefing keys\n    got =%s\n' "$bundle" "$GET" ;;
+            FAIL=$((FAIL + 1)); printf '  FAIL %s: opted-out handoff GET omits the briefing keys\n    got =%s\n' "$name" "$GET" ;;
         *'/handoff?'*)
-            PASS=$((PASS + 1)); printf '  ok  %s\n' "$bundle: opted-out handoff GET omits the briefing keys" ;;
-        *) FAIL=$((FAIL + 1)); printf '  FAIL %s: opted-out session start still fetches the handoff\n    got =%s\n' "$bundle" "$GET" ;;
+            PASS=$((PASS + 1)); printf '  ok  %s\n' "$name: opted-out handoff GET omits the briefing keys" ;;
+        *) FAIL=$((FAIL + 1)); printf '  FAIL %s: opted-out session start still fetches the handoff\n    got =%s\n' "$name" "$GET" ;;
     esac
 done
 # Guards the discovery itself: an empty glob or a renamed helper would
 # otherwise pass with nothing checked.
-assert_eq "session-start bundles that fetch the handoff were found" "yes" \
-    "$([ "$BRIEF_BUNDLES" -ge 9 ] && printf 'yes' || printf 'no (%s)' "$BRIEF_BUNDLES")"
+assert_eq "all handoff-fetching scripts were checked for briefing" "13" "$BRIEF_SCRIPTS"
 
 # --- a handoff is never claimed without a project directory -------------
 # `GET /handoff` claims the newest open handoff in whatever project the server

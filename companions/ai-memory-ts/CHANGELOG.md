@@ -8,6 +8,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- Capability initialization is owned by the client rather than its first
+  caller. Concurrent callers now wait with independent abort signals and
+  deadlines; cancelling one does not fail or delay the others. (#1815)
+
+- Initialized the MCP session before the first `callTool`, so raw tool calls
+  work with `--http-stateful` without a preceding wrapped call. Raw calls
+  still skip `tools/list` and schema checks. (#1816)
+
 ### Added
 
 - `query` takes the server's `memory_query` page filters: `kind`, `tier`,

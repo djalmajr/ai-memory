@@ -1500,6 +1500,135 @@ async fn api_project_routes_return_404_for_missing_project() {
 }
 
 #[tokio::test]
+async fn recent_page_lists_order_timestamps_chronologically() {
+    let (tmp, store, wiki) = setup().await;
+    let ws = store
+        .writer
+        .get_or_create_workspace("default")
+        .await
+        .unwrap();
+    let proj = store
+        .writer
+        .get_or_create_project(ws, "scratch", None)
+        .await
+        .unwrap();
+    let second = "2026-01-01T12:00:00Z"
+        .parse::<jiff::Timestamp>()
+        .unwrap()
+        .as_microsecond();
+    let conn = rusqlite::Connection::open(tmp.path().join("db/memory.sqlite")).unwrap();
+    for (path, delta) in [
+        ("notes/oldest.md", -2_000_000),
+        ("notes/prior.md", -1_000_000),
+        ("notes/whole.md", 0),
+        ("notes/tenth.md", 100_000),
+        ("notes/z-newest.md", 100_001),
+        ("notes/a-newest.md", 100_001),
+    ] {
+        let id = store
+            .writer
+            .upsert_page(new_page(ws, proj, path, "Repeated title", "body"))
+            .await
+            .unwrap();
+        conn.execute(
+            "UPDATE pages SET updated_at = ?1 WHERE id = ?2",
+            rusqlite::params![second + delta, id.as_bytes()],
+        )
+        .unwrap();
+    }
+    let expected = [
+        "notes/a-newest.md",
+        "notes/z-newest.md",
+        "notes/tenth.md",
+        "notes/whole.md",
+        "notes/prior.md",
+        "notes/oldest.md",
+    ];
+    let api = api_router(store.reader.clone(), wiki.clone());
+    let (status, body) =
+        get_body(&api, "/workspaces/default/projects/scratch/recent?limit=1").await;
+    assert_eq!(status, StatusCode::OK);
+    let rows: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(
+        rows[0]["path"], expected[0],
+        "limit must retain the newest instant, not the lexically largest timestamp"
+    );
+    let (_, body) = get_body(
+        &api,
+        "/workspaces/default/projects/scratch/recent?limit=100",
+    )
+    .await;
+    let rows: Value = serde_json::from_str(&body).unwrap();
+    let paths: Vec<_> = rows
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|row| row["path"].as_str().unwrap())
+        .collect();
+    assert_eq!(paths, expected);
+    assert_eq!(rows[2]["updated_at"], "2026-01-01T12:00:00.1Z");
+    assert_eq!(rows[3]["updated_at"], "2026-01-01T12:00:00Z");
+
+    // Incremental reads keep their SQL-backed ascending order.
+    let (status, body) = get_body(
+        &api,
+        "/workspaces/default/projects/scratch/recent?updated_since=2026-01-01T00:00:00Z&limit=100",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let incremental: Value = serde_json::from_str(&body).unwrap();
+    let ascending: Vec<_> = incremental["pages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|page| page["path"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        ascending,
+        [
+            expected[5],
+            expected[4],
+            expected[3],
+            expected[2],
+            expected[0],
+            expected[1]
+        ]
+    );
+
+    let web = router(store.reader.clone(), wiki);
+    let assert_order = |html: &str, paths: &[&str]| {
+        let positions: Vec<_> = paths
+            .iter()
+            .map(|path| {
+                html.find(&format!("href=\"w/default/scratch/p/{path}\""))
+                    .unwrap_or_else(|| panic!("missing {path}"))
+            })
+            .collect();
+        assert!(
+            positions.windows(2).all(|pair| pair[0] < pair[1]),
+            "wrong chronological order: {positions:?}"
+        );
+    };
+    let (_, project) = get_body(&web, "/w/default/scratch").await;
+    let sidebar = &project[..project.find("</aside>").unwrap()];
+    assert_order(sidebar, &expected[..5]);
+    assert!(
+        !sidebar.contains("p/notes/oldest.md\""),
+        "folder preview must omit the oldest page"
+    );
+    let recent = &project[project.find("Recent Activity").unwrap()..];
+    assert_order(recent, &expected);
+    for uri in [
+        "/w/default/scratch/p/notes/",
+        "/w/default/scratch/p/notes/?sort=title",
+    ] {
+        let (status, body) = get_body(&web, uri).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_order(&body, &expected);
+    }
+}
+
+#[tokio::test]
 async fn api_recent_and_briefing_return_project_data() {
     let (_tmp, store, wiki) = setup().await;
     let ws = store

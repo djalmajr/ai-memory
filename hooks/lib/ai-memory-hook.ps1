@@ -753,7 +753,8 @@ function Write-AiMemorySpoolEvent {
 # the pass and keeps the remainder for the next one. The per-entry timeout
 # is this bundle's own POST budget. ConvertFrom-Json reads every escape
 # either serializer emits, so entries written by the shell bundle or the
-# native binary drain here too.
+# native binary drain here too, except OIDC entries that need native auth.json
+# credential resolution.
 function Invoke-AiMemoryDrainSpool {
     param([int] $Max = 64)
     try {
@@ -778,6 +779,9 @@ function Invoke-AiMemoryDrainSpool {
         } catch {
             continue
         }
+        # OIDC entries have no inline bearer. The native drain resolves/refreshes
+        # auth.json; an anonymous POST here can retire the event without it.
+        if ($entry.auth_mode -eq "oidc") { continue }
         if (-not $entry.url) { continue }
         $headers = @{}
         $headers["X-AI-Memory-Client"] = "hook-ps"

@@ -29,6 +29,7 @@ mod logging;
 mod marker;
 mod process_guard;
 mod proxy_env;
+pub mod runtime_flavor;
 mod server_profiles;
 mod terminal;
 

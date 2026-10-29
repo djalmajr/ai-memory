@@ -138,6 +138,13 @@ jobs:
           else
             echo "no tests under $dir"
           fi
+      # The two example eval scorers must keep giving the same verdict; the
+      # suite runs the Python one and the sh + awk one on the same proposals.
+      - name: Auto-improve eval example scorer tests
+        if: matrix.os == 'ubuntu-latest'
+        env:
+          PYTHONDONTWRITEBYTECODE: "1"
+        run: uv run --no-project python -m unittest discover -s docs/examples/auto-improve-eval -p 'test_*.py' -v
       # The capture policy every generated OpenCode/OMP/Pi/OpenClaw plugin
       # embeds is TypeScript; only Node can execute it against the shared
       # capture-policy fixture. The test is ignored locally, where Node is not
@@ -470,8 +477,11 @@ jobs:
       - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
       - uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16 # v2
       - run: cargo install cargo-audit --locked
+      # zip is versioned 8.6.0 for Candle compatibility but pinned to
+      # upstream's official 8.x fix commit (507c5c76) for this GHSA.
       - run: >
           cargo audit
+          --ignore GHSA-m665-v7pm-7grj
           --ignore RUSTSEC-2025-0141
           --ignore RUSTSEC-2024-0320
       - run: cargo audit --file companions/ai-memory-relay/Cargo.lock
