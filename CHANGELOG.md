@@ -82,6 +82,8 @@ version in [`docs/changelog/`](docs/changelog/):
   job. (#18)
 
 ### Fixed
+- Fixed the fork's deploy image build, which stopped compiling after the v3.3.3
+  sync because `deploy/Dockerfile` did not copy `docs/` and `CHANGELOG.md`. (#TBD)
 - Timeout and ambiguous 499/5xx LLM failures now receive at most one replay
   after a 60-second cooldown plus jitter. Fast retries remain for connection
   failures, 429 with Retry-After, and 503 explicitly marked as capacity;

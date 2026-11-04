@@ -73,8 +73,10 @@ WORKDIR /work
 #     building any member, including the test-only `evals` member;
 #   - the crates, with their vendored assets (ai-memory-web/static/...);
 #   - hooks/, installed into the runtime image below;
-#   - docs/logo.png, embedded by ai-memory-web (routes/statics.rs
-#     include_bytes!) in every release build;
+#   - docs/ and CHANGELOG.md: ai-memory-web embeds the product documentation
+#     (changelog included) and the logos in every release build, and the CLI
+#     embeds docs/ARCHITECTURE.md. CI never builds this file, so a source file
+#     missing from this COPY list only fails when the image is built;
 #   - LICENSE (include_str!'d by `render-plugins`) and the packaged systemd /
 #     launchd templates (include_str!'d by `ai-memory setup`'s user-service
 #     rendering): upstream 3.0 compiles them into the binary.
@@ -82,7 +84,8 @@ COPY Cargo.toml Cargo.lock rust-toolchain.toml LICENSE ./
 COPY crates/ crates/
 COPY evals/ evals/
 COPY hooks/ hooks/
-COPY docs/logo.png docs/logo.png
+COPY docs/ docs/
+COPY CHANGELOG.md ./
 COPY packaging/systemd packaging/systemd
 COPY packaging/launchd packaging/launchd
 RUN cargo build --release -p ai-memory-cli \
