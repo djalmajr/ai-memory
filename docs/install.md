@@ -1941,7 +1941,9 @@ Droid reads the `hooks` key of `~/.factory/settings.json` only while
 create `hooks.json`, which would switch them off, and says so. Either move
 that `hooks` object into `~/.factory/hooks.json` and run the command again, or
 merge the entries `ai-memory install-hooks --agent droid` prints (without
-`--apply`) under the `hooks` key of `settings.json` yourself.
+`--apply`) under the `hooks` key of `settings.json` yourself. When a token is
+configured, those entries show `<redacted>` in its place, so put the real value
+there.
 
 The `SessionStart` hook delivers the prior session's handoff through
 `hookSpecificOutput.additionalContext`, which Droid adds to the session, and
@@ -2074,6 +2076,9 @@ hermes` (alias `hermes-agent`) prints the block to paste there:
 ```bash
 ai-memory install-hooks --agent hermes --server-url "http://homelab:49374"
 ```
+
+When a token is configured, this preview shows `<redacted>` in its place. Add
+`--apply` to store the token under the data dir and print a block without it.
 
 Hermes splits each configured `command` with `shlex.split` and runs it with
 **no shell**, passing the event JSON on stdin, so the generated entry invokes

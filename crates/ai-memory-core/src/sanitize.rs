@@ -18,8 +18,8 @@
 //! all GitHub token prefixes ghp_/gho_/ghu_/ghs_/ghr_ and fine-grained
 //! github_pat_…, Google AIza… and AQ.Ab… plus OAuth refresh tokens 1//…, Meta /
 //! Facebook Graph EAA…, Telegram bot tokens, GoHighLevel pit-…, Slack
-//! xoxb/xoxp…, AWS AKIA/ASIA…), PEM-bracketed private
-//! keys, URL-embedded credentials (`postgres://user:pass@host`), and
+//! xoxb/xoxp…, AWS AKIA/ASIA…), ai-memory's own aim_/amk_/ams_ credentials,
+//! PEM-bracketed private keys, URL-embedded credentials (`postgres://user:pass@host`), and
 //! dotless base64 JSON tokens (Cloudflare tunnel tokens), and anything
 //! matching the generic `*_(KEY|KEY_ID|TOKEN|SECRET|PASSWORD|CREDENTIAL|
 //! PEPPER|SALT|…)=value` shape. Operators can extend the list via
@@ -254,6 +254,14 @@ const BUILTIN_PATTERNS: &[(&str, &str)] = &[
     // Slack tokens (bot/user/admin/app-level/refresh).
     (r"xox[abprs]-[A-Za-z0-9\-]{10,}", "slack_token"),
     (r"xapp-[A-Za-z0-9\-]{10,}", "slack_token"),
+    // ai-memory's own credentials: `aim_` API keys and `ams_` web sessions are
+    // these prefixes plus 43 base64url characters; external `amk_` keys come
+    // from mcp-auth, so their length is not known here. The floor is the 22
+    // base64url characters of a 128-bit secret. It sits above snake_case names
+    // that happen to start with a prefix (`ams_session_token_hash`), and the
+    // leading word boundary rejects `claim_…`. No trailing boundary: base64url
+    // can end in `-`, which would otherwise be left behind.
+    (r"\b(?:aim|amk|ams)_[A-Za-z0-9_\-]{22,}", "ai_memory_token"),
     // JWTs (three base64url segments separated by dots).
     (
         r"eyJ[A-Za-z0-9_\-]{16,}\.[A-Za-z0-9_\-]{16,}\.[A-Za-z0-9_\-]{16,}",
@@ -800,6 +808,99 @@ mod tests {
         let out = s().scrub("Authorization: Bearer abcdef0123456789ABCDEF0123456789");
         assert!(out.contains("[REDACTED:"));
         assert!(!out.contains("abcdef0123"));
+    }
+
+    /// A credential shaped like the real ones: the prefix plus 43 base64url
+    /// characters. Obviously fake, and built at run time so it is not a literal.
+    fn native_key(prefix: &str) -> String {
+        format!("{prefix}FAKEfake-FAKEfake_FAKEfakeFAKEfakeFAKEfake000")
+    }
+
+    #[test]
+    fn scrubs_native_keys_in_every_position() {
+        for prefix in ["aim_", "amk_", "ams_"] {
+            let key = native_key(prefix);
+            for (shape, text) in [
+                (
+                    "const TOKEN",
+                    format!("const TOKEN: string | null = \"{key}\";"),
+                ),
+                ("bare", format!("the key is {key} for now")),
+                ("json", format!("{{\"token\":\"{key}\",\"other\":1}}")),
+                ("line end", format!("first line\ntoken {key}\nlast line")),
+                ("text end", format!("token {key}")),
+                ("cli flag", format!("--auth-token {key} --next")),
+            ] {
+                let out = s().scrub(&text);
+                assert!(
+                    out.contains("[REDACTED:ai_memory_token]"),
+                    "{prefix} {shape}: {out}"
+                );
+                assert!(!out.contains("FAKEfake"), "{prefix} {shape}: {out}");
+                assert!(!out.contains(prefix), "{prefix} {shape}: {out}");
+            }
+        }
+    }
+
+    #[test]
+    fn native_key_redaction_keeps_the_surrounding_text() {
+        let key = native_key("aim_");
+        assert_eq!(
+            s().scrub(&format!("const TOKEN: string | null = \"{key}\";")),
+            "const TOKEN: string | null = \"[REDACTED:ai_memory_token]\";"
+        );
+    }
+
+    #[test]
+    fn native_key_ending_in_a_url_safe_symbol_leaves_nothing_behind() {
+        for tail in ["-", "_", "--"] {
+            let key = format!("{}{tail}", native_key("aim_"));
+            assert_eq!(
+                s().scrub(&format!("key {key} end")),
+                "key [REDACTED:ai_memory_token] end"
+            );
+        }
+    }
+
+    #[test]
+    fn native_key_split_by_an_invisible_character_is_redacted() {
+        let key = native_key("aim_");
+        let (head, tail) = key.split_at(10);
+        let out = s().scrub(&format!("key {head}\u{200b}{tail}"));
+        assert_eq!(out, "key [REDACTED:ai_memory_token]");
+    }
+
+    #[test]
+    fn bearer_rule_still_wins_for_a_native_key_in_a_header() {
+        let key = native_key("aim_");
+        assert_eq!(
+            s().scrub(&format!("Authorization: Bearer {key}")),
+            "Authorization: [REDACTED:bearer_token]"
+        );
+    }
+
+    #[test]
+    fn native_key_floor_is_twenty_two_tail_characters() {
+        let at_floor = format!("aim_{}", "x".repeat(22));
+        assert_eq!(s().scrub(&at_floor), "[REDACTED:ai_memory_token]");
+        let below_floor = format!("aim_{}", "x".repeat(21));
+        assert_eq!(s().scrub(&below_floor), below_floor);
+    }
+
+    #[test]
+    fn identifiers_and_prose_with_a_native_prefix_survive() {
+        for keep in [
+            "claim_session_consolidation_jobs",
+            "ams_session_token_hash",
+            "reclaim_session_consolidation_jobs_now",
+            "SELECT claim_session_consolidation_jobs(ams_session_token_hash)",
+            "the aim_ prefix marks a native key, amk_ an external one, ams_ a session",
+            "aim_assist and aim_low are short names",
+            "AIM_SESSION_TOKEN_HASH_COLUMN_NAME_V2",
+            "xaim_FAKEfake-FAKEfake_FAKEfakeFAKEfake",
+        ] {
+            assert_eq!(s().scrub(keep), keep);
+        }
     }
 
     #[test]

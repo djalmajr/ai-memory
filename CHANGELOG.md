@@ -113,6 +113,16 @@ version in [`docs/changelog/`](docs/changelog/):
 - Updated `tokio` 1.52.3 → 1.53.3 for
   [RUSTSEC-2026-0386](https://rustsec.org/advisories/RUSTSEC-2026-0386), in
   which `AsyncFd::new` and related constructors violate I/O safety. (#17)
+- Stopped `install-hooks` without `--apply` from printing the bearer token, which
+  a terminal's scrollback, a CI log or an agent's transcript could keep. Every
+  agent's preview now omits the value, whether it came from `--auth-token`, the
+  environment, the config or an installed MCP entry: generated TypeScript plugins
+  show `TOKEN` as `null`, and hook configs show `<redacted>`. What `--apply` writes
+  is unchanged. Rotate a token that a preview printed before this release. (#TBD)
+- Added a sanitizer rule that redacts ai-memory's own `aim_`, `amk_` and `ams_`
+  credentials anywhere in captured text, as `[REDACTED:ai_memory_token]`; only a
+  `Bearer` header was covered before. Text stored before this release is not
+  rewritten, so a key already captured stays in the store until it is purged. (#TBD)
 
 ## [3.2.2] - 2026-10-22
 
