@@ -6,12 +6,42 @@
 //! rules for private keys and invisible characters: key blocks are matched
 //! first, including PGP armor and a block cut off before its end line, and
 //! invisible formatting characters do not hide a credential from the
-//! patterns.
+//! patterns. Unlike the server it does not decode JSON string escapes, so a key
+//! with part of itself written as `\uXXXX` passes here and is caught there.
 
 use regex::Regex;
 use std::sync::OnceLock;
 
+/// ANSI/VT escape sequences, removed whole like the server's sanitizer does.
+/// Removing only the ESC would leave `[32m` glued to whatever follows, where
+/// neither this scrub nor the server could see a key behind it.
+const ESCAPE_SEQUENCES: &str =
+    r"\x1b\[[0-9;?]*[ -/]*[@-~]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)|\x1b[@-Z\\-_]";
+
+fn escape_sequences() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| Regex::new(ESCAPE_SEQUENCES).unwrap())
+}
+
+/// A native key prefix right after a word character and something removed
+/// below. Removing that alone would glue the key to the word and hide it from
+/// the native rule's word boundary, here and on the server, so the match becomes
+/// `$1 $2` first. The prefix is enough: the key's body can hold a removed
+/// character too. Mirrors the server's sanitizer.
+fn native_key_after_stripped() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        Regex::new(&format!(
+            r"([0-9A-Za-z_])(?:{ESCAPE_SEQUENCES}|[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x{{9f}}\x{{202a}}-\x{{202e}}\x{{2066}}-\x{{2069}}\x{{2061}}-\x{{2064}}\x{{feff}}\x{{e0000}}-\x{{e007f}}])+((?:aim|amk|ams)_)"
+        ))
+        .unwrap()
+    })
+}
+
 pub fn sanitize_external_text(input: &str) -> String {
+    let spaced = native_key_after_stripped().replace_all(input, "$1 $2");
+    let stripped = escape_sequences().replace_all(&spaced, "");
+    let input = stripped.as_ref();
     let mut offset = 0;
     let mut controls_removed = String::with_capacity(input.len());
     while let Some(ch) = input[offset..].chars().next() {

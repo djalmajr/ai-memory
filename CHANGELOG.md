@@ -82,6 +82,8 @@ version in [`docs/changelog/`](docs/changelog/):
   job. (#18)
 
 ### Fixed
+- Fixed the fork's deploy image build, which stopped compiling after the v3.3.3
+  sync because `deploy/Dockerfile` did not copy `docs/` and `CHANGELOG.md`. (#22)
 - Timeout and ambiguous 499/5xx LLM failures now receive at most one replay
   after a 60-second cooldown plus jitter. Fast retries remain for connection
   failures, 429 with Retry-After, and 503 explicitly marked as capacity;
@@ -113,17 +115,17 @@ version in [`docs/changelog/`](docs/changelog/):
   agent's preview now omits the value, whether it came from `--auth-token`, the
   environment, the config or an installed MCP entry: generated TypeScript plugins
   show `TOKEN` as `null`, and hook configs show `<redacted>`. What `--apply` writes
-  is unchanged. Rotate a token that a preview printed before this release. (#TBD)
+  is unchanged. Rotate a token that a preview printed before this release. (#23)
 - Added a sanitizer rule that redacts ai-memory's own `aim_`, `amk_` and `ams_`
-  credentials in captured text, including right after a serialized control
-  character, an ANSI color code or a URL-encoded byte, as
+  credentials in captured text, including right after a control character or an
+  ANSI color code, raw or serialized, or a URL-encoded byte, as
   `[REDACTED:ai_memory_token]`; only a `Bearer` header was covered before.
   `ai-memory-client` redacts the same keys in the external text it scrubs.
   Text stored before this release is not rewritten, so a key already captured
-  stays in the store until it is purged. (#TBD)
+  stays in the store until it is purged. (#23)
 - Stopped `config.toml` errors from echoing values, which could hold
   `[auth].bearer_token`, on every subcommand. A syntax error keeps the file, line
-  and column, and a type error keeps the key and the expected type. (#TBD)
+  and column, and a type error keeps the key and the expected type. (#23)
 - Stopped `install-mcp` without `--apply` and `setup-agent` from printing the
   bearer token. Their snippets now show `<redacted>` in its place, whichever
   source the token came from: replace it by hand or use `install-mcp --apply`.
