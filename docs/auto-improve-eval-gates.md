@@ -9,7 +9,7 @@ and before staging or auto-approval. Hooks never run eval commands.
 ```toml
 [auto_improve.eval]
 enabled = true
-command = "python3 docs/examples/auto-improve-eval/score_proposal.py"
+command = "sh docs/examples/auto-improve-eval/score_proposal.sh"
 timeout_secs = 30
 targets = ["_rules", "procedures"]
 min_delta = 0.0
@@ -18,6 +18,38 @@ min_delta = 0.0
 The command is split on whitespace and executed directly, not through a shell.
 Use a wrapper script if you need quoting, environment setup, or multiple
 commands.
+
+### The built-in scorer
+
+Writing, mounting and maintaining a scorer is optional: `builtin = "structure"`
+runs the checks in process, so the gate needs no interpreter, no script inside
+the container, and no timeout.
+
+```toml
+[auto_improve.eval]
+enabled = true
+builtin = "structure"
+targets = ["_rules", "procedures"]
+min_delta = 0.0
+```
+
+It checks, never matching a section name or a wording (so a wiki in any
+language scores the same):
+
+- an H1 heading;
+- no upper-case `TODO`/`TBD` placeholder — a hard failure, not a deduction; the
+  Portuguese word "todo" in prose is not a placeholder;
+- for `procedures/`, a `##` section and a list of steps;
+- for `_rules/`, text beyond the heading, within 2,400 characters.
+
+A proposal passes at `score_after >= 0.70` and no lower than `score_before`.
+`eval_results` records `checker_name = "builtin:structure"` and an invocation
+digest over the scorer name and the binary version, instead of a command
+string.
+
+`builtin` and `command` are mutually exclusive: setting both is a startup
+error rather than one being silently ignored. `command` keeps working
+unchanged for project-specific scorers.
 
 The eval policy is owned by the server process. `ai-memory auto-improve` and
 direct HTTP requests cannot replace the configured command, targets, timeout,
@@ -109,16 +141,27 @@ to pending evidence; reading a report cannot restore independent observations.
 - Prefer simple checks that match the target path: heading structure for
   procedures, forbidden placeholders for `_rules`, or project-specific smoke
   assertions for critical docs.
+- Check structure, not wording. Pages are written in whatever language the
+  team works in, so a check for an English section name or keyword rejects
+  every proposal written in another language.
 
 ## Examples
 
-This repository includes two dependency-free templates:
+This repository includes two templates that apply the same checks: an H1,
+no TODO/TBD placeholder, a `##` section and a list of steps for procedures, and
+text beyond the heading within 2,400 characters for rules. None of them looks
+at section names or wording, so pages in any language score the same way.
 
 - [`docs/examples/auto-improve-eval/score_proposal.py`](examples/auto-improve-eval/score_proposal.py):
-  Python scorer that checks basic structure and placeholders.
+  Python scorer. It needs `python3` on the host that runs the server.
 - [`docs/examples/auto-improve-eval/score_proposal.sh`](examples/auto-improve-eval/score_proposal.sh):
-  POSIX shell wrapper around an embedded Python scorer for hosts that prefer a
-  script entrypoint.
+  the same scorer in POSIX `sh` and `awk`, with no other dependency.
+
+The official Docker image ships no `python3`, so use the shell scorer there.
+The command runs inside the container, from its working directory `/data`, and
+the image does not include `docs/`: copy the script into the data volume and
+point the command at that copy, for example
+`command = "sh /data/eval/score_proposal.sh"`.
 
 Try them with the sample payload:
 

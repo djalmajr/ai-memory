@@ -23,6 +23,8 @@ struct MoveProjectRequest {
     confirm: bool,
     force: bool,
     on_conflict: String,
+    /// Acknowledge the copy+purge merge (#1713).
+    allow_lossy_merge: bool,
 }
 
 /// The exact command that performs the move the refusal just described.
@@ -45,6 +47,9 @@ fn confirm_command(from_workspace: &str, target_flag: &str, args: &MoveProjectAr
     );
     if args.force {
         cmd.push_str(" --force");
+    }
+    if args.allow_lossy_merge {
+        cmd.push_str(" --allow-lossy-merge");
     }
     if args.on_conflict != "block" {
         cmd.push_str(&format!(
@@ -69,6 +74,10 @@ fn confirm_command(from_workspace: &str, target_flag: &str, args: &MoveProjectAr
 /// Returns an error when `--confirm` is absent, the server is unreachable,
 /// or the server returns a non-2xx response.
 pub async fn run(config: &Config, args: MoveProjectArgs) -> Result<()> {
+    super::refuse_empty_explicit(args.from_workspace.as_deref(), "--from-workspace")?;
+    super::refuse_empty_explicit(Some(args.to_workspace.as_str()), "--to-workspace")?;
+    super::refuse_empty_explicit(args.project.as_deref(), "--project")?;
+    super::refuse_empty_explicit(args.project_id.as_deref(), "--project-id")?;
     let (from_workspace, project, project_id) = match &args.project_id {
         Some(id) => (
             super::resolve_workspace(config, args.from_workspace.as_deref())?,
@@ -129,6 +138,7 @@ pub async fn run(config: &Config, args: MoveProjectArgs) -> Result<()> {
             confirm: true,
             force: args.force,
             on_conflict: args.on_conflict.clone(),
+            allow_lossy_merge: args.allow_lossy_merge,
         },
     )
     .await?;
@@ -226,6 +236,7 @@ mod tests {
             confirm: false,
             force: false,
             on_conflict: "block".into(),
+            allow_lossy_merge: false,
         }
     }
 

@@ -25,6 +25,7 @@ Before these commands were added:
 | **OpenAI Codex CLI** | `~/.codex/config.toml`<br>`~/.codex/mcp.json` | `~/.agents/skills/`<br>`.agents/skills/`<br>`~/.codex/skills/` | `~/.codex/plugins/` | `AGENTS.md` |
 | **Antigravity CLI (`agy`) / Gemini** | `~/.gemini/settings.json`<br>`~/.gemini/config/mcp_config.json`<br>`antigravity-cli/mcp_config.json` | Antigravity: `~/.gemini/config/skills/`, `~/.gemini/antigravity-cli/skills/`, `.agents/skills/`<br>Gemini: `~/.gemini/skills/`, `.gemini/skills/` | `antigravity-cli/plugins/`<br>`~/.gemini/plugins/` | `GEMINI.md`<br>`AGENTS.md`<br>`rules/` |
 | **Qwen Code** | `~/.qwen/settings.json` | `~/.qwen/skills/`<br>`~/.agents/skills/` | — | `QWEN.md`<br>`AGENTS.md` |
+| **Qoder** | `~/.qoder/settings.json` | `~/.agents/skills/` | — | `AGENTS.md` |
 | **Cursor IDE** | `~/.cursor/mcp.json`<br>`.cursor/mcp.json` | — | VS Code / Cursor extensions | `.cursorrules`<br>`.cursor/rules/` |
 | **OpenCode (v1 / v2)** | `opencode.json`<br>`opencode.jsonc`<br>`~/.config/opencode/opencode.json` | `~/.config/opencode/skills/` | `~/.config/opencode/plugins/` | `AGENTS.md` |
 | **Devin CLI** | `~/.devin/config.json` | `~/.devin/skills/` | — | Devin instructions |
@@ -139,7 +140,10 @@ Stored in the root of the generated tarball:
      are rolled back; timestamped copies of overwritten files remain available.
    - Non-managed custom files are never overwritten without explicit `--force`.
    - Portable Unix execute/read/write bits are restored; set-id and sticky bits
-     are never accepted from a manifest.
+     are never accepted from a manifest. A file with matching content but
+     different recorded permissions still needs `--apply --force` to restore
+     its mode. Without a recorded mode, or on platforms without portable Unix
+     permissions, matching content remains a no-op.
 5. **Active Content:**
    - Skills, plugins, and instruction files can contain executable code or
      model-visible instructions. Restore is dry-run by default and prints this

@@ -112,6 +112,8 @@ fn preview_message(outcome: &PreviewOutcome, label: &str) -> Option<String> {
 /// UUID, the server is unreachable, or the server returns a non-2xx
 /// response (including `404` for a session outside the named scope).
 pub async fn run(config: &Config, args: PurgeSessionArgs) -> Result<()> {
+    super::refuse_empty_explicit(args.workspace.as_deref(), "--workspace")?;
+    super::refuse_empty_explicit(args.project.as_deref(), "--project")?;
     let (workspace, project) =
         super::resolve_scope(config, args.workspace.as_deref(), args.project.as_deref())?;
 
@@ -429,20 +431,30 @@ mod tests {
         assert!(msg.starts_with("Would purge session from default/scratch: 1063 observations"));
     }
 
-    /// Nothing listening at all (connection refused) must classify as
-    /// `Unreachable`, the same as a timeout — both are silent fallbacks.
+    /// A dropped connection must classify as `Unreachable`, the same as a
+    /// timeout — both are silent fallbacks.
     #[tokio::test]
-    async fn run_preview_classifies_a_connection_failure_as_unreachable() {
+    async fn run_preview_classifies_a_dropped_connection_as_unreachable() {
         let tmp = tempfile::TempDir::new().unwrap();
-        // Bind then drop immediately: the port is very likely free again by
-        // the time the request lands, and nothing else can be listening on
-        // it inside this test's short lifetime.
+        // Own the endpoint until the request arrives; releasing a reserved
+        // port first lets another concurrent test answer the preview instead.
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
-        drop(listener);
+        let server = tokio::spawn(async move {
+            use tokio::io::AsyncReadExt;
+
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = [0; 1024];
+            assert!(stream.read(&mut request).await.unwrap() > 0);
+            // Close after receiving the request, without an HTTP response.
+        });
         let config = config_for(&tmp, format!("http://{addr}"));
         let outcome = run_preview(&config, "/admin/purge-session", &preview_request()).await;
         assert!(matches!(outcome, PreviewOutcome::Unreachable));
         assert!(preview_message(&outcome, "default/scratch").is_none());
+        tokio::time::timeout(std::time::Duration::from_secs(1), server)
+            .await
+            .expect("the preview must reach the fixture")
+            .unwrap();
     }
 }

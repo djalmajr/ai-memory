@@ -41,6 +41,7 @@ pub(super) fn render(report: &DoctorReport, terminal: &crate::terminal::Terminal
     terminal.text(&render_capture_health(report));
     terminal.text(&render_plugins(&report.plugins));
     terminal.text(&render_muse(report.muse.as_ref()));
+    terminal.text(&hermes::render(&report.hermes));
     terminal.text(&super::super::agentmemory_residue::render(
         &report.agentmemory_residue,
     ));
@@ -69,7 +70,7 @@ pub(super) fn render(report: &DoctorReport, terminal: &crate::terminal::Terminal
 
     if !report.native_memory.is_empty() {
         terminal.line(format_args!(
-            "Note: a shell/PowerShell hook install (the Docker-wrapper default) does not \
+            "Note: a shell/PowerShell hook install does not \
              enforce capture-policy v1 — \"excluded\" below only holds on a native hook \
              install or a generated integration. Check the configured hook command; a dry-run \
              `ai-memory install-hooks` reports the selected install path, not the active one.\n"

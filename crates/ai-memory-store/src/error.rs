@@ -70,6 +70,14 @@ pub enum StoreError {
     #[error("migration: {0}")]
     Migration(#[from] refinery::Error),
 
+    /// A restore source would initialize a new store instead of opening a
+    /// database that ai-memory already migrated.
+    #[error(
+        "backup has no initialized ai-memory database snapshot at db/memory.sqlite; \
+         restore requires an existing snapshot with applied migration history"
+    )]
+    UninitializedSnapshot,
+
     /// The store's schema is newer than this binary: an applied migration is
     /// above the highest compiled-in version (refinery reports this as
     /// `MissingVersion`). The data was written by a newer ai-memory build than
@@ -166,6 +174,21 @@ pub enum StoreError {
     #[error("session {0} was purged and cannot be recreated")]
     SessionPurged(String),
 
+    /// A hook named an ID-selected managed run whose boundary refuses it: the
+    /// run is no longer active, or the hook's agent, owner, native session or
+    /// checkout does not match the run. A lapsed renewable lease has its own
+    /// retryable error below. Typed apart from
+    /// `InvalidState` because the refusal is permanent for that event, so a
+    /// spool drain must drop it rather than stop behind it (#1892).
+    #[error("ID-selected managed run boundary mismatch")]
+    ManagedRunBoundaryRefused,
+
+    /// An otherwise-valid ID-selected run is still active but its renewable
+    /// lease has lapsed. Unlike a terminal boundary refusal, a heartbeat may
+    /// make the same spooled event valid after a server outage.
+    #[error("ID-selected managed run lease lapsed")]
+    ManagedRunLeaseLapsed,
+
     /// A workspace delete was refused because it still holds projects and the
     /// caller did not pass `force`. Carries the project count so the admin
     /// endpoint / CLI can report it before the operator retries with force.
@@ -190,6 +213,14 @@ pub enum StoreError {
         count: u64,
         /// Comma-separated workstream names holding those runs.
         workstreams: String,
+    },
+
+    /// A project merge was refused because sessions can still receive hook
+    /// observations under the source coordinate.
+    #[error("project has {count} open session(s); finish them before merging the project")]
+    ProjectSessionsOpen {
+        /// Number of source sessions whose `ended_at` is still NULL.
+        count: u64,
     },
 
     /// A workspace rename was rejected because the destination name is already

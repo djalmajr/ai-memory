@@ -160,6 +160,42 @@ async fn e2e_vault_import_is_searchable_and_idempotent() {
     assert_eq!(second["present_versions"], 5);
 }
 
+/// The server returns 12,000 characters of a body unless the caller asks for
+/// more (#1827). A rerun asks for the whole body before comparing it, so a
+/// page longer than that is still found present.
+#[tokio::test]
+async fn e2e_vault_rerun_finds_a_long_page_present() {
+    let Some(server) = start().await else { return };
+    let vault_dir = tempfile::tempdir().unwrap();
+    let page = vault_dir.path().join("memories/long.md");
+    std::fs::create_dir_all(page.parent().unwrap()).unwrap();
+    let line = "Every mutation goes through one writer thread.\n";
+    std::fs::write(
+        &page,
+        format!("---\nid: \"long\"\n---\n# Long\n\n{}", line.repeat(500)),
+    )
+    .unwrap();
+    let manifest_path = vault_dir.path().join("manifest.json");
+    let args = || VaultArgs {
+        dir: vault_dir.path().to_path_buf(),
+        workspace: Some("e2e".into()),
+        project: Some("long".into()),
+        dest_prefix: DEFAULT_DEST_PREFIX.into(),
+        server_url: server.url.clone(),
+        apply: true,
+        manifest_out: Some(manifest_path.clone()),
+        create_destination: true,
+        show_body: false,
+    };
+
+    vault::run(args()).await.unwrap();
+    assert_eq!(manifest(&manifest_path)["written_versions"], 1);
+    vault::run(args()).await.unwrap();
+    let second = manifest(&manifest_path);
+    assert_eq!(second["written_versions"], 0, "{second}");
+    assert_eq!(second["present_versions"], 1, "{second}");
+}
+
 #[tokio::test]
 async fn e2e_export_import_rebuilds_chains_and_honours_ttl() {
     let Some(server) = start().await else { return };
@@ -254,4 +290,36 @@ async fn e2e_export_import_rebuilds_chains_and_honours_ttl() {
     let second = manifest(&fixture.manifest);
     assert_eq!(second["written_versions"], 0, "a rerun writes 0");
     assert_eq!(second["present_versions"], 14);
+
+    // The destination can evolve independently between imports. Keeping the
+    // attribution footer does not mean the current body is still ours.
+    let edited_body = format!(
+        "Keep this destination correction.\n\n{}",
+        latest["body"].as_str().unwrap()
+    );
+    let edited = tool(
+        &server,
+        "memory_write_page",
+        json!({"workspace": "acme", "project": "acme-api",
+            "path": "imported/agentmemory/memories/mem-q1.md",
+            "body": edited_body, "expected_page_id": latest["page_id"]}),
+    )
+    .await;
+    data["memories"].as_array_mut().unwrap().push(json!({
+        "id": "mem_q4", "version": 4, "parentId": "mem_q3",
+        "supersedes": ["mem_q3"], "project": "api",
+        "title": "A new source version", "content": "Do not replace the destination edit."
+    }));
+    std::fs::write(&fixture.file, serde_json::to_vec(&data).unwrap()).unwrap();
+    assert!(export::run(args()).await.is_err());
+    let current = tool(
+        &server,
+        "memory_read_page",
+        json!({"workspace": "acme", "project": "acme-api",
+            "path": "imported/agentmemory/memories/mem-q1.md"}),
+    )
+    .await;
+    assert_eq!(current["page_id"], edited["page_id"]);
+    assert_eq!(current["body"], edited_body);
+    assert_eq!(manifest(&fixture.manifest)["status"], "failed");
 }

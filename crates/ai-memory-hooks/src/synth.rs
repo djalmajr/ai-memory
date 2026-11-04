@@ -18,8 +18,9 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use ai_memory_core::{
-    AgentKind, NewPage, Observation, ObservationKind, PagePath, ProjectId, SessionId, Tier,
-    WorkspaceId, looks_like_markup_block, looks_like_scaffolding, truncate_for_title,
+    AgentKind, FAILED_TOOL_OUTCOME_LINE, NewPage, Observation, ObservationKind, PagePath,
+    ProjectId, SessionId, TOOL_BODY_HEADER_MAX_CHARS, TOOL_BODY_SEPARATOR, Tier, WorkspaceId,
+    looks_like_markup_block, looks_like_scaffolding, truncate_for_title, truncate_utf8_bytes,
 };
 use ai_memory_store::{
     ObservationOrder, ReaderPool, SessionKindSummary, SessionLine, SessionObservationSnapshot,
@@ -29,7 +30,9 @@ use jiff::Timestamp;
 use jiff::tz::TimeZone;
 
 use crate::capture_policy::ToolFamily;
-use crate::payload::{is_safe_tool_title, tool_family_from_title};
+use crate::payload::{
+    is_safe_tool_title, listable_tool_name, tool_family_from_title, tool_title_display,
+};
 
 const RAW_OBSERVATION_MAX_LINES: usize = 500;
 const RAW_OBSERVATION_HEAD_LINES: usize = 250;
@@ -118,6 +121,71 @@ struct SessionEndFact {
     body: String,
 }
 
+/// Bytes of error text the page and the handoff quote.
+const FAILED_TOOL_EXCERPT_BYTES: usize = 240;
+
+/// A tool call the harness reported as failed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct FailedToolFact {
+    /// A recorded tool name or a family label.
+    pub(crate) title: String,
+    /// Error text after the header, whitespace-collapsed and capped at
+    /// [`FAILED_TOOL_EXCERPT_BYTES`]; empty when none was stored.
+    pub(crate) error: String,
+}
+
+impl FailedToolFact {
+    /// `"Bash: Exit code 1 …"`, or the error alone when the title is a family
+    /// label, which names no tool.
+    pub(crate) fn describe(&self) -> String {
+        let error = if self.error.is_empty() {
+            "(no error text captured)"
+        } else {
+            self.error.as_str()
+        };
+        match listable_tool_name(&self.title) {
+            Some(name) => format!("{name}: {error}"),
+            None => error.to_string(),
+        }
+    }
+}
+
+/// A `post-tool-use` whose header (the text before the first
+/// [`TOOL_BODY_SEPARATOR`], within the first [`TOOL_BODY_HEADER_MAX_CHARS`]
+/// characters) ends in [`FAILED_TOOL_OUTCOME_LINE`]. The store counts with
+/// the same rule, so an `outcome: error` line inside a tool's output never
+/// counts.
+fn is_failed_tool(obs: &Observation) -> bool {
+    if obs.kind != ObservationKind::PostToolUse {
+        return false;
+    }
+    let body = obs.body.as_str();
+    let head = body
+        .char_indices()
+        .nth(TOOL_BODY_HEADER_MAX_CHARS)
+        .map_or(body, |(end, _)| &body[..end]);
+    let header = head
+        .split_once(TOOL_BODY_SEPARATOR)
+        .map_or(head, |(header, _)| header);
+    header.ends_with(FAILED_TOOL_OUTCOME_LINE)
+}
+
+/// [`is_failed_tool`] with the quoted error text.
+fn failed_tool_fact(obs: &Observation) -> Option<FailedToolFact> {
+    if !is_failed_tool(obs) {
+        return None;
+    }
+    let output = obs
+        .body
+        .split_once(TOOL_BODY_SEPARATOR)
+        .map_or("", |(_, output)| output);
+    let collapsed = output.split_whitespace().collect::<Vec<_>>().join(" ");
+    Some(FailedToolFact {
+        title: obs.title.clone(),
+        error: truncate_utf8_bytes(&collapsed, FAILED_TOOL_EXCERPT_BYTES),
+    })
+}
+
 /// Everything the auto-handoff and the abrupt-ending note read from a
 /// session's observations, besides what [`SessionDigest`] already counts.
 ///
@@ -135,6 +203,8 @@ pub(crate) struct HandoffFacts {
     pub(crate) question_prompt: Option<PromptFact>,
     /// Title of the last completed tool call.
     pub(crate) last_tool_title: Option<String>,
+    /// The newest failed call.
+    pub(crate) last_failed_tool: Option<FailedToolFact>,
     /// Body of the last `Stop` that carries assistant text.
     pub(crate) latest_assistant: Option<String>,
     /// The session recorded a `Stop`.
@@ -177,6 +247,8 @@ pub struct SessionDigest {
     prompt_count: usize,
     /// Completed calls per tool name, keyed for stable ordering.
     tool_counts: BTreeMap<String, usize>,
+    /// Calls the harness reported as failed.
+    failed_tool_calls: usize,
     /// The page title.
     title: String,
     /// What the handoff and the abrupt-ending note read.
@@ -235,7 +307,7 @@ impl SessionDigest {
                 // Overflow only with more than 9.2e18 observations: fail
                 // toward `Lost` at the stamp (an unrepresentable count never
                 // matches the stamp-time COUNT), never toward a wrong stamp.
-                let total = i64::try_from(snapshot.kind_summary()?.total).unwrap_or(i64::MAX);
+                let total = i64::try_from(digest.observation_count()).unwrap_or(i64::MAX);
                 Ok((digest, total))
             })
             .await
@@ -272,6 +344,12 @@ impl SessionDigest {
 
     pub(crate) fn handoff_facts(&self) -> &HandoffFacts {
         &self.handoff
+    }
+
+    /// For tests in other modules; the renderers read the field.
+    #[cfg(test)]
+    pub(crate) fn failed_tool_calls(&self) -> usize {
+        self.failed_tool_calls
     }
 }
 
@@ -323,14 +401,6 @@ fn session_line(obs: &Observation) -> SessionLine {
             .collect(),
         created_at: obs.created_at,
     }
-}
-
-/// Tool names worth listing: a harness's own tool name. Skip `tool <family>` /
-/// bare-`<family>` labels: a family is a partition of the calls, not a name
-/// for a tool, so "Tools used: tool file, tool non-file" tells the receiver
-/// nothing.
-fn is_listable_tool_title(title: &str) -> bool {
-    !title.is_empty() && tool_family_from_title(title).is_none()
 }
 
 fn build_digest(
@@ -394,7 +464,12 @@ fn build_digest(
     };
 
     let tools = snapshot.tool_titles()?;
-    let tool_counts: BTreeMap<String, usize> = tools.completed.into_iter().collect();
+    let mut tool_counts: BTreeMap<String, usize> = BTreeMap::new();
+    for (title, count) in tools.completed {
+        *tool_counts
+            .entry(tool_title_display(&title).to_owned())
+            .or_insert(0) += count;
+    }
 
     let handoff = HandoffFacts {
         first_prompt: if summary.prompts > 0 {
@@ -425,6 +500,15 @@ fn build_digest(
             summary.last_post_tool_at,
             |obs| Some(obs.title.clone()),
         )?,
+        last_failed_tool: match summary.last_failed_tool_at {
+            Some(at) => snapshot.scan(
+                ObservationOrder::Desc,
+                &[ObservationKind::PostToolUse],
+                Some(at),
+                failed_tool_fact,
+            )?,
+            None => None,
+        },
         latest_assistant: match summary.last_stop_with_body_at {
             Some(at) => snapshot.scan(
                 ObservationOrder::Desc,
@@ -438,8 +522,9 @@ fn build_digest(
         has_session_end: summary.last_session_end_at.is_some(),
         tools: tools
             .titles
-            .into_iter()
-            .filter(|title| is_listable_tool_title(title))
+            .iter()
+            .filter_map(|title| listable_tool_name(title))
+            .map(str::to_owned)
             .collect(),
     };
 
@@ -459,6 +544,7 @@ fn build_digest(
             prompt_titles,
             prompt_count: prompts.total,
             tool_counts,
+            failed_tool_calls: summary.failed_tool_calls,
             title,
             handoff,
         },
@@ -665,6 +751,9 @@ fn session_summary(digest: &SessionDigest) -> String {
             )
         });
     }
+    if digest.failed_tool_calls > 0 {
+        parts.push(format!("{} failed", digest.failed_tool_calls));
+    }
 
     if let (Some(start), Some(end)) = (digest.start_at, digest.end.as_ref())
         && let Some(spent) = format_duration(end.created_at.as_second() - start.as_second())
@@ -774,6 +863,16 @@ fn render_body(session_id: SessionId, digest: &SessionDigest, title: &str) -> St
         buf.push_str("## Tool calls\n\n");
         for (name, count) in &digest.tool_counts {
             buf.push_str(&format!("- `{name}`: {count}\n"));
+        }
+        buf.push('\n');
+    }
+
+    // What broke: the count and the newest error text.
+    if digest.failed_tool_calls > 0 {
+        buf.push_str("## Failed tool calls\n\n");
+        buf.push_str(&format!("- **count:** {}\n", digest.failed_tool_calls));
+        if let Some(failed) = &digest.handoff.last_failed_tool {
+            buf.push_str(&format!("- **last:** {}\n", failed.describe()));
         }
         buf.push('\n');
     }
@@ -913,7 +1012,9 @@ impl SessionDigest {
         let mut tool_counts = BTreeMap::new();
         for obs in observations {
             if obs.kind == ObservationKind::PostToolUse && !obs.title.is_empty() {
-                *tool_counts.entry(obs.title.clone()).or_insert(0) += 1;
+                *tool_counts
+                    .entry(tool_title_display(&obs.title).to_owned())
+                    .or_insert(0) += 1;
             }
         }
         let prompt_titles_all: Vec<String> = observations
@@ -956,6 +1057,7 @@ impl SessionDigest {
             prompt_titles,
             prompt_count,
             tool_counts,
+            failed_tool_calls: observations.iter().filter(|o| is_failed_tool(o)).count(),
             title,
             handoff: HandoffFacts::from_observations(observations),
         }
@@ -974,6 +1076,7 @@ impl HandoffFacts {
                 .rev()
                 .find(|o| o.kind == ObservationKind::PostToolUse)
                 .map(|o| o.title.clone()),
+            last_failed_tool: observations.iter().rev().find_map(failed_tool_fact),
             latest_assistant: observations.iter().rev().find_map(assistant_response),
             has_stop: observations.iter().any(|o| o.kind == ObservationKind::Stop),
             has_session_end: observations
@@ -985,9 +1088,10 @@ impl HandoffFacts {
                     matches!(
                         o.kind,
                         ObservationKind::PostToolUse | ObservationKind::PreToolUse
-                    ) && is_listable_tool_title(&o.title)
+                    )
                 })
-                .map(|o| o.title.clone())
+                .filter_map(|o| listable_tool_name(&o.title))
+                .map(str::to_owned)
                 .collect(),
         }
     }
@@ -1052,6 +1156,12 @@ mod tests {
     fn obs_at(kind: ObservationKind, title: &str, at: &str) -> Observation {
         let mut o = obs(kind, title);
         o.created_at = at.parse::<Timestamp>().expect("fixture timestamp");
+        o
+    }
+
+    fn obs_with_body(kind: ObservationKind, title: &str, body: &str) -> Observation {
+        let mut o = obs(kind, title);
+        o.body = body.into();
         o
     }
 
@@ -1561,6 +1671,200 @@ mod tests {
         assert!(page.body.contains("`Edit`: 2"));
         assert!(page.body.contains("`Bash`: 1"));
         assert!(page.body.contains("build the thing"));
+    }
+
+    /// `[ingest] record_tool_names` titles count under their tool name, a bare
+    /// family label still counts under the label, and the file family they
+    /// carry still marks an abrupt ending.
+    #[test]
+    fn recorded_tool_names_count_by_name_and_keep_the_file_signal() {
+        let observations = vec![
+            obs(ObservationKind::SessionStart, "session"),
+            obs(ObservationKind::UserPrompt, "rework the retry loop"),
+            obs(ObservationKind::PostToolUse, "tool non-file: Bash"),
+            obs(ObservationKind::PostToolUse, "tool non-file: Bash"),
+            obs(ObservationKind::PostToolUse, "tool unknown: Skill"),
+            obs(ObservationKind::PostToolUse, "tool non-file"),
+            obs(ObservationKind::PostToolUse, "tool file: Edit"),
+        ];
+        let page = synthesize_session_page(
+            WorkspaceId::new(),
+            ProjectId::new(),
+            SessionId::new(),
+            AgentKind::ClaudeCode,
+            &observations,
+        );
+        assert!(page.body.contains("- `Bash`: 2\n"), "{}", page.body);
+        assert!(page.body.contains("- `Skill`: 1\n"), "{}", page.body);
+        assert!(page.body.contains("- `Edit`: 1\n"), "{}", page.body);
+        assert!(
+            page.body.contains("- `tool non-file`: 1\n"),
+            "{}",
+            page.body
+        );
+        assert!(
+            !page.body.contains("`tool non-file: Bash`"),
+            "{}",
+            page.body
+        );
+        assert!(
+            page.body
+                .contains("Session ended without a normal stop while working with files"),
+            "{}",
+            page.body
+        );
+    }
+
+    /// Failed calls are counted in the summary and the newest one is quoted,
+    /// with the tool name when recorded and never its arguments.
+    #[test]
+    fn failed_tool_calls_are_counted_and_the_last_one_is_quoted() {
+        let page_for = |rows: &[Observation]| {
+            synthesize_session_page(
+                WorkspaceId::new(),
+                ProjectId::new(),
+                SessionId::new(),
+                AgentKind::ClaudeCode,
+                rows,
+            )
+        };
+        let observations = vec![
+            obs(ObservationKind::UserPrompt, "make the tests pass"),
+            obs_with_body(
+                ObservationKind::PostToolUse,
+                "tool non-file: Bash",
+                "tool_family: non-file\ntool_call_id: toolu_1\noutcome: error\n---\n\
+                 Exit code 1\nError: Cannot find module 'express'\n    at require",
+            ),
+            obs_with_body(
+                ObservationKind::PostToolUse,
+                "tool non-file: Bash",
+                "tool_family: non-file\ntool_call_id: toolu_2\noutcome: unknown\n---\n\
+                 {\"stdout\":\"42 passing\"}",
+            ),
+        ];
+        let digest = tally_session(&observations);
+        assert_eq!(digest.failed_tool_calls(), 1);
+        assert_eq!(
+            session_summary(&digest),
+            "1 prompt, 2 completed tool calls across Bash, 1 failed."
+        );
+        let page = page_for(&observations);
+        assert!(
+            page.body
+                .contains("## Failed tool calls\n\n- **count:** 1\n"),
+            "{}",
+            page.body
+        );
+        assert!(
+            page.body.contains(
+                "- **last:** Bash: Exit code 1 Error: Cannot find module 'express' at require\n"
+            ),
+            "{}",
+            page.body
+        );
+        assert!(!page.body.contains("toolu_1"), "{}", page.body);
+
+        // A family label names no tool; a header-only body still counts.
+        let bare = vec![
+            obs_with_body(
+                ObservationKind::PostToolUse,
+                "tool file",
+                "tool_family: file\noutcome: error\n---\nENOENT: no such file",
+            ),
+            obs_with_body(
+                ObservationKind::PostToolUse,
+                "tool unknown",
+                "tool_family: unknown\nmcp_server: aim\nmcp_tool: memory_query\noutcome: error",
+            ),
+        ];
+        let digest = tally_session(&bare);
+        assert_eq!(digest.failed_tool_calls(), 2);
+        assert_eq!(
+            digest
+                .handoff_facts()
+                .last_failed_tool
+                .as_ref()
+                .map(FailedToolFact::describe),
+            Some("(no error text captured)".to_string())
+        );
+        assert_eq!(
+            session_summary(&digest),
+            "2 completed tool calls, 2 failed."
+        );
+        let page = page_for(&bare);
+        assert!(
+            page.body.contains("- **last:** (no error text captured)\n"),
+            "{}",
+            page.body
+        );
+
+        // Control: no failures, nothing added.
+        let fine = vec![obs_with_body(
+            ObservationKind::PostToolUse,
+            "tool non-file: Bash",
+            "tool_family: non-file\noutcome: unknown\n---\nok",
+        )];
+        let digest = tally_session(&fine);
+        assert_eq!(digest.failed_tool_calls(), 0);
+        assert!(digest.handoff_facts().last_failed_tool.is_none());
+        assert_eq!(
+            session_summary(&digest),
+            "1 completed tool call across Bash."
+        );
+        let page = page_for(&fine);
+        assert!(!page.body.contains("Failed tool calls"), "{}", page.body);
+    }
+
+    /// Adversarial: the marker is read from the header only, so a tool output
+    /// that echoes a stored body is not a failure. A long error is capped.
+    #[test]
+    fn an_outcome_marker_inside_tool_output_is_not_a_failure() {
+        let echoed = obs_with_body(
+            ObservationKind::PostToolUse,
+            "tool non-file: Bash",
+            "tool_family: non-file\noutcome: unknown\n---\n\
+             tool_family: file\noutcome: error\n---\nquoted from a page\noutcome: error",
+        );
+        let prompt = obs_with_body(
+            ObservationKind::UserPrompt,
+            "why outcome: error",
+            "tool_family: file\noutcome: error\n---\nnot a tool row",
+        );
+        let digest = tally_session(&[prompt, echoed]);
+        assert_eq!(digest.failed_tool_calls(), 0);
+        assert!(digest.handoff_facts().last_failed_tool.is_none());
+
+        let long = obs_with_body(
+            ObservationKind::PostToolUse,
+            "Bash",
+            &format!(
+                "tool_family: non-file\noutcome: error\n---\n{}",
+                "e ".repeat(400)
+            ),
+        );
+        let fact = failed_tool_fact(&long).expect("a failed call");
+        assert!(
+            fact.error.len() <= FAILED_TOOL_EXCERPT_BYTES,
+            "{}",
+            fact.error
+        );
+        assert!(fact.error.ends_with('…'));
+        assert_eq!(fact.describe(), format!("Bash: {}", fact.error));
+    }
+
+    /// The store and the router spell the marker in different crates; keep
+    /// them equal.
+    #[test]
+    fn the_failed_outcome_marker_is_the_one_the_router_writes() {
+        assert_eq!(
+            format!(
+                "{}{}",
+                ai_memory_core::TOOL_OUTCOME_LINE_PREFIX,
+                crate::capture_policy::ToolOutcome::Error.as_str()
+            ),
+            FAILED_TOOL_OUTCOME_LINE
+        );
     }
 
     #[test]

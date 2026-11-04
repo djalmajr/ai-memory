@@ -5,8 +5,8 @@
 //! pieces of state:
 //!
 //! 1. The per-agent lifecycle-hook event lists ai-memory wires up
-//!    (Claude/Grok share `CLAUDE_CODE_EVENTS`; Codex, Cursor, Gemini,
-//!    and Antigravity define their own profiles) — kept in sync between
+//!    (`CLAUDE_CODE_EVENTS`; Grok's own `GROK_EVENTS`; Codex, Cursor,
+//!    Gemini, and Antigravity define their own profiles) — kept in sync between
 //!    hook-bundle generation (setup-agent) and config rendering
 //!    (install-hooks).
 //! 2. The optional `Authorization: Bearer <token>` header used by
@@ -30,15 +30,23 @@ use crate::commands::path_util::strip_windows_verbatim_prefix;
 /// Claude Code lifecycle events ai-memory hooks. Each pair is
 /// `(event-name-in-Claude-Code-settings, POSIX hook-script-filename)`.
 ///
+/// `PostToolUse` fires only when a tool succeeds; `PostToolUseFailure` fires
+/// when it fails (<https://code.claude.com/docs/en/hooks>). Without the second
+/// entry every failed command, build and test run was invisible. It reuses the
+/// post-tool-use script: the server aliases the event and reads the outcome
+/// from the payload.
+///
 /// Adding a hook event means updating this list AND adding the matching `.sh`
-/// and `.ps1` files under the agents that use this profile (`claude-code` and
-/// `grok`). Agents with different vocabularies keep their own event arrays
-/// below. The install-hooks parity test fails if a bundle drifts.
-pub(crate) const CLAUDE_CODE_EVENTS: [(&str, &str); 9] = [
+/// and `.ps1` files under `hooks/claude-code/` (a reused script like
+/// post-tool-use needs no new file). Agents with different vocabularies keep
+/// their own event arrays below. The install-hooks parity test fails if a
+/// bundle drifts.
+pub(crate) const CLAUDE_CODE_EVENTS: [(&str, &str); 10] = [
     ("SessionStart", "session-start.sh"),
     ("UserPromptSubmit", "user-prompt-submit.sh"),
     ("PreToolUse", "pre-tool-use.sh"),
     ("PostToolUse", "post-tool-use.sh"),
+    ("PostToolUseFailure", "post-tool-use.sh"),
     ("PreCompact", "pre-compact.sh"),
     ("Stop", "stop.sh"),
     ("SessionEnd", "session-end.sh"),
@@ -49,14 +57,29 @@ pub(crate) const CLAUDE_CODE_EVENTS: [(&str, &str); 9] = [
     ("SubagentStop", "subagent-stop.sh"),
 ];
 
+/// Grok Build CLI: Claude Code's JSON shape and the nine events Grok is known
+/// to fire. `PostToolUseFailure` waits until Grok's vocabulary is verified.
+/// Its script bundle is `hooks/grok/`.
+pub(crate) const GROK_EVENTS: [(&str, &str); 9] = [
+    ("SessionStart", "session-start.sh"),
+    ("UserPromptSubmit", "user-prompt-submit.sh"),
+    ("PreToolUse", "pre-tool-use.sh"),
+    ("PostToolUse", "post-tool-use.sh"),
+    ("PreCompact", "pre-compact.sh"),
+    ("Stop", "stop.sh"),
+    ("SessionEnd", "session-end.sh"),
+    ("SubagentStart", "subagent-start.sh"),
+    ("SubagentStop", "subagent-stop.sh"),
+];
+
 /// Claude Code otherwise gives SessionEnd hooks a 1.5-second shared budget.
 /// A settings-file timeout raises that budget (up to Claude's 60-second cap),
 /// leaving room for a slow local spool fsync without making other hooks wait.
 pub(crate) const CLAUDE_SESSION_END_TIMEOUT_SECS: u64 = 15;
 
-/// Kimi Code lifecycle events ai-memory hooks. Claude Code's 9-event
-/// vocabulary (`CLAUDE_CODE_EVENTS`) plus `PostToolUseFailure`: Kimi Code
-/// fires `PostToolUse` on successful calls only and reports failures
+/// Kimi Code lifecycle events ai-memory hooks: the same ten events as
+/// Claude Code (`CLAUDE_CODE_EVENTS`), `PostToolUseFailure` included. Kimi
+/// Code fires `PostToolUse` on successful calls only and reports failures
 /// separately. The failure entry reuses the post-tool-use script — the
 /// server aliases `PostToolUseFailure` to `PostToolUse` and reads the
 /// outcome from the payload.
@@ -89,7 +112,7 @@ pub(crate) const KIMI_CODE_EVENTS: [(&str, &str); 10] = [
 /// its native camelCase one — this lets it free-ride on the same key-based
 /// payload extraction as Claude Code/Codex/Zcode (see `tool_observation_metadata`
 /// in `capture_policy.rs`) rather than needing a dedicated parser (#1040).
-/// Same vocabulary as `KIMI_CODE_EVENTS`: Claude Code's 9 events plus
+/// Same vocabulary as `KIMI_CODE_EVENTS` and `CLAUDE_CODE_EVENTS`, including
 /// `PostToolUseFailure`, which Copilot (per
 /// <https://docs.github.com/en/copilot/reference/hooks-configuration>) fires
 /// instead of `PostToolUse` when a tool call errors — the server already
@@ -165,6 +188,19 @@ pub(crate) const CODEBUDDY_EVENTS: [(&str, &str); 7] = [
     ("UserPromptSubmit", "user-prompt-submit.sh"),
     ("PreToolUse", "pre-tool-use.sh"),
     ("PostToolUse", "post-tool-use.sh"),
+    ("PreCompact", "pre-compact.sh"),
+    ("Stop", "stop.sh"),
+    ("SessionEnd", "session-end.sh"),
+];
+
+/// Qoder CLI/IDE events used for capture and handoff delivery. Qoder exposes
+/// additional policy and notification events that do not carry memory data.
+pub(crate) const QODER_EVENTS: [(&str, &str); 8] = [
+    ("SessionStart", "session-start.sh"),
+    ("UserPromptSubmit", "user-prompt-submit.sh"),
+    ("PreToolUse", "pre-tool-use.sh"),
+    ("PostToolUse", "post-tool-use.sh"),
+    ("PostToolUseFailure", "post-tool-use.sh"),
     ("PreCompact", "pre-compact.sh"),
     ("Stop", "stop.sh"),
     ("SessionEnd", "session-end.sh"),
@@ -820,7 +856,7 @@ fn with_claude_session_end_timeout(mut payload: Value) -> Value {
 }
 
 /// Grok Build CLI hook payload for docker/setup-agent script snippets.
-/// Grok shares Claude Code's JSON shape and event vocabulary, but uses
+/// Grok shares Claude Code's JSON shape (`GROK_EVENTS`), but uses
 /// its own script bundle so script fallback keeps `agent=grok` and never
 /// destructively fetches handoffs on SessionStart.
 #[must_use]
@@ -830,7 +866,7 @@ pub(crate) fn build_grok_payload(
     auth_token: Option<&str>,
 ) -> serde_json::Value {
     build_hook_payload_for_platform(
-        &CLAUDE_CODE_EVENTS,
+        &GROK_EVENTS,
         emit_root,
         server_url,
         auth_token,
@@ -1201,7 +1237,7 @@ pub(crate) fn build_grok_payload_with_data_dir(
     project_strategy: Option<&str>,
 ) -> serde_json::Value {
     build_hook_payload_for_platform(
-        &CLAUDE_CODE_EVENTS,
+        &GROK_EVENTS,
         emit_root,
         server_url,
         auth_token,
@@ -1336,6 +1372,28 @@ pub(crate) fn build_codebuddy_hooks_payload(
         HookCommandContext::new(
             HookCommandPlatform::native(),
             "codebuddy",
+            data_dir,
+            project_strategy,
+        ),
+    )
+}
+
+/// `{"hooks": <event map>}` for Qoder's `~/.qoder/settings.json`.
+pub(crate) fn build_qoder_hooks_payload(
+    server_url: &str,
+    auth_token: Option<&str>,
+    data_dir: Option<&Path>,
+    project_strategy: Option<&str>,
+) -> Value {
+    build_hook_payload_for_platform(
+        &QODER_EVENTS,
+        Path::new(""),
+        server_url,
+        auth_token,
+        HookShape::Nested,
+        HookCommandContext::new(
+            HookCommandPlatform::native(),
+            "qoder",
             data_dir,
             project_strategy,
         ),
@@ -2437,7 +2495,7 @@ fn windows_native_hook_command_with_exe(
     };
     let quote_field = |s: &str| {
         if bare {
-            s.to_string()
+            cmd_bare_escape(s)
         } else {
             win_double_quote(s)
         }
@@ -2527,10 +2585,10 @@ enum NativeQuote {
     /// Windows, but with NO surrounding double quotes. Antigravity's hook
     /// executor runs the `command` string through `cmd /c "<string>"`, and
     /// cmd does not strip the inner quotes, so a quoted `"C:\…\ai-memory.exe"`
-    /// is reported as "not recognized" and crashes the session (#611). The
-    /// whole-string wrapping means a bare path is what actually runs; a path
-    /// with a space in it is a known residual limitation (as it was before
-    /// the native-hook rendering added quotes).
+    /// is reported as "not recognized" and crashes the session (#611).
+    /// Spaces and cmd metacharacters are caret-escaped per field instead
+    /// (#1767). A literal `"` is stripped so it cannot be written back into
+    /// the command. `%` is left unchanged: caret does not stop percent expansion.
     WindowsBare,
 }
 
@@ -2553,7 +2611,7 @@ fn native_data_dir_arg(data_dir: Option<&Path>, quote: NativeQuote) -> String {
     match quote {
         NativeQuote::Posix => format!(" --data-dir {}", shell_quote(&path)),
         NativeQuote::Windows => format!(" --data-dir {}", win_double_quote(&path)),
-        NativeQuote::WindowsBare => format!(" --data-dir {path}"),
+        NativeQuote::WindowsBare => format!(" --data-dir {}", cmd_bare_escape(&path)),
     }
 }
 
@@ -2567,7 +2625,9 @@ fn native_project_strategy_arg(strategy: Option<&str>, quote: NativeQuote) -> St
     match quote {
         NativeQuote::Posix => format!(" --project-strategy {}", shell_quote(strategy)),
         NativeQuote::Windows => format!(" --project-strategy {}", win_double_quote(strategy)),
-        NativeQuote::WindowsBare => format!(" --project-strategy {strategy}"),
+        NativeQuote::WindowsBare => {
+            format!(" --project-strategy {}", cmd_bare_escape(strategy))
+        }
     }
 }
 
@@ -2671,13 +2731,46 @@ fn win_double_quote(s: &str) -> String {
     format!("\"{}\"", s.replace('"', ""))
 }
 
+/// Escape one field for Antigravity's bare command (#1767).
+///
+/// The executor wraps the whole string in `cmd /c "…"` and does not strip
+/// inner quotes (#611), so this must not emit `"`. Escape only characters
+/// inside the field; the caller keeps the separating spaces bare.
+///
+/// Existing `^` is doubled first. `Felipe^ Leite` therefore becomes
+/// `Felipe^^^ Leite`: `^^` is a literal caret and `^ ` is a literal space.
+/// `Felipe^^ Leite` is one escape short and cmd still splits the token.
+fn cmd_bare_escape(field: &str) -> String {
+    let mut out = String::with_capacity(field.len());
+    for c in field.chars() {
+        if c == '"' {
+            continue;
+        }
+        if c == '^' {
+            out.push_str("^^");
+            continue;
+        }
+        if matches!(c, ' ' | '\t' | '&' | '|' | '<' | '>' | '(' | ')') {
+            out.push('^');
+        }
+        out.push(c);
+    }
+    out
+}
+
 #[test]
 fn powershell_call_operator_is_limited_to_known_powershell_runners() {
     for agent in ["codex", "grok", "copilot-cli", "gemini-cli"] {
         assert_eq!(powershell_call_operator(agent), "& ", "agent: {agent}");
     }
 
-    for agent in ["claude-code", "kiro-cli", "opencode", "qwen-code"] {
+    for agent in [
+        "claude-code",
+        "kiro-cli",
+        "opencode",
+        "qwen-code",
+        "antigravity-cli",
+    ] {
         assert_eq!(powershell_call_operator(agent), "", "agent: {agent}");
     }
 }
@@ -3053,8 +3146,11 @@ async function drainHookSpool(): Promise<void> {
       if (entry.token) headers["Authorization"] = `Bearer ${entry.token}`;
       // Bun reads HTTP(S)_PROXY and ALL_PROXY even for a loopback URL;
       // `proxy: false` connects directly. Node's fetch ignores the key.
+      // A redirect is refused, not followed: a gateway's login page answers
+      // 200, and the entry would be deleted as delivered.
       const resp = await fetch(entry.url, {
         proxy: false,
+        redirect: "error",
         method: "POST",
         headers,
         body: entry.body,
@@ -3190,6 +3286,14 @@ fn assert_every_ts_request_carries_client_marker(name: &str, source: &str) {
         assert!(
             call.contains("proxy: false,"),
             "{name}: a fetch that can reach an environment proxy:\n{call}"
+        );
+        // A followed redirect lets a gateway's login page count as a
+        // delivery (deleting a spooled event) or arrive as the handoff, and a
+        // 307 or 308 replays the body to the redirect target. The native hook
+        // client refuses redirects for the same reasons (#1818).
+        assert!(
+            call.contains("redirect: \"error\","),
+            "{name}: a fetch that follows redirects:\n{call}"
         );
     }
     assert!(
@@ -3899,13 +4003,32 @@ if (inheritOnly) {
             v.pointer("/hooks/PostToolUse/0/hooks/0/timeout").is_none(),
             "only the cancellation-prone SessionEnd budget is raised"
         );
+        // The failure event shares the post-tool-use handler.
+        assert_eq!(
+            v.pointer("/hooks/PostToolUseFailure/0/hooks/0/command"),
+            v.pointer("/hooks/PostToolUse/0/hooks/0/command"),
+            "the failure event must reuse the post-tool-use handler"
+        );
+    }
+
+    /// Grok's vocabulary is unverified, so its payload keeps nine events.
+    #[test]
+    fn grok_payload_keeps_its_nine_events() {
+        let root = PathBuf::from("/host/hooks/grok");
+        let v = build_grok_payload(&root, "http://localhost:49374", None);
+        let hooks = v.get("hooks").and_then(|h| h.as_object()).unwrap();
+        assert_eq!(hooks.len(), GROK_EVENTS.len());
+        assert!(!hooks.contains_key("PostToolUseFailure"));
+        for (event, _) in GROK_EVENTS {
+            assert!(hooks.contains_key(event), "missing event {event}");
+        }
     }
 
     #[test]
     fn grok_native_payload_uses_grok_agent() {
         let root = PathBuf::from("/host/hooks/grok");
         let v = build_hook_payload_for_platform(
-            &CLAUDE_CODE_EVENTS,
+            &GROK_EVENTS,
             &root,
             "http://localhost:49374",
             None,
@@ -3924,7 +4047,7 @@ if (inheritOnly) {
     fn grok_script_payload_uses_grok_bundle() {
         let root = PathBuf::from("/host/hooks/grok");
         let v = build_hook_payload_for_platform(
-            &CLAUDE_CODE_EVENTS,
+            &GROK_EVENTS,
             &root,
             "http://localhost:49374",
             None,
@@ -4663,6 +4786,191 @@ if (inheritOnly) {
             other_cmd.contains('"'),
             "non-antigravity Windows agents keep their double quotes: {other_cmd}"
         );
+        assert!(
+            !other_cmd.contains("^ "),
+            "quoted agents must not caret-escape spaces: {other_cmd}"
+        );
+    }
+
+    #[test]
+    fn cmd_bare_escape_escapes_fields_without_emitting_quotes() {
+        assert_eq!(cmd_bare_escape(r"C:\Users\me"), r"C:\Users\me");
+        assert_eq!(cmd_bare_escape("Felipe Leite"), "Felipe^ Leite");
+        // `^^` is a literal caret and `^ ` is a literal space. Two carets
+        // leave the space unescaped, which cmd still splits.
+        assert_eq!(cmd_bare_escape("Felipe^ Leite"), "Felipe^^^ Leite");
+        assert_eq!(cmd_bare_escape("Felipe (Work)"), "Felipe^ ^(Work^)");
+        assert_eq!(cmd_bare_escape("a&b|c<d>e"), "a^&b^|c^<d^>e");
+        assert!(!cmd_bare_escape("ai\"memory").contains('"'));
+    }
+
+    #[test]
+    fn antigravity_bare_command_caret_escapes_spaced_fields() {
+        let cmd = windows_native_hook_command_with_exe(
+            Path::new(r"C:\Users\Felipe Leite\.local\bin\ai-memory.exe"),
+            Path::new("pre-tool-use.sh"),
+            "https://memory.example.com?a=1&b=2",
+            Some("tok en"),
+            HookCommandContext::new(
+                HookCommandPlatform::WindowsNative,
+                "antigravity-cli",
+                Some(Path::new(r"C:\Users\Felipe Leite\AppData\Local\ai-memory")),
+                Some("repo root"),
+            ),
+        );
+        assert!(!cmd.contains('"'), "must not reopen #611: {cmd}");
+        assert!(
+            cmd.contains(r"C:\Users\Felipe^ Leite\.local\bin\ai-memory.exe"),
+            "{cmd}"
+        );
+        assert!(
+            cmd.contains(r"--data-dir C:\Users\Felipe^ Leite\AppData\Local\ai-memory"),
+            "{cmd}"
+        );
+        assert!(cmd.contains(" --auth-token tok^ en"), "{cmd}");
+        assert!(cmd.contains(" --project-strategy repo^ root"), "{cmd}");
+        assert!(cmd.contains("https://memory.example.com?a=1^&b=2"), "{cmd}");
+        assert!(
+            cmd.contains(" hook --event pre-tool-use --agent antigravity-cli"),
+            "separator spaces must stay bare: {cmd}"
+        );
+        assert!(
+            !cmd.contains("^ --"),
+            "do not escape separator spaces: {cmd}"
+        );
+        assert!(
+            !cmd.starts_with('&'),
+            "antigravity must not gain a call operator: {cmd}"
+        );
+
+        let metacharacters = windows_native_hook_command_with_exe(
+            Path::new(r"C:\Users\Felipe^ Leite\.local\bin\ai-memory.exe"),
+            Path::new("pre-tool-use.sh"),
+            "https://memory.example.com",
+            None,
+            HookCommandContext::new(
+                HookCommandPlatform::WindowsNative,
+                "antigravity-cli",
+                Some(Path::new(r"C:\Users\Felipe (Work)\AppData")),
+                None,
+            ),
+        );
+        assert!(!metacharacters.contains('"'), "{metacharacters}");
+        assert!(
+            metacharacters.contains(r"C:\Users\Felipe^^^ Leite\.local\bin\ai-memory.exe"),
+            "existing caret must be doubled before the space escape: {metacharacters}"
+        );
+        assert!(
+            metacharacters.contains(r"--data-dir C:\Users\Felipe^ ^(Work^)\AppData"),
+            "parentheses must be escaped on the rendered command: {metacharacters}"
+        );
+
+        let quoted_field = windows_native_hook_command_with_exe(
+            Path::new("C:\\Users\\me\\ai\"memory.exe"),
+            Path::new("pre-tool-use.sh"),
+            "https://memory.example.com",
+            Some("tok\"en"),
+            HookCommandContext::new(
+                HookCommandPlatform::WindowsNative,
+                "antigravity-cli",
+                Some(Path::new("C:\\Users\\me\\App\"Data")),
+                Some("repo\"root"),
+            ),
+        );
+        assert!(
+            !quoted_field.contains('"'),
+            "a quote in a field must not be written back: {quoted_field}"
+        );
+    }
+
+    #[test]
+    fn antigravity_pre_tool_use_escapes_spaces_and_other_agents_keep_quotes() {
+        let ag = build_antigravity_payload_for_platform(
+            Path::new(r"C:\hooks"),
+            "https://memory.example.com",
+            Some("tok en"),
+            HookCommandPlatform::WindowsNative,
+            "antigravity-cli",
+            Some(Path::new(r"C:\Users\Felipe Leite\AppData\Local\ai-memory")),
+            Some("repo root"),
+        );
+        let cmd = ag
+            .pointer("/ai-memory/PreToolUse/0/hooks/0/command")
+            .and_then(|v| v.as_str())
+            .expect("PreToolUse command");
+        assert!(!cmd.contains('"'), "{cmd}");
+        assert!(!cmd.starts_with('&'), "{cmd}");
+        assert!(
+            cmd.contains(r"--data-dir C:\Users\Felipe^ Leite\AppData\Local\ai-memory"),
+            "{cmd}"
+        );
+        assert!(
+            cmd.contains("hook --event pre-tool-use --agent antigravity-cli"),
+            "{cmd}"
+        );
+        assert!(cmd.contains("--auth-token tok^ en"), "{cmd}");
+        assert!(cmd.contains("--project-strategy repo^ root"), "{cmd}");
+
+        for agent in ["grok", "gemini-cli"] {
+            let other = build_antigravity_payload_for_platform(
+                Path::new(r"C:\hooks"),
+                "https://memory.example.com",
+                None,
+                HookCommandPlatform::WindowsNative,
+                agent,
+                Some(Path::new(r"C:\Users\Felipe Leite\AppData")),
+                None,
+            );
+            let other_cmd = other
+                .pointer("/ai-memory/PreToolUse/0/hooks/0/command")
+                .and_then(|v| v.as_str())
+                .expect(agent);
+            assert!(
+                other_cmd.contains(r#"--data-dir "C:\Users\Felipe Leite\AppData""#),
+                "{agent} must quote the spaced data-dir, not merely some other field: {other_cmd}"
+            );
+            assert!(!other_cmd.contains("^ "), "{agent}: {other_cmd}");
+            if agent == "gemini-cli" {
+                assert!(
+                    other_cmd.starts_with("& "),
+                    "gemini call operator must be the command prefix: {other_cmd}"
+                );
+            }
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn antigravity_bare_escape_runs_under_cmd_outer_quotes() {
+        let root = std::env::temp_dir().join(format!("ai-memory-1767-{}", std::process::id()));
+        let dir = root.join("Felipe Leite");
+        std::fs::create_dir_all(&dir).unwrap();
+        let dest = dir.join("where.exe");
+        std::fs::copy(r"C:\Windows\System32\where.exe", &dest).unwrap();
+        let escaped = cmd_bare_escape(&dest.to_string_lossy());
+        let command = format!("{escaped} where");
+        let output = std::process::Command::new("cmd.exe")
+            .args(["/d", "/c", &command])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "stdout={:?} stderr={:?}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        let quoted = format!("\"{}\" where", dest.display());
+        let rejected = std::process::Command::new("cmd.exe")
+            .args(["/d", "/c", &quoted])
+            .output()
+            .unwrap();
+        let stderr = String::from_utf8_lossy(&rejected.stderr);
+        assert!(
+            !rejected.status.success() && stderr.contains('"'),
+            "inner quotes must still be rejected: {stderr}"
+        );
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
