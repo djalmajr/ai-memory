@@ -134,9 +134,11 @@ curl -sI http://homelab:49374/handoff \
 ```
 
 **Then update every MCP client** to send the same token. `ai-memory
-install-mcp --client <name> --auth-token <token>` prints the exact
-snippet for every client in the [README Support Matrix](../README.md#support-matrix);
-run `ai-memory install-mcp --help` for the current accepted values. The agent
+install-mcp --client <name> --auth-token <token>` prints the snippet for every
+client in the [README Support Matrix](../README.md#support-matrix); the
+printed snippet shows `<redacted>` where the token goes: replace it with your
+token, or use `--apply`. Run `ai-memory install-mcp --help` for the current
+accepted values. The agent
 CLI sends an `Authorization: Bearer <token>` header on every call; ai-memory's
 middleware validates with a constant-time comparison. For Claude Code, prefer
 the session-aware bridge: `ai-memory install-mcp --client claude-code

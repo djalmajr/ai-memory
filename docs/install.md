@@ -2363,6 +2363,9 @@ known not to remap UIDs.
 See [**`docs/mcp-install.md`**](mcp-install.md) for the per-client MCP
 config file path and snippet, or one-shot it via:
 
+The printed snippet shows `<redacted>` where the token goes: replace it
+with your token, or use `--apply`.
+
 ```bash
 docker run --rm akitaonrails/ai-memory:latest \
     install-mcp --client cursor          --auth-token "$TOKEN" \

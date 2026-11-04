@@ -124,6 +124,10 @@ version in [`docs/changelog/`](docs/changelog/):
   `Bearer` header was covered before. `ai-memory-client` redacts the same keys in
   the external text it scrubs. Text stored before this release is not rewritten,
   so a key already captured stays in the store until it is purged. (#TBD)
+- Stopped `install-mcp` without `--apply` and `setup-agent` from printing the
+  bearer token. Their snippets now show `<redacted>` in its place, whichever
+  source the token came from: replace it by hand or use `install-mcp --apply`.
+  `--token-env-var` and what `--apply` writes are unchanged. (#TBD)
 
 ## [3.2.2] - 2026-10-22
 

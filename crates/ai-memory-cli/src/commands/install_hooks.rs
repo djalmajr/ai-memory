@@ -32,14 +32,15 @@ use crate::commands::path_util::{home_dir, strip_windows_verbatim_prefix};
 use crate::commands::render_shared::{
     ANTIGRAVITY_LIFECYCLE_EVENTS, ANTIGRAVITY_TOOL_EVENTS, CODEX_PROFILE, COMMAND_CODE_PROFILE,
     COPILOT_CLI_PROFILE, CURSOR_PROFILE, DSH_EVENTS, GEMINI_PROFILE, HermesHookSet,
-    KIMI_CODE_EVENTS, KIRO_CLI_V2_EVENTS, KIRO_CLI_V3_EVENTS, POOL_EVENTS, TS_PREVIEW_TOKEN_NOTE,
-    build_antigravity_payload_with_data_dir, build_claude_code_payload_with_data_dir,
-    build_devin_payload_with_data_dir, build_dsh_hooks_payload, build_grok_payload_with_data_dir,
-    build_kiro_cli_v2_hooks_value, build_kiro_cli_v3_hooks_value,
-    build_pool_settings_yaml_with_data_dir, build_profile_payload_for_agent,
-    hook_embedded_exe_path, hook_script_for_claude_code, hook_script_for_current_platform,
-    kimi_code_hook_commands, local_hook_policy_v1_supported, ts_auth_headers_fn,
-    ts_capture_policy_v1, ts_string_literal, ts_timeout_signal, yaml_single_quote,
+    KIMI_CODE_EVENTS, KIRO_CLI_V2_EVENTS, KIRO_CLI_V3_EVENTS, POOL_EVENTS,
+    PREVIEW_TOKEN_PLACEHOLDER, TS_PREVIEW_TOKEN_NOTE, build_antigravity_payload_with_data_dir,
+    build_claude_code_payload_with_data_dir, build_devin_payload_with_data_dir,
+    build_dsh_hooks_payload, build_grok_payload_with_data_dir, build_kiro_cli_v2_hooks_value,
+    build_kiro_cli_v3_hooks_value, build_pool_settings_yaml_with_data_dir,
+    build_profile_payload_for_agent, hook_embedded_exe_path, hook_script_for_claude_code,
+    hook_script_for_current_platform, kimi_code_hook_commands, local_hook_policy_v1_supported,
+    ts_auth_headers_fn, ts_capture_policy_v1, ts_string_literal, ts_timeout_signal,
+    yaml_single_quote,
 };
 use crate::commands::uninstall::hook_command_is_ours;
 use crate::config::{Config, DEFAULT_SERVER_URL};
@@ -639,9 +640,6 @@ fn kiro_cli_home_join(
 ///
 /// # Errors
 /// Returns an error if the hook script directory cannot be located.
-/// What every `install-hooks` preview shows in place of the bearer.
-const PREVIEW_TOKEN_PLACEHOLDER: &str = "<redacted>";
-
 /// The comment a preview prints when its hook entries show
 /// [`PREVIEW_TOKEN_PLACEHOLDER`], behind the format's own comment marker.
 fn preview_token_note(comment: &str) -> String {

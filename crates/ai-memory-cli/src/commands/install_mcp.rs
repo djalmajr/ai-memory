@@ -27,7 +27,8 @@ use crate::cli::{InstallMcpArgs, McpClient, SchemaFlavor};
 use crate::commands::apply_shared::{ApplyOutcome, apply_atomic, mutate_json, mutate_toml};
 use crate::commands::path_util::{claude_config_dir, home_dir};
 use crate::commands::render_shared::{
-    bearer_header_value, hook_embedded_exe_path, shell_quote, yaml_single_quote,
+    PREVIEW_TOKEN_PLACEHOLDER, bearer_header_value, hook_embedded_exe_path, shell_quote,
+    yaml_single_quote,
 };
 use crate::config::{Config, DEFAULT_MCP_URL};
 use crate::local_auth::HookCredential;
@@ -201,6 +202,14 @@ pub(crate) fn run_with_opencode_dialect(
         }
         return apply_to_config_file(&args);
     }
+    // A preview goes to stdout, where a terminal's scrollback, a CI log or an
+    // agent's transcript keeps it. From here on no renderer holds the token,
+    // whichever source it came from: flag, environment, config or inferred
+    // MCP. `--apply` returned above with the real value, so the write path is
+    // unchanged.
+    args.auth_token = args
+        .auth_token
+        .map(|_| PREVIEW_TOKEN_PLACEHOLDER.to_string());
     let snippet = match args.client {
         McpClient::ClaudeCode => render_claude_code(&args, &resolve_config_file(&args)?)?,
         McpClient::Codex => render_codex(&args)?,
@@ -234,6 +243,11 @@ pub(crate) fn run_with_opencode_dialect(
         McpClient::Cline => render_json_mcp_fragment(&args)?,
         McpClient::Freebuff => render_json_mcp_fragment(&args)?,
     };
+    if snippet.contains(PREVIEW_TOKEN_PLACEHOLDER) {
+        eprintln!(
+            "[ai-memory] token omitted from this output: replace {PREVIEW_TOKEN_PLACEHOLDER} with it, or rerun with --apply."
+        );
+    }
     println!("{snippet}");
     Ok(())
 }

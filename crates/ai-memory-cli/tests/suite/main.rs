@@ -25,6 +25,7 @@ mod harness_switch_e2e;
 mod hook_drain;
 mod hook_payload;
 mod install_hooks_preview;
+mod install_mcp_preview;
 mod install_script;
 mod jail_toggles_e2e;
 mod marker_scope;

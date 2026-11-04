@@ -2507,10 +2507,11 @@ fn an_explicit_freebuff_bridge_key_is_stored_outside_the_client_config() {
 }
 
 /// Without `--apply` nothing is stored: a printed FreeBuff snippet is the
-/// operator's to place, so it still carries the key inline. This is the guard
+/// operator's to place, so the key goes out as the placeholder, not the
+/// value (the preview's token never reaches a transcript). This is the guard
 /// that keeps the redirect above from reaching the print path.
 #[test]
-fn a_printed_freebuff_snippet_keeps_the_key_inline() {
+fn a_printed_freebuff_snippet_shows_the_placeholder() {
     const KEY: &str = "aim_freebuff_printed_0123456789";
     let _guard = cli_test_lock();
     let home = tempfile::tempdir().unwrap();
@@ -2527,8 +2528,12 @@ fn a_printed_freebuff_snippet_keeps_the_key_inline() {
     );
     let snippet = String::from_utf8_lossy(&output.stdout);
     assert!(
-        snippet.contains(KEY),
-        "the printed snippet dropped the key the operator has to place: {snippet}"
+        !snippet.contains(KEY),
+        "the printed snippet carries the key: {snippet}"
+    );
+    assert!(
+        snippet.contains("<redacted>"),
+        "the printed snippet must show the placeholder the operator replaces: {snippet}"
     );
     assert!(
         !home

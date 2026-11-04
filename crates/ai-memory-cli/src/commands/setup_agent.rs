@@ -42,8 +42,9 @@ use crate::cli::{
 use crate::commands::render_shared::{
     ANTIGRAVITY_LIFECYCLE_EVENTS, ANTIGRAVITY_TOOL_EVENTS, CODEX_PROFILE, COMMAND_CODE_PROFILE,
     COPILOT_CLI_PROFILE, CURSOR_PROFILE, GEMINI_PROFILE, KIMI_CODE_EVENTS, KIRO_CLI_V2_EVENTS,
-    KIRO_CLI_V3_EVENTS, build_claude_code_payload, build_devin_payload, build_dsh_hooks_payload,
-    build_grok_payload, build_pool_settings_yaml, hook_script_for_current_platform,
+    KIRO_CLI_V3_EVENTS, PREVIEW_TOKEN_PLACEHOLDER, build_claude_code_payload, build_devin_payload,
+    build_dsh_hooks_payload, build_grok_payload, build_pool_settings_yaml,
+    hook_script_for_current_platform,
 };
 use crate::commands::{install_hooks, install_mcp};
 use crate::config::{Config, DEFAULT_SERVER_URL};
@@ -80,13 +81,25 @@ pub fn run(config: &Config, mut args: SetupAgentArgs) -> Result<()> {
     };
     let args = SetupAgentArgs {
         server_url,
-        // Only an inline token may be printed into snippets; one read from
-        // `[auth].bearer_token_file` stays out of rendered configs (#552).
+        // The printout below lands in a terminal scrollback, a CI log or an
+        // agent's transcript, so it never carries the bearer, whichever
+        // source it came from: the flag or this install's config. Every
+        // `emit_*` sees the placeholder and the operator pastes the real
+        // value in; the staged scripts are static, so nothing written to
+        // `--to` carries it either. (A token read from
+        // `[auth].bearer_token_file` stays out of rendered configs anyway,
+        // as before. #552)
         auth_token: args
             .auth_token
-            .or_else(|| config.auth.renderable_bearer_token().map(str::to_owned)),
+            .or_else(|| config.auth.renderable_bearer_token().map(str::to_owned))
+            .map(|_| PREVIEW_TOKEN_PLACEHOLDER.to_string()),
         ..args
     };
+    if args.auth_token.is_some() {
+        eprintln!(
+            "[ai-memory] token omitted from this output: replace any {PREVIEW_TOKEN_PLACEHOLDER} with it."
+        );
+    }
     if matches!(
         args.agent,
         AgentChoice::OpenCode
