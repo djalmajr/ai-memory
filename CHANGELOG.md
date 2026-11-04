@@ -132,9 +132,9 @@ version in [`docs/changelog/`](docs/changelog/):
   `--token-env-var` and what `--apply` writes are unchanged. (#TBD)
 - Stopped a syntax error in a client's TOML config from echoing the offending
   line, which could hold a bearer token, in `install-mcp --apply`,
-  `install-hooks --apply` and `auth enable`, and one in `servers.toml` from
-  echoing a `url` that could hold credentials. The error keeps the file, line and
-  column. (#TBD)
+  `install-hooks --apply` and `auth enable`. The error keeps the line and column.
+  `servers.toml` errors no longer echo a `url`, which could hold credentials,
+  after a syntax error or an invalid URL. (#TBD)
 
 ## [3.3.3] - 2026-11-03
 

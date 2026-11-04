@@ -2446,7 +2446,7 @@ docker run --rm -v "$HOME/.ai-memory:/host" \
         --server-url "http://homelab:49374" --auth-token "$TOKEN"
 ```
 
-The output shows <redacted> where the token goes, and a note on stderr says so.
+The output shows `<redacted>` where the token goes, and a note on stderr says so.
 
 This works cleanly when the container user's UID matches the host
 user's UID (e.g. the homelab where both are 1000). It **fails on
