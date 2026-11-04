@@ -313,6 +313,97 @@ fn preview_without_a_token_announces_none() {
     }
 }
 
+/// A syntax error in `config.toml` used to fail with the parser's snippet
+/// on stderr, echoing the offending line — which may hold
+/// `[auth].bearer_token`. Both subcommands must exit 1 with the line and
+/// column and none of the source line.
+#[test]
+fn config_syntax_error_exits_one_without_echoing_the_line() {
+    let bodies = [
+        (
+            "trailing text after the closing quote",
+            format!("[auth]\nbearer_token = \"{TOKEN}\" trailing\n"),
+        ),
+        (
+            "missing closing quote",
+            format!("[auth]\nbearer_token = \"{TOKEN}\n"),
+        ),
+    ];
+    for (what, body) in bodies {
+        let sandbox = Sandbox::new();
+        sandbox.write_config(&body);
+        let installs: [(&str, &[&str]); 2] = [
+            (
+                "install-hooks",
+                &[
+                    "install-hooks",
+                    "--agent",
+                    "opencode2",
+                    "--server-url",
+                    SERVER_URL,
+                ],
+            ),
+            ("install-mcp", &["install-mcp", "--server-url", SERVER_URL]),
+        ];
+        for (subcommand, args) in installs {
+            let mut cmd = sandbox.command();
+            cmd.args(args);
+            let output = cmd.output().unwrap();
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert_eq!(
+                output.status.code(),
+                Some(1),
+                "{what} + {subcommand}: expected exit 1:\n{stdout}\n{stderr}"
+            );
+            assert!(
+                !stdout.contains(TOKEN_BODY) && !stderr.contains(TOKEN_BODY),
+                "{what} + {subcommand} printed the token:\n{stdout}\n{stderr}"
+            );
+            assert!(
+                !stderr.contains('|'),
+                "{what} + {subcommand} printed the parser's margin:\n{stderr}"
+            );
+            assert!(
+                stderr.contains("line 2"),
+                "{what} + {subcommand} lost the line position:\n{stderr}"
+            );
+        }
+    }
+
+    // Control: a valid config still loads and previews.
+    let sandbox = Sandbox::new();
+    sandbox.write_config(&format!("[auth]\nbearer_token = \"{TOKEN}\"\n"));
+    let stdout = clean_preview("valid config control", sandbox.install_hooks("opencode2"));
+    assert!(stdout.contains(TS_NOTE), "{stdout}");
+}
+
+/// Control for the token-file preview check above: with the token only in
+/// `[auth].bearer_token_file`, `--apply` must still consume the file and
+/// store its value, without printing it. A preview that merely never shows
+/// the token would also pass `bearer_token_file_stays_out_of_previews` if
+/// the loader ignored the file; this one cannot.
+#[test]
+fn bearer_token_file_apply_stores_the_file_value_without_printing_it() {
+    let sandbox = Sandbox::new();
+    let token_file = sandbox.home.join("root-token");
+    std::fs::write(&token_file, TOKEN).unwrap();
+    sandbox.write_config(&format!(
+        "[auth]\nbearer_token_file = {:?}\n",
+        token_file.display().to_string()
+    ));
+    let plugin = sandbox.home.join("ai-memory-opencode2.ts");
+    let mut cmd = sandbox.install_hooks("opencode2");
+    cmd.args(["--apply", "--config-file"]).arg(&plugin);
+    let stdout = clean_preview("opencode2 --apply with [auth].bearer_token_file", cmd);
+    assert!(!stdout.contains(TS_NOTE), "{stdout}");
+
+    let stored = std::fs::read_to_string(sandbox.data_dir.join("auth-token")).unwrap();
+    assert_eq!(stored.trim(), TOKEN);
+    let written = std::fs::read_to_string(&plugin).unwrap();
+    assert!(written.contains(TS_NULL_TOKEN), "{written}");
+}
+
 /// Control: `--apply` still stores the same token, and the file it generates
 /// stays token-less because of that store rather than because of the preview.
 #[test]

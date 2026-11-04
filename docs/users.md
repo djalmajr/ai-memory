@@ -518,7 +518,9 @@ stay in `mcp-auth`; they are not listed here.
 
 `install-hooks` without `--apply` only prints a preview, and that preview never
 holds the token: generated TypeScript plugins show `TOKEN` as `null` and hook
-configs show `<redacted>`. `install-hooks --apply --auth-token …` writes the
+configs show `<redacted>`. A syntax error in `config.toml` is reported with the
+file, line and column but never with the offending line, which may hold
+`[auth].bearer_token`. `install-hooks --apply --auth-token …` writes the
 bearer to two files inside the data dir, both `0600` (the data dir itself is
 `0700`):
 
