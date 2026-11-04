@@ -27,6 +27,9 @@ What that means for you:
   needs that protection, `require_approval_prefixes` (for example
   `["_rules/"]`) holds just the proposals under the configured prefixes
   while the rest of each run is auto-approved.
+  Both keys cover auto-improve proposals only: ordinary consolidation
+  writes a page of kind `rule` to `_rules/` through its own path, without
+  review.
 - **Cost**: one bounded LLM call per completed session that passes the
   preflight filters (minimum observations/duration); prompt and output
   sizes are capped in `[auto_improve]`.

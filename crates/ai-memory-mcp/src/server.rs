@@ -89,7 +89,7 @@ fn default_auto_improve_review_config() -> AutoImproveReviewConfig {
 /// prefixes, reading the STORED target path (the row an operator can audit)
 /// rather than the path the model claimed. Fails closed: a read error or a
 /// missing row holds the proposal as pending, and the warning carries the id
-/// only — never proposal content.
+/// and any store error, never proposal content.
 async fn auto_improve_held_by_prefixes(
     reader: &ReaderPool,
     ws: WorkspaceId,

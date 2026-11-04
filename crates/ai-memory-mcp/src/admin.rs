@@ -2972,8 +2972,8 @@ async fn finalize_auto_improve_proposals(
 /// Decide whether one staged proposal is held by the configured prefixes,
 /// reading the STORED target path (the row an operator can audit) rather
 /// than the path the model claimed. Fails closed: a read error or a missing
-/// row holds the proposal as pending, and the warning carries the id only —
-/// never proposal content.
+/// row holds the proposal as pending, and the warning carries the id and any
+/// store error, never proposal content.
 async fn auto_improve_held_by_prefixes(
     state: &AdminState,
     workspace_id: WorkspaceId,
