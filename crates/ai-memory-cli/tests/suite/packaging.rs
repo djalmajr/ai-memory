@@ -373,6 +373,47 @@ fn docker_source_build_uses_vendored_tailwind() {
     );
 }
 
+/// CI never builds the fork's `deploy/Dockerfile`, so a source file the build
+/// starts to embed only fails when the image is built, after the merge. The
+/// v3.3.3 sync hit this with `docs/` and `CHANGELOG.md`. The source builder in
+/// `docker/Dockerfile` is the list upstream keeps current, so this one must
+/// cover it. `deny.toml` is exempt: no build step reads it.
+#[test]
+fn deploy_image_copies_every_source_the_ci_builder_copies() {
+    fn builder_copy_sources(dockerfile: &str) -> std::collections::BTreeSet<String> {
+        dockerfile
+            .lines()
+            .skip_while(|line| !line.starts_with("FROM rust:"))
+            .skip(1)
+            .take_while(|line| !line.starts_with("FROM "))
+            .filter_map(|line| line.strip_prefix("COPY "))
+            .flat_map(|args| {
+                let tokens: Vec<&str> = args.split_whitespace().collect();
+                let sources = tokens.len().saturating_sub(1);
+                tokens[..sources]
+                    .iter()
+                    .map(|source| source.trim_end_matches('/').to_string())
+                    .collect::<Vec<_>>()
+            })
+            .collect()
+    }
+
+    let ci = builder_copy_sources(&read_repo("docker/Dockerfile"));
+    assert!(
+        ci.contains("crates") && ci.contains("CHANGELOG.md"),
+        "control: the parser must read the CI builder's COPY list: {ci:?}"
+    );
+    let deploy = builder_copy_sources(&read_repo("deploy/Dockerfile"));
+    let missing: Vec<&String> = ci
+        .iter()
+        .filter(|source| source.as_str() != "deny.toml" && !deploy.contains(*source))
+        .collect();
+    assert!(
+        missing.is_empty(),
+        "deploy/Dockerfile must copy what the CI builder copies; missing: {missing:?}"
+    );
+}
+
 #[test]
 fn docker_context_excludes_operator_deployment_files() {
     let dockerignore = read_repo(".dockerignore");
