@@ -22,7 +22,7 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context as _, Result, bail};
+use anyhow::{Context as _, Result, anyhow, bail};
 
 /// `<data_dir>/servers.toml`.
 const REGISTRY_FILE: &str = "servers.toml";
@@ -209,8 +209,14 @@ fn read_bounded(path: &Path) -> Result<Option<String>> {
 }
 
 fn parse_doc(text: &str) -> Result<toml_edit::DocumentMut> {
-    text.parse()
-        .with_context(|| format!("{REGISTRY_FILE} is not valid TOML"))
+    // The parser's own message repeats the offending line, and a `url` can hold
+    // credentials.
+    text.parse().map_err(|e| {
+        anyhow!(
+            "{REGISTRY_FILE} is not valid TOML: {}",
+            crate::config::toml_parse_error_message(text, &e)
+        )
+    })
 }
 
 fn validate(doc: &toml_edit::DocumentMut) -> Result<Registry> {
@@ -597,6 +603,21 @@ mod tests {
                 "{text}"
             );
         }
+    }
+
+    #[test]
+    fn a_malformed_registry_error_keeps_the_url_credentials_out() {
+        let dd = tempfile::tempdir().unwrap();
+        let line = "url = \"https://user:FAKEfakeFAKEfake@a.example\" trailing";
+        std::fs::write(
+            dd.path().join(REGISTRY_FILE),
+            format!("[servers.a]\n{line}\n"),
+        )
+        .unwrap();
+        let error = format!("{:#}", load(dd.path()).unwrap_err());
+        assert!(!error.contains("FAKEfake"), "{error}");
+        assert!(error.contains(REGISTRY_FILE), "{error}");
+        assert!(error.contains("line 2"), "{error}");
     }
 
     #[test]
