@@ -1801,15 +1801,43 @@ mod tests {
         }
     }
 
-    fn install_capture() -> (CapturedLog, tracing::subscriber::DefaultGuard) {
+    /// Keeps the capture installed. Fields drop in order, so the companion
+    /// outlives the default guard.
+    struct CaptureGuard {
+        _default: tracing::subscriber::DefaultGuard,
+        _companion: tracing::Dispatch,
+    }
+
+    /// tracing-core caches each callsite's interest process-wide. While one
+    /// dispatcher is registered, a parallel test hitting the same `warn!` from
+    /// a subscriber-less thread pins `Interest::never`, and the emission never
+    /// reaches this capture. A second live `Dispatch` makes the cache read the
+    /// registered dispatchers instead of the calling thread, and the rebuild
+    /// heals a callsite poisoned before the companion came alive. It must be a
+    /// distinct `Dispatch` and must outlive the capture.
+    fn install_capture() -> (CapturedLog, CaptureGuard) {
         let captured = CapturedLog::default();
+        let companion = tracing::Dispatch::new(
+            tracing_subscriber::fmt()
+                .with_writer(CapturedLog::default())
+                .with_max_level(tracing::Level::INFO)
+                .with_ansi(false)
+                .finish(),
+        );
         let subscriber = tracing_subscriber::fmt()
             .with_writer(captured.clone())
             .with_max_level(tracing::Level::INFO)
             .with_ansi(false)
             .finish();
-        let guard = tracing::subscriber::set_default(subscriber);
-        (captured, guard)
+        let default = tracing::subscriber::set_default(subscriber);
+        tracing::callsite::rebuild_interest_cache();
+        (
+            captured,
+            CaptureGuard {
+                _default: default,
+                _companion: companion,
+            },
+        )
     }
 
     /// Acceptance (f): the success log is production-visible (INFO), carries
