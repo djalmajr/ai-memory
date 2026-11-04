@@ -121,8 +121,9 @@ version in [`docs/changelog/`](docs/changelog/):
   is unchanged. Rotate a token that a preview printed before this release. (#TBD)
 - Added a sanitizer rule that redacts ai-memory's own `aim_`, `amk_` and `ams_`
   credentials anywhere in captured text, as `[REDACTED:ai_memory_token]`; only a
-  `Bearer` header was covered before. Text stored before this release is not
-  rewritten, so a key already captured stays in the store until it is purged. (#TBD)
+  `Bearer` header was covered before. `ai-memory-client` redacts the same keys in
+  the external text it scrubs. Text stored before this release is not rewritten,
+  so a key already captured stays in the store until it is purged. (#TBD)
 
 ## [3.2.2] - 2026-10-22
 

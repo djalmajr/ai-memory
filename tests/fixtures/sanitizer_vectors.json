@@ -3,7 +3,10 @@
   "credentials": [
     "sk-leak-0123456789abcdef0123",
     "ghp_FAKE0123456789ABCDEFGHIJ0123",
-    "AKIAFAKEFAKEFAKEFAKE"
+    "AKIAFAKEFAKEFAKEFAKE",
+    "aim_FAKEfake-FAKEfake_FAKEfakeFAKEfakeFAKEfake000",
+    "amk_FAKEfake-FAKEfake_FAKEfakeFAKEfakeFAKEfake000",
+    "ams_FAKEfake-FAKEfake_FAKEfakeFAKEfakeFAKEfake000"
   ],
   "invisibles": [
     "\u200b",
@@ -78,6 +81,9 @@
     "-----BEGIN PGP PUBLIC KEY BLOCK-----\n\nmQENBFakeFakeFakeFakeFakeFakeFake\n-----END PGP PUBLIC KEY BLOCK-----",
     "The file starts with -----BEGIN OPENSSH PRIVATE KEY----- and that is expected.",
     "-----BEGIN RSA PRIVATE KEY-----\nThat header marks a PKCS#1 key.",
-    "const HEADER: &str = \"-----BEGIN RSA PRIVATE KEY-----\";\nparseHeaderLineFromInput(x)"
+    "const HEADER: &str = \"-----BEGIN RSA PRIVATE KEY-----\";\nparseHeaderLineFromInput(x)",
+    "claim_session_consolidation_jobs",
+    "ams_session_token_hash",
+    "aim_xxxxxxxxxxxxxxxxxxxxx"
   ]
 }

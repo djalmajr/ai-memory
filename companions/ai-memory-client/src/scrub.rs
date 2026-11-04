@@ -178,6 +178,12 @@ fn secret_patterns() -> &'static [RedactionRule] {
                 regex: Regex::new(r"(?i)\b(bearer\s+)[A-Za-z0-9._~+/=-]{8,}").unwrap(),
                 replacement: "$1[REDACTED]",
             },
+            // Same rule and label as the server's: `aim_`, `amk_` and `ams_`
+            // credentials anywhere in the text.
+            RedactionRule {
+                regex: Regex::new(r"\b(?:aim|amk|ams)_[A-Za-z0-9_\-]{22,}").unwrap(),
+                replacement: "[REDACTED:ai_memory_token]",
+            },
             RedactionRule {
                 regex: Regex::new(
                     r#"(?i)\b(api[_-]?key|access[_-]?token|auth[_-]?token|token|secret|password)\b(\s*[:=]\s*)(\"[^\"\r\n]{6,}\"|'[^'\r\n]{6,}'|(?:\[REDACTED(?: CREDENTIAL| PRIVATE KEY)?\]|[^\s,;])+)"#,
