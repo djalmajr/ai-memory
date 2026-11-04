@@ -354,6 +354,11 @@ pub(crate) fn bearer_header_value(token: Option<&str>) -> Option<String> {
 pub(crate) const TS_PREVIEW_TOKEN_NOTE: &str =
     "// Auth: the token is omitted from this preview (TOKEN is null below); `--apply` stores it.";
 
+/// What an `install-mcp` preview or a `setup-agent` printout shows in place
+/// of the bearer: the output lands in a terminal scrollback, a CI log or an
+/// agent's transcript, so the value itself stays in the operator's hands.
+pub(crate) const PREVIEW_TOKEN_PLACEHOLDER: &str = "<redacted>";
+
 /// Emit a TypeScript string literal containing `s`. Escapes
 /// backslashes, double quotes, and common control characters. This is
 /// sufficient for URL, auth-token, and path strings embedded into

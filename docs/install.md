@@ -2446,6 +2446,8 @@ docker run --rm -v "$HOME/.ai-memory:/host" \
         --server-url "http://homelab:49374" --auth-token "$TOKEN"
 ```
 
+The output shows `<redacted>` where the token goes, and a note on stderr says so.
+
 This works cleanly when the container user's UID matches the host
 user's UID (e.g. the homelab where both are 1000). It **fails on
 rootless Docker** and on hosts with `userns-remap` enabled - the
@@ -2462,6 +2464,9 @@ known not to remap UIDs.
 
 See [**`docs/mcp-install.md`**](mcp-install.md) for the per-client MCP
 config file path and snippet, or one-shot it via:
+
+The printed snippet shows `<redacted>` where the token goes: replace it
+with your token, or use `--apply`.
 
 ```bash
 docker run --rm akitaonrails/ai-memory:latest \

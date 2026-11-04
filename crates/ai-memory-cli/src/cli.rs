@@ -2050,8 +2050,8 @@ pub struct SetupAgentArgs {
     /// configured `server_url` / AI_MEMORY_SERVER_URL when set, else loopback.
     #[arg(long, default_value_t = crate::config::DEFAULT_SERVER_URL.to_string())]
     pub server_url: String,
-    /// Bearer token embedded into each hook's env block. When omitted,
-    /// uses the token resolved by the config loader.
+    /// Bearer token for the printed hook config. The printed output shows
+    /// <redacted> in its place.
     #[arg(long, hide_env_values = true)]
     pub auth_token: Option<String>,
     /// Source directory for the embedded hook bundle. Defaults to
@@ -3532,10 +3532,8 @@ pub struct InstallMcpArgs {
     /// Friendly name the client should show for this server entry.
     #[arg(long, default_value = "ai-memory")]
     pub name: String,
-    /// Bearer token to embed in the client config. When set, the
-    /// rendered snippet includes an `Authorization: Bearer <token>`
-    /// header so the client can authenticate against a server that
-    /// requires it. When omitted, uses the token resolved by the config loader.
+    /// Bearer token for the client config. With --apply it is written there.
+    /// Without --apply the printed snippet shows <redacted> in its place.
     #[arg(long, hide_env_values = true)]
     pub auth_token: Option<String>,
     /// **Mutate** the client's config file in place instead of just

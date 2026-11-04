@@ -300,9 +300,15 @@ where
     let mut doc: toml_edit::DocumentMut = if original.trim().is_empty() {
         toml_edit::DocumentMut::new()
     } else {
-        original.parse().with_context(|| {
-            "existing file isn't valid TOML; refusing to overwrite. Inspect by hand, \
-             rename it, or delete it before re-running --apply."
+        original.parse().map_err(|e| {
+            // The parser's own display repeats the offending line, which may
+            // hold a bearer, so the error goes out reworded: position and
+            // reason only.
+            anyhow::anyhow!(
+                "existing file isn't valid TOML; refusing to overwrite. Inspect by hand, \
+                 rename it, or delete it before re-running --apply: {}",
+                crate::config::toml_parse_error_message(original, &e)
+            )
         })?
     };
     mutator(&mut doc)?;

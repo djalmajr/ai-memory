@@ -11,6 +11,8 @@ Warp, Kilo Code, Goose and OpenHuman have no
 > remote server (homelab, LAN box) substitute the appropriate URL AND add an
 > `Authorization: Bearer <token>` header to the `headers` block when bearer auth
 > is enabled. The MCP wire protocol expects the `/mcp` path suffix on the URL.
+> The printed snippet shows `<redacted>` where the token goes: replace it with
+> your token, or use `--apply`.
 
 > **Token kept in the data dir.** When this install's bearer comes from
 > `[auth].bearer_token_file` (every fresh `ai-memory init`, and

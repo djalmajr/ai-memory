@@ -22,7 +22,7 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context as _, Result, bail};
+use anyhow::{Context as _, Result, anyhow, bail};
 
 /// `<data_dir>/servers.toml`.
 const REGISTRY_FILE: &str = "servers.toml";
@@ -209,8 +209,14 @@ fn read_bounded(path: &Path) -> Result<Option<String>> {
 }
 
 fn parse_doc(text: &str) -> Result<toml_edit::DocumentMut> {
-    text.parse()
-        .with_context(|| format!("{REGISTRY_FILE} is not valid TOML"))
+    // The parser's own message repeats the offending line, and a `url` can hold
+    // credentials.
+    text.parse().map_err(|e| {
+        anyhow!(
+            "{REGISTRY_FILE} is not valid TOML: {}",
+            crate::config::toml_parse_error_message(text, &e)
+        )
+    })
 }
 
 fn validate(doc: &toml_edit::DocumentMut) -> Result<Registry> {
@@ -267,9 +273,10 @@ fn parse_profile(table: &dyn toml_edit::TableLike) -> Result<Profile> {
 /// slashes — rejected here rather than on every hook request.
 fn validate_url(raw: &str) -> Result<String> {
     let trimmed = raw.trim().trim_end_matches('/');
-    let parsed = reqwest::Url::parse(trimmed).with_context(|| format!("`{raw}` is not a URL"))?;
+    // The value stays out of both errors: a URL can hold credentials.
+    let parsed = reqwest::Url::parse(trimmed).context("`url` is not a valid URL")?;
     if !matches!(parsed.scheme(), "http" | "https") || parsed.host_str().is_none_or(str::is_empty) {
-        bail!("`{raw}` is not an http:// or https:// URL with a host");
+        bail!("`url` is not an http:// or https:// URL with a host");
     }
     Ok(trimmed.to_owned())
 }
@@ -596,6 +603,42 @@ mod tests {
                 Err(Rejection::InvalidRegistry),
                 "{text}"
             );
+        }
+    }
+
+    #[test]
+    fn a_malformed_registry_error_keeps_the_url_credentials_out() {
+        let dd = tempfile::tempdir().unwrap();
+        let line = "url = \"https://user:FAKEfakeFAKEfake@a.example\" trailing";
+        std::fs::write(
+            dd.path().join(REGISTRY_FILE),
+            format!("[servers.a]\n{line}\n"),
+        )
+        .unwrap();
+        let error = format!("{:#}", load(dd.path()).unwrap_err());
+        assert!(!error.contains("FAKEfake"), "{error}");
+        assert!(error.contains(REGISTRY_FILE), "{error}");
+        assert!(error.contains("line 2"), "{error}");
+    }
+
+    #[test]
+    fn an_invalid_url_error_keeps_its_credentials_out() {
+        let dd = tempfile::tempdir().unwrap();
+        for url in [
+            "https://user:FAKEfakeFAKEfake@a.example:bad",
+            "htps://user:FAKEfakeFAKEfake@a.example",
+        ] {
+            std::fs::write(
+                dd.path().join(REGISTRY_FILE),
+                format!("[servers.a]\nurl = \"{url}\"\n"),
+            )
+            .unwrap();
+            let loaded = format!("{:#}", load(dd.path()).unwrap_err());
+            assert!(!loaded.contains("FAKEfake"), "{loaded}");
+            assert!(loaded.contains("profile `a`"), "{loaded}");
+            // `server add` validates through the same function.
+            let added = format!("{:#}", validate_url(url).unwrap_err());
+            assert!(!added.contains("FAKEfake"), "{added}");
         }
     }
 

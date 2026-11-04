@@ -2395,7 +2395,7 @@ fn apply_run_require_server_env(config: &mut Config, raw: Option<&str>) {
 /// A TOML syntax error, reworded so the source line never reaches the error
 /// chain: the parser's own display prints it as a margin snippet, and the
 /// offending line may hold `[auth].bearer_token`.
-fn toml_parse_error_message(raw: &str, parse: &toml_edit::TomlError) -> String {
+pub(crate) fn toml_parse_error_message(raw: &str, parse: &toml_edit::TomlError) -> String {
     // `span()` is only `None` for errors the parser built without a raw
     // document, and those have no snippet to strip, so their message is
     // already snippet-free.
