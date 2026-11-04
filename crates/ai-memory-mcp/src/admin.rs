@@ -132,6 +132,13 @@ pub struct AdminState {
     /// approval; otherwise it approves them immediately through the normal wiki
     /// write path.
     pub auto_improve_require_approval: bool,
+    /// If non-blank, auto-improve leaves staged proposals pending for manual
+    /// approval when their stored target path starts with one of these
+    /// prefixes, while the rest are still approved
+    /// (`[auto_improve] require_approval_prefixes`). Blank entries are
+    /// ignored; `auto_improve_require_approval = true` holds every
+    /// proposal.
+    pub auto_improve_require_approval_prefixes: Vec<String>,
     /// Server-configured defaults used by direct admin auto-improvement.
     /// Request fields remain explicit overrides; omitted eval settings inherit
     /// this operator policy instead of disabling eval silently.
@@ -2815,6 +2822,7 @@ async fn handle_auto_improve(
             workspace_id: ws,
             project_id: proj,
             require_approval: state.auto_improve_require_approval,
+            require_approval_prefixes: state.auto_improve_require_approval_prefixes.clone(),
             actor,
             author_id,
             admission_ctx: Some(AdmissionContext {
@@ -2825,17 +2833,28 @@ async fn handle_auto_improve(
         },
     )
     .await?;
+    // Prefix-only retention leaves some proposals pending without the global
+    // switch: report the run as approval-required, and name the policy.
+    let approval_required =
+        state.auto_improve_require_approval || outcomes.iter().any(|o| o.status == "pending");
+    let approval_policy = if state.auto_improve_require_approval {
+        "manual".to_string()
+    } else if approval_required {
+        ai_memory_core::auto_improve_approval_policy(
+            false,
+            &state.auto_improve_require_approval_prefixes,
+        )
+        .to_string()
+    } else {
+        "auto_approve".to_string()
+    };
     Ok((
         StatusCode::OK,
         Json(
             serde_json::to_value(AutoImproveStageResponse {
                 run_id: staged.run_id.to_string(),
-                approval_required: state.auto_improve_require_approval,
-                approval_policy: if state.auto_improve_require_approval {
-                    "manual".into()
-                } else {
-                    "auto_approve".into()
-                },
+                approval_required,
+                approval_policy,
                 session_id: req.session_id.to_string(),
                 summary: report.summary,
                 warnings: report.warnings,
@@ -2861,7 +2880,15 @@ fn auto_improve_auto_approve_actor(
 struct AutoImproveFinalizeContext {
     workspace_id: WorkspaceId,
     project_id: ProjectId,
+    /// When true, staged proposals are left pending and never auto-approved
+    /// (`[auto_improve] require_approval`).
     require_approval: bool,
+    /// Path prefixes whose staged proposals stay pending even when
+    /// `require_approval` is false; the rest are auto-approved
+    /// (`[auto_improve] require_approval_prefixes`). Blank entries are
+    /// ignored; the decision reads the stored target path and fails closed
+    /// on an unreadable detail.
+    require_approval_prefixes: Vec<String>,
     actor: ai_memory_core::ActorContext,
     author_id: Option<ai_memory_core::UserId>,
     admission_ctx: Option<AdmissionContext>,
@@ -2873,8 +2900,31 @@ async fn finalize_auto_improve_proposals(
     ctx: AutoImproveFinalizeContext,
 ) -> Result<Vec<AutoImproveProposalOutcome>, (StatusCode, Json<serde_json::Value>)> {
     let mut outcomes = Vec::with_capacity(staged.proposal_ids.len());
+    // The prefixes only matter when the global switch is off; when it is on,
+    // every proposal is held without a store read (unchanged behaviour).
+    let prefix_hold = !ctx.require_approval
+        && ai_memory_core::auto_improve_prefixes_active(&ctx.require_approval_prefixes);
     for (proposal_id, sidecar_path) in staged.proposal_ids.iter().zip(staged.sidecar_paths.iter()) {
         if ctx.require_approval {
+            outcomes.push(AutoImproveProposalOutcome {
+                id: proposal_id.to_string(),
+                sidecar_path: sidecar_path.clone(),
+                status: "pending".into(),
+                page_id: None,
+            });
+            continue;
+        }
+
+        if prefix_hold
+            && auto_improve_held_by_prefixes(
+                state,
+                ctx.workspace_id,
+                ctx.project_id,
+                *proposal_id,
+                &ctx.require_approval_prefixes,
+            )
+            .await
+        {
             outcomes.push(AutoImproveProposalOutcome {
                 id: proposal_id.to_string(),
                 sidecar_path: sidecar_path.clone(),
@@ -2917,6 +2967,46 @@ async fn finalize_auto_improve_proposals(
         }
     }
     Ok(outcomes)
+}
+
+/// Decide whether one staged proposal is held by the configured prefixes,
+/// reading the STORED target path (the row an operator can audit) rather
+/// than the path the model claimed. Fails closed: a read error or a missing
+/// row holds the proposal as pending, and the warning carries the id only —
+/// never proposal content.
+async fn auto_improve_held_by_prefixes(
+    state: &AdminState,
+    workspace_id: WorkspaceId,
+    project_id: ProjectId,
+    proposal_id: AutoImproveProposalId,
+    prefixes: &[String],
+) -> bool {
+    match state
+        .reader
+        .auto_improve_proposal_detail(workspace_id, project_id, proposal_id)
+        .await
+    {
+        Ok(Some(detail)) => ai_memory_core::auto_improve_requires_approval(
+            false,
+            prefixes,
+            detail.summary.target_path.as_str(),
+        ),
+        Ok(None) => {
+            tracing::warn!(
+                %proposal_id,
+                "auto-improve approval check found no stored proposal; holding it pending"
+            );
+            true
+        }
+        Err(e) => {
+            tracing::warn!(
+                %proposal_id,
+                error = %e,
+                "auto-improve approval check could not read the stored proposal; holding it pending"
+            );
+            true
+        }
+    }
 }
 
 async fn auto_improve_new_proposals(
@@ -10227,6 +10317,77 @@ mod tests {
         }
     }
 
+    /// Reviews one session into two `_rules/` proposals (a patch of an
+    /// existing page and a create) plus one `gotchas/` create, so the
+    /// approval-prefix decision is exercised on both sides of the match in a
+    /// single admin run.
+    struct PrefixHoldLlm;
+
+    #[async_trait::async_trait]
+    impl LlmProvider for PrefixHoldLlm {
+        fn name(&self) -> &'static str {
+            "fake-prefix-hold"
+        }
+
+        fn model(&self) -> &str {
+            "fake-model"
+        }
+
+        async fn complete(&self, _request: ChatRequest) -> LlmResult<ChatResponse> {
+            Ok(ChatResponse {
+                text: String::new(),
+                usage: None,
+                model: self.model().to_string(),
+            })
+        }
+
+        async fn complete_structured_raw(
+            &self,
+            _request: ChatRequest,
+            _schema: serde_json::Value,
+        ) -> LlmResult<serde_json::Value> {
+            Ok(serde_json::json!({
+                "summary": "two rule proposals and one gotcha",
+                "proposals": [
+                    {
+                        "operation": "create_or_update",
+                        "path": "_rules/existing.md",
+                        "title": "Existing rule",
+                        "kind": "rule",
+                        "confidence": 0.93,
+                        "rationale": "The scope should be extended.",
+                        "evidence": [{"page": "session", "quote": "durable lesson"}],
+                        "edit_mode": "patch",
+                        "edits": [
+                            {"op": "append", "anchor": "## Scope", "content": "Added by the review."}
+                        ]
+                    },
+                    {
+                        "operation": "create_or_update",
+                        "path": "gotchas/y.md",
+                        "title": "Release Gotcha",
+                        "kind": "gotcha",
+                        "confidence": 0.9,
+                        "rationale": "A reproducible pitfall surfaced in the session.",
+                        "evidence": [{"page": "session", "quote": "the deploy failed"}],
+                        "body_markdown": "# Release Gotcha\n\nDeploy fails without the gate."
+                    },
+                    {
+                        "operation": "create_or_update",
+                        "path": "_rules/new-rule.md",
+                        "title": "New Rule",
+                        "kind": "rule",
+                        "confidence": 0.91,
+                        "rationale": "The session established a new rule.",
+                        "evidence": [{"page": "session", "quote": "always run the gate"}],
+                        "body_markdown": "# New Rule\n\nAlways run the gate before release."
+                    }
+                ],
+                "rejected_candidates": []
+            }))
+        }
+    }
+
     #[tokio::test]
     async fn status_reports_provider_health_block() {
         let tmp = TempDir::new().unwrap();
@@ -10243,6 +10404,7 @@ mod tests {
             wiki,
             llm: None,
             auto_improve_require_approval: false,
+            auto_improve_require_approval_prefixes: Vec::new(),
             auto_improve_review_config: Default::default(),
             embedder: None,
             provider_health: ProviderHealth::default(),
@@ -10313,6 +10475,7 @@ mod tests {
             wiki,
             llm: Some(llm),
             auto_improve_require_approval: false,
+            auto_improve_require_approval_prefixes: Vec::new(),
             auto_improve_review_config: Default::default(),
             embedder: None,
             provider_health,
@@ -10389,6 +10552,7 @@ mod tests {
             wiki,
             llm: None,
             auto_improve_require_approval: false,
+            auto_improve_require_approval_prefixes: Vec::new(),
             auto_improve_review_config: Default::default(),
             embedder: None,
             provider_health: ProviderHealth::default(),
@@ -10518,6 +10682,7 @@ mod tests {
             wiki,
             llm: None,
             auto_improve_require_approval: false,
+            auto_improve_require_approval_prefixes: Vec::new(),
             auto_improve_review_config: Default::default(),
             embedder: None,
             provider_health: ProviderHealth::default(),
@@ -10758,6 +10923,7 @@ mod tests {
             wiki,
             llm: None,
             auto_improve_require_approval: false,
+            auto_improve_require_approval_prefixes: Vec::new(),
             auto_improve_review_config: Default::default(),
             embedder: None,
             provider_health: ProviderHealth::default(),
@@ -10957,6 +11123,7 @@ mod tests {
             wiki,
             llm: None,
             auto_improve_require_approval: false,
+            auto_improve_require_approval_prefixes: Vec::new(),
             auto_improve_review_config: Default::default(),
             embedder: None,
             provider_health: ProviderHealth::default(),
@@ -11183,6 +11350,7 @@ mod tests {
             wiki,
             llm: None,
             auto_improve_require_approval: false,
+            auto_improve_require_approval_prefixes: Vec::new(),
             auto_improve_review_config: Default::default(),
             embedder: None,
             provider_health: ProviderHealth::default(),
@@ -12082,6 +12250,7 @@ mod tests {
             wiki,
             llm,
             auto_improve_require_approval: false,
+            auto_improve_require_approval_prefixes: Vec::new(),
             auto_improve_review_config: Default::default(),
             embedder: None,
             provider_health: ProviderHealth::default(),
@@ -13167,6 +13336,395 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn auto_improve_require_approval_prefixes_holds_matching_proposals() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let wiki = Wiki::new(tmp.path(), store.writer.clone())
+            .unwrap()
+            .with_store_reader(store.reader.clone());
+        let ws = store
+            .writer
+            .get_or_create_workspace("default")
+            .await
+            .unwrap();
+        let proj = store
+            .writer
+            .get_or_create_project(ws, "scratch", None)
+            .await
+            .unwrap();
+
+        // Existing _rules/ page the patch proposal targets.
+        wiki.write_page(WritePageRequest {
+            workspace_id: ws,
+            project_id: proj,
+            path: PagePath::new("_rules/existing.md").unwrap(),
+            frontmatter: serde_json::json!({"kind": "rule"}),
+            body: "# Existing rule\n\nBase text.\n\n## Scope\n\nApplies here.\n".into(),
+            tier: Tier::Working,
+            pinned: false,
+            title: Some("Existing rule".into()),
+            admission_ctx: None,
+            author_id: None,
+            actor: ai_memory_core::ActorContext::anonymous(),
+            evidence: Vec::new(),
+        })
+        .await
+        .unwrap();
+        let base_body = store
+            .reader
+            .page_body_by_ids(ws, proj, "_rules/existing.md")
+            .await
+            .unwrap()
+            .unwrap();
+
+        let session_id = SessionId::new();
+        store
+            .writer
+            .begin_session(NewSession {
+                occurred_at: None,
+                id: session_id,
+                workspace_id: ws,
+                project_id: proj,
+                agent_kind: AgentKind::Other,
+                cwd: None,
+                actor_user: None,
+            })
+            .await
+            .unwrap();
+        store
+            .writer
+            .insert_observation(Sanitized::new(
+                NewObservation {
+                    occurred_at: None,
+                    session_id,
+                    workspace_id: ws,
+                    project_id: proj,
+                    kind: ObservationKind::UserPrompt,
+                    extension: None,
+                    source_event: None,
+                    title: "prompt".into(),
+                    body: "durable lesson".into(),
+                    importance: 5,
+                },
+                &Sanitizer::builtin(),
+            ))
+            .await
+            .unwrap();
+
+        let mut state =
+            admin_state_for_store_with_llm(&tmp, &store, wiki, Some(Arc::new(PrefixHoldLlm)));
+        state.auto_improve_require_approval = false;
+        state.auto_improve_require_approval_prefixes = vec!["_rules/".to_string()];
+        let router = admin_router(state);
+
+        let resp = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/admin/auto-improve")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&serde_json::json!({
+                            "workspace": "default",
+                            "project": "scratch",
+                            "session_id": session_id.to_string(),
+                            "min_observations": 1,
+                            "min_session_duration_secs": 0,
+                            "min_confidence": 0.75,
+                            "max_proposals_per_run": 5
+                        }))
+                        .unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            json["approval_required"], true,
+            "a run with any held proposal reports approval_required"
+        );
+        assert_eq!(
+            json["approval_policy"], "manual_for_prefixes",
+            "prefix-only retention names its own policy"
+        );
+        let proposals = json["proposals"].as_array().unwrap();
+        assert_eq!(proposals.len(), 3, "all three proposals must stage");
+
+        // Join the response ids against the stored rows to settle each
+        // proposal's status by its stored target path.
+        let stored = store
+            .reader
+            .list_auto_improve_proposals(ws, proj, None, 10)
+            .await
+            .unwrap();
+        let resp_status_by_id: std::collections::HashMap<String, String> = proposals
+            .iter()
+            .map(|p| {
+                (
+                    p["id"].as_str().unwrap().to_string(),
+                    p["status"].as_str().unwrap().into(),
+                )
+            })
+            .collect();
+        let status_of = |path: &str| -> String {
+            let stored_row = stored
+                .iter()
+                .find(|p| p.target_path.as_str() == path)
+                .unwrap_or_else(|| panic!("{path} must have staged"));
+            resp_status_by_id[&stored_row.id.to_string()].clone()
+        };
+        assert_eq!(
+            status_of("_rules/existing.md"),
+            "pending",
+            "the prefix-matching patch must stay pending"
+        );
+        assert_eq!(status_of("gotchas/y.md"), "approved");
+        assert_eq!(
+            status_of("_rules/new-rule.md"),
+            "pending",
+            "the prefix-matching create must stay pending"
+        );
+        assert_eq!(
+            stored
+                .iter()
+                .find(|p| p.target_path.as_str() == "gotchas/y.md")
+                .unwrap()
+                .status
+                .as_str(),
+            "approved",
+            "the non-matching proposal is stored approved"
+        );
+
+        // The held patch must not have touched its target page.
+        let after_run = store
+            .reader
+            .page_body_by_ids(ws, proj, "_rules/existing.md")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            after_run.body, base_body.body,
+            "a held patch must not write its target page"
+        );
+
+        // Approve the held patch: the materialized patch body lands.
+        let patch_id = stored
+            .iter()
+            .find(|p| p.target_path.as_str() == "_rules/existing.md")
+            .unwrap()
+            .id;
+        let approve_resp = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!(
+                        "/admin/pending-writes/{}/approve?workspace=default&project=scratch",
+                        patch_id
+                    ))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(approve_resp.status(), StatusCode::OK);
+        let patched = store
+            .reader
+            .page_body_by_ids(ws, proj, "_rules/existing.md")
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            patched.body.contains("Added by the review."),
+            "approving the held patch writes the patched body: {}",
+            patched.body
+        );
+
+        // Reject the held create: nothing is written.
+        let create_id = stored
+            .iter()
+            .find(|p| p.target_path.as_str() == "_rules/new-rule.md")
+            .unwrap()
+            .id;
+        let reject_resp = router
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!(
+                        "/admin/pending-writes/{}/reject?workspace=default&project=scratch",
+                        create_id
+                    ))
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&serde_json::json!({
+                            "reason": "not wanted"
+                        }))
+                        .unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(reject_resp.status(), StatusCode::OK);
+        assert!(
+            store
+                .reader
+                .page_body_by_ids(ws, proj, "_rules/new-rule.md")
+                .await
+                .unwrap()
+                .is_none(),
+            "a rejected proposal writes no page"
+        );
+    }
+
+    #[tokio::test]
+    async fn auto_improve_without_prefixes_still_auto_approves() {
+        // Control: the same run with no configured prefixes behaves exactly
+        // as before — everything auto-approves, policy `auto_approve`.
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let wiki = Wiki::new(tmp.path(), store.writer.clone())
+            .unwrap()
+            .with_store_reader(store.reader.clone());
+        let ws = store
+            .writer
+            .get_or_create_workspace("default")
+            .await
+            .unwrap();
+        let proj = store
+            .writer
+            .get_or_create_project(ws, "scratch", None)
+            .await
+            .unwrap();
+        let session_id = SessionId::new();
+        store
+            .writer
+            .begin_session(NewSession {
+                occurred_at: None,
+                id: session_id,
+                workspace_id: ws,
+                project_id: proj,
+                agent_kind: AgentKind::Other,
+                cwd: None,
+                actor_user: None,
+            })
+            .await
+            .unwrap();
+        store
+            .writer
+            .insert_observation(Sanitized::new(
+                NewObservation {
+                    occurred_at: None,
+                    session_id,
+                    workspace_id: ws,
+                    project_id: proj,
+                    kind: ObservationKind::UserPrompt,
+                    extension: None,
+                    source_event: None,
+                    title: "prompt".into(),
+                    body: "durable lesson".into(),
+                    importance: 5,
+                },
+                &Sanitizer::builtin(),
+            ))
+            .await
+            .unwrap();
+
+        let mut state =
+            admin_state_for_store_with_llm(&tmp, &store, wiki, Some(Arc::new(FakeAutoImproveLlm)));
+        state.auto_improve_require_approval = false;
+        state.auto_improve_require_approval_prefixes = Vec::new();
+        let router = admin_router(state);
+
+        let resp = router
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/admin/auto-improve")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&serde_json::json!({
+                            "workspace": "default",
+                            "project": "scratch",
+                            "session_id": session_id.to_string(),
+                            "min_observations": 1,
+                            "min_session_duration_secs": 0,
+                            "min_confidence": 0.75,
+                            "max_proposals_per_run": 5
+                        }))
+                        .unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["approval_required"], false);
+        assert_eq!(json["approval_policy"], "auto_approve");
+        let proposals = json["proposals"].as_array().unwrap();
+        assert_eq!(proposals.len(), 2);
+        assert!(
+            proposals.iter().all(|p| p["status"] == "approved"),
+            "without prefixes every proposal auto-approves"
+        );
+    }
+
+    #[tokio::test]
+    async fn auto_improve_holds_a_proposal_whose_detail_is_unreadable() {
+        // Fail closed at the admin decision point: a stored proposal whose
+        // detail cannot be read (missing row, or unreadable table) is held
+        // pending, never approved.
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let wiki = Wiki::new(tmp.path(), store.writer.clone())
+            .unwrap()
+            .with_store_reader(store.reader.clone());
+        let ws = store
+            .writer
+            .get_or_create_workspace("default")
+            .await
+            .unwrap();
+        let proj = store
+            .writer
+            .get_or_create_project(ws, "scratch", None)
+            .await
+            .unwrap();
+        let state = admin_state_for_store_with_llm(&tmp, &store, wiki, None);
+        let prefixes = vec!["_rules/".to_string()];
+
+        // Missing row: a fresh id stages nothing, so the read finds no
+        // stored path to decide on.
+        let missing = AutoImproveProposalId::new();
+        assert!(
+            auto_improve_held_by_prefixes(&state, ws, proj, missing, &prefixes).await,
+            "an unreadable detail must hold the proposal"
+        );
+
+        // Unreadable table: rename it through a direct connection so the
+        // reader pool's query fails, restore it before asserting.
+        let conn = rusqlite::Connection::open(store.db_path()).unwrap();
+        conn.execute_batch(
+            "ALTER TABLE auto_improve_proposals RENAME TO auto_improve_proposals_broken",
+        )
+        .unwrap();
+        let broken = auto_improve_held_by_prefixes(&state, ws, proj, missing, &prefixes).await;
+        conn.execute_batch(
+            "ALTER TABLE auto_improve_proposals_broken RENAME TO auto_improve_proposals",
+        )
+        .unwrap();
+        assert!(
+            broken,
+            "a read error must hold the proposal, not approve it"
+        );
+    }
+
+    #[tokio::test]
     async fn auto_improve_removed_mode_fields_fail_closed() {
         let (_tmp, router) = read_page_test_router();
         let resp = router
@@ -13983,6 +14541,7 @@ mod tests {
             wiki,
             llm: None,
             auto_improve_require_approval: false,
+            auto_improve_require_approval_prefixes: Vec::new(),
             auto_improve_review_config: Default::default(),
             embedder: None,
             provider_health: ProviderHealth::default(),
@@ -14097,6 +14656,7 @@ mod tests {
             wiki,
             llm: None,
             auto_improve_require_approval: false,
+            auto_improve_require_approval_prefixes: Vec::new(),
             auto_improve_review_config: Default::default(),
             embedder: None,
             provider_health: ProviderHealth::default(),
@@ -14204,6 +14764,7 @@ mod tests {
             wiki,
             llm: None,
             auto_improve_require_approval: false,
+            auto_improve_require_approval_prefixes: Vec::new(),
             auto_improve_review_config: Default::default(),
             embedder: None,
             provider_health: ProviderHealth::default(),
@@ -14317,6 +14878,7 @@ mod tests {
             wiki,
             llm: None,
             auto_improve_require_approval: false,
+            auto_improve_require_approval_prefixes: Vec::new(),
             auto_improve_review_config: Default::default(),
             embedder: None,
             provider_health: ProviderHealth::default(),
@@ -14869,6 +15431,7 @@ mod tests {
             wiki,
             llm: None,
             auto_improve_require_approval: false,
+            auto_improve_require_approval_prefixes: Vec::new(),
             auto_improve_review_config: Default::default(),
             embedder: None,
             provider_health: ProviderHealth::default(),
@@ -14939,6 +15502,7 @@ mod tests {
             wiki,
             llm: None,
             auto_improve_require_approval: false,
+            auto_improve_require_approval_prefixes: Vec::new(),
             auto_improve_review_config: Default::default(),
             embedder: None,
             provider_health: ProviderHealth::default(),
@@ -15634,6 +16198,7 @@ mod tests {
             wiki,
             llm: None,
             auto_improve_require_approval: false,
+            auto_improve_require_approval_prefixes: Vec::new(),
             auto_improve_review_config: Default::default(),
             embedder: None,
             provider_health: ProviderHealth::default(),
@@ -15770,6 +16335,7 @@ mod tests {
             wiki,
             llm: None,
             auto_improve_require_approval: false,
+            auto_improve_require_approval_prefixes: Vec::new(),
             auto_improve_review_config: Default::default(),
             embedder: None,
             provider_health: ProviderHealth::default(),
@@ -16744,6 +17310,7 @@ mod tests {
             wiki,
             llm: None,
             auto_improve_require_approval: false,
+            auto_improve_require_approval_prefixes: Vec::new(),
             auto_improve_review_config: Default::default(),
             embedder: None,
             provider_health: ProviderHealth::default(),

@@ -12,6 +12,9 @@ version in [`docs/changelog/`](docs/changelog/):
 ## [Unreleased]
 
 ### Added
+- Added `[auto_improve] require_approval_prefixes`, which holds auto-improve
+  proposals for matching page paths for review while the rest are still approved
+  automatically. `require_approval = true` still holds everything. (#TBD)
 - Added a background mode to `POST /admin/compact` (`"background": true`,
   answered `202`) and a `GET /admin/compact` status route, so a compaction that
   outlasts a proxy timeout is followed instead of cut off with `524`. Both forms

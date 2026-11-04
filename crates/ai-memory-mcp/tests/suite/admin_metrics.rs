@@ -110,6 +110,7 @@ async fn harness() -> Harness {
         wiki,
         llm: None,
         auto_improve_require_approval: false,
+        auto_improve_require_approval_prefixes: Vec::new(),
         auto_improve_review_config: Default::default(),
         embedder: None,
         provider_health: ProviderHealth::default(),
