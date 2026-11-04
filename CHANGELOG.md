@@ -129,12 +129,12 @@ version in [`docs/changelog/`](docs/changelog/):
 - Stopped `install-mcp` without `--apply` and `setup-agent` from printing the
   bearer token. Their snippets now show `<redacted>` in its place, whichever
   source the token came from: replace it by hand or use `install-mcp --apply`.
-  `--token-env-var` and what `--apply` writes are unchanged. (#TBD)
+  `--token-env-var` and what `--apply` writes are unchanged. (#24)
 - Stopped a syntax error in a client's TOML config from echoing the offending
   line, which could hold a bearer token, in `install-mcp --apply`,
   `install-hooks --apply` and `auth enable`. The error keeps the line and column.
   `servers.toml` errors no longer echo a `url`, which could hold credentials,
-  after a syntax error or an invalid URL. (#TBD)
+  after a syntax error or an invalid URL. (#24)
 
 ## [3.3.3] - 2026-11-03
 
