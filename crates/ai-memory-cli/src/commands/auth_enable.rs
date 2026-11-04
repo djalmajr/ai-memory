@@ -169,11 +169,17 @@ fn record_token_file(config_path: &Path) -> Result<bool> {
             return Err(e).with_context(|| format!("reading {}", display_path(config_path)));
         }
     };
-    let mut doc: toml_edit::DocumentMut = existing
-        .as_deref()
-        .unwrap_or_default()
-        .parse()
-        .with_context(|| format!("parsing {}", display_path(config_path)))?;
+    let raw = existing.as_deref().unwrap_or_default();
+    let mut doc: toml_edit::DocumentMut = raw.parse().map_err(|e| {
+        // The parser's own display repeats the offending line, which may
+        // hold `[auth].bearer_token`, so the error goes out reworded: position
+        // and reason only.
+        anyhow::anyhow!(
+            "parsing {}: {}",
+            display_path(config_path),
+            crate::config::toml_parse_error_message(raw, &e)
+        )
+    })?;
     let auth = doc
         .entry("auth")
         .or_insert_with(|| toml_edit::Item::Table(toml_edit::Table::new()))

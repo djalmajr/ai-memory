@@ -453,9 +453,16 @@ pub(crate) fn existing_entry_endpoint(
         Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
     };
     if matches!(client, McpClient::Codex | McpClient::Grok) {
-        let doc: toml_edit::DocumentMut = text
-            .parse()
-            .with_context(|| format!("parsing {}", path.display()))?;
+        let doc: toml_edit::DocumentMut = text.parse().map_err(|e| {
+            // The parser's own display repeats the offending line, which may
+            // hold a bearer, so the error goes out reworded: position and
+            // reason only.
+            anyhow::anyhow!(
+                "parsing {}: {}",
+                path.display(),
+                crate::config::toml_parse_error_message(&text, &e)
+            )
+        })?;
         let Some(table) = doc
             .get("mcp_servers")
             .and_then(|servers| servers.get(name))

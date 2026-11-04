@@ -476,3 +476,153 @@ fn apply_still_writes_the_token_to_the_named_config_file() {
         "the applied file must hold the real token:\n{written}"
     );
 }
+
+/// A client TOML whose second line is a syntax error, with the bearer on
+/// that line. `toml_edit`'s own display repeats the offending line as a
+/// margin snippet, so an error that carries it prints the bearer to a
+/// log or transcript.
+fn malformed_client_toml() -> String {
+    format!(
+        "[mcp_servers.ai-memory]\n\
+         http_headers = {{ Authorization = \"Bearer {TOKEN}\" }} trailing\n"
+    )
+}
+
+/// The assertions a refused write of a malformed client TOML owes the
+/// operator: the failure keeps the position, drops the source line (and
+/// with it the bearer), leaves no parser margin bar, and preserves the
+/// file.
+fn assert_refused_without_the_line(what: &str, config: &Path, body: &str, output: &Output) {
+    assert!(
+        !output.status.success(),
+        "{what}: the malformed client TOML must be refused:\n{}",
+        combined(output)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !stdout.contains(TOKEN_BODY),
+        "{what}: the token reached stdout:\n{stdout}"
+    );
+    assert!(
+        !stderr.contains(TOKEN_BODY),
+        "{what}: the token reached stderr:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("line 2"),
+        "{what}: the error must keep the line position:\n{stderr}"
+    );
+    assert!(
+        !stderr.contains('|'),
+        "{what}: the parser's margin snippet must not be echoed:\n{stderr}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(config).unwrap(),
+        body,
+        "{what}: the malformed file must be preserved unchanged"
+    );
+}
+
+/// `install-mcp --apply` (Codex, Grok) and `install-hooks --apply`
+/// (Kimi Code) refuse a client TOML that no longer parses. The error may
+/// keep the file, line and column — never the offending line, which holds
+/// the bearer, and never the parser's margin snippet.
+#[test]
+fn apply_keeps_the_bearer_out_of_a_malformed_toml_error() {
+    for client in ["codex", "grok"] {
+        let sandbox = Sandbox::new();
+        let config = sandbox.home.join(format!("{client}-config.toml"));
+        let body = malformed_client_toml();
+        std::fs::write(&config, &body).unwrap();
+        let mut cmd = sandbox.install_mcp(client);
+        cmd.args(["--apply", "--config-file"]);
+        cmd.arg(&config);
+        let what = format!("install-mcp --client {client} --apply on a malformed TOML");
+        assert_refused_without_the_line(&what, &config, &body, &cmd.output().unwrap());
+    }
+
+    let sandbox = Sandbox::new();
+    let config = sandbox.home.join("kimi-config.toml");
+    let body = malformed_client_toml();
+    std::fs::write(&config, &body).unwrap();
+    let mut cmd = sandbox.command();
+    cmd.args([
+        "install-hooks",
+        "--agent",
+        "kimi-code",
+        "--apply",
+        "--config-file",
+        config.display().to_string().as_str(),
+        "--hooks-dir",
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../hooks")
+            .display()
+            .to_string()
+            .as_str(),
+        "--server-url",
+        SERVER_URL,
+    ]);
+    let what = "install-hooks --agent kimi-code --apply on a malformed TOML";
+    assert_refused_without_the_line(what, &config, &body, &cmd.output().unwrap());
+}
+
+/// `auth enable` reports a client whose config no longer parses as a
+/// manual change; that reason may keep the position but not the offending
+/// line with its bearer.
+#[test]
+fn auth_enable_keeps_the_bearer_out_of_a_malformed_client_config() {
+    let sandbox = Sandbox::new();
+    sandbox.write_config(&format!("server_url = \"{SERVER_URL}\"\n"));
+    let codex = sandbox.home.join(".codex").join("config.toml");
+    std::fs::create_dir_all(codex.parent().unwrap()).unwrap();
+    let body = malformed_client_toml();
+    std::fs::write(&codex, &body).unwrap();
+
+    let mut cmd = sandbox.command();
+    cmd.args(["auth", "enable"]);
+    let output = cmd.output().unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "auth enable must still succeed and list the client as manual:\n{stdout}\n{stderr}"
+    );
+    assert!(
+        !stdout.contains(TOKEN_BODY),
+        "the token reached stdout:\n{stdout}"
+    );
+    assert!(
+        !stderr.contains(TOKEN_BODY),
+        "the token reached stderr:\n{stderr}"
+    );
+    assert!(
+        stdout.contains("needs a manual change"),
+        "the malformed client must stay listed as a manual change:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("line 2"),
+        "the reason must keep the line position:\n{stdout}"
+    );
+    assert!(
+        !stdout.contains('|'),
+        "the parser's margin snippet must not be echoed:\n{stdout}"
+    );
+}
+
+/// Control: the same `--apply` against a valid Codex TOML still writes the
+/// real token to the file; only the error path changes.
+#[test]
+fn apply_still_writes_the_token_to_a_valid_codex_toml() {
+    let sandbox = Sandbox::new();
+    let config = sandbox.home.join("codex-config.toml");
+    std::fs::write(&config, "[mcp_servers]\n").unwrap();
+    let mut cmd = sandbox.install_mcp("codex");
+    cmd.args(["--auth-token", TOKEN, "--apply", "--config-file"]);
+    cmd.arg(&config);
+    clean("codex --apply on a valid TOML", cmd);
+    let written = std::fs::read_to_string(&config).unwrap();
+    assert!(
+        written.contains(TOKEN),
+        "the applied file must hold the real token:\n{written}"
+    );
+}

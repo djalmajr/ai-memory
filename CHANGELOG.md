@@ -128,6 +128,11 @@ version in [`docs/changelog/`](docs/changelog/):
   bearer token. Their snippets now show `<redacted>` in its place, whichever
   source the token came from: replace it by hand or use `install-mcp --apply`.
   `--token-env-var` and what `--apply` writes are unchanged. (#TBD)
+- Stopped a syntax error in a client's TOML config from echoing the offending
+  line, which could hold a bearer token, in `install-mcp --apply`,
+  `install-hooks --apply` and `auth enable`, and one in `servers.toml` from
+  echoing a `url` that could hold credentials. The error keeps the file, line and
+  column. (#TBD)
 
 ## [3.3.3] - 2026-11-03
 
