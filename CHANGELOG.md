@@ -101,10 +101,11 @@ version in [`docs/changelog/`](docs/changelog/):
   fork's `84 consolidation_chunk_progress` row drops only that row, so
   upstream's V84 still runs. (#16)
 - Kept map-reduce consolidation checkpoints with their session. `merge-project`,
-  `move-project` and session moves now carry them to the new scope, so a resumed
-  run reuses them instead of paying for the same calls again, and `purge-session`,
-  `purge-project` and workspace deletion now remove them, where they used to stay
-  in the database. Rows left behind by earlier purges are not swept. (#TBD)
+  a true `move-project` and session moves now carry them to the new scope, so a
+  resumed run reuses them instead of paying for the same calls again, and
+  `purge-session`, `purge-project` and workspace deletion now remove them, where
+  they used to stay in the database. Rows left behind by earlier purges are not
+  swept. (#TBD)
 
 ## [3.3.3] - 2026-11-03
 
