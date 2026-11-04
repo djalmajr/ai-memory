@@ -115,8 +115,8 @@ version in [`docs/changelog/`](docs/changelog/):
   show `TOKEN` as `null`, and hook configs show `<redacted>`. What `--apply` writes
   is unchanged. Rotate a token that a preview printed before this release. (#TBD)
 - Added a sanitizer rule that redacts ai-memory's own `aim_`, `amk_` and `ams_`
-  credentials in captured text, including right after a serialized control
-  character, an ANSI color code or a URL-encoded byte, as
+  credentials in captured text, including right after a control character or an
+  ANSI color code, raw or serialized, or a URL-encoded byte, as
   `[REDACTED:ai_memory_token]`; only a `Bearer` header was covered before.
   `ai-memory-client` redacts the same keys in the external text it scrubs.
   Text stored before this release is not rewritten, so a key already captured

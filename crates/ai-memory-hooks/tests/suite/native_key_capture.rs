@@ -172,9 +172,13 @@ async fn begin(store: &Store, state: &HookState) -> SessionId {
     sid
 }
 
-/// POST a real `/hook` PostToolUse with an OpenCode-shaped `tool_response`
-/// whose `stdout` is `stdout`, and return the HTTP status of the acceptance.
-async fn post_tool_use(state: &HookState, sid: SessionId, stdout: &str) -> StatusCode {
+/// POST a real `/hook` PostToolUse with an OpenCode-shaped `tool_response` and
+/// return the HTTP status of the acceptance.
+async fn post_tool_use(
+    state: &HookState,
+    sid: SessionId,
+    tool_response: serde_json::Value,
+) -> StatusCode {
     let app = hook_router(state.clone());
     let body = serde_json::json!({
         "session_id": sid.to_string(),
@@ -182,9 +186,7 @@ async fn post_tool_use(state: &HookState, sid: SessionId, stdout: &str) -> Statu
         "tool": "exec",
         "callID": "call-nkc-route",
         "payload": {
-            "tool_response": {
-                "stdout": stdout,
-            },
+            "tool_response": tool_response,
         },
     });
     let req = Request::builder()
@@ -218,31 +220,39 @@ where
     cond().await
 }
 
-/// The re-revision's canonical shape, end to end: the `stdout` of a
-/// structured tool response holds a real control character and a native key.
-/// The envelope's compact JSON serialization writes the control out as the
-/// literal `\u00XX` escape (or `\u001b[32m` for an ESC + colour code), and
-/// `strip_control` does not touch that text — only the native rule's
-/// serialized-control prefix can reach the key. The observation persisted by
-/// the real `/hook` route must carry the marker and no part of the key.
+/// End to end through the real `/hook` route, in the two shapes a tool result
+/// takes. A structured `stdout` is serialized first, so a control character
+/// arrives written out as `\u00XX` (or `\u001b[32m` for an ESC + colour code).
+/// A plain string arrives with the real character, which `strip_control`
+/// removes, and the key must not end up glued to the word before it. The
+/// persisted observation must carry the marker and no part of the key.
 #[tokio::test]
 async fn a_native_key_after_a_serialized_control_reaches_sqlite_redacted() {
     let (_tmp, store, state) = harness().await;
     let sid = begin(&store, &state).await;
 
-    // Real control characters in the `stdout`; the envelope serializes each
-    // one the way `serde_json` spells it.
-    let cases = [
-        ("real vertical tab", format!("title\n\x0b{KEY}")),
+    let structured = [
+        ("real vertical tab", format!("title\x0b{KEY}")),
         (
             "real ESC + CSI colour code",
             format!("title\u{1b}[32m{KEY}"),
         ),
         // Control: the real LF is what the original rule already covered.
         ("real line break", format!("title\n{KEY}")),
+    ]
+    .map(|(what, stdout)| (what, serde_json::json!({ "stdout": stdout })));
+    let plain = [
+        (
+            "plain string, ESC + CSI after a word",
+            serde_json::json!(format!("title\u{1b}[32m{KEY}")),
+        ),
+        (
+            "plain string, BEL after a word",
+            serde_json::json!(format!("title\u{7}{KEY}")),
+        ),
     ];
-    for (index, (what, stdout)) in cases.into_iter().enumerate() {
-        let status = post_tool_use(&state, sid, &stdout).await;
+    for (index, (what, tool_response)) in structured.into_iter().chain(plain).enumerate() {
+        let status = post_tool_use(&state, sid, tool_response).await;
         assert_eq!(status, StatusCode::ACCEPTED, "{what}: the hook must accept");
 
         // Fire-and-forget: wait for this case's own row. The count must
