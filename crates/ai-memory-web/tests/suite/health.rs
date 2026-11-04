@@ -30,7 +30,7 @@ use tower::ServiceExt;
 
 const PLANTED_PROVIDER: &str = "sk-PLANTEDPROVIDERSECRET0123456789";
 const PLANTED_EMBED: &str = "sk-PLANTEDEMBEDDERSECRET0123456789";
-const PLANTED_BODY: &str = "aim_PLANTEDBODYSECRET0123456789";
+const PLANTED_BODY: &str = "PLANTEDBODYSECRET0123456789";
 const PLANTED_TITLE: &str = "PLANTEDTITLESECRET";
 const PLANTED_PROJECT: &str = "proj-PLANTEDSCOPESECRET";
 const RETRY_HINT: &str = "ai-memory llm-test --provider openai --model gpt-test --prompt ping";

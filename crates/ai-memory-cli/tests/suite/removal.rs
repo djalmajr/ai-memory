@@ -305,8 +305,9 @@ fn project_scope_install_then_uninstall_round_trip_claude_hooks() {
     }
 }
 
-/// A print-only preview of a project-scoped install must not hand the operator
-/// a bearer to paste into the checkout; the user-level preview still embeds it.
+/// A print-only preview must not put the bearer where a transcript or a CI log
+/// can keep it. The project scope withholds it because the file lands in the
+/// checkout; the user-level preview shows the placeholder the operator replaces.
 #[test]
 fn project_scope_preview_withholds_the_bearer_token() {
     let _guard = cli_test_lock();
@@ -343,8 +344,12 @@ fn project_scope_preview_withholds_the_bearer_token() {
 
     let global = preview("global");
     assert!(
-        global.contains("SEKRIT-PREVIEW"),
-        "control: the user-level preview embeds it as before: {global}"
+        !global.contains("SEKRIT-PREVIEW"),
+        "the user-level preview must not embed the bearer: {global}"
+    );
+    assert!(
+        global.contains("<redacted>"),
+        "control: the user-level preview shows where the token goes: {global}"
     );
     assert!(
         !home.path().join(".claude").exists() && !project.path().join(".claude").exists(),

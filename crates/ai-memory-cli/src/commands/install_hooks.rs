@@ -32,7 +32,7 @@ use crate::commands::path_util::{home_dir, strip_windows_verbatim_prefix};
 use crate::commands::render_shared::{
     ANTIGRAVITY_LIFECYCLE_EVENTS, ANTIGRAVITY_TOOL_EVENTS, CODEX_PROFILE, COMMAND_CODE_PROFILE,
     COPILOT_CLI_PROFILE, CURSOR_PROFILE, DSH_EVENTS, GEMINI_PROFILE, HermesHookSet,
-    KIMI_CODE_EVENTS, KIRO_CLI_V2_EVENTS, KIRO_CLI_V3_EVENTS, POOL_EVENTS,
+    KIMI_CODE_EVENTS, KIRO_CLI_V2_EVENTS, KIRO_CLI_V3_EVENTS, POOL_EVENTS, TS_PREVIEW_TOKEN_NOTE,
     build_antigravity_payload_with_data_dir, build_claude_code_payload_with_data_dir,
     build_devin_payload_with_data_dir, build_dsh_hooks_payload, build_grok_payload_with_data_dir,
     build_kiro_cli_v2_hooks_value, build_kiro_cli_v3_hooks_value,
@@ -647,6 +647,19 @@ fn kiro_cli_home_join(
 ///
 /// # Errors
 /// Returns an error if the hook script directory cannot be located.
+/// What every `install-hooks` preview shows in place of the bearer.
+const PREVIEW_TOKEN_PLACEHOLDER: &str = "<redacted>";
+
+/// The comment a preview prints when its hook entries show
+/// [`PREVIEW_TOKEN_PLACEHOLDER`], behind the format's own comment marker.
+fn preview_token_note(comment: &str) -> String {
+    format!(
+        "{comment} Auth: the token is omitted from this preview ({PREVIEW_TOKEN_PLACEHOLDER} below).\n\
+         {comment}       `--apply` stores it under the data dir (0600); a hand-placed copy\n\
+         {comment}       needs the real value in place of the placeholder.\n"
+    )
+}
+
 pub fn run(config: &Config, args: InstallHooksArgs) -> Result<()> {
     if args.scope == HookInstallScope::Project && args.agent != AgentChoice::ClaudeCode {
         anyhow::bail!(
@@ -1061,25 +1074,31 @@ pub(crate) fn run_with_opencode_dialect_and_mcp_path(
             }
         };
     }
+    // A preview goes to stdout, where a terminal's scrollback, a CI log or an
+    // agent's transcript keeps it. From here on no renderer holds the token,
+    // whichever source it came from: flag, environment, config or inferred MCP.
+    let auth = auth.map(|_| PREVIEW_TOKEN_PLACEHOLDER);
     let strategy = args.project_strategy.and_then(ProjectStrategyArg::baked);
     // Preview must bake the same `CAPTURE_MODE` the next `--apply` would
     // persist (#661) — resolved read-only so a bare preview never writes.
     let preview_capture_mode = resolve_capture_mode(&config.data_dir, args.capture_mode);
     match args.agent {
         AgentChoice::OpenCode => {
-            render_opencode_plugin(&server_url, auth, strategy, &preview_capture_mode)
+            render_opencode_plugin(&server_url, auth.is_some(), strategy, &preview_capture_mode)
         }
         AgentChoice::OpenCode2 => render_opencode2_plugin(
             &server_url,
-            auth,
+            auth.is_some(),
             strategy,
             &preview_capture_mode,
             args.capture_assistant,
         ),
-        AgentChoice::Pi => render_pi_extension(&server_url, auth, strategy, &preview_capture_mode),
+        AgentChoice::Pi => {
+            render_pi_extension(&server_url, auth.is_some(), strategy, &preview_capture_mode)
+        }
         AgentChoice::Omp => render_omp_extension(
             &server_url,
-            auth,
+            auth.is_some(),
             strategy,
             args.profile.as_deref(),
             &preview_capture_mode,
@@ -1184,7 +1203,7 @@ pub(crate) fn run_with_opencode_dialect_and_mcp_path(
             render_devin(&hooks_dir, &server_url, auth, &config.data_dir, strategy)
         }
         AgentChoice::Openclaw => {
-            openclaw_plugin::render(&server_url, auth, strategy, &preview_capture_mode);
+            openclaw_plugin::render(&server_url, auth.is_some(), strategy, &preview_capture_mode);
             Ok(())
         }
         AgentChoice::KimiCode => {
@@ -4019,17 +4038,20 @@ fn warn_opencode_plugin_restore_conflict(quarantine: &Path, sibling: &Path) {
 
 fn render_opencode_plugin(
     server_url: &str,
-    auth_token: Option<&str>,
+    has_token: bool,
     project_strategy: Option<&str>,
     capture_mode: &str,
 ) -> Result<()> {
     println!("// OpenCode plugin — write to ~/.config/opencode/plugins/ai-memory.ts");
     println!("// Or re-run with `--apply` to install it automatically.");
     println!("// Restart OpenCode after changing plugins; config is loaded at startup.");
+    if has_token {
+        println!("{TS_PREVIEW_TOKEN_NOTE}");
+    }
     println!();
     println!(
         "{}",
-        build_opencode_plugin(server_url, auth_token, project_strategy, capture_mode)
+        build_opencode_plugin(server_url, None, project_strategy, capture_mode)
     );
     Ok(())
 }
@@ -4097,7 +4119,7 @@ fn apply_to_opencode2_plugin(
 
 fn render_opencode2_plugin(
     server_url: &str,
-    auth_token: Option<&str>,
+    has_token: bool,
     project_strategy: Option<&str>,
     capture_mode: &str,
     capture_assistant: bool,
@@ -4105,12 +4127,15 @@ fn render_opencode2_plugin(
     println!("// OpenCode V2 plugin — write to ~/.config/opencode/plugins/ai-memory-opencode2.ts");
     println!("// Or re-run with `--apply` to install it automatically.");
     println!("// Restart OpenCode V2 after changing plugins; config is loaded at startup.");
+    if has_token {
+        println!("{TS_PREVIEW_TOKEN_NOTE}");
+    }
     println!();
     println!(
         "{}",
         build_opencode2_plugin(
             server_url,
-            auth_token,
+            None,
             project_strategy,
             capture_mode,
             capture_assistant
@@ -5691,7 +5716,7 @@ fn pi_extension_hint_in(env_override: Option<std::ffi::OsString>) -> String {
 
 fn render_omp_extension(
     server_url: &str,
-    auth_token: Option<&str>,
+    has_token: bool,
     project_strategy: Option<&str>,
     profile: Option<&str>,
     capture_mode: &str,
@@ -5702,10 +5727,13 @@ fn render_omp_extension(
     );
     println!("// Or re-run with `--apply` to install it automatically.");
     println!("// Restart OMP after changing extensions; config is loaded at startup.");
+    if has_token {
+        println!("{TS_PREVIEW_TOKEN_NOTE}");
+    }
     println!();
     println!(
         "{}",
-        build_omp_extension(server_url, auth_token, project_strategy, capture_mode)
+        build_omp_extension(server_url, None, project_strategy, capture_mode)
     );
     Ok(())
 }
@@ -5752,7 +5780,7 @@ fn apply_to_pi_extension(
 
 fn render_pi_extension(
     server_url: &str,
-    auth_token: Option<&str>,
+    has_token: bool,
     project_strategy: Option<&str>,
     capture_mode: &str,
 ) -> Result<()> {
@@ -5762,10 +5790,13 @@ fn render_pi_extension(
     );
     println!("// Or re-run with `--apply` to install it automatically.");
     println!("// Restart Pi after changing extensions; MCP tools are bridged by this file.");
+    if has_token {
+        println!("{TS_PREVIEW_TOKEN_NOTE}");
+    }
     println!();
     println!(
         "{}",
-        build_pi_extension(server_url, auth_token, project_strategy, capture_mode)
+        build_pi_extension(server_url, None, project_strategy, capture_mode)
     );
     Ok(())
 }
@@ -6770,9 +6801,8 @@ fn render_claude_code(
         assistant: capture_assistant,
         prompts: capture_prompts,
     } = capture;
-    // A preview never persists the bearer (#552), so it would land inline in
-    // the snippet — and project scope tells the operator to paste that snippet
-    // into a checkout. Withhold it there; `--apply` persists it instead.
+    // Project scope tells the operator to paste this snippet into a checkout,
+    // so even the placeholder stays out; `--apply` persists the bearer instead.
     let token_withheld = scope == HookInstallScope::Project && auth_token.is_some();
     let auth_token = if token_withheld { None } else { auth_token };
     // Soft check: warn (don't bail) if a script is missing. The user
@@ -6822,11 +6852,7 @@ fn render_claude_code(
             data_dir.display()
         );
     } else if auth_token.is_some() {
-        println!("# Auth: AI_MEMORY_AUTH_TOKEN embedded in each hook command below.");
-        println!(
-            "#       Treat {} as sensitive (chmod 600).",
-            settings_path.display()
-        );
+        print!("{}", preview_token_note("#"));
     }
     println!();
     println!("{serialized}");
@@ -6872,11 +6898,7 @@ fn render_grok(
     println!("# Hook scripts: {}", hooks_dir.display());
     println!("# AI-memory server URL: {server_url}");
     if auth_token.is_some() {
-        println!("# Auth: AI_MEMORY_AUTH_TOKEN embedded in each hook command below.");
-        println!(
-            "#       Treat {} as sensitive (chmod 600).",
-            config_path.display()
-        );
+        print!("{}", preview_token_note("#"));
     }
     println!("# NOTE: Grok ignores hook stdout on SessionStart — capture works,");
     println!("#       but that event does not inject the handoff. The first");
@@ -7008,8 +7030,7 @@ fn render_zero(
     println!("# re-run with --apply to merge it in place, preserving other hooks.");
     println!("# AI-memory server URL: {server_url}");
     if auth_token.is_some() {
-        println!("# Auth: token embedded in each hook's args below.");
-        println!("#       Treat hooks.json as sensitive (chmod 600).");
+        print!("{}", preview_token_note("#"));
     }
     print!("{}", zero_install_notes(data_dir.display()));
     println!();
@@ -7275,12 +7296,7 @@ fn render_zcode(
     println!("# merge it in place, preserving the rest of the config.");
     println!("# AI-memory server URL: {server_url}");
     if auth_token.is_some() {
-        println!("# Auth: this printed snippet embeds the token in each hook's args");
-        println!("#       so a hand-placed config works as-is — treat it as");
-        println!("#       sensitive (chmod 600). NOTE: `--apply` does NOT embed the");
-        println!("#       token; it persists it to <data-dir>/auth-token (0600) and");
-        println!("#       writes token-less args, so the applied config differs from");
-        println!("#       this snippet by design (#552, #600).");
+        print!("{}", preview_token_note("#"));
     }
     println!("# NOTE: ZCode injects SessionStart stdout as model context, so the");
     println!("#       prior session's handoff is delivered automatically.");
@@ -7371,7 +7387,9 @@ fn render_hermes_output(
     out.push_str("# write that file: it is YAML you also edit, and it would have to\n");
     out.push_str("# be spliced. Restart Hermes (and its gateway) to load it.\n");
     out.push_str(&format!("# AI-memory server URL: {server_url}\n"));
-    if auth_token.is_some() {
+    if auth_token == Some(PREVIEW_TOKEN_PLACEHOLDER) {
+        out.push_str(&preview_token_note("#"));
+    } else if auth_token.is_some() {
         out.push_str("# Auth: this snippet embeds the token in each hook command —\n");
         out.push_str("#       treat ~/.hermes/config.yaml as sensitive (chmod 600).\n");
     }
@@ -7542,9 +7560,7 @@ fn render_droid(
     println!("# while hooks.json does not exist.");
     println!("# AI-memory server URL: {server_url}");
     if auth_token.is_some() {
-        println!("# Auth: this printed snippet embeds the token in each hook command —");
-        println!("#       treat the file as sensitive (chmod 600). `--apply` stores it");
-        println!("#       under the data dir instead.");
+        print!("{}", preview_token_note("#"));
     }
     print!("{DROID_INSTALL_NOTES}");
     println!();
@@ -7627,9 +7643,7 @@ fn render_codebuddy(
     println!("# place.");
     println!("# AI-memory server URL: {server_url}");
     if auth_token.is_some() {
-        println!("# Auth: this printed snippet embeds the token in each hook command —");
-        println!("#       treat settings.json as sensitive (chmod 600). `--apply` stores it");
-        println!("#       under the data dir instead.");
+        print!("{}", preview_token_note("#"));
     }
     print!("{CODEBUDDY_INSTALL_NOTES}");
     println!();
@@ -7791,9 +7805,7 @@ fn render_ibm_bob(
     println!("# ~/.bob/settings/settings.json, or re-run with --apply to merge it in place.");
     println!("# AI-memory server URL: {server_url}");
     if auth_token.is_some() {
-        println!("# Auth: this printed snippet embeds the token in each hook command —");
-        println!("#       treat settings.json as sensitive (chmod 600). `--apply` stores it");
-        println!("#       under the data dir instead.");
+        print!("{}", preview_token_note("#"));
     }
     print!("{IBM_BOB_INSTALL_NOTES}");
     println!();
@@ -7876,9 +7888,7 @@ fn render_qwen_code(
     println!("# place. MCP servers share this file under `mcpServers`.");
     println!("# AI-memory server URL: {server_url}");
     if auth_token.is_some() {
-        println!("# Auth: this printed snippet embeds the token in each hook command —");
-        println!("#       treat settings.json as sensitive (chmod 600). `--apply` stores it");
-        println!("#       under the data dir instead.");
+        print!("{}", preview_token_note("#"));
     }
     print!("{QWEN_CODE_INSTALL_NOTES}");
     println!();
@@ -7972,9 +7982,7 @@ fn render_muse(
     println!("# muse command fails at startup.");
     println!("# AI-memory server URL: {server_url}");
     if auth_token.is_some() {
-        println!("# Auth: this printed snippet embeds the token in each hook command —");
-        println!("#       treat the file as sensitive (chmod 600). `--apply` stores it");
-        println!("#       under the data dir instead.");
+        print!("{}", preview_token_note("#"));
     }
     print!("{MUSE_INSTALL_NOTES}");
     println!();
@@ -8019,10 +8027,7 @@ fn render_devin(
     println!("# Hook scripts: {}", hooks_dir.display());
     println!("# AI-memory server URL: {server_url}");
     if auth_token.is_some() {
-        println!("# Auth: AI_MEMORY_AUTH_TOKEN embedded in each hook command below.");
-        println!(
-            "#       Treat ~/.devin/hooks.v1.json or ~/.devin/config.json as sensitive (chmod 600)."
-        );
+        print!("{}", preview_token_note("#"));
     }
     println!(
         "# NOTE: Devin consumes the handoff via hookSpecificOutput.additionalContext on SessionStart."
@@ -8074,8 +8079,7 @@ fn render_kimi_code(
     println!("# Hook scripts: {}", hooks_dir.display());
     println!("# AI-memory server URL: {server_url}");
     if auth_token.is_some() {
-        println!("# Auth: AI_MEMORY_AUTH_TOKEN embedded in each hook command below.");
-        println!("#       Treat config.toml as sensitive (chmod 600).");
+        print!("{}", preview_token_note("#"));
     }
     println!();
     print!("{doc}");
@@ -8121,8 +8125,7 @@ fn render_kiro_cli(
     println!("// Hook scripts: {}", hooks_dir.display());
     println!("// AI-memory server URL: {server_url}");
     if auth_token.is_some() {
-        println!("// Auth: AI_MEMORY_AUTH_TOKEN embedded in each hook command below.");
-        println!("//       Treat agent configs as sensitive (chmod 600).");
+        print!("{}", preview_token_note("//"));
     }
     println!();
     println!(
@@ -8164,8 +8167,7 @@ fn render_kiro_cli_v3(
     println!("// Hook scripts: {}", hooks_dir.display());
     println!("// AI-memory server URL: {server_url}");
     if auth_token.is_some() {
-        println!("// Auth: AI_MEMORY_AUTH_TOKEN embedded in each hook command below.");
-        println!("//       Treat the hook file as sensitive (chmod 600).");
+        print!("{}", preview_token_note("//"));
     }
     println!();
     println!(
@@ -8237,7 +8239,9 @@ fn render_pool_output(
     out.push_str("# (re-run with --apply first to stage the scripts to a stable path).\n");
     out.push_str(&format!("# Hook scripts: {}\n", hooks_dir.display()));
     out.push_str(&format!("# AI-memory server URL: {server_url}\n"));
-    if auth_token.is_some() {
+    if auth_token == Some(PREVIEW_TOKEN_PLACEHOLDER) {
+        out.push_str(&preview_token_note("#"));
+    } else if auth_token.is_some() {
         out.push_str("# Auth: AI_MEMORY_AUTH_TOKEN embedded in each hook command below.\n");
         out.push_str("#       Treat .poolside/settings.yaml as sensitive (chmod 600).\n");
     }
@@ -8392,7 +8396,7 @@ fn render_cline_hooks(
         );
     }
     for (name, event) in CLINE_HOOK_EVENTS {
-        let preview_token = auth_token.map(|_| "<redacted>");
+        let preview_token = auth_token.map(|_| PREVIEW_TOKEN_PLACEHOLDER);
         let argv = cline_hook_argv(
             event,
             server_url,
@@ -8544,8 +8548,7 @@ fn render_dsh_output(
     out.push_str(&format!("# Hook scripts: {}\n", hooks_dir.display()));
     out.push_str(&format!("# AI-memory server URL: {server_url}\n"));
     if auth_token.is_some() {
-        out.push_str("# Auth: AI_MEMORY_AUTH_TOKEN embedded in each hook command below.\n");
-        out.push_str("#       Treat the hook config as sensitive (chmod 600).\n");
+        out.push_str(&preview_token_note("#"));
     }
     out.push_str("# NOTE: the bridge delivers exactly these seven events - no\n");
     out.push_str("#       PreCompact or SessionEnd, and SessionStart runs detached,\n");
@@ -10639,6 +10642,74 @@ command = "AI_MEMORY_HOOK_URL=http://h AI_MEMORY_PROJECT_STRATEGY=repo-root /x/a
             "one single-quoted command per event"
         );
         assert!(snippet.contains("tok-test"), "auth token must be embedded");
+    }
+
+    /// `--apply` for Hermes and Pool prints through the same functions as the
+    /// preview. When the token could not be stored it is still embedded, as it
+    /// was, and the comment has to say so rather than promise a placeholder.
+    #[test]
+    fn apply_output_with_an_unstored_token_still_embeds_it_and_says_so() {
+        let token = "aim_FAKEfakeFAKEfakeFAKEfake";
+        let hermes = render_hermes_output(
+            "http://127.0.0.1:49374",
+            Some(token),
+            Path::new("/data"),
+            None,
+            None,
+        );
+        assert!(hermes.contains(token));
+        assert!(hermes.contains("embeds the token"));
+        assert!(!hermes.contains("omitted from this preview"));
+
+        let pool = render_pool_output(
+            Path::new("/staging/pool"),
+            "http://127.0.0.1:49374",
+            Some(token),
+            Path::new("/data"),
+            None,
+        );
+        assert!(pool.contains(token));
+        assert!(pool.contains("embedded in each hook command"));
+        assert!(!pool.contains("omitted from this preview"));
+    }
+
+    #[test]
+    fn output_with_the_placeholder_says_the_token_was_omitted() {
+        let hermes = render_hermes_output(
+            "http://127.0.0.1:49374",
+            Some(PREVIEW_TOKEN_PLACEHOLDER),
+            Path::new("/data"),
+            None,
+            None,
+        );
+        assert!(hermes.contains("omitted from this preview"));
+        assert!(!hermes.contains("embeds the token"));
+
+        let pool = render_pool_output(
+            Path::new("/staging/pool"),
+            "http://127.0.0.1:49374",
+            Some(PREVIEW_TOKEN_PLACEHOLDER),
+            Path::new("/data"),
+            None,
+        );
+        assert!(pool.contains("omitted from this preview"));
+        assert!(!pool.contains("embedded in each hook command"));
+    }
+
+    /// The other half of the preview fix: a generated plugin written by
+    /// `--apply` with a token it could not store still carries that token.
+    #[test]
+    fn apply_with_an_unstored_token_still_writes_it_into_the_plugin() {
+        let temp = TempDir::new().unwrap();
+        let plugin = temp.path().join("ai-memory.ts");
+        let mut args = default_hook_args();
+        args.config_file = Some(plugin.clone());
+        let token = "aim_FAKEfakeFAKEfakeFAKEfake";
+
+        apply_to_opencode_plugin("http://127.0.0.1:49374", Some(token), &args, "denylist").unwrap();
+
+        let written = fs::read_to_string(&plugin).unwrap();
+        assert!(written.contains(&format!("const TOKEN: string | null = \"{token}\";")));
     }
 
     #[test]

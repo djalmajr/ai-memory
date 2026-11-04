@@ -18,8 +18,8 @@
 //! all GitHub token prefixes ghp_/gho_/ghu_/ghs_/ghr_ and fine-grained
 //! github_pat_…, Google AIza… and AQ.Ab… plus OAuth refresh tokens 1//…, Meta /
 //! Facebook Graph EAA…, Telegram bot tokens, GoHighLevel pit-…, Slack
-//! xoxb/xoxp…, AWS AKIA/ASIA…), PEM-bracketed private
-//! keys, URL-embedded credentials (`postgres://user:pass@host`), and
+//! xoxb/xoxp…, AWS AKIA/ASIA…), ai-memory's own aim_/amk_/ams_ credentials,
+//! PEM-bracketed private keys, URL-embedded credentials (`postgres://user:pass@host`), and
 //! dotless base64 JSON tokens (Cloudflare tunnel tokens), and anything
 //! matching the generic `*_(KEY|KEY_ID|TOKEN|SECRET|PASSWORD|CREDENTIAL|
 //! PEPPER|SALT|…)=value` shape. Operators can extend the list via
@@ -76,6 +76,21 @@ pub const OBSERVATION_BODY_MAX_BYTES: usize = 16 * 1024;
 /// does not leave `[31m` behind as text.
 const ESCAPE_SEQUENCES: &str =
     r"\x1b\[[0-9;?]*[ -/]*[@-~]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)|\x1b[@-Z\\-_]";
+
+/// The characters [`is_stripped_control`] and [`is_hidden_text_char`] remove,
+/// as a regex class.
+const STRIPPED_CHARS: &str = r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x{9f}\x{202a}-\x{202e}\x{2066}-\x{2069}\x{2061}-\x{2064}\x{feff}\x{e0000}-\x{e007f}]";
+
+/// A native key prefix right after a word character and something
+/// `strip_control` removes. Removing that alone would glue the key to the word
+/// (`title` + ESC `[32m` + `aim_...` becomes `titleaim_...`), and the native
+/// rule's word boundary could no longer see it, so the key would be stored
+/// whole. The match becomes `$1 $2` first, which keeps the boundary. The prefix
+/// is enough: the key's body can hold a removed character too, so it may not be
+/// whole yet. Any other text around a removed character stays joined as before.
+fn native_key_after_stripped() -> String {
+    format!(r"([0-9A-Za-z_])(?:{ESCAPE_SEQUENCES}|{STRIPPED_CHARS})+((?:aim|amk|ams)_)")
+}
 
 /// C0 and C1 controls except tab, newline and carriage return, DEL, and the
 /// bidi overrides that let stored text render as something else.
@@ -436,6 +451,36 @@ const BUILTIN_PATTERNS: &[(&str, &str)] = &[
     ),
     // Bearer-style tokens.
     (r#"(?i)bearer\s+[A-Za-z0-9._\-+/=]{16,}"#, "bearer_token"),
+    // ai-memory's own credentials: `aim_` API keys and `ams_` web sessions
+    // are these prefixes plus 43 base64url characters; external `amk_` keys
+    // come from mcp-auth, so their length is not known here. The floor is the
+    // 22 base64url characters of a 128-bit secret. It sits above snake_case
+    // names that happen to start with a prefix (`ams_session_token_hash`),
+    // and the leading word boundary rejects `claim_…` — ASCII, so a
+    // non-ASCII word character glued to the key (`éaim_…`) is not mistaken
+    // for one. This rule runs before the vendor-prefixed rules below,
+    // because a key body may contain a fragment one of their patterns
+    // matches (`sk-…`): running it last would redact the fragment and leave
+    // the prefix behind.
+    //
+    // The pipeline compact-serializes a structured tool response before this
+    // pass runs: a real control character survives as the literal escape text
+    // of the serializer, and that text is not a word boundary — the escaped
+    // letters are word characters — so the boundary alone cannot see the key.
+    // `strip_control` only removes REAL control characters, so the serialized
+    // spellings are matched here, outside the `secret` group, so the
+    // redaction keeps them: the one-letter escapes the serializers use (\b
+    // \t \n \f \r), the numeric spellings of a control character
+    // (\uXXXX, \xNN), the ANSI escape that follows a serialized ESC — the
+    // CSI parameters, intermediates and final byte — and the
+    // percent-encoded forms. A `\u0041`-style escape of a word character
+    // also breaks the key; that is accepted cost, like the `C:\temp\naim_…`
+    // false positive. No trailing boundary: base64url can end in `-`, which
+    // would otherwise be left behind.
+    (
+        r"(?:(?:\\(?:[nrtbf]|u[0-9A-Fa-f]{4}|x[0-9A-Fa-f]{2})(?:\[[0-9;?]*[ -/]*[@-~])?|%[0-9A-Fa-f]{2})|(?-u:\b))(?P<secret>(?:aim|amk|ams)_[A-Za-z0-9_\-]{22,})",
+        "ai_memory_token",
+    ),
     // Vendor-prefixed API keys.
     (r"sk-[A-Za-z0-9_\-]{16,}", "api_key"),
     // Stripe secret *and* restricted keys. `rk_live_` is scoped rather than
@@ -612,6 +657,7 @@ struct SanitizerInner {
     patterns: Vec<Pattern>,
     allowlist: Vec<String>,
     escapes: Regex,
+    native_key_after_stripped: Regex,
 }
 
 struct Pattern {
@@ -687,6 +733,7 @@ impl Sanitizer {
                     .cloned()
                     .collect(),
                 escapes: Regex::new(ESCAPE_SEQUENCES)?,
+                native_key_after_stripped: Regex::new(&native_key_after_stripped())?,
             }),
         })
     }
@@ -813,7 +860,11 @@ impl Sanitizer {
     /// Tag characters spell out text no reader sees; the ones that finish an
     /// emoji flag (England, Scotland, Wales) stay.
     fn strip_control(&self, input: &str) -> String {
-        let stripped = self.inner.escapes.replace_all(input, "");
+        let spaced = self
+            .inner
+            .native_key_after_stripped
+            .replace_all(input, "$1 $2");
+        let stripped = self.inner.escapes.replace_all(&spaced, "");
         if !stripped
             .char_indices()
             .any(|(offset, c)| is_stripped_control(c) || is_hidden_text_char(offset, c))
@@ -1076,6 +1127,220 @@ mod tests {
         let out = s().scrub("Authorization: Bearer abcdef0123456789ABCDEF0123456789");
         assert!(out.contains("[REDACTED:"));
         assert!(!out.contains("abcdef0123"));
+    }
+
+    /// A credential shaped like the real ones: the prefix plus 43 base64url
+    /// characters. Obviously fake, and built at run time so it is not a literal.
+    fn native_key(prefix: &str) -> String {
+        format!("{prefix}FAKEfake-FAKEfake_FAKEfakeFAKEfakeFAKEfake000")
+    }
+
+    #[test]
+    fn scrubs_native_keys_in_every_position() {
+        for prefix in ["aim_", "amk_", "ams_"] {
+            let key = native_key(prefix);
+            for (shape, text) in [
+                (
+                    "const TOKEN",
+                    format!("const TOKEN: string | null = \"{key}\";"),
+                ),
+                ("bare", format!("the key is {key} for now")),
+                ("json", format!("{{\"token\":\"{key}\",\"other\":1}}")),
+                ("line end", format!("first line\ntoken {key}\nlast line")),
+                ("text end", format!("token {key}")),
+                ("cli flag", format!("--auth-token {key} --next")),
+            ] {
+                let out = s().scrub(&text);
+                assert!(
+                    out.contains("[REDACTED:ai_memory_token]"),
+                    "{prefix} {shape}: {out}"
+                );
+                assert!(!out.contains("FAKEfake"), "{prefix} {shape}: {out}");
+                assert!(!out.contains(prefix), "{prefix} {shape}: {out}");
+            }
+        }
+    }
+
+    #[test]
+    fn native_key_redaction_keeps_the_surrounding_text() {
+        let key = native_key("aim_");
+        assert_eq!(
+            s().scrub(&format!("const TOKEN: string | null = \"{key}\";")),
+            "const TOKEN: string | null = \"[REDACTED:ai_memory_token]\";"
+        );
+    }
+
+    #[test]
+    fn native_key_ending_in_a_url_safe_symbol_leaves_nothing_behind() {
+        for tail in ["-", "_", "--"] {
+            let key = format!("{}{tail}", native_key("aim_"));
+            assert_eq!(
+                s().scrub(&format!("key {key} end")),
+                "key [REDACTED:ai_memory_token] end"
+            );
+        }
+    }
+
+    #[test]
+    fn native_key_split_by_an_invisible_character_is_redacted() {
+        let key = native_key("aim_");
+        let (head, tail) = key.split_at(10);
+        let out = s().scrub(&format!("key {head}\u{200b}{tail}"));
+        assert_eq!(out, "key [REDACTED:ai_memory_token]");
+    }
+
+    #[test]
+    fn bearer_rule_still_wins_for_a_native_key_in_a_header() {
+        let key = native_key("aim_");
+        assert_eq!(
+            s().scrub(&format!("Authorization: Bearer {key}")),
+            "Authorization: [REDACTED:bearer_token]"
+        );
+    }
+
+    #[test]
+    fn native_key_floor_is_twenty_two_tail_characters() {
+        let at_floor = format!("aim_{}", "x".repeat(22));
+        assert_eq!(s().scrub(&at_floor), "[REDACTED:ai_memory_token]");
+        let below_floor = format!("aim_{}", "x".repeat(21));
+        assert_eq!(s().scrub(&below_floor), below_floor);
+    }
+
+    #[test]
+    fn identifiers_and_prose_with_a_native_prefix_survive() {
+        for keep in [
+            "claim_session_consolidation_jobs",
+            "ams_session_token_hash",
+            "reclaim_session_consolidation_jobs_now",
+            "SELECT claim_session_consolidation_jobs(ams_session_token_hash)",
+            "the aim_ prefix marks a native key, amk_ an external one, ams_ a session",
+            "aim_assist and aim_low are short names",
+            "AIM_SESSION_TOKEN_HASH_COLUMN_NAME_V2",
+            "xaim_FAKEfake-FAKEfake_FAKEfakeFAKEfake",
+        ] {
+            assert_eq!(s().scrub(keep), keep);
+        }
+    }
+
+    /// The hook's compact tool-response serialization turns a line break or
+    /// tab into the two characters `\` plus the letter before the sanitizer
+    /// sees the text; the escaped letter is a word character, so the key
+    /// must be matched through the escape, which the redaction keeps.
+    #[test]
+    fn native_key_after_a_json_escaped_break_keeps_the_escape_and_redacts_the_key() {
+        let marker = "[REDACTED:ai_memory_token]";
+        for (input, expected) in [
+            (
+                format!("title\\n{}", native_key("aim_")),
+                format!("title\\n{marker}"),
+            ),
+            (
+                format!("title\\r\\n{}", native_key("aim_")),
+                format!("title\\r\\n{marker}"),
+            ),
+            (
+                format!("title\\t{}", native_key("amk_")),
+                format!("title\\t{marker}"),
+            ),
+            (format!("\\b{}", native_key("ams_")), format!("\\b{marker}")),
+            (format!("\\f{}", native_key("aim_")), format!("\\f{marker}")),
+            (
+                format!("{{\"stdout\":\"title\\n{}\"}}", native_key("aim_")),
+                format!("{{\"stdout\":\"title\\n{marker}\"}}"),
+            ),
+            (
+                format!("{{\"stdout\":\"title\\n{}\\nfim\"}}", native_key("amk_")),
+                format!("{{\"stdout\":\"title\\n{marker}\\nfim\"}}"),
+            ),
+        ] {
+            let out = s().scrub(&input);
+            assert_eq!(out, expected, "{input:?}");
+            assert_eq!(s().scrub(&out), out, "{input:?} must be a no-op twice");
+        }
+    }
+
+    /// `\\n` in source text: the rule matches the inner `\\n`, which the
+    /// redaction keeps, so the whole escape survives and only the key is
+    /// redacted.
+    #[test]
+    fn a_double_escaped_backslash_before_the_key_keeps_the_escape() {
+        let out = s().scrub(&format!("\\\\n{}", native_key("aim_")));
+        assert_eq!(out, "\\\\n[REDACTED:ai_memory_token]");
+        assert_eq!(s().scrub(&out), out);
+    }
+
+    /// The leading word boundary is ASCII: a non-ASCII word character glued
+    /// to the key is not a word boundary, so the key is redacted instead of
+    /// mistaken for an identifier.
+    #[test]
+    fn native_key_glued_to_a_unicode_word_is_redacted_like_a_bare_one() {
+        let marker = "[REDACTED:ai_memory_token]";
+        for input in [
+            format!("\u{e9}{}", native_key("aim_")),
+            format!("\u{65e5}\u{672c}{}", native_key("amk_")),
+        ] {
+            let out = s().scrub(&input);
+            assert!(
+                out.contains(marker) && !out.contains("FAKEfake"),
+                "{input:?} -> {out:?}"
+            );
+            assert_eq!(s().scrub(&out), out, "{input:?} must be a no-op twice");
+        }
+    }
+
+    #[test]
+    fn escaped_break_then_invisible_split_key_is_redacted_whole() {
+        let key = native_key("aim_");
+        let (head, tail) = key.split_at(10);
+        let out = s().scrub(&format!("title\\n{head}\u{200b}{tail}"));
+        assert_eq!(out, "title\\n[REDACTED:ai_memory_token]");
+    }
+
+    /// A native key whose base64url body contains `sk-` must be matched whole
+    /// by the native rule, which runs before the generic `sk-` suffix rule:
+    /// without that order the suffix rule eats the tail and the leading
+    /// fragment of the key stays in clear.
+    #[test]
+    fn a_native_key_with_an_sk_suffix_in_its_body_leaves_no_fragment() {
+        let marker = "[REDACTED:ai_memory_token]";
+        // `sk-` after 5, 21 and 22 body characters; the tail after it stays
+        // long enough for the `sk-` rule to want it.
+        let bodies = [
+            format!("abcde{}{}", "sk-", "Z".repeat(22)),
+            format!("a{}{}{}", "a".repeat(21), "sk-", "Z".repeat(16)),
+            format!("b{}{}{}", "b".repeat(22), "sk-", "Z".repeat(16)),
+        ];
+        for (index, body) in bodies.iter().enumerate() {
+            let key = format!("aim_{body}");
+            let out = s().scrub(&format!("token {key} end"));
+            assert_eq!(
+                out,
+                format!("token {marker} end"),
+                "case {index} (body {body:?}): {out:?}"
+            );
+            for fragment in [key.as_str(), body.as_str(), "sk-"] {
+                assert!(
+                    !out.contains(fragment),
+                    "case {index} (body {body:?}): fragment {fragment:?} in {out:?}"
+                );
+            }
+            // The router scrubs and then `Sanitized::new` scrubs again: the
+            // second pass must be a no-op, not a fresh fragment.
+            assert_eq!(s().scrub(&out), out, "second pass: {out:?}");
+        }
+    }
+
+    /// A raw colour code (real ESC + CSI) before a native key: `strip_control`
+    /// removes the sequence whole before the patterns run, and the key must
+    /// still be redacted at the boundary the removal leaves.
+    #[test]
+    fn a_raw_esc_code_before_a_native_key_is_still_redacted() {
+        let key = native_key("aim_");
+        for prefix in ["\u{1b}[32m", "\u{1b}[0m", "\u{1b}"] {
+            let out = s().scrub(&format!("{prefix}{key}"));
+            assert_eq!(out, "[REDACTED:ai_memory_token]", "{prefix:?} -> {out:?}");
+            assert_eq!(s().scrub(&out), out, "second pass: {prefix:?}");
+        }
     }
 
     #[test]
@@ -1737,6 +2002,24 @@ mod tests {
         }
         for text in strings("unchanged") {
             assert_eq!(s().scrub(&text), text);
+        }
+        // The structured tool-response cases the shared loop's `key … end`
+        // wrap cannot express: exact input, exact output, and idempotency.
+        for case in vectors["native_key_cases"].as_array().unwrap() {
+            let input = case["input"].as_str().unwrap();
+            let expected = case["output"].as_str().unwrap();
+            let out = s().scrub(input);
+            assert_eq!(out, expected, "{input:?}");
+            for credential in strings("credentials") {
+                if input.contains(credential.as_str()) {
+                    let (head, tail) = credential.split_at(credential.len() / 2);
+                    assert!(
+                        !out.contains(head) && !out.contains(tail),
+                        "{input:?} -> {out:?}"
+                    );
+                }
+            }
+            assert_eq!(s().scrub(&out), out, "{input:?} must be a no-op twice");
         }
     }
 

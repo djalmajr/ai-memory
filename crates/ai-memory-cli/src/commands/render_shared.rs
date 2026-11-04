@@ -348,6 +348,12 @@ pub(crate) fn bearer_header_value(token: Option<&str>) -> Option<String> {
     token.map(|t| format!("Bearer {t}"))
 }
 
+/// What a generated TypeScript integration's preview says when a token is
+/// configured: the preview renders `TOKEN` as `null`, which is what `--apply`
+/// writes once it has stored the token under the data dir.
+pub(crate) const TS_PREVIEW_TOKEN_NOTE: &str =
+    "// Auth: the token is omitted from this preview (TOKEN is null below); `--apply` stores it.";
+
 /// Emit a TypeScript string literal containing `s`. Escapes
 /// backslashes, double quotes, and common control characters. This is
 /// sufficient for URL, auth-token, and path strings embedded into

@@ -4,6 +4,7 @@
 
 mod escaped_json_secret;
 mod idle_end;
+mod native_key_capture;
 mod powershell_home;
 mod powershell_marker_aliases;
 mod powershell_server_routed;

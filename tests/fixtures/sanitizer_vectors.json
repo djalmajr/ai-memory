@@ -3,7 +3,13 @@
   "credentials": [
     "sk-leak-0123456789abcdef0123",
     "ghp_FAKE0123456789ABCDEFGHIJ0123",
-    "AKIAFAKEFAKEFAKEFAKE"
+    "AKIAFAKEFAKEFAKEFAKE",
+    "aim_FAKEfake-FAKEfake_FAKEfakeFAKEfakeFAKEfake000",
+    "amk_FAKEfake-FAKEfake_FAKEfakeFAKEfakeFAKEfake000",
+    "ams_FAKEfake-FAKEfake_FAKEfakeFAKEfakeFAKEfake000",
+    "\\naim_FAKEfake-FAKEfake_FAKEfakeFAKEfakeFAKEfake000",
+    "\\tamk_FAKEfake-FAKEfake_FAKEfakeFAKEfakeFAKEfake000",
+    "\\\\nams_FAKEfake-FAKEfake_FAKEfakeFAKEfakeFAKEfake000"
   ],
   "invisibles": [
     "\u200b",
@@ -65,6 +71,285 @@
       "kept": []
     }
   ],
+  "_comment_native_key_cases": "The \\n below is the two literal characters backslash and n after JSON decoding: the JSON-escaped line break the hook's compact tool-response serialization produces. Each case must redact the whole key (both halves gone), produce the exact output, and survive a second pass unchanged.",
+  "native_key_cases": [
+    {
+      "input": "title\\naim_FAKEfake-FAKEfake_FAKEfakeFAKEfakeFAKEfake000",
+      "output": "title\\n[REDACTED:ai_memory_token]"
+    },
+    {
+      "input": "title\\r\\namk_FAKEfake-FAKEfake_FAKEfakeFAKEfakeFAKEfake000",
+      "output": "title\\r\\n[REDACTED:ai_memory_token]"
+    },
+    {
+      "input": "title\\tams_FAKEfake-FAKEfake_FAKEfakeFAKEfakeFAKEfake000",
+      "output": "title\\t[REDACTED:ai_memory_token]"
+    },
+    {
+      "input": "\\baim_FAKEfake-FAKEfake_FAKEfakeFAKEfakeFAKEfake000",
+      "output": "\\b[REDACTED:ai_memory_token]"
+    },
+    {
+      "input": "\\fams_FAKEfake-FAKEfake_FAKEfakeFAKEfakeFAKEfake000",
+      "output": "\\f[REDACTED:ai_memory_token]"
+    },
+    {
+      "input": "{\"stdout\":\"title\\naim_FAKEfake-FAKEfake_FAKEfakeFAKEfakeFAKEfake000\"}",
+      "output": "{\"stdout\":\"title\\n[REDACTED:ai_memory_token]\"}"
+    },
+    {
+      "input": "{\"stdout\":\"title\\namk_FAKEfake-FAKEfake_FAKEfakeFAKEfakeFAKEfake000\\nfim\"}",
+      "output": "{\"stdout\":\"title\\n[REDACTED:ai_memory_token]\\nfim\"}"
+    },
+    {
+      "input": "\\\\naim_FAKEfake-FAKEfake_FAKEfakeFAKEfakeFAKEfake000",
+      "output": "\\\\n[REDACTED:ai_memory_token]"
+    },
+    {
+      "input": "\u00e9amk_FAKEfake-FAKEfake_FAKEfakeFAKEfakeFAKEfake000",
+      "output": "\u00e9[REDACTED:ai_memory_token]"
+    },
+    {
+      "input": "\u65e5\u672cams_FAKEfake-FAKEfake_FAKEfakeFAKEfakeFAKEfake000",
+      "output": "\u65e5\u672c[REDACTED:ai_memory_token]"
+    },
+    {
+      "input": "title\\namk_FAKEfake-FAKEfake_FAKEfakeFAKEfakeFAKEfake000-",
+      "output": "title\\n[REDACTED:ai_memory_token]"
+    },
+    {
+      "input": "title\\nams_FAKEfake-FAKEfake_FAKEfakeFAKEfakeFAKEfake000_",
+      "output": "title\\n[REDACTED:ai_memory_token]"
+    },
+    {
+      "input": "title aim_FAKEfake-FAKEfake_FAKEfakeFAKEfakeFAKEfake000",
+      "output": "title [REDACTED:ai_memory_token]"
+    },
+    {
+      "input": "title\\u0000aim_FAKEfake-FAKEfake_FAKEfakeFAKEfakeFAKEfake000",
+      "output": "title\\u0000[REDACTED:ai_memory_token]"
+    },
+    {
+      "input": "title\\u0001amk_FAKEfake-FAKEfake_FAKEfakeFAKEfakeFAKEfake000",
+      "output": "title\\u0001[REDACTED:ai_memory_token]"
+    },
+    {
+      "input": "title\\u0002ams_FAKEfake-FAKEfake_FAKEfakeFAKEfakeFAKEfake000",
+      "output": "title\\u0002[REDACTED:ai_memory_token]"
+    },
+    {
+      "input": "title\\u0003aim_FAKEfake-FAKEfake_FAKEfakeFAKEfakeFAKEfake000",
+      "output": "title\\u0003[REDACTED:ai_memory_token]"
+    },
+    {
+      "input": "title\\u0004amk_FAKEfake-FAKEfake_FAKEfakeFAKEfakeFAKEfake000",
+      "output": "title\\u0004[REDACTED:ai_memory_token]"
+    },
+    {
+      "input": "title\\u0005ams_FAKEfake-FAKEfake_FAKEfakeFAKEfakeFAKEfake000",
+      "output": "title\\u0005[REDACTED:ai_memory_token]"
+    },
+    {
+      "input": "title\\u0006aim_FAKEfake-FAKEfake_FAKEfakeFAKEfakeFAKEfake000",
+      "output": "title\\u0006[REDACTED:ai_memory_token]"
+    },
+    {
+      "input": "title\\u0007amk_FAKEfake-FAKEfake_FAKEfakeFAKEfakeFAKEfake000",
+      "output": "title\\u0007[REDACTED:ai_memory_token]"
+    },
+    {
+      "input": "title\\u000bams_FAKEfake-FAKEfake_FAKEfakeFAKEfakeFAKEfake000",
+      "output": "title\\u000b[REDACTED:ai_memory_token]"
+    },
+    {
+      "input": "title\\u000eaim_FAKEfake-FAKEfake_FAKEfakeFAKEfakeFAKEfake000",
+      "output": "title\\u000e[REDACTED:ai_memory_token]"
+    },
+    {
+      "input": "title\\u000famk_FAKEfake-FAKEfake_FAKEfakeFAKEfakeFAKEfake000",
+      "output": "title\\u000f[REDACTED:ai_memory_token]"
+    },
+    {
+      "input": "title\\u0010ams_FAKEfake-FAKEfake_FAKEfakeFAKEfakeFAKEfake000",
+      "output": "title\\u0010[REDACTED:ai_memory_token]"
+    },
+    {
+      "input": "title\\u0011aim_FAKEfake-FAKEfake_FAKEfakeFAKEfakeFAKEfake000",
+      "output": "title\\u0011[REDACTED:ai_memory_token]"
+    },
+    {
+      "input": "title\\u0012amk_FAKEfake-FAKEfake_FAKEfakeFAKEfakeFAKEfake000",
+      "output": "title\\u0012[REDACTED:ai_memory_token]"
+    },
+    {
+      "input": "title\\u0013ams_FAKEfake-FAKEfake_FAKEfakeFAKEfakeFAKEfake000",
+      "output": "title\\u0013[REDACTED:ai_memory_token]"
+    },
+    {
+      "input": "title\\u0014aim_FAKEfake-FAKEfake_FAKEfakeFAKEfakeFAKEfake000",
+      "output": "title\\u0014[REDACTED:ai_memory_token]"
+    },
+    {
+      "input": "title\\u0015amk_FAKEfake-FAKEfake_FAKEfakeFAKEfakeFAKEfake000",
+      "output": "title\\u0015[REDACTED:ai_memory_token]"
+    },
+    {
+      "input": "title\\u0016ams_FAKEfake-FAKEfake_FAKEfakeFAKEfakeFAKEfake000",
+      "output": "title\\u0016[REDACTED:ai_memory_token]"
+    },
+    {
+      "input": "title\\u0017aim_FAKEfake-FAKEfake_FAKEfakeFAKEfakeFAKEfake000",
+      "output": "title\\u0017[REDACTED:ai_memory_token]"
+    },
+    {
+      "input": "title\\u0018amk_FAKEfake-FAKEfake_FAKEfakeFAKEfakeFAKEfake000",
+      "output": "title\\u0018[REDACTED:ai_memory_token]"
+    },
+    {
+      "input": "title\\u0019ams_FAKEfake-FAKEfake_FAKEfakeFAKEfakeFAKEfake000",
+      "output": "title\\u0019[REDACTED:ai_memory_token]"
+    },
+    {
+      "input": "title\\u001aaim_FAKEfake-FAKEfake_FAKEfakeFAKEfakeFAKEfake000",
+      "output": "title\\u001a[REDACTED:ai_memory_token]"
+    },
+    {
+      "input": "title\\u001bamk_FAKEfake-FAKEfake_FAKEfakeFAKEfakeFAKEfake000",
+      "output": "title\\u001b[REDACTED:ai_memory_token]"
+    },
+    {
+      "input": "title\\u001cams_FAKEfake-FAKEfake_FAKEfakeFAKEfakeFAKEfake000",
+      "output": "title\\u001c[REDACTED:ai_memory_token]"
+    },
+    {
+      "input": "title\\u001daim_FAKEfake-FAKEfake_FAKEfakeFAKEfakeFAKEfake000",
+      "output": "title\\u001d[REDACTED:ai_memory_token]"
+    },
+    {
+      "input": "title\\u001eamk_FAKEfake-FAKEfake_FAKEfakeFAKEfakeFAKEfake000",
+      "output": "title\\u001e[REDACTED:ai_memory_token]"
+    },
+    {
+      "input": "title\\u001fams_FAKEfake-FAKEfake_FAKEfakeFAKEfakeFAKEfake000",
+      "output": "title\\u001f[REDACTED:ai_memory_token]"
+    },
+    {
+      "input": "title\\u000Aaim_FAKEfake-FAKEfake_FAKEfakeFAKEfakeFAKEfake000",
+      "output": "title\\u000A[REDACTED:ai_memory_token]"
+    },
+    {
+      "input": "title\\x0bamk_FAKEfake-FAKEfake_FAKEfakeFAKEfakeFAKEfake000",
+      "output": "title\\x0b[REDACTED:ai_memory_token]"
+    },
+    {
+      "input": "title\\u001b[32mams_FAKEfake-FAKEfake_FAKEfakeFAKEfakeFAKEfake000",
+      "output": "title\\u001b[32m[REDACTED:ai_memory_token]"
+    },
+    {
+      "input": "title\\x1b[0maim_FAKEfake-FAKEfake_FAKEfakeFAKEfakeFAKEfake000",
+      "output": "title\\x1b[0m[REDACTED:ai_memory_token]"
+    },
+    {
+      "input": "title%0Aamk_FAKEfake-FAKEfake_FAKEfakeFAKEfakeFAKEfake000",
+      "output": "title%0A[REDACTED:ai_memory_token]"
+    },
+    {
+      "input": "title%09ams_FAKEfake-FAKEfake_FAKEfakeFAKEfakeFAKEfake000",
+      "output": "title%09[REDACTED:ai_memory_token]"
+    },
+    {
+      "input": "title\u001b[32maim_FAKEfake-FAKEfake_FAKEfakeFAKEfakeFAKEfake000",
+      "output": "title [REDACTED:ai_memory_token]"
+    },
+    {
+      "input": "title\u001b[0mamk_FAKEfake-FAKEfake_FAKEfakeFAKEfakeFAKEfake000",
+      "output": "title [REDACTED:ai_memory_token]"
+    },
+    {
+      "input": "title\u001b[1m\u001b[32mams_FAKEfake-FAKEfake_FAKEfakeFAKEfakeFAKEfake000",
+      "output": "title [REDACTED:ai_memory_token]"
+    },
+    {
+      "input": "title\u001b]0;tab\u0007ams_FAKEfake-FAKEfake_FAKEfakeFAKEfakeFAKEfake000",
+      "output": "title [REDACTED:ai_memory_token]"
+    },
+    {
+      "input": "title\u0007aim_FAKEfake-FAKEfake_FAKEfakeFAKEfakeFAKEfake000",
+      "output": "title [REDACTED:ai_memory_token]"
+    },
+    {
+      "input": "title\u0000aim_FAKEfake-FAKEfake_FAKEfakeFAKEfakeFAKEfake000",
+      "output": "title [REDACTED:ai_memory_token]"
+    },
+    {
+      "input": "title\u000bamk_FAKEfake-FAKEfake_FAKEfakeFAKEfakeFAKEfake000",
+      "output": "title [REDACTED:ai_memory_token]"
+    },
+    {
+      "input": "title\u007fams_FAKEfake-FAKEfake_FAKEfakeFAKEfakeFAKEfake000",
+      "output": "title [REDACTED:ai_memory_token]"
+    },
+    {
+      "input": "title\u0085aim_FAKEfake-FAKEfake_FAKEfakeFAKEfakeFAKEfake000",
+      "output": "title [REDACTED:ai_memory_token]"
+    },
+    {
+      "input": "title\u202eamk_FAKEfake-FAKEfake_FAKEfakeFAKEfakeFAKEfake000",
+      "output": "title [REDACTED:ai_memory_token]"
+    },
+    {
+      "input": "title\u2066ams_FAKEfake-FAKEfake_FAKEfakeFAKEfakeFAKEfake000",
+      "output": "title [REDACTED:ai_memory_token]"
+    },
+    {
+      "input": "title\u2062aim_FAKEfake-FAKEfake_FAKEfakeFAKEfakeFAKEfake000",
+      "output": "title [REDACTED:ai_memory_token]"
+    },
+    {
+      "input": "title\udb40\udc61amk_FAKEfake-FAKEfake_FAKEfakeFAKEfakeFAKEfake000",
+      "output": "title [REDACTED:ai_memory_token]"
+    },
+    {
+      "input": "title\ufeffams_FAKEfake-FAKEfake_FAKEfakeFAKEfakeFAKEfake000",
+      "output": "title [REDACTED:ai_memory_token]"
+    },
+    {
+      "input": "title: \u001b[32maim_FAKEfake-FAKEfake_FAKEfakeFAKEfakeFAKEfake000",
+      "output": "title: [REDACTED:ai_memory_token]"
+    },
+    {
+      "input": "\u001b[32mamk_FAKEfake-FAKEfake_FAKEfakeFAKEfakeFAKEfake000",
+      "output": "[REDACTED:ai_memory_token]"
+    },
+    {
+      "input": "title\u0007aim_short",
+      "output": "title aim_short"
+    },
+    {
+      "input": "title\u0007aim_FAKEfake\u0000-FAKEfake_FAKEfakeFAKEfakeFAKEfake000",
+      "output": "title [REDACTED:ai_memory_token]"
+    },
+    {
+      "input": "title\u0007aim_FAKEfake\u200b-FAKEfake_FAKEfakeFAKEfakeFAKEfake000",
+      "output": "title [REDACTED:ai_memory_token]"
+    },
+    {
+      "input": "title\u001b[32maim_FAKEfake\u200b-FAKEfake_FAKEfakeFAKEfakeFAKEfake000",
+      "output": "title [REDACTED:ai_memory_token]"
+    },
+    {
+      "input": "title\u001b[32maim_FAKEfake\u0007-FAKEfake_FAKEfakeFAKEfakeFAKEfake000",
+      "output": "title [REDACTED:ai_memory_token]"
+    },
+    {
+      "input": "title\u0007aimless",
+      "output": "titleaimless"
+    },
+    {
+      "input": "title\u0007claim_session_consolidation_jobs",
+      "output": "titleclaim_session_consolidation_jobs"
+    }
+  ],
   "unchanged": [
     "family \ud83d\udc68\u200d\ud83d\udc69\u200d\ud83d\udc67 emoji",
     "keycaps 1\ufe0f\u20e3 #\ufe0f\u20e3",
@@ -78,6 +363,16 @@
     "-----BEGIN PGP PUBLIC KEY BLOCK-----\n\nmQENBFakeFakeFakeFakeFakeFakeFake\n-----END PGP PUBLIC KEY BLOCK-----",
     "The file starts with -----BEGIN OPENSSH PRIVATE KEY----- and that is expected.",
     "-----BEGIN RSA PRIVATE KEY-----\nThat header marks a PKCS#1 key.",
-    "const HEADER: &str = \"-----BEGIN RSA PRIVATE KEY-----\";\nparseHeaderLineFromInput(x)"
+    "const HEADER: &str = \"-----BEGIN RSA PRIVATE KEY-----\";\nparseHeaderLineFromInput(x)",
+    "claim_session_consolidation_jobs",
+    "ams_session_token_hash",
+    "aim_xxxxxxxxxxxxxxxxxxxxx",
+    "naim_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+    "\\nclaim_session_consolidation_jobs",
+    "\\naim_xxxxxxxxxxxxxxxxxxxxx",
+    "\\u000bclaim_session_consolidation_jobs",
+    "%0Aclaim_session_consolidation_jobs",
+    "\\u001b[32mclaim_session_consolidation_jobs",
+    "100%25aim_xxxxxxxxxxxxxxxxx"
   ]
 }

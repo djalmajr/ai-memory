@@ -9,8 +9,8 @@ use anyhow::{Context, Result};
 use crate::cli::InstallHooksArgs;
 use crate::commands::apply_shared::{ApplyOutcome, apply_atomic};
 use crate::commands::render_shared::{
-    ts_auth_headers_fn, ts_capture_policy_v1, ts_resolve_token_fn, ts_spool_runtime,
-    ts_string_literal, ts_timeout_signal,
+    TS_PREVIEW_TOKEN_NOTE, ts_auth_headers_fn, ts_capture_policy_v1, ts_resolve_token_fn,
+    ts_spool_runtime, ts_string_literal, ts_timeout_signal,
 };
 
 pub(crate) const PLUGIN_ID: &str = "ai-memory";
@@ -68,7 +68,7 @@ pub(crate) fn apply(
 /// Print the generated package for manual installation.
 pub(crate) fn render(
     server_url: &str,
-    auth_token: Option<&str>,
+    has_token: bool,
     project_strategy: Option<&str>,
     capture_mode: &str,
 ) {
@@ -83,9 +83,12 @@ pub(crate) fn render(
     println!("## {MANIFEST_JSON}");
     println!("{}", manifest_json());
     println!("## {ENTRYPOINT_TS}");
+    if has_token {
+        println!("{TS_PREVIEW_TOKEN_NOTE}");
+    }
     println!(
         "{}",
-        build_plugin(server_url, auth_token, project_strategy, capture_mode)
+        build_plugin(server_url, None, project_strategy, capture_mode)
     );
 }
 

@@ -2392,6 +2392,153 @@ fn apply_run_require_server_env(config: &mut Config, raw: Option<&str>) {
     }
 }
 
+/// A TOML syntax error, reworded so the source line never reaches the error
+/// chain: the parser's own display prints it as a margin snippet, and the
+/// offending line may hold `[auth].bearer_token`.
+fn toml_parse_error_message(raw: &str, parse: &toml_edit::TomlError) -> String {
+    // `span()` is only `None` for errors the parser built without a raw
+    // document, and those have no snippet to strip, so their message is
+    // already snippet-free.
+    match parse.span().map(|span| span.start) {
+        Some(offset) => {
+            let (line, column) = toml_error_position(raw, offset);
+            // The message is empty for an end-of-input error (a value missing
+            // at EOF has nothing left to name); report the failure class
+            // instead of ending on a blank reason.
+            let reason = parse.message().trim();
+            if reason.is_empty() {
+                format!("TOML parse error at line {line}, column {column}: invalid TOML syntax")
+            } else {
+                format!("TOML parse error at line {line}, column {column}: {reason}")
+            }
+        }
+        None => parse.message().to_string(),
+    }
+}
+
+/// 1-based `(line, column)` of byte `offset`, the same way the parser's own
+/// display reports a position: an offset at the end of the input points one
+/// column past the last character of the final line.
+fn toml_error_position(raw: &str, offset: usize) -> (usize, usize) {
+    let bytes = raw.as_bytes();
+    if bytes.is_empty() {
+        return (1, 1);
+    }
+    if offset >= bytes.len() {
+        // End of file: one past the last character of the final line.
+        let line_start = bytes
+            .iter()
+            .rposition(|byte| *byte == b'\n')
+            .map_or(0, |nl| nl + 1);
+        let line = bytes[..line_start]
+            .iter()
+            .filter(|byte| **byte == b'\n')
+            .count()
+            + 1;
+        let column = std::str::from_utf8(&bytes[line_start..])
+            .map(|s| s.chars().count() + 1)
+            .unwrap_or_else(|_| bytes.len() - line_start + 1);
+        return (line, column);
+    }
+    let line_start = bytes[..offset]
+        .iter()
+        .rposition(|byte| *byte == b'\n')
+        .map_or(0, |nl| nl + 1);
+    let line = bytes[..line_start]
+        .iter()
+        .filter(|byte| **byte == b'\n')
+        .count()
+        + 1;
+    let column = std::str::from_utf8(&bytes[line_start..=offset])
+        .map(|s| s.chars().count())
+        .unwrap_or(offset - line_start + 1);
+    (line, column)
+}
+
+/// The class of a `figment::error::Actual`, without its value: the error
+/// rewrite below must say what kind of thing arrived (a string, an
+/// integer), never what it said — a `[auth].bearer_token` is the value that
+/// must stay out of the message.
+fn actual_class(actual: &figment::error::Actual) -> &'static str {
+    use figment::error::Actual::*;
+    match actual {
+        Bool(_) => "boolean",
+        Unsigned(_) => "unsigned integer",
+        Signed(_) => "integer",
+        Float(_) => "float",
+        Char(_) => "character",
+        Str(_) => "string",
+        Bytes(_) => "bytes",
+        Unit => "unit",
+        Option => "option",
+        NewtypeStruct => "newtype struct",
+        Seq => "sequence",
+        Map => "map",
+        Enum => "enum",
+        UnitVariant => "unit variant",
+        NewtypeVariant => "newtype variant",
+        TupleVariant => "tuple variant",
+        StructVariant => "struct variant",
+        Other(_) => "other",
+    }
+}
+
+/// Reword a figment extraction error so no value reaches stderr: figment's
+/// own display prints the value it found (``found signed int
+/// `123456789012` ``), and a numeric `[auth].bearer_token` saved without
+/// quotes is the confirmed leak. The chain is walked from the outermost
+/// link: the first kind that must be value-free is reworded with the key
+/// and the expected type and none of the value, and the other kinds keep
+/// their current text. Returns `None` — so the original error stands — when
+/// no link needs rewording.
+fn reword_figment_error(err: figment::error::Error) -> Option<String> {
+    for e in err {
+        let key = e.path.join(".");
+        let with_key = |head: String| {
+            if key.is_empty() {
+                head
+            } else {
+                format!("{head} for key \"{key}\"")
+            }
+        };
+        match &e.kind {
+            figment::error::Kind::InvalidType(actual, expected) => {
+                return Some(with_key(format!(
+                    "invalid type: found {}, expected {}",
+                    actual_class(actual),
+                    expected
+                )));
+            }
+            figment::error::Kind::InvalidValue(actual, expected) => {
+                return Some(with_key(format!(
+                    "invalid value: found {}, expected {}",
+                    actual_class(actual),
+                    expected
+                )));
+            }
+            // The unknown variant name is the value the input held; the
+            // rewording keeps only the expected list.
+            figment::error::Kind::UnknownVariant(_, expected) => {
+                return Some(with_key(format!(
+                    "unknown variant: expected one of: {}",
+                    expected.join(", ")
+                )));
+            }
+            figment::error::Kind::Unsupported(actual) => {
+                return Some(format!("unsupported: {}", actual_class(actual)));
+            }
+            figment::error::Kind::UnsupportedKey(actual, _) => {
+                return Some(format!("unsupported key: {}", actual_class(actual)));
+            }
+            // MissingField, UnknownField, DuplicateField, InvalidLength,
+            // Message and friends name fields or classes, not values: their
+            // current text is safe as is.
+            _ => continue,
+        }
+    }
+    None
+}
+
 impl Config {
     /// Load the merged configuration: defaults → file → env → CLI.
     ///
@@ -2417,9 +2564,62 @@ impl Config {
             .map(PathBuf::from)
             .unwrap_or_else(|| probe_data_dir.join("config.toml"));
 
+        // The file is read exactly once: the pre-parse check, the figment
+        // merge and the explicit-key lookups must all work on the same bytes,
+        // so a file replaced between two reads cannot put the credential on
+        // the error path the check never saw.
+        let config_text = if resolved_config_path.is_file() {
+            Some(Self::load_config_text(&resolved_config_path)?)
+        } else {
+            None
+        };
+        Self::load_from_text(
+            &resolved_config_path,
+            config_text,
+            cli_data_dir,
+            runtime_env,
+        )
+    }
+
+    /// Read the config file once, up front, and pre-parse it so a syntax
+    /// error can be reported without the offending line — which may hold
+    /// `[auth].bearer_token`, since the TOML parser's own display echoes it
+    /// as a margin snippet. Returns the exact bytes the caller must then
+    /// hand to `load_from_text`, so the file is never read twice.
+    ///
+    /// # Errors
+    /// Fails with the IO error (never the file's content) when the file
+    /// cannot be read or is not valid UTF-8, and with the file, line,
+    /// column and reason when it is not valid TOML.
+    pub(crate) fn load_config_text(path: &Path) -> Result<String> {
+        let raw = std::fs::read_to_string(path).map_err(|err| {
+            anyhow::anyhow!(
+                "loading configuration (config file = {}): {err}",
+                path.display()
+            )
+        })?;
+        if let Err(parse) = raw.parse::<toml_edit::DocumentMut>() {
+            return Err(anyhow::anyhow!(
+                "loading configuration (config file = {}): {}",
+                path.display(),
+                toml_parse_error_message(&raw, &parse)
+            ));
+        }
+        Ok(raw)
+    }
+
+    pub(crate) fn load_from_text(
+        resolved_config_path: &Path,
+        config_text: Option<String>,
+        cli_data_dir: Option<PathBuf>,
+        runtime_env: RuntimeEnv,
+    ) -> Result<Self> {
+        // `resolved_config_path` is where the file *would* live (CLI > env >
+        // default) and `config_text` its content, read exactly once by the
+        // caller — `None` when the path does not point at an existing file.
         let mut figment = Figment::from(Serialized::defaults(Self::default()));
-        if resolved_config_path.exists() {
-            figment = figment.merge(Toml::file(&resolved_config_path));
+        if let Some(raw) = &config_text {
+            figment = figment.merge(Toml::string(raw));
         }
         figment = figment.merge(Env::prefixed("AI_MEMORY_").split("__"));
         // The environment is read once, here, and passed down as data —
@@ -2436,12 +2636,34 @@ impl Config {
                 .as_deref(),
         );
 
-        let mut config: Config = figment.extract().with_context(|| {
+        let mut config: Config = match figment.extract().with_context(|| {
             format!(
                 "loading configuration (config file = {})",
                 resolved_config_path.display()
             )
-        })?;
+        }) {
+            Ok(config) => config,
+            // The cause that reaches stderr is the figment error itself:
+            // its display prints the value it found
+            // (`found signed int `123456789012``) — a numeric
+            // `[auth].bearer_token` saved without quotes is the confirmed
+            // leak — so reword it with the key and the expected type only.
+            Err(err) => {
+                // `downcast_ref` borrows, so the original error still stands
+                // when no link rewords; the chain walk runs over a clone
+                // (outermost first), which only the error path pays.
+                let Some(fer) = err.downcast_ref::<figment::error::Error>() else {
+                    return Err(err);
+                };
+                let Some(rewritten) = reword_figment_error(fer.clone()) else {
+                    return Err(err);
+                };
+                return Err(anyhow::anyhow!(
+                    "loading configuration (config file = {}): {rewritten}",
+                    resolved_config_path.display()
+                ));
+            }
+        };
 
         if let Some(token) = runtime_env.auth_token.clone() {
             config.auth.bearer_token = Some(token);
@@ -2452,10 +2674,11 @@ impl Config {
         // default URL itself, so the file is asked for the key rather than
         // the loaded value being compared against the default.
         let explicit_server_url = runtime_env.server_url.is_some()
-            || (resolved_config_path.exists()
-                && Figment::from(Toml::file(&resolved_config_path))
+            || config_text.as_ref().is_some_and(|raw| {
+                Figment::from(Toml::string(raw))
                     .find_value("server_url")
-                    .is_ok());
+                    .is_ok()
+            });
         config.server_url_explicit = explicit_server_url;
         if let Some(server_url) = runtime_env.server_url.clone() {
             config.server_url = server_url;
@@ -2508,10 +2731,11 @@ impl Config {
         // equal to the default still counts as chosen.
         config.data_dir_explicit = cli_data_dir.is_some()
             || runtime_env.data_dir.is_some()
-            || (resolved_config_path.exists()
-                && Figment::from(Toml::file(&resolved_config_path))
+            || config_text.as_ref().is_some_and(|raw| {
+                Figment::from(Toml::string(raw))
                     .find_value("data_dir")
-                    .is_ok());
+                    .is_ok()
+            });
         // CLI override always wins (figment doesn't see it because clap has
         // already parsed the flag into `cli_data_dir`).
         if let Some(dir) = cli_data_dir {
@@ -4651,6 +4875,254 @@ mod tests {
         let blank = load_auth(tmp.path(), toml, None).unwrap();
         assert!(blank.auth.bearer_token.is_none());
         assert!(blank.auth.missing_token_file().is_some());
+    }
+
+    /// A syntax error on the bearer line must report the position and the
+    /// reason without the source line: the parser's own display echoes it as
+    /// a margin snippet, and the line may hold the root bearer.
+    #[test]
+    fn a_toml_syntax_error_reports_position_without_the_source_line() {
+        let tmp = TempDir::new().unwrap();
+        let token = "aim_FAKEfakeFAKEfakeFAKEfakeFAKEfakeFAKEfake000";
+        let err = load_auth(
+            tmp.path(),
+            &format!("[auth]\nbearer_token = \"{token}\" trailing\n"),
+            None,
+        )
+        .expect_err("trailing text after the closing quote must fail the load");
+        let message = format!("{err:?}");
+        assert!(message.contains("line 2"), "{message}");
+        assert!(message.contains("column"), "{message}");
+        assert!(message.contains("expected newline"), "{message}");
+        assert!(!message.contains(token), "{message}");
+        assert!(!message.contains("trailing"), "{message}");
+        assert!(!message.contains('|'), "{message}");
+
+        let err = load_auth(
+            tmp.path(),
+            &format!("[auth]\nbearer_token = \"{token}\n"),
+            None,
+        )
+        .expect_err("an unterminated string must fail the load");
+        let message = format!("{err:?}");
+        assert!(message.contains("line 2"), "{message}");
+        assert!(!message.contains(token), "{message}");
+        assert!(!message.contains('|'), "{message}");
+
+        // Control: a value-level (not syntax) error still names the key.
+        let err = load_auth(tmp.path(), "[auth]\nbearer_token = 42\n", None)
+            .expect_err("a non-string bearer must fail the load");
+        let message = format!("{err:?}");
+        assert!(message.contains("bearer_token"), "{message}");
+        assert!(!message.contains('|'), "{message}");
+    }
+
+    /// A wrong-typed value may hold `[auth].bearer_token` (a numeric bearer
+    /// saved without quotes is the confirmed leak), so the diagnostic keeps
+    /// the key and the expected type — never the value, which figment's own
+    /// display would print (``found signed int `123` ``).
+    #[test]
+    fn a_type_error_names_the_key_and_expected_type_without_the_value() {
+        let cases = [
+            (
+                "[auth]\nbearer_token = 123456789012\n",
+                "123456789012",
+                "bearer_token",
+                "a string",
+            ),
+            (
+                "[auth]\nbearer_token = [\"FAKEfakeFAKEfakeFAKEfakeFAKEfake000\"]\n",
+                "FAKEfake",
+                "bearer_token",
+                "a string",
+            ),
+            (
+                "[sanitize]\nallowlist = \"FAKEfakeFAKEfakeFAKEfakeFAKEfake000\"\n",
+                "FAKEfake",
+                "allowlist",
+                "a sequence",
+            ),
+        ];
+        for (toml, secret, key, expected) in cases {
+            let tmp = TempDir::new().unwrap();
+            let err = load_auth(tmp.path(), toml, None)
+                .expect_err("a wrong-typed value must fail the load");
+            let message = format!("{err:?}");
+            assert!(!message.contains(secret), "{toml} -> {message}");
+            assert!(message.contains(key), "{toml} -> {message}");
+            assert!(message.contains(expected), "{toml} -> {message}");
+            assert!(
+                message.contains("loading configuration"),
+                "the context prefix must survive the rewrite: {message}"
+            );
+            assert!(!message.contains('|'), "no parser margin: {message}");
+        }
+    }
+
+    /// The reported position must be the parser's own display position, also
+    /// at end of file — where the old clamp to `len - 1` shifted the column
+    /// back — and an empty parser message must never come out blank.
+    #[test]
+    fn a_toml_error_position_matches_the_parser_display() {
+        // `(line, column)` from the parser's own `TOML parse error at line
+        // X, column Y` header.
+        fn parser_position(parse: &toml_edit::TomlError) -> (usize, usize) {
+            let display = format!("{parse}");
+            let header = display.lines().next().unwrap();
+            let after_line = &header[header.find("line ").unwrap() + 5..];
+            let line: usize = after_line
+                .split(',')
+                .next()
+                .unwrap()
+                .trim()
+                .parse()
+                .unwrap();
+            let after_column = &header[header.find("column ").unwrap() + 7..];
+            let column: usize = after_column
+                .split(|c: char| !c.is_ascii_digit())
+                .next()
+                .unwrap()
+                .parse()
+                .unwrap();
+            (line, column)
+        }
+        let cases = [
+            "bearer_token = ",               // missing value at EOF, empty message
+            "bearer_token = \"abc\u{e9}",    // unclosed string, multibyte at EOF
+            "a = 1\r\nb = ",                 // CRLF line endings, EOF on line 2
+            "bearer_token = \"x\" trailing", // mid-line error, control
+        ];
+        // The table must exercise the empty-message branch.
+        assert!(
+            cases.iter().any(|raw| raw
+                .parse::<toml_edit::DocumentMut>()
+                .unwrap_err()
+                .message()
+                .is_empty()),
+            "the table needs an empty-message case"
+        );
+        for raw in cases {
+            let parse = raw
+                .parse::<toml_edit::DocumentMut>()
+                .expect_err("must fail to parse");
+            let (line, column) = parser_position(&parse);
+            let message = toml_parse_error_message(raw, &parse);
+            assert!(
+                message.contains(&format!("line {line}, column {column}")),
+                "{raw:?} -> {message} (parser: line {line}, column {column})"
+            );
+            if parse.message().is_empty() {
+                assert!(
+                    message.contains("invalid TOML syntax"),
+                    "an empty parser message must name a failure class: {raw:?} -> {message}"
+                );
+            }
+            assert!(
+                !message.trim_end().ends_with(':'),
+                "the reason must never come out blank: {raw:?} -> {message:?}"
+            );
+        }
+    }
+
+    /// A directory named as the config path keeps being ignored, and a
+    /// non-UTF-8 file fails with the IO error — never the file's content.
+    #[test]
+    fn a_directory_config_is_ignored_and_a_non_utf8_file_fails_without_content() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().join("config-dir");
+        std::fs::create_dir(&dir).unwrap();
+        let config = Config::load_with_runtime_env(
+            Some(&dir),
+            Some(tmp.path().to_path_buf()),
+            RuntimeEnv::default(),
+        )
+        .expect("a directory named as the config path must be ignored, as an absent one is");
+        assert!(
+            !config.server_url_explicit,
+            "an ignored path must not count as a choice"
+        );
+
+        let tmp = TempDir::new().unwrap();
+        let config_path = tmp.path().join("config.toml");
+        std::fs::write(&config_path, b"[auth]\nbearer_token = \xff\xfe\n").unwrap();
+        let err = Config::load_with_runtime_env(
+            Some(&config_path),
+            Some(tmp.path().to_path_buf()),
+            RuntimeEnv::default(),
+        )
+        .expect_err("a non-UTF-8 config file must fail the load");
+        let message = format!("{err:?}");
+        assert!(
+            message.contains("loading configuration (config file = ")
+                && message.contains("config.toml"),
+            "the context prefix must name the path: {message}"
+        );
+        assert!(
+            message.contains("UTF-8"),
+            "the IO error must carry through: {message}"
+        );
+        assert!(
+            !message.contains("bearer_token"),
+            "no file content: {message}"
+        );
+    }
+
+    /// The disk is read exactly once: the pre-parse check, the figment merge
+    /// and the explicit-key lookups all work on the bytes `load_config_text`
+    /// read, so a file replaced on disk cannot put the credential on an
+    /// error path the check never saw. The load runs from the already-read
+    /// text; nothing else touches the file.
+    #[test]
+    fn the_disk_is_read_once_and_a_replaced_file_cannot_reach_the_error_path() {
+        let tmp = TempDir::new().unwrap();
+        let config_path = tmp.path().join("config.toml");
+        std::fs::write(&config_path, "server_url = \"http://localhost:1\"\n").unwrap();
+
+        // The single disk read: one pre-parse check over those bytes.
+        let raw =
+            Config::load_config_text(&config_path).expect("a valid file must read and pre-parse");
+
+        // Replace the file with one that holds a bearer token after a syntax
+        // break: the load below must not see it — the error path is built
+        // from `raw` only.
+        std::fs::write(
+            &config_path,
+            "[auth]\nbearer_token = \"FAKEfakeFAKEfakeFAKEfakeFAKEfake000\" trailing\n",
+        )
+        .unwrap();
+
+        let config = Config::load_from_text(
+            &config_path,
+            Some(raw),
+            Some(tmp.path().to_path_buf()),
+            RuntimeEnv::default(),
+        )
+        .expect("the load must use the bytes read once, not re-read the disk");
+        assert_eq!(
+            config.server_url.as_str(),
+            "http://localhost:1",
+            "the value must come from the single read"
+        );
+        assert!(
+            config.server_url_explicit,
+            "the explicit-key lookup uses the same bytes"
+        );
+        assert!(
+            config.auth.bearer_token.is_none(),
+            "the replaced file's token must not have been loaded"
+        );
+
+        // The same bytes fed through the syntax-error path report the break
+        // with the line and column and none of the offending line.
+        let err = Config::load_config_text(&config_path)
+            .expect_err("the replaced file is a syntax error and must fail the pre-parse");
+        let message = format!("{err:?}");
+        assert!(
+            !message.contains("FAKEfake"),
+            "the replaced file's line must not reach the error: {message}"
+        );
+        assert!(message.contains("line 2"), "{message}");
+        assert!(!message.contains('|'), "{message}");
     }
 
     /// `AI_MEMORY_AUTH_TOKEN` wins over the file, as it wins over the inline
