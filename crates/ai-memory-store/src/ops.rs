@@ -7788,12 +7788,15 @@ pub fn purge_project(
     // Map-reduce checkpoints hang off the session by id: a row for this
     // project's session stamped under a sibling project survives a
     // project-scoped delete, so the session subquery covers it — and it
-    // must run before the cascade below removes the sessions it reads.
+    // must run before the cascade below removes the sessions it reads. The
+    // project delete below matches nothing for a project of another workspace,
+    // so the EXISTS keeps such a call from taking a live project's checkpoints.
     tx.execute(
         "DELETE FROM consolidation_chunk_progress \
-         WHERE project_id = ?1 \
-            OR session_id IN (SELECT id FROM sessions WHERE project_id = ?1)",
-        rusqlite::params![&pid[..]],
+         WHERE EXISTS (SELECT 1 FROM projects WHERE id = ?1 AND workspace_id = ?2) \
+           AND (project_id = ?1 \
+                OR session_id IN (SELECT id FROM sessions WHERE project_id = ?1))",
+        rusqlite::params![&pid[..], workspace_id.as_bytes()],
     )?;
 
     // Cascade handles pages / sessions / observations / handoffs /
@@ -10539,6 +10542,63 @@ pub(crate) mod tests {
             1,
             "the other project's session keeps its checkpoint"
         );
+    }
+
+    /// The checkpoint delete keys on the project id alone, while the project
+    /// delete also requires the workspace. A project id paired with another
+    /// workspace deletes no project, so it must not delete that live project's
+    /// checkpoints either. Control: the right pair still removes them.
+    #[test]
+    fn purge_project_with_a_foreign_workspace_keeps_the_checkpoints() {
+        let (_tmp, mut conn, ws, proj) = fresh_db();
+        let foreign_ws = get_or_create_workspace(&mut conn, "foreign").unwrap();
+        let sibling = get_or_create_project(&mut conn, &ws, "sibling", None).unwrap();
+        let (sid, _) = seed_session(&mut conn, ws, proj, "liveproject");
+        record_consolidation_chunk(&conn, &ws, &proj, &sid, "fp-a", "own-extraction").unwrap();
+        record_consolidation_chunk(&conn, &ws, &sibling, &sid, "fp-b", "stray-extraction").unwrap();
+        let rows = |conn: &Connection| -> i64 {
+            conn.query_row(
+                "SELECT COUNT(*) FROM consolidation_chunk_progress",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+
+        purge_project(
+            &mut conn,
+            &foreign_ws,
+            &proj,
+            "foreign/scratch",
+            None,
+            false,
+            Compaction::Skip,
+            PurgeMode::Commit,
+        )
+        .unwrap();
+
+        assert_eq!(rows(&conn), 2, "a foreign pair deletes no checkpoint");
+        let live_project: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM projects WHERE id = ?1 AND workspace_id = ?2",
+                params![proj.as_bytes(), ws.as_bytes()],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(live_project, 1, "the project is still alive");
+
+        purge_project(
+            &mut conn,
+            &ws,
+            &proj,
+            "default/scratch",
+            None,
+            false,
+            Compaction::Skip,
+            PurgeMode::Commit,
+        )
+        .unwrap();
+        assert_eq!(rows(&conn), 0, "control: the right pair removes both rows");
     }
 
     /// The reason `reclaim_freed_pages` rebuilds all three FTS indexes rather
