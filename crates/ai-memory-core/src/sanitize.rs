@@ -259,9 +259,18 @@ const BUILTIN_PATTERNS: &[(&str, &str)] = &[
     // from mcp-auth, so their length is not known here. The floor is the 22
     // base64url characters of a 128-bit secret. It sits above snake_case names
     // that happen to start with a prefix (`ams_session_token_hash`), and the
-    // leading word boundary rejects `claim_…`. No trailing boundary: base64url
-    // can end in `-`, which would otherwise be left behind.
-    (r"\b(?:aim|amk|ams)_[A-Za-z0-9_\-]{22,}", "ai_memory_token"),
+    // leading word boundary rejects `claim_…` — ASCII, so a non-ASCII word
+    // character glued to the key (`éaim_…`) is not mistaken for one. The hook
+    // compact-serializes a structured tool response before this pass runs,
+    // where a line break or tab becomes the two characters `\` plus the
+    // letter, and that escaped letter is a word character that defeats the
+    // boundary; the escape is matched instead, outside the `secret` group so
+    // the redaction keeps it. No trailing boundary: base64url can end in `-`,
+    // which would otherwise be left behind.
+    (
+        r"(?:(?:\\[nrtbf])|(?-u:\b))(?P<secret>(?:aim|amk|ams)_[A-Za-z0-9_\-]{22,})",
+        "ai_memory_token",
+    ),
     // JWTs (three base64url segments separated by dots).
     (
         r"eyJ[A-Za-z0-9_\-]{16,}\.[A-Za-z0-9_\-]{16,}\.[A-Za-z0-9_\-]{16,}",
@@ -901,6 +910,80 @@ mod tests {
         ] {
             assert_eq!(s().scrub(keep), keep);
         }
+    }
+
+    /// The hook's compact tool-response serialization turns a line break or
+    /// tab into the two characters `\` plus the letter before the sanitizer
+    /// sees the text; the escaped letter is a word character, so the key
+    /// must be matched through the escape, which the redaction keeps.
+    #[test]
+    fn native_key_after_a_json_escaped_break_keeps_the_escape_and_redacts_the_key() {
+        let marker = "[REDACTED:ai_memory_token]";
+        for (input, expected) in [
+            (
+                format!("title\\n{}", native_key("aim_")),
+                format!("title\\n{marker}"),
+            ),
+            (
+                format!("title\\r\\n{}", native_key("aim_")),
+                format!("title\\r\\n{marker}"),
+            ),
+            (
+                format!("title\\t{}", native_key("amk_")),
+                format!("title\\t{marker}"),
+            ),
+            (format!("\\b{}", native_key("ams_")), format!("\\b{marker}")),
+            (format!("\\f{}", native_key("aim_")), format!("\\f{marker}")),
+            (
+                format!("{{\"stdout\":\"title\\n{}\"}}", native_key("aim_")),
+                format!("{{\"stdout\":\"title\\n{marker}\"}}"),
+            ),
+            (
+                format!("{{\"stdout\":\"title\\n{}\\nfim\"}}", native_key("amk_")),
+                format!("{{\"stdout\":\"title\\n{marker}\\nfim\"}}"),
+            ),
+        ] {
+            let out = s().scrub(&input);
+            assert_eq!(out, expected, "{input:?}");
+            assert_eq!(s().scrub(&out), out, "{input:?} must be a no-op twice");
+        }
+    }
+
+    /// `\\n` in source text: the rule matches the inner `\\n`, which the
+    /// redaction keeps, so the whole escape survives and only the key is
+    /// redacted.
+    #[test]
+    fn a_double_escaped_backslash_before_the_key_keeps_the_escape() {
+        let out = s().scrub(&format!("\\\\n{}", native_key("aim_")));
+        assert_eq!(out, "\\\\n[REDACTED:ai_memory_token]");
+        assert_eq!(s().scrub(&out), out);
+    }
+
+    /// The leading word boundary is ASCII: a non-ASCII word character glued
+    /// to the key is not a word boundary, so the key is redacted instead of
+    /// mistaken for an identifier.
+    #[test]
+    fn native_key_glued_to_a_unicode_word_is_redacted_like_a_bare_one() {
+        let marker = "[REDACTED:ai_memory_token]";
+        for input in [
+            format!("\u{e9}{}", native_key("aim_")),
+            format!("\u{65e5}\u{672c}{}", native_key("amk_")),
+        ] {
+            let out = s().scrub(&input);
+            assert!(
+                out.contains(marker) && !out.contains("FAKEfake"),
+                "{input:?} -> {out:?}"
+            );
+            assert_eq!(s().scrub(&out), out, "{input:?} must be a no-op twice");
+        }
+    }
+
+    #[test]
+    fn escaped_break_then_invisible_split_key_is_redacted_whole() {
+        let key = native_key("aim_");
+        let (head, tail) = key.split_at(10);
+        let out = s().scrub(&format!("title\\n{head}\u{200b}{tail}"));
+        assert_eq!(out, "title\\n[REDACTED:ai_memory_token]");
     }
 
     #[test]
@@ -1562,6 +1645,24 @@ mod tests {
         }
         for text in strings("unchanged") {
             assert_eq!(s().scrub(&text), text);
+        }
+        // The structured tool-response cases the shared loop's `key … end`
+        // wrap cannot express: exact input, exact output, and idempotency.
+        for case in vectors["native_key_cases"].as_array().unwrap() {
+            let input = case["input"].as_str().unwrap();
+            let expected = case["output"].as_str().unwrap();
+            let out = s().scrub(input);
+            assert_eq!(out, expected, "{input:?}");
+            for credential in strings("credentials") {
+                if input.contains(credential.as_str()) {
+                    let (head, tail) = credential.split_at(credential.len() / 2);
+                    assert!(
+                        !out.contains(head) && !out.contains(tail),
+                        "{input:?} -> {out:?}"
+                    );
+                }
+            }
+            assert_eq!(s().scrub(&out), out, "{input:?} must be a no-op twice");
         }
     }
 

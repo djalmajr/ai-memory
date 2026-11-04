@@ -2347,6 +2347,48 @@ fn apply_run_require_server_env(config: &mut Config, raw: Option<&str>) {
     }
 }
 
+/// A TOML syntax error, reworded so the source line never reaches the error
+/// chain: the parser's own display prints it as a margin snippet, and the
+/// offending line may hold `[auth].bearer_token`.
+fn toml_parse_error_message(raw: &str, parse: &toml_edit::TomlError) -> String {
+    // `span()` is only `None` for errors the parser built without a raw
+    // document, and those have no snippet to strip, so their message is
+    // already snippet-free.
+    match parse.span().map(|span| span.start) {
+        Some(offset) => {
+            let (line, column) = toml_error_position(raw, offset);
+            format!(
+                "TOML parse error at line {line}, column {column}: {}",
+                parse.message()
+            )
+        }
+        None => parse.message().to_string(),
+    }
+}
+
+/// 1-based `(line, column)` of byte `offset`, the same way the parser's own
+/// display reports a position.
+fn toml_error_position(raw: &str, offset: usize) -> (usize, usize) {
+    let bytes = raw.as_bytes();
+    if bytes.is_empty() {
+        return (1, 1);
+    }
+    let index = offset.min(bytes.len() - 1);
+    let line_start = bytes[..index]
+        .iter()
+        .rposition(|byte| *byte == b'\n')
+        .map_or(0, |nl| nl + 1);
+    let line = bytes[..line_start]
+        .iter()
+        .filter(|byte| **byte == b'\n')
+        .count()
+        + 1;
+    let column = std::str::from_utf8(&bytes[line_start..=index])
+        .map(|s| s.chars().count())
+        .unwrap_or(index - line_start);
+    (line, column)
+}
+
 impl Config {
     /// Load the merged configuration: defaults → file → env → CLI.
     ///
@@ -2374,6 +2416,21 @@ impl Config {
 
         let mut figment = Figment::from(Serialized::defaults(Self::default()));
         if resolved_config_path.exists() {
+            // The TOML parser's error display echoes the offending source
+            // line as a margin snippet, and a syntax error on
+            // `[auth].bearer_token` would therefore print the credential on
+            // every subcommand before any redaction runs. Parse the file up
+            // front so the failure can report the file, line, column and
+            // reason without the line itself.
+            if let Ok(raw) = std::fs::read_to_string(&resolved_config_path)
+                && let Err(parse) = raw.parse::<toml_edit::DocumentMut>()
+            {
+                return Err(anyhow::anyhow!(
+                    "loading configuration (config file = {}): {}",
+                    resolved_config_path.display(),
+                    toml_parse_error_message(&raw, &parse)
+                ));
+            }
             figment = figment.merge(Toml::file(&resolved_config_path));
         }
         figment = figment.merge(Env::prefixed("AI_MEMORY_").split("__"));
@@ -4568,6 +4625,46 @@ mod tests {
         let blank = load_auth(tmp.path(), toml, None).unwrap();
         assert!(blank.auth.bearer_token.is_none());
         assert!(blank.auth.missing_token_file().is_some());
+    }
+
+    /// A syntax error on the bearer line must report the position and the
+    /// reason without the source line: the parser's own display echoes it as
+    /// a margin snippet, and the line may hold the root bearer.
+    #[test]
+    fn a_toml_syntax_error_reports_position_without_the_source_line() {
+        let tmp = TempDir::new().unwrap();
+        let token = "aim_FAKEfakeFAKEfakeFAKEfakeFAKEfakeFAKEfake000";
+        let err = load_auth(
+            tmp.path(),
+            &format!("[auth]\nbearer_token = \"{token}\" trailing\n"),
+            None,
+        )
+        .expect_err("trailing text after the closing quote must fail the load");
+        let message = format!("{err:?}");
+        assert!(message.contains("line 2"), "{message}");
+        assert!(message.contains("column"), "{message}");
+        assert!(message.contains("expected newline"), "{message}");
+        assert!(!message.contains(token), "{message}");
+        assert!(!message.contains("trailing"), "{message}");
+        assert!(!message.contains('|'), "{message}");
+
+        let err = load_auth(
+            tmp.path(),
+            &format!("[auth]\nbearer_token = \"{token}\n"),
+            None,
+        )
+        .expect_err("an unterminated string must fail the load");
+        let message = format!("{err:?}");
+        assert!(message.contains("line 2"), "{message}");
+        assert!(!message.contains(token), "{message}");
+        assert!(!message.contains('|'), "{message}");
+
+        // Control: a value-level (not syntax) error still names the key.
+        let err = load_auth(tmp.path(), "[auth]\nbearer_token = 42\n", None)
+            .expect_err("a non-string bearer must fail the load");
+        let message = format!("{err:?}");
+        assert!(message.contains("bearer_token"), "{message}");
+        assert!(!message.contains('|'), "{message}");
     }
 
     /// `AI_MEMORY_AUTH_TOKEN` wins over the file, as it wins over the inline

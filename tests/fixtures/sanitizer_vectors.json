@@ -6,7 +6,10 @@
     "AKIAFAKEFAKEFAKEFAKE",
     "aim_FAKEfake-FAKEfake_FAKEfakeFAKEfakeFAKEfake000",
     "amk_FAKEfake-FAKEfake_FAKEfakeFAKEfakeFAKEfake000",
-    "ams_FAKEfake-FAKEfake_FAKEfakeFAKEfakeFAKEfake000"
+    "ams_FAKEfake-FAKEfake_FAKEfakeFAKEfakeFAKEfake000",
+    "\\naim_FAKEfake-FAKEfake_FAKEfakeFAKEfakeFAKEfake000",
+    "\\tamk_FAKEfake-FAKEfake_FAKEfakeFAKEfakeFAKEfake000",
+    "\\\\nams_FAKEfake-FAKEfake_FAKEfakeFAKEfakeFAKEfake000"
   ],
   "invisibles": [
     "\u200b",
@@ -68,6 +71,61 @@
       "kept": []
     }
   ],
+  "_comment_native_key_cases": "The \\n below is the two literal characters backslash and n after JSON decoding: the JSON-escaped line break the hook's compact tool-response serialization produces. Each case must redact the whole key (both halves gone), produce the exact output, and survive a second pass unchanged.",
+  "native_key_cases": [
+    {
+      "input": "title\\naim_FAKEfake-FAKEfake_FAKEfakeFAKEfakeFAKEfake000",
+      "output": "title\\n[REDACTED:ai_memory_token]"
+    },
+    {
+      "input": "title\\r\\namk_FAKEfake-FAKEfake_FAKEfakeFAKEfakeFAKEfake000",
+      "output": "title\\r\\n[REDACTED:ai_memory_token]"
+    },
+    {
+      "input": "title\\tams_FAKEfake-FAKEfake_FAKEfakeFAKEfakeFAKEfake000",
+      "output": "title\\t[REDACTED:ai_memory_token]"
+    },
+    {
+      "input": "\\baim_FAKEfake-FAKEfake_FAKEfakeFAKEfakeFAKEfake000",
+      "output": "\\b[REDACTED:ai_memory_token]"
+    },
+    {
+      "input": "\\fams_FAKEfake-FAKEfake_FAKEfakeFAKEfakeFAKEfake000",
+      "output": "\\f[REDACTED:ai_memory_token]"
+    },
+    {
+      "input": "{\"stdout\":\"title\\naim_FAKEfake-FAKEfake_FAKEfakeFAKEfakeFAKEfake000\"}",
+      "output": "{\"stdout\":\"title\\n[REDACTED:ai_memory_token]\"}"
+    },
+    {
+      "input": "{\"stdout\":\"title\\namk_FAKEfake-FAKEfake_FAKEfakeFAKEfakeFAKEfake000\\nfim\"}",
+      "output": "{\"stdout\":\"title\\n[REDACTED:ai_memory_token]\\nfim\"}"
+    },
+    {
+      "input": "\\\\naim_FAKEfake-FAKEfake_FAKEfakeFAKEfakeFAKEfake000",
+      "output": "\\\\n[REDACTED:ai_memory_token]"
+    },
+    {
+      "input": "\u00e9amk_FAKEfake-FAKEfake_FAKEfakeFAKEfakeFAKEfake000",
+      "output": "\u00e9[REDACTED:ai_memory_token]"
+    },
+    {
+      "input": "\u65e5\u672cams_FAKEfake-FAKEfake_FAKEfakeFAKEfakeFAKEfake000",
+      "output": "\u65e5\u672c[REDACTED:ai_memory_token]"
+    },
+    {
+      "input": "title\\namk_FAKEfake-FAKEfake_FAKEfakeFAKEfakeFAKEfake000-",
+      "output": "title\\n[REDACTED:ai_memory_token]"
+    },
+    {
+      "input": "title\\nams_FAKEfake-FAKEfake_FAKEfakeFAKEfakeFAKEfake000_",
+      "output": "title\\n[REDACTED:ai_memory_token]"
+    },
+    {
+      "input": "title aim_FAKEfake-FAKEfake_FAKEfakeFAKEfakeFAKEfake000",
+      "output": "title [REDACTED:ai_memory_token]"
+    }
+  ],
   "unchanged": [
     "family \ud83d\udc68\u200d\ud83d\udc69\u200d\ud83d\udc67 emoji",
     "keycaps 1\ufe0f\u20e3 #\ufe0f\u20e3",
@@ -84,6 +142,9 @@
     "const HEADER: &str = \"-----BEGIN RSA PRIVATE KEY-----\";\nparseHeaderLineFromInput(x)",
     "claim_session_consolidation_jobs",
     "ams_session_token_hash",
-    "aim_xxxxxxxxxxxxxxxxxxxxx"
+    "aim_xxxxxxxxxxxxxxxxxxxxx",
+    "naim_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+    "\\nclaim_session_consolidation_jobs",
+    "\\naim_xxxxxxxxxxxxxxxxxxxxx"
   ]
 }
