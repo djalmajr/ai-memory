@@ -7259,6 +7259,15 @@ pub(crate) fn purge_session_with_owner(
         rusqlite::params![&sid[..], &wid[..], &pid[..]],
     )? as u64;
 
+    // Map-reduce checkpoints hang off the session by id in whichever scope
+    // they landed: one left behind would let a resumed run reuse — and
+    // re-expose — the purged session's extractions, so the delete is keyed
+    // on the session id alone, like the `profile_candidates` delete below.
+    tx.execute(
+        "DELETE FROM consolidation_chunk_progress WHERE session_id = ?1",
+        rusqlite::params![&sid[..]],
+    )?;
+
     // Profile evidence harvested from this session's prompts. A candidate
     // keeps the user's own sentence (`statement`, `quote`), so one left behind
     // would let a later convergence write that sentence into a profile page.
@@ -7776,6 +7785,17 @@ pub fn purge_project(
         });
     }
 
+    // Map-reduce checkpoints hang off the session by id: a row for this
+    // project's session stamped under a sibling project survives a
+    // project-scoped delete, so the session subquery covers it — and it
+    // must run before the cascade below removes the sessions it reads.
+    tx.execute(
+        "DELETE FROM consolidation_chunk_progress \
+         WHERE project_id = ?1 \
+            OR session_id IN (SELECT id FROM sessions WHERE project_id = ?1)",
+        rusqlite::params![&pid[..]],
+    )?;
+
     // Cascade handles pages / sessions / observations / handoffs /
     // page_embeddings. The workspace row is intentionally left intact —
     // other projects may still live there.
@@ -8002,6 +8022,19 @@ pub fn delete_workspace(
             compacted: false,
         });
     }
+
+    // Map-reduce checkpoints carry the denormalized scope in their key, so
+    // a row for this workspace's project or session stamped under another
+    // workspace survives the cascade: the subqueries read `projects` and
+    // `sessions`, which the delete below removes, so this runs first — and
+    // only past the non-empty guard, like the rest of the commit path.
+    tx.execute(
+        "DELETE FROM consolidation_chunk_progress \
+         WHERE workspace_id = ?1 \
+            OR project_id IN (SELECT id FROM projects WHERE workspace_id = ?1) \
+            OR session_id IN (SELECT id FROM sessions WHERE workspace_id = ?1)",
+        rusqlite::params![&wid[..]],
+    )?;
 
     let removed = tx.execute(
         "DELETE FROM workspaces WHERE id = ?1",
@@ -8266,6 +8299,25 @@ pub fn move_project_workspace(
         "UPDATE agent_messages SET from_workspace_id = ?1 \
           WHERE from_project_id = ?2 AND from_workspace_id = ?3",
         params![&to[..], &pid[..], &from[..]],
+    )?;
+
+    // Map-reduce checkpoints carry the workspace in their key: the copy
+    // keeps a destination row that already answers the same (session,
+    // fingerprint), and the delete drops only the rows outside the
+    // destination — a re-stamp would abort the move on that collision.
+    tx.execute(
+        "INSERT INTO consolidation_chunk_progress \
+             (workspace_id, project_id, session_id, chunk_fingerprint, extraction_json, created_at) \
+         SELECT ?1, project_id, session_id, chunk_fingerprint, extraction_json, created_at \
+         FROM consolidation_chunk_progress \
+         WHERE project_id = ?2 AND workspace_id != ?1 \
+         ON CONFLICT(workspace_id, project_id, session_id, chunk_fingerprint) DO NOTHING",
+        params![&to[..], &pid[..]],
+    )?;
+    tx.execute(
+        "DELETE FROM consolidation_chunk_progress \
+         WHERE project_id = ?1 AND workspace_id != ?2",
+        params![&pid[..], &to[..]],
     )?;
 
     let projects_updated = tx.execute(
@@ -8653,6 +8705,26 @@ pub fn merge_project(
         params![dst, src],
     )?;
 
+    // Map-reduce checkpoints key the session by the full scope: the
+    // destination row already answers a colliding (session, fingerprint),
+    // so the move copies with a conflict fall-through instead of re-stamping
+    // (which would abort the merge on that collision) — and the destination
+    // row wins, because the fingerprint is content-derived and both rows
+    // serve the same input. The merge's workspace is stamped, not the row's
+    // stored one.
+    tx.execute(
+        "INSERT INTO consolidation_chunk_progress \
+             (workspace_id, project_id, session_id, chunk_fingerprint, extraction_json, created_at) \
+         SELECT ?1, ?2, session_id, chunk_fingerprint, extraction_json, created_at \
+         FROM consolidation_chunk_progress WHERE project_id = ?3 \
+         ON CONFLICT(workspace_id, project_id, session_id, chunk_fingerprint) DO NOTHING",
+        params![ws, dst, src],
+    )?;
+    tx.execute(
+        "DELETE FROM consolidation_chunk_progress WHERE project_id = ?1",
+        params![src],
+    )?;
+
     let mut page_conflicts = 0u64;
     for page in pages {
         if let Some(merged) = &page.merged_page {
@@ -9011,6 +9083,26 @@ pub fn move_session(
         "DELETE FROM ingest_keys \
          WHERE session_id = ?1 AND project_id != ?2",
         params![&sid[..], &to_proj[..]],
+    )?;
+
+    // Map-reduce checkpoints are keyed by the full scope plus the
+    // content-derived fingerprint: a destination row already answers the
+    // same block, so the move copies with a conflict fall-through instead
+    // of re-stamping (which would abort on that collision) and deletes the
+    // source rows — the destination row wins the collision.
+    tx.execute(
+        "INSERT INTO consolidation_chunk_progress \
+             (workspace_id, project_id, session_id, chunk_fingerprint, extraction_json, created_at) \
+         SELECT ?1, ?2, session_id, chunk_fingerprint, extraction_json, created_at \
+         FROM consolidation_chunk_progress \
+         WHERE session_id = ?3 AND NOT (workspace_id = ?1 AND project_id = ?2) \
+         ON CONFLICT(workspace_id, project_id, session_id, chunk_fingerprint) DO NOTHING",
+        params![&to_ws[..], &to_proj[..], &sid[..]],
+    )?;
+    tx.execute(
+        "DELETE FROM consolidation_chunk_progress \
+         WHERE session_id = ?1 AND NOT (workspace_id = ?2 AND project_id = ?3)",
+        params![&sid[..], &to_ws[..], &to_proj[..]],
     )?;
 
     // Page rows to handle: the source scope's in a real move; in a re-home,
@@ -10367,6 +10459,88 @@ pub(crate) mod tests {
         .collect()
     }
 
+    /// A project purge removes the checkpoints of its own scope and of its
+    /// sessions stamped under a sibling project: a session's rows are
+    /// gathered by session id, so a checkpoint can sit outside the project's
+    /// own scope. The subquery reads `sessions`, so it must run before the
+    /// cascade removes them. Another project's rows survive; a dry run
+    /// deletes nothing.
+    #[test]
+    fn purge_project_deletes_consolidation_checkpoints() {
+        let (_tmp, mut conn, ws, proj) = fresh_db();
+        let other = get_or_create_project(&mut conn, &ws, "other", None).unwrap();
+        let (sid, _) = seed_session(&mut conn, ws, proj, "purgedproj");
+        let (other_sid, _) = seed_session(&mut conn, ws, other, "otherproj");
+        record_consolidation_chunk(&conn, &ws, &proj, &sid, "fp-a", "project-extraction").unwrap();
+        // The purged project's session, stamped under a sibling project.
+        record_consolidation_chunk(&conn, &ws, &other, &sid, "fp-b", "stray-extraction").unwrap();
+        record_consolidation_chunk(&conn, &ws, &other, &other_sid, "fp-a", "other-extraction")
+            .unwrap();
+
+        // The dry run previews, it does not delete.
+        purge_project(
+            &mut conn,
+            &ws,
+            &proj,
+            "default/scratch",
+            None,
+            false,
+            Compaction::Skip,
+            PurgeMode::Preview,
+        )
+        .unwrap();
+        let own_before: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM consolidation_chunk_progress WHERE project_id = ?1",
+                params![proj.as_bytes()],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(own_before, 1, "the preview leaves the project's own row");
+        assert_eq!(
+            load_consolidation_chunks(&conn, &ws, &other, &sid)
+                .unwrap()
+                .len(),
+            1,
+            "the preview leaves the sibling-stamped row"
+        );
+
+        purge_project(
+            &mut conn,
+            &ws,
+            &proj,
+            "default/scratch",
+            None,
+            false,
+            Compaction::Skip,
+            PurgeMode::Commit,
+        )
+        .unwrap();
+
+        let by_project: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM consolidation_chunk_progress WHERE project_id = ?1",
+                params![proj.as_bytes()],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(by_project, 0, "the project's own row is gone");
+        assert_eq!(
+            load_consolidation_chunks(&conn, &ws, &other, &sid)
+                .unwrap()
+                .len(),
+            0,
+            "the session's checkpoint under the sibling project goes with the purge"
+        );
+        assert_eq!(
+            load_consolidation_chunks(&conn, &ws, &other, &other_sid)
+                .unwrap()
+                .len(),
+            1,
+            "the other project's session keeps its checkpoint"
+        );
+    }
+
     /// The reason `reclaim_freed_pages` rebuilds all three FTS indexes rather
     /// than the two a session purge needs.
     ///
@@ -10644,6 +10818,89 @@ pub(crate) mod tests {
         assert!(
             from_session_id.is_none(),
             "the handoff's from_session_id must be nulled, not the row deleted"
+        );
+    }
+
+    /// A workspace delete removes the checkpoints of its projects and
+    /// sessions — including a residual row stamped with a foreign
+    /// `workspace_id` but this workspace's `project_id` — and leaves another
+    /// workspace's rows alone. The no-`force` refusal and the dry run both
+    /// delete nothing.
+    #[test]
+    fn delete_workspace_deletes_consolidation_checkpoints() {
+        let (_tmp, mut conn, ws, proj) = fresh_db();
+        let other_ws = get_or_create_workspace(&mut conn, "other").unwrap();
+        let other_proj = get_or_create_project(&mut conn, &other_ws, "other", None).unwrap();
+        let stray_ws = get_or_create_workspace(&mut conn, "stray").unwrap();
+        let (sid, _) = seed_session(&mut conn, ws, proj, "purgedws");
+        let (other_sid, _) = seed_session(&mut conn, other_ws, other_proj, "otherws");
+        record_consolidation_chunk(&conn, &ws, &proj, &sid, "fp-a", "workspace-extraction")
+            .unwrap();
+        // A residual row: a foreign workspace, but this workspace's project.
+        record_consolidation_chunk(&conn, &stray_ws, &proj, &sid, "fp-b", "residual-extraction")
+            .unwrap();
+        record_consolidation_chunk(
+            &conn,
+            &other_ws,
+            &other_proj,
+            &other_sid,
+            "fp-a",
+            "other-extraction",
+        )
+        .unwrap();
+
+        // The no-`force` refusal must delete nothing.
+        let err = delete_workspace(&mut conn, &ws, false, Compaction::Skip, PurgeMode::Commit)
+            .expect_err("a workspace holding a project refuses without `force`");
+        assert!(
+            matches!(err, StoreError::WorkspaceNotEmpty(_)),
+            "got {err:?}"
+        );
+        assert_eq!(
+            load_consolidation_chunks(&conn, &ws, &proj, &sid)
+                .unwrap()
+                .len(),
+            1,
+            "the refusal leaves the row"
+        );
+
+        // The dry run previews, it does not delete.
+        delete_workspace(&mut conn, &ws, true, Compaction::Skip, PurgeMode::Preview).unwrap();
+        assert_eq!(
+            load_consolidation_chunks(&conn, &ws, &proj, &sid)
+                .unwrap()
+                .len(),
+            1,
+            "the preview leaves the row"
+        );
+
+        delete_workspace(&mut conn, &ws, true, Compaction::Skip, PurgeMode::Commit).unwrap();
+
+        let by_workspace: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM consolidation_chunk_progress WHERE workspace_id = ?1",
+                params![ws.as_bytes()],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(by_workspace, 0, "no row keeps the deleted workspace_id");
+        let by_project: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM consolidation_chunk_progress WHERE project_id = ?1",
+                params![proj.as_bytes()],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            by_project, 0,
+            "the residual row with this workspace's project_id is removed"
+        );
+        assert_eq!(
+            load_consolidation_chunks(&conn, &other_ws, &other_proj, &other_sid)
+                .unwrap()
+                .len(),
+            1,
+            "the other workspace's row survives"
         );
     }
 
@@ -11838,6 +12095,41 @@ pub(crate) mod tests {
         );
     }
 
+    /// The `--compact` promise on checkpoints: `extraction_json` is session
+    /// content, so a reclaimed purge must not leave its bytes in the database
+    /// file — the same pattern as the observation-body test above.
+    #[test]
+    fn purge_session_with_reclaim_removes_checkpoint_bytes_from_the_file() {
+        let (tmp, mut conn, ws, proj) = fresh_db();
+        let db_path = tmp.path().join("test.sqlite");
+        let (sid, _) = seed_session(&mut conn, ws, proj, "target");
+        let (keep, _) = seed_session(&mut conn, ws, proj, "keep");
+        record_consolidation_chunk(&conn, &ws, &proj, &sid, "fp", "CHKPURGE-XYZ-04271").unwrap();
+        record_consolidation_chunk(&conn, &ws, &proj, &keep, "fp", "CHKKEEP--ABC-99318").unwrap();
+
+        purge_session(
+            &mut conn,
+            ws,
+            proj,
+            sid,
+            None,
+            Compaction::Reclaim,
+            PurgeMode::Commit,
+        )
+        .unwrap();
+
+        conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);").ok();
+        let bytes = std::fs::read(&db_path).unwrap();
+        assert!(
+            !bytes.windows(10).any(|w| w == b"CHKPURGE-X"),
+            "Reclaim must remove the purged checkpoint's bytes from the database file"
+        );
+        assert!(
+            bytes.windows(10).any(|w| w == b"CHKKEEP--A"),
+            "the surviving session's checkpoint bytes are untouched by the compaction"
+        );
+    }
+
     /// Row counts of every table a real session purge touches, used to prove
     /// a dry run changed nothing. `purged_sessions` and `audit_log` are
     /// included deliberately: both are written inside the same transaction
@@ -12291,6 +12583,107 @@ pub(crate) mod tests {
             "still gone"
         );
         assert_eq!(count(&conn, "SELECT COUNT(*) FROM observations"), 0);
+    }
+
+    /// A session purge deletes its checkpoint rows in every scope they
+    /// landed in — a row stamped under a sibling project goes with the
+    /// session, like the `profile_candidates` and `observations` it is
+    /// shaped after. A sibling session's row survives, a dry run deletes
+    /// nothing, and a purge refused by wrong scope deletes nothing.
+    #[test]
+    fn purge_session_deletes_consolidation_checkpoints_in_every_scope() {
+        let (_tmp, mut conn, ws, proj) = fresh_db();
+        let other = get_or_create_project(&mut conn, &ws, "other", None).unwrap();
+        let (sid, _) = seed_session(&mut conn, ws, proj, "purged");
+        let (sibling, _) = seed_session(&mut conn, ws, proj, "sibling");
+        record_consolidation_chunk(&conn, &ws, &proj, &sid, "fp-a", "purged-extraction").unwrap();
+        // A checkpoint of the same session stamped under a sibling project.
+        record_consolidation_chunk(&conn, &ws, &other, &sid, "fp-b", "stray-extraction").unwrap();
+        record_consolidation_chunk(&conn, &ws, &proj, &sibling, "fp-a", "sibling-extraction")
+            .unwrap();
+
+        // The dry run previews, it does not delete.
+        purge_session(
+            &mut conn,
+            ws,
+            proj,
+            sid,
+            None,
+            Compaction::Skip,
+            PurgeMode::Preview,
+        )
+        .unwrap();
+        assert_eq!(
+            load_consolidation_chunks(&conn, &ws, &proj, &sid)
+                .unwrap()
+                .len(),
+            1,
+            "the preview leaves the own-scope row"
+        );
+        assert_eq!(
+            load_consolidation_chunks(&conn, &ws, &other, &sid)
+                .unwrap()
+                .len(),
+            1,
+            "the preview leaves the sibling-stamped row"
+        );
+
+        // A purge named at the wrong scope is refused and deletes nothing.
+        let err = purge_session(
+            &mut conn,
+            ws,
+            other,
+            sid,
+            None,
+            Compaction::Skip,
+            PurgeMode::Commit,
+        )
+        .expect_err("the session lives in `proj`, not `other`");
+        assert!(matches!(err, StoreError::NotFound(_)), "got {err:?}");
+        assert_eq!(
+            load_consolidation_chunks(&conn, &ws, &proj, &sid)
+                .unwrap()
+                .len(),
+            1,
+            "the refusal leaves the own-scope row"
+        );
+        assert_eq!(
+            load_consolidation_chunks(&conn, &ws, &other, &sid)
+                .unwrap()
+                .len(),
+            1,
+            "the refusal leaves the sibling-stamped row"
+        );
+
+        purge_session(
+            &mut conn,
+            ws,
+            proj,
+            sid,
+            None,
+            Compaction::Skip,
+            PurgeMode::Commit,
+        )
+        .unwrap();
+
+        let left: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM consolidation_chunk_progress WHERE session_id = ?1",
+                params![sid.as_bytes()],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            left, 0,
+            "the purge removes the session's checkpoints in every scope"
+        );
+        assert_eq!(
+            load_consolidation_chunks(&conn, &ws, &proj, &sibling)
+                .unwrap()
+                .len(),
+            1,
+            "the sibling session's checkpoint survives"
+        );
     }
 
     /// `begin_session` is not the only way a hook event creates a session:
@@ -15960,6 +16353,40 @@ pub(crate) mod tests {
         assert_eq!(src_pages, 1, "rollback must preserve source pages");
     }
 
+    /// A checkpoint row follows the project into the destination workspace,
+    /// leaving nothing in the source workspace for the project.
+    #[test]
+    fn move_project_workspace_moves_consolidation_checkpoints_to_the_new_workspace() {
+        let (_tmp, mut conn, src_ws, proj) = fresh_db();
+        let dst_ws = get_or_create_workspace(&mut conn, "djalmajr").unwrap();
+        let sid = SessionId::new();
+        begin_session(&mut conn, &hook_session(sid, src_ws, proj, None)).unwrap();
+        end_session(&mut conn, &sid, None).unwrap();
+        record_consolidation_chunk(&conn, &src_ws, &proj, &sid, "fp", "moved-extraction").unwrap();
+
+        move_project_workspace(&mut conn, &proj, &src_ws, &dst_ws).unwrap();
+
+        let loaded = load_consolidation_chunks(&conn, &dst_ws, &proj, &sid).unwrap();
+        assert_eq!(
+            loaded.len(),
+            1,
+            "the checkpoint is readable in the new workspace"
+        );
+        assert_eq!(loaded[0].extraction_json, "moved-extraction");
+        let in_source: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM consolidation_chunk_progress \
+                 WHERE project_id = ?1 AND workspace_id = ?2",
+                params![proj.as_bytes(), src_ws.as_bytes()],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            in_source, 0,
+            "the move leaves nothing in the source workspace"
+        );
+    }
+
     #[test]
     fn merge_project_preserves_both_page_histories_and_dependent_rows() {
         let (_tmp, mut conn, ws, source) = fresh_db();
@@ -16451,6 +16878,103 @@ pub(crate) mod tests {
                 "ingest_keys must not sit in the other project"
             );
         }
+    }
+
+    /// Checkpoints follow the merged session: `merge_project` moves them to
+    /// the target scope using the merge's own workspace, and leaves nothing
+    /// in the source project. The preview changes nothing, and a third
+    /// project's row is left alone — the legitimate controls for the
+    /// source-only sweep.
+    #[test]
+    fn merge_project_moves_consolidation_checkpoints_to_the_target() {
+        let (_tmp, mut conn, ws, source) = fresh_db();
+        let target = get_or_create_project(&mut conn, &ws, "target", None).unwrap();
+        let third = get_or_create_project(&mut conn, &ws, "third", None).unwrap();
+        let sid = SessionId::new();
+        begin_session(&mut conn, &hook_session(sid, ws, source, None)).unwrap();
+        end_session(&mut conn, &sid, None).unwrap();
+        record_consolidation_chunk(&conn, &ws, &source, &sid, "fp", "source-extraction").unwrap();
+        let third_sid = SessionId::new();
+        begin_session(&mut conn, &hook_session(third_sid, ws, third, None)).unwrap();
+        end_session(&mut conn, &third_sid, None).unwrap();
+        record_consolidation_chunk(&conn, &ws, &third, &third_sid, "fp", "third-extraction")
+            .unwrap();
+
+        let count_in_project = |conn: &Connection, proj: ProjectId| -> i64 {
+            conn.query_row(
+                "SELECT COUNT(*) FROM consolidation_chunk_progress WHERE project_id = ?1",
+                params![proj.as_bytes()],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+
+        // The preview must not touch the checkpoint rows.
+        merge_project(&mut conn, ws, source, target, &[], false).unwrap();
+        assert_eq!(
+            count_in_project(&conn, source),
+            1,
+            "the preview leaves the source row"
+        );
+
+        merge_project(&mut conn, ws, source, target, &[], true).unwrap();
+        assert_eq!(
+            count_in_project(&conn, source),
+            0,
+            "the merge leaves no checkpoint behind in the source project"
+        );
+        let loaded = load_consolidation_chunks(&conn, &ws, &target, &sid).unwrap();
+        assert_eq!(
+            loaded.len(),
+            1,
+            "the resumed run reads the checkpoint in the target scope"
+        );
+        assert_eq!(loaded[0].extraction_json, "source-extraction");
+        assert_eq!(
+            count_in_project(&conn, third),
+            1,
+            "a third project's row is untouched"
+        );
+    }
+
+    /// A checkpoint row already in the target scope answers the same
+    /// (session, fingerprint) as the source row — the fingerprint is
+    /// content-derived, so both rows would serve the same input. The merge
+    /// must complete, keep the destination row, and leave nothing in the
+    /// source: a plain re-stamp would abort the whole merge on the primary
+    /// key collision.
+    #[test]
+    fn merge_project_collision_keeps_the_destination_checkpoint() {
+        let (_tmp, mut conn, ws, source) = fresh_db();
+        let target = get_or_create_project(&mut conn, &ws, "target", None).unwrap();
+        let sid = SessionId::new();
+        begin_session(&mut conn, &hook_session(sid, ws, source, None)).unwrap();
+        end_session(&mut conn, &sid, None).unwrap();
+        record_consolidation_chunk(&conn, &ws, &source, &sid, "fp", "source-extraction").unwrap();
+        // A residual row already in the target scope, same session and
+        // fingerprint — the shape a merge that ran partway before leaves.
+        record_consolidation_chunk(&conn, &ws, &target, &sid, "fp", "dest-extraction").unwrap();
+
+        merge_project(&mut conn, ws, source, target, &[], true).unwrap();
+
+        let loaded = load_consolidation_chunks(&conn, &ws, &target, &sid).unwrap();
+        assert_eq!(
+            loaded.len(),
+            1,
+            "the destination row survives the collision"
+        );
+        assert_eq!(
+            loaded[0].extraction_json, "dest-extraction",
+            "the destination row wins, the source row cannot overwrite it"
+        );
+        let left: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM consolidation_chunk_progress WHERE project_id = ?1",
+                params![source.as_bytes()],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(left, 0, "the source row must not survive the merge");
     }
 
     #[test]
@@ -16949,6 +17473,99 @@ pub(crate) mod tests {
         assert_eq!(summary.page_versions_moved, 0);
         assert_eq!(session_page_versions(&conn, sid, ws, stray), (1, 0));
         assert_eq!(session_page_versions(&conn, sid, ws, target), (2, 1));
+    }
+
+    /// A checkpoint row follows the session across workspaces, and a row of
+    /// a different session in the old project is left behind. A round trip
+    /// with a residual row already in the target must not abort the move —
+    /// the destination row wins the collision and the source row is deleted.
+    #[test]
+    fn move_session_moves_consolidation_checkpoints_to_the_target() {
+        let (_tmp, mut conn, src_ws, src_proj) = fresh_db();
+        let dst_ws = get_or_create_workspace(&mut conn, "other").unwrap();
+        let dst_proj = get_or_create_project(&mut conn, &dst_ws, "target", None).unwrap();
+        let sid = seed_movable_session(&mut conn, src_ws, src_proj);
+        record_consolidation_chunk(&conn, &src_ws, &src_proj, &sid, "fp", "moved-extraction")
+            .unwrap();
+        // Sibling session in the old project: its checkpoint must stay.
+        let (sibling, _) = seed_session(&mut conn, src_ws, src_proj, "sibling");
+        record_consolidation_chunk(
+            &conn,
+            &src_ws,
+            &src_proj,
+            &sibling,
+            "fp",
+            "sibling-extraction",
+        )
+        .unwrap();
+        // A residual row already in the target scope, same session and
+        // fingerprint: a plain re-stamp would abort the move here.
+        record_consolidation_chunk(&conn, &dst_ws, &dst_proj, &sid, "fp", "residual-extraction")
+            .unwrap();
+
+        move_session(
+            &mut conn,
+            sid,
+            dst_ws,
+            dst_proj,
+            PagesMode::Move,
+            None,
+            true,
+        )
+        .unwrap();
+
+        let loaded = load_consolidation_chunks(&conn, &dst_ws, &dst_proj, &sid).unwrap();
+        assert_eq!(
+            loaded.len(),
+            1,
+            "the checkpoint is readable in the target scope"
+        );
+        assert_eq!(
+            loaded[0].extraction_json, "residual-extraction",
+            "the destination row wins the collision"
+        );
+        let in_source: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM consolidation_chunk_progress \
+                 WHERE session_id = ?1 AND NOT (workspace_id = ?2 AND project_id = ?3)",
+                params![sid.as_bytes(), dst_ws.as_bytes(), dst_proj.as_bytes()],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            in_source, 0,
+            "the move leaves nothing behind for the moved session"
+        );
+        assert_eq!(
+            load_consolidation_chunks(&conn, &src_ws, &src_proj, &sibling)
+                .unwrap()
+                .len(),
+            1,
+            "the sibling session's checkpoint stays in the old project"
+        );
+
+        // Round trip: the session moves back to the original scope. The row
+        // now sitting in the move's source scope crosses back without
+        // aborting; the original scope receives it and the other is empty.
+        move_session(
+            &mut conn,
+            sid,
+            src_ws,
+            src_proj,
+            PagesMode::Move,
+            None,
+            true,
+        )
+        .unwrap();
+        let loaded = load_consolidation_chunks(&conn, &src_ws, &src_proj, &sid).unwrap();
+        assert_eq!(loaded.len(), 1, "the round trip brings the checkpoint home");
+        assert_eq!(
+            load_consolidation_chunks(&conn, &dst_ws, &dst_proj, &sid)
+                .unwrap()
+                .len(),
+            0,
+            "the round trip leaves nothing in the intermediate scope"
+        );
     }
 
     #[test]

@@ -10400,6 +10400,89 @@ mod tests {
         );
     }
 
+    /// Lifecycle row: the checkpoints follow the session through
+    /// `merge_project`. A run that paid the map blocks and failed before
+    /// publishing leaves them in the source scope; after the source project
+    /// is merged into the destination, a resumed run there must reuse them
+    /// instead of re-paying for the same calls.
+    #[tokio::test]
+    async fn chunked_merge_project_reuses_checkpoints_at_the_destination() {
+        let t = ChunkedTest::fresh().await;
+        let destination = t
+            .store
+            .writer
+            .get_or_create_project(t.ws, "destination", None)
+            .await
+            .unwrap();
+        let llm1 = Arc::new(StagedLlm::new("m1"));
+        let consolidator = t.consolidator(Arc::clone(&llm1));
+        let session = SessionId::new();
+        t.seed_session(session, &[big_body(), big_body()]).await;
+
+        // Run 1: both map blocks succeed (checkpoints recorded), then the
+        // final call fails — the run aborts with the checkpoints intact.
+        llm1.fail_final_once(LlmError::Auth("final stage denied".into()));
+        let outcome = consolidator
+            .consolidate_session(
+                session,
+                false,
+                ai_memory_core::ActorContext::anonymous(),
+                None,
+                None,
+            )
+            .await;
+        assert!(matches!(
+            outcome,
+            Err(ConsolidatorError::Llm(LlmError::Auth(_)))
+        ));
+        assert_eq!(llm1.calls(), (2, 0, 1));
+
+        // Close the session and merge its project into the destination. The
+        // checkpoints must follow the session's scope out of the source.
+        t.store.writer.end_session(session, None).await.unwrap();
+        t.store
+            .writer
+            .merge_project(t.ws, t.proj, destination, vec![], true)
+            .await
+            .unwrap();
+        assert!(
+            t.checkpoints(session).await.is_empty(),
+            "the source scope no longer holds the checkpoints"
+        );
+
+        // Run 2, resumed in the destination scope: every map block is
+        // reused, so the only call the fake provider sees is the final one.
+        let llm2 = Arc::new(StagedLlm::new("m1"));
+        let wiki = Wiki::new(t.tmp.path(), t.store.writer.clone()).unwrap();
+        let llm2_trait: Arc<dyn LlmProvider> = llm2.clone();
+        let consolidator2 = Consolidator::new(
+            t.store.reader.clone(),
+            t.store.writer.clone(),
+            wiki,
+            llm2_trait,
+            t.ws,
+            destination,
+        )
+        .with_chunking(t.base + 700, Some(t.base + 1_600), Some(&t.tokenizer_path))
+        .unwrap();
+        let outcome = consolidator2
+            .consolidate_session(
+                session,
+                false,
+                ai_memory_core::ActorContext::anonymous(),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        assert!(outcome.page_id.is_some());
+        assert_eq!(
+            llm2.calls(),
+            (0, 0, 1),
+            "the checkpoints merged into the destination must be reused: zero map calls"
+        );
+    }
+
     /// Clock row: checkpoints carry `created_at` only as bookkeeping. A row
     /// stamped a day in the future (a rolled-back or jumped clock) is still
     /// reused, because the decision is fingerprint-based, never
