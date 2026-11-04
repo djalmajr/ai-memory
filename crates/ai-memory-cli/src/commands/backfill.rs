@@ -43,15 +43,15 @@ use ai_memory_core::{NewWorkstreamEvent, WorkstreamEventKind};
 use ai_memory_hooks::capture_policy::metadata_only_body;
 use ai_memory_workstream::{
     LaunchRoots, ManagedHarness, OVERSIZED_RECORD_LOSS, build_launch_plan_with_env,
-    export_transcript, export_transcript_delta, export_transcript_range, list_native_sessions,
-    wait_for_transcript_flush,
+    export_transcript, export_transcript_delta, export_transcript_range, find_native_session,
+    list_native_sessions, wait_for_transcript_flush,
 };
 
 use super::doctor::{SCANNED_HARNESSES, relocated_session_dir};
 use super::run;
 use super::transcript_capture::{EventCapture, TranscriptCapture};
 use crate::config::Config;
-use crate::http_client::{ServerEndpoint, get_json, post_json};
+use crate::http_client::{ServerEndpoint, get_json, http_client, post_json};
 
 /// Circuit breaker on total imported events across the whole bootstrap. Once
 /// reached, no further sessions are started; the remaining sessions are
@@ -338,7 +338,7 @@ async fn backfill_endpoint(
     if let Some(url) = args.server_url.as_deref() {
         let static_token = crate::config::read_hook_auth_token(&config.data_dir);
         let token = super::hook_spool::resolve_bearer(
-            &reqwest::Client::new(),
+            &http_client(),
             &config.data_dir,
             static_token.as_deref(),
         )
@@ -433,13 +433,24 @@ async fn run_in(config: &Config, args: crate::cli::BackfillArgs, cwd: PathBuf) -
 
     // Import each selected session, oldest-first so the imported history reads
     // chronologically, until the total-events circuit breaker trips.
+    let mut session_dirs: Vec<(ManagedHarness, Option<PathBuf>)> = Vec::new();
     for session in selected.into_iter().rev() {
         if report.imported_events >= MAX_EVENTS_TOTAL {
             report.skipped_for_cap += 1;
             continue;
         }
-        match import_one(
-            &endpoint, &workspace, &project, &home, &cwd, &capture, &session,
+        let session_dir = cached_session_dir(&mut session_dirs, session.harness, || {
+            import_session_dir(&home, &cwd, session.harness)
+        });
+        match import_one_with_session_dir(
+            &endpoint,
+            &workspace,
+            &project,
+            &home,
+            &cwd,
+            &capture,
+            &session,
+            session_dir.as_deref(),
         )
         .await
         {
@@ -611,6 +622,21 @@ pub(crate) async fn collect_local_sessions_with(
     let mut limit_hit = Vec::new();
     for &harness in SCANNED_HARNESSES {
         let session_dir = session_dir_for(harness);
+        if let Some(id) = only_session {
+            // A named recovery target may be older than every session in the
+            // bounded listing. Resolve it directly, with the adapter's same
+            // checkout checks, rather than broadening the automatic scan.
+            if let Ok(Some(session)) =
+                find_native_session(harness, home, cwd, session_dir.as_deref(), id)
+            {
+                out.push(SessionRef {
+                    harness,
+                    native_session_id: session.native_session_id,
+                    updated_at: session.updated_at,
+                });
+            }
+            continue;
+        }
         let Ok(sessions) = list_native_sessions(
             harness,
             home,
@@ -626,9 +652,6 @@ pub(crate) async fn collect_local_sessions_with(
             limit_hit.push(harness);
         }
         for session in sessions {
-            if only_session.is_some_and(|want| want != session.native_session_id) {
-                continue;
-            }
             out.push(SessionRef {
                 harness,
                 native_session_id: session.native_session_id,
@@ -715,6 +738,7 @@ fn acknowledged_items(ack: &HookBatchAck, items: &[&HookItem]) -> Result<Vec<usi
 /// every event, so retroactive text crosses the same trust boundary as live
 /// capture, and `capture` drops or strips tool events the checkout's
 /// `[capture] ignore_paths` excludes before anything is posted.
+#[cfg(all(test, unix))]
 async fn import_one(
     endpoint: &ServerEndpoint,
     workspace: &str,
@@ -724,11 +748,51 @@ async fn import_one(
     capture: &TranscriptCapture,
     session: &SessionRef,
 ) -> Result<usize> {
+    let session_dir = import_session_dir(home, cwd, session.harness);
+    import_one_with_session_dir(
+        endpoint,
+        workspace,
+        project,
+        home,
+        cwd,
+        capture,
+        session,
+        session_dir.as_deref(),
+    )
+    .await
+}
+
+fn import_session_dir(home: &Path, cwd: &Path, harness: ManagedHarness) -> Option<PathBuf> {
     let roots = LaunchRoots { home, cwd };
-    let session_dir =
-        build_launch_plan_with_env(session.harness, None, Vec::new(), None, &[], Some(roots))
-            .ok()
-            .and_then(|plan| plan.session_dir);
+    build_launch_plan_with_env(harness, None, Vec::new(), None, &[], Some(roots))
+        .ok()
+        .and_then(|plan| plan.session_dir)
+}
+
+fn cached_session_dir(
+    cache: &mut Vec<(ManagedHarness, Option<PathBuf>)>,
+    harness: ManagedHarness,
+    resolve: impl FnOnce() -> Option<PathBuf>,
+) -> Option<PathBuf> {
+    if let Some((_, session_dir)) = cache.iter().find(|(cached, _)| *cached == harness) {
+        return session_dir.clone();
+    }
+    let session_dir = resolve();
+    cache.push((harness, session_dir.clone()));
+    session_dir
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn import_one_with_session_dir(
+    endpoint: &ServerEndpoint,
+    workspace: &str,
+    project: &str,
+    home: &Path,
+    cwd: &Path,
+    capture: &TranscriptCapture,
+    session: &SessionRef,
+    session_dir: Option<&Path>,
+) -> Result<usize> {
     import_exact_session(
         endpoint,
         workspace,
@@ -737,7 +801,7 @@ async fn import_one(
         cwd,
         session.harness,
         &session.native_session_id,
-        session_dir.as_deref(),
+        session_dir,
         None,
         capture,
     )
@@ -1386,6 +1450,24 @@ mod tests {
     }
 
     #[test]
+    fn session_directory_resolution_is_cached_per_harness() {
+        let mut cache = Vec::new();
+        let mut calls = 0;
+        let first = cached_session_dir(&mut cache, ManagedHarness::Crush, || {
+            calls += 1;
+            Some(PathBuf::from("crush-data"))
+        });
+        let second = cached_session_dir(&mut cache, ManagedHarness::Crush, || {
+            calls += 1;
+            Some(PathBuf::from("wrong"))
+        });
+
+        assert_eq!(first, Some(PathBuf::from("crush-data")));
+        assert_eq!(second, first);
+        assert_eq!(calls, 1);
+    }
+
+    #[test]
     fn member_sessions_path_encodes_each_name_as_one_segment() {
         assert_eq!(
             member_sessions_path("team", "app").unwrap(),
@@ -1862,6 +1944,7 @@ mod tests {
             mid_session_routing: ai_memory_core::MidSessionRouting::default(),
             profile: ai_memory_core::profile::ProfileSettings::default(),
             ingest_drop_list: ai_memory_hooks::IngestDropList::default(),
+            record_tool_names: false,
             skip_wiki_checkpoints: false,
         };
         let endpoint = ServerEndpoint::for_hook_target("http://localhost".into(), None);
@@ -2064,6 +2147,7 @@ mod tests {
             mid_session_routing: ai_memory_core::MidSessionRouting::default(),
             profile: ai_memory_core::profile::ProfileSettings::default(),
             ingest_drop_list: ai_memory_hooks::IngestDropList::default(),
+            record_tool_names: false,
             skip_wiki_checkpoints: false,
         };
         let endpoint = ServerEndpoint::for_hook_target("http://localhost".into(), None);
@@ -2430,6 +2514,190 @@ mod tests {
         let (only, _limit_hit) =
             collect_local_sessions_with(home.path(), cwd.path(), Some("nope"), |_| None).await;
         assert!(only.is_empty(), "no session matches the filter: {only:?}");
+    }
+
+    // These exercise the real listing cap with more than 200 files/rows.
+    // Setup, listing and cleanup take more than a second alone on macOS,
+    // even with the SQLite fixture inserted in one transaction.
+    mod slow_explicit_session_lookup {
+        use super::*;
+
+        #[tokio::test]
+        async fn collect_local_sessions_explicit_file_target_bypasses_listing_cap() {
+            let home = tempfile::tempdir().unwrap();
+            let cwd = tempfile::tempdir().unwrap();
+            let session_dir = home
+                .path()
+                .join(".claude/projects")
+                .join(ai_memory_workstream::claude_project_dir_name(cwd.path()));
+            std::fs::create_dir_all(&session_dir).unwrap();
+            let target = "11111111-2222-4333-8444-000000000000";
+            for index in 0..=PER_HARNESS_SCAN_LIMIT {
+                let id = format!("11111111-2222-4333-8444-{index:012}");
+                let header = serde_json::json!({ "sessionId": id, "cwd": cwd.path() });
+                let path = session_dir.join(format!("{id}.jsonl"));
+                std::fs::write(&path, format!("{header}\n")).unwrap();
+                std::fs::File::options()
+                    .write(true)
+                    .open(path)
+                    .unwrap()
+                    .set_times(std::fs::FileTimes::new().set_modified(
+                        SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000 + index as u64),
+                    ))
+                    .unwrap();
+            }
+
+            let (listed, limit_hit) =
+                collect_local_sessions_with(home.path(), cwd.path(), None, |_| None).await;
+            assert_eq!(listed.len(), PER_HARNESS_SCAN_LIMIT);
+            assert_eq!(limit_hit, vec![ManagedHarness::Claude]);
+            assert!(
+                listed
+                    .iter()
+                    .all(|session| session.native_session_id != target)
+            );
+
+            let (selected, limit_hit) =
+                collect_local_sessions_with(home.path(), cwd.path(), Some(target), |_| None).await;
+            assert_eq!(selected.len(), 1, "the explicit old session must be found");
+            assert_eq!(selected[0].harness, ManagedHarness::Claude);
+            assert_eq!(selected[0].native_session_id, target);
+            assert_eq!(
+                selected[0].updated_at,
+                SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000),
+            );
+            assert!(
+                limit_hit.is_empty(),
+                "an exact lookup is not a capped listing"
+            );
+
+            for missing in ["no-such-session", "../outside", ""] {
+                let (selected, _) =
+                    collect_local_sessions_with(home.path(), cwd.path(), Some(missing), |_| None)
+                        .await;
+                assert!(selected.is_empty(), "must not select {missing:?}");
+            }
+            let foreign = tempfile::tempdir().unwrap();
+            let (selected, _) =
+                collect_local_sessions_with(home.path(), foreign.path(), Some(target), |_| None)
+                    .await;
+            assert!(
+                selected.is_empty(),
+                "the exact ID must still belong to this cwd"
+            );
+        }
+
+        #[tokio::test]
+        async fn collect_local_sessions_explicit_sql_target_bypasses_listing_cap() {
+            let home = tempfile::tempdir().unwrap();
+            let cwd = tempfile::tempdir().unwrap();
+            let store = home.path().join("opencode");
+            std::fs::create_dir_all(&store).unwrap();
+            let mut db = rusqlite::Connection::open(store.join("opencode.db")).unwrap();
+            let transaction = db.transaction().unwrap();
+            for table in ["session", "session_v2"] {
+                transaction.execute_batch(&format!(
+                "CREATE TABLE {table}(id TEXT PRIMARY KEY, directory TEXT, time_updated INTEGER);"
+            ))
+            .unwrap();
+                for index in 0..=PER_HARNESS_SCAN_LIMIT {
+                    transaction
+                        .execute(
+                            &format!("INSERT INTO {table} VALUES (?1, ?2, ?3)"),
+                            rusqlite::params![
+                                format!("{table}-{index:04}"),
+                                cwd.path().to_string_lossy(),
+                                1_700_000_000_000_i64 + index as i64,
+                            ],
+                        )
+                        .unwrap();
+                }
+            }
+            transaction.commit().unwrap();
+            let session_dir_for = |harness| {
+                matches!(
+                    harness,
+                    ManagedHarness::OpenCode | ManagedHarness::OpenCode2
+                )
+                .then(|| store.clone())
+            };
+            let (listed, limit_hit) =
+                collect_local_sessions_with(home.path(), cwd.path(), None, session_dir_for).await;
+            assert_eq!(listed.len(), 2 * PER_HARNESS_SCAN_LIMIT);
+            assert_eq!(
+                limit_hit,
+                vec![ManagedHarness::OpenCode, ManagedHarness::OpenCode2]
+            );
+
+            for (table, harness) in [
+                ("session", ManagedHarness::OpenCode),
+                ("session_v2", ManagedHarness::OpenCode2),
+            ] {
+                let target = format!("{table}-0000");
+                let (selected, limit_hit) = collect_local_sessions_with(
+                    home.path(),
+                    cwd.path(),
+                    Some(&target),
+                    session_dir_for,
+                )
+                .await;
+                assert_eq!(selected.len(), 1, "the explicit old {harness:?} session");
+                assert_eq!(selected[0].harness, harness);
+                assert_eq!(selected[0].native_session_id, target);
+                assert_eq!(
+                    selected[0].updated_at,
+                    SystemTime::UNIX_EPOCH + Duration::from_millis(1_700_000_000_000),
+                );
+                assert!(limit_hit.is_empty());
+
+                let foreign = tempfile::tempdir().unwrap();
+                let (selected, _) = collect_local_sessions_with(
+                    home.path(),
+                    foreign.path(),
+                    Some(&target),
+                    session_dir_for,
+                )
+                .await;
+                assert!(
+                    selected.is_empty(),
+                    "must not import a foreign {harness:?} session"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn collect_local_sessions_explicit_crush_target_keeps_subagents_excluded() {
+        let home = tempfile::tempdir().unwrap();
+        let cwd = tempfile::tempdir().unwrap();
+        let store = cwd.path().join(".crush");
+        std::fs::create_dir_all(&store).unwrap();
+        let db = rusqlite::Connection::open(store.join("crush.db")).unwrap();
+        db.execute_batch(
+            "CREATE TABLE sessions(id TEXT PRIMARY KEY, parent_session_id TEXT, updated_at INTEGER); \
+             INSERT INTO sessions VALUES ('parent', NULL, 1700000000); \
+             INSERT INTO sessions VALUES ('child', 'parent', 1700000001); \
+             INSERT INTO sessions VALUES ('invalid-time', NULL, -1);",
+        )
+        .unwrap();
+        let session_dir_for = |harness| (harness == ManagedHarness::Crush).then(|| store.clone());
+        let (selected, limit_hit) =
+            collect_local_sessions_with(home.path(), cwd.path(), Some("parent"), session_dir_for)
+                .await;
+        assert_eq!(selected.len(), 1);
+        assert_eq!(selected[0].harness, ManagedHarness::Crush);
+        assert_eq!(selected[0].native_session_id, "parent");
+        assert_eq!(
+            selected[0].updated_at,
+            SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000),
+        );
+        assert!(limit_hit.is_empty());
+        for id in ["child", "invalid-time", "missing"] {
+            let (selected, _) =
+                collect_local_sessions_with(home.path(), cwd.path(), Some(id), session_dir_for)
+                    .await;
+            assert!(selected.is_empty(), "must not select {id}");
+        }
     }
 
     /// GHSA-gcpc-88hm-3xqr: a planted Claude transcript reads one file under

@@ -332,10 +332,9 @@ pub struct Config {
     /// CLI commands prepend it to every `/admin/*` request so deployments
     /// hosted behind a reverse proxy under a subpath don't 404. Settable via
     /// `AI_MEMORY_BASE_PATH`. Empty for root-mounted deployments (the
-    /// default). The `serve` subcommand reads the same env var via clap and
-    /// nests its router accordingly; this field is what the thin-client
-    /// path needs to discover the same prefix without a second
-    /// `std::env::var` call (invariant: one config-read path).
+    /// default). The `serve` subcommand uses this value unless an explicit
+    /// flag or env override wins, so it mounts the same prefix thin clients
+    /// resolve without another environment read (invariant: one config-read path).
     #[serde(default)]
     pub base_path: String,
     /// Operator home directory, captured once here (the single config-read
@@ -402,9 +401,10 @@ pub struct Config {
     /// OpenCode asks callers for `x-opencode-session` plus a specific
     /// `User-Agent` and reports traffic carrying neither as an unknown
     /// client. Set with
-    /// `AI_MEMORY_LLM_HEADERS=x-opencode-session=…,user-agent=…` (comma
-    /// separated, so a header *value* cannot contain a comma — use
-    /// `llm_headers` in `config.toml` for those) or `llm_headers = [...]`.
+    /// `AI_MEMORY_LLM_HEADERS='["x-opencode-session=…","user-agent=…"]'` (a
+    /// JSON array of `Name: Value` / `Name=Value` strings; a bare comma
+    /// separated string is rejected at config load) or
+    /// `llm_headers = [...]` in `config.toml`.
     ///
     /// Headers ai-memory sets itself (`authorization`, `content-type`,
     /// `x-api-key`, …) are refused at startup: `reqwest` appends rather than
@@ -478,7 +478,8 @@ pub struct Config {
     /// per harness and config home. Turn off with `AI_MEMORY_RUN_AUTOWIRE=false` /
     /// `run_autowire = false`, or per launch with `ai-memory run --no-autowire`.
     pub run_autowire: bool,
-    /// Named, env-only presets for `ai-memory run --profile NAME`.
+    /// Managed-launch settings, including the exit menu and named, env-only
+    /// presets for `ai-memory run --profile NAME`.
     /// Profiles deliberately do not carry executable paths, native argv, or
     /// permission-bypass flags. Configure them under `[run.profiles.<name>.env]`.
     #[serde(default)]
@@ -526,6 +527,12 @@ pub struct Config {
     /// preserves the fused, authority-adjusted order. Set with
     /// `AI_MEMORY_RERANKER=llm`.
     pub reranker: Option<String>,
+    /// Wall-clock budget, in seconds, for one rerank call before the search
+    /// answers from the pre-rerank order. Defaults to
+    /// `ai_memory_llm::reranker::RERANK_TIMEOUT` (20s). Raise it when the
+    /// LLM chain falls back across slow free-tier candidates (a hosted 503
+    /// can take ~20s alone). Set with `AI_MEMORY_RERANK_TIMEOUT_SECS`.
+    pub rerank_timeout_secs: u64,
     /// Optional embedding provider (`openai`, `voyage`, `google` / `gemini`,
     /// or `openai-compat`).
     pub embedding_provider: Option<String>,
@@ -622,6 +629,8 @@ pub struct Config {
     /// LLM consolidation prompt limits. Defaults are sized for a model with a
     /// 200k-token context window.
     pub consolidation: ConsolidationSettings,
+    /// Optional context admission for query answer synthesis.
+    pub query_answer: QueryAnswerSettings,
     /// Auto-improvement reviewer. The scheduler launches background review for
     /// newly completed sessions; manual CLI/admin/MCP runs remain available.
     /// Both approve validated proposals by default unless `require_approval` is
@@ -1357,6 +1366,12 @@ pub struct IngestSettings {
     /// (`AI_MEMORY_INGEST__DROP_EVENTS=pre-tool-use`).
     #[serde(default, deserialize_with = "deserialize_string_or_vec")]
     pub drop_events: Vec<String>,
+    /// Name each tool call in its observation: `tool non-file: Bash` instead
+    /// of `tool non-file`, plus the skill (`Skill`) or subagent type
+    /// (`Agent`) a Claude Code call ran. Only identifiers are kept, never a
+    /// tool's arguments, and a call a capture policy reduced to metadata stays
+    /// unnamed. Off by default (`AI_MEMORY_INGEST__RECORD_TOOL_NAMES`).
+    pub record_tool_names: bool,
     /// The validated list the hook router checks. Set by [`Config::load`];
     /// never read from or written to a config file. Kept off the `Config`
     /// stack frame because that value is constructed in short-stack CLI
@@ -1436,6 +1451,7 @@ impl Default for Config {
             strip_root_combinators: false,
             gemini_safe_schemas: false,
             reranker: None,
+            rerank_timeout_secs: ai_memory_llm::reranker::RERANK_TIMEOUT.as_secs(),
             embedding_provider: None,
             embedding_model: None,
             embedding_dim: None,
@@ -1452,6 +1468,7 @@ impl Default for Config {
             search: SearchSettings::default(),
             slots: SlotSettings::default(),
             consolidation: ConsolidationSettings::default(),
+            query_answer: QueryAnswerSettings::default(),
             auto_improve: AutoImproveSettings::default(),
             handoff: HandoffSettings::default(),
             profile: ai_memory_core::profile::ProfileSettings::default(),
@@ -1472,9 +1489,13 @@ impl Default for Config {
 }
 
 /// `[run]` settings for the managed harness launcher.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct RunSettings {
+    /// Offer the switch/rerun menu after a successful interactive session.
+    /// On by default; `AI_MEMORY_RUN_EXIT_PROMPT=false` or
+    /// `run --no-exit-prompt` disables it.
+    pub exit_prompt: bool,
     /// Persisted env-only launch profiles, selected with `run --profile`.
     pub profiles: BTreeMap<String, RunProfile>,
     /// Fail a managed launch when the server is unreachable instead of
@@ -1483,6 +1504,16 @@ pub struct RunSettings {
     /// `AI_MEMORY_RUN_REQUIRE_SERVER=true` request it per launch or per
     /// environment.
     pub require_server: bool,
+}
+
+impl Default for RunSettings {
+    fn default() -> Self {
+        Self {
+            exit_prompt: true,
+            profiles: BTreeMap::new(),
+            require_server: false,
+        }
+    }
 }
 
 /// One named managed-launch preset.
@@ -1553,6 +1584,16 @@ fn validate_run_profiles(run: &RunSettings) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// Optional query-answer context admission. Omitted means unlimited admission.
+/// The limit counts each UTF-8 input byte as one estimated token and reserves
+/// schema, 1024 envelope units and the requested output token allowance.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct QueryAnswerSettings {
+    /// Conservative combined context target; not a tokenizer-exact guarantee.
+    pub max_context_tokens: Option<usize>,
 }
 
 /// `[consolidation]` LLM consolidation prompt sizing.
@@ -1723,6 +1764,9 @@ pub struct AutoImproveEvalSettings {
     pub enabled: bool,
     /// Executable command plus whitespace-separated args. Executed directly, not through a shell.
     pub command: String,
+    /// Built-in scorer, run in-process. `structure` is the only one; it is
+    /// mutually exclusive with `command` (#1638).
+    pub builtin: String,
     /// Timeout per proposal eval command.
     pub timeout_secs: u64,
     /// Wiki path prefixes that require eval when enabled.
@@ -1736,6 +1780,7 @@ impl Default for AutoImproveEvalSettings {
         Self {
             enabled: false,
             command: String::new(),
+            builtin: String::new(),
             timeout_secs: 120,
             targets: ai_memory_consolidate::default_auto_improve_eval_targets(),
             min_delta: 0.0,
@@ -2357,24 +2402,45 @@ fn toml_parse_error_message(raw: &str, parse: &toml_edit::TomlError) -> String {
     match parse.span().map(|span| span.start) {
         Some(offset) => {
             let (line, column) = toml_error_position(raw, offset);
-            format!(
-                "TOML parse error at line {line}, column {column}: {}",
-                parse.message()
-            )
+            // The message is empty for an end-of-input error (a value missing
+            // at EOF has nothing left to name); report the failure class
+            // instead of ending on a blank reason.
+            let reason = parse.message().trim();
+            if reason.is_empty() {
+                format!("TOML parse error at line {line}, column {column}: invalid TOML syntax")
+            } else {
+                format!("TOML parse error at line {line}, column {column}: {reason}")
+            }
         }
         None => parse.message().to_string(),
     }
 }
 
 /// 1-based `(line, column)` of byte `offset`, the same way the parser's own
-/// display reports a position.
+/// display reports a position: an offset at the end of the input points one
+/// column past the last character of the final line.
 fn toml_error_position(raw: &str, offset: usize) -> (usize, usize) {
     let bytes = raw.as_bytes();
     if bytes.is_empty() {
         return (1, 1);
     }
-    let index = offset.min(bytes.len() - 1);
-    let line_start = bytes[..index]
+    if offset >= bytes.len() {
+        // End of file: one past the last character of the final line.
+        let line_start = bytes
+            .iter()
+            .rposition(|byte| *byte == b'\n')
+            .map_or(0, |nl| nl + 1);
+        let line = bytes[..line_start]
+            .iter()
+            .filter(|byte| **byte == b'\n')
+            .count()
+            + 1;
+        let column = std::str::from_utf8(&bytes[line_start..])
+            .map(|s| s.chars().count() + 1)
+            .unwrap_or_else(|_| bytes.len() - line_start + 1);
+        return (line, column);
+    }
+    let line_start = bytes[..offset]
         .iter()
         .rposition(|byte| *byte == b'\n')
         .map_or(0, |nl| nl + 1);
@@ -2383,10 +2449,94 @@ fn toml_error_position(raw: &str, offset: usize) -> (usize, usize) {
         .filter(|byte| **byte == b'\n')
         .count()
         + 1;
-    let column = std::str::from_utf8(&bytes[line_start..=index])
+    let column = std::str::from_utf8(&bytes[line_start..=offset])
         .map(|s| s.chars().count())
-        .unwrap_or(index - line_start);
+        .unwrap_or(offset - line_start + 1);
     (line, column)
+}
+
+/// The class of a `figment::error::Actual`, without its value: the error
+/// rewrite below must say what kind of thing arrived (a string, an
+/// integer), never what it said — a `[auth].bearer_token` is the value that
+/// must stay out of the message.
+fn actual_class(actual: &figment::error::Actual) -> &'static str {
+    use figment::error::Actual::*;
+    match actual {
+        Bool(_) => "boolean",
+        Unsigned(_) => "unsigned integer",
+        Signed(_) => "integer",
+        Float(_) => "float",
+        Char(_) => "character",
+        Str(_) => "string",
+        Bytes(_) => "bytes",
+        Unit => "unit",
+        Option => "option",
+        NewtypeStruct => "newtype struct",
+        Seq => "sequence",
+        Map => "map",
+        Enum => "enum",
+        UnitVariant => "unit variant",
+        NewtypeVariant => "newtype variant",
+        TupleVariant => "tuple variant",
+        StructVariant => "struct variant",
+        Other(_) => "other",
+    }
+}
+
+/// Reword a figment extraction error so no value reaches stderr: figment's
+/// own display prints the value it found (``found signed int
+/// `123456789012` ``), and a numeric `[auth].bearer_token` saved without
+/// quotes is the confirmed leak. The chain is walked from the outermost
+/// link: the first kind that must be value-free is reworded with the key
+/// and the expected type and none of the value, and the other kinds keep
+/// their current text. Returns `None` — so the original error stands — when
+/// no link needs rewording.
+fn reword_figment_error(err: figment::error::Error) -> Option<String> {
+    for e in err {
+        let key = e.path.join(".");
+        let with_key = |head: String| {
+            if key.is_empty() {
+                head
+            } else {
+                format!("{head} for key \"{key}\"")
+            }
+        };
+        match &e.kind {
+            figment::error::Kind::InvalidType(actual, expected) => {
+                return Some(with_key(format!(
+                    "invalid type: found {}, expected {}",
+                    actual_class(actual),
+                    expected
+                )));
+            }
+            figment::error::Kind::InvalidValue(actual, expected) => {
+                return Some(with_key(format!(
+                    "invalid value: found {}, expected {}",
+                    actual_class(actual),
+                    expected
+                )));
+            }
+            // The unknown variant name is the value the input held; the
+            // rewording keeps only the expected list.
+            figment::error::Kind::UnknownVariant(_, expected) => {
+                return Some(with_key(format!(
+                    "unknown variant: expected one of: {}",
+                    expected.join(", ")
+                )));
+            }
+            figment::error::Kind::Unsupported(actual) => {
+                return Some(format!("unsupported: {}", actual_class(actual)));
+            }
+            figment::error::Kind::UnsupportedKey(actual, _) => {
+                return Some(format!("unsupported key: {}", actual_class(actual)));
+            }
+            // MissingField, UnknownField, DuplicateField, InvalidLength,
+            // Message and friends name fields or classes, not values: their
+            // current text is safe as is.
+            _ => continue,
+        }
+    }
+    None
 }
 
 impl Config {
@@ -2414,24 +2564,62 @@ impl Config {
             .map(PathBuf::from)
             .unwrap_or_else(|| probe_data_dir.join("config.toml"));
 
+        // The file is read exactly once: the pre-parse check, the figment
+        // merge and the explicit-key lookups must all work on the same bytes,
+        // so a file replaced between two reads cannot put the credential on
+        // the error path the check never saw.
+        let config_text = if resolved_config_path.is_file() {
+            Some(Self::load_config_text(&resolved_config_path)?)
+        } else {
+            None
+        };
+        Self::load_from_text(
+            &resolved_config_path,
+            config_text,
+            cli_data_dir,
+            runtime_env,
+        )
+    }
+
+    /// Read the config file once, up front, and pre-parse it so a syntax
+    /// error can be reported without the offending line — which may hold
+    /// `[auth].bearer_token`, since the TOML parser's own display echoes it
+    /// as a margin snippet. Returns the exact bytes the caller must then
+    /// hand to `load_from_text`, so the file is never read twice.
+    ///
+    /// # Errors
+    /// Fails with the IO error (never the file's content) when the file
+    /// cannot be read or is not valid UTF-8, and with the file, line,
+    /// column and reason when it is not valid TOML.
+    pub(crate) fn load_config_text(path: &Path) -> Result<String> {
+        let raw = std::fs::read_to_string(path).map_err(|err| {
+            anyhow::anyhow!(
+                "loading configuration (config file = {}): {err}",
+                path.display()
+            )
+        })?;
+        if let Err(parse) = raw.parse::<toml_edit::DocumentMut>() {
+            return Err(anyhow::anyhow!(
+                "loading configuration (config file = {}): {}",
+                path.display(),
+                toml_parse_error_message(&raw, &parse)
+            ));
+        }
+        Ok(raw)
+    }
+
+    pub(crate) fn load_from_text(
+        resolved_config_path: &Path,
+        config_text: Option<String>,
+        cli_data_dir: Option<PathBuf>,
+        runtime_env: RuntimeEnv,
+    ) -> Result<Self> {
+        // `resolved_config_path` is where the file *would* live (CLI > env >
+        // default) and `config_text` its content, read exactly once by the
+        // caller — `None` when the path does not point at an existing file.
         let mut figment = Figment::from(Serialized::defaults(Self::default()));
-        if resolved_config_path.exists() {
-            // The TOML parser's error display echoes the offending source
-            // line as a margin snippet, and a syntax error on
-            // `[auth].bearer_token` would therefore print the credential on
-            // every subcommand before any redaction runs. Parse the file up
-            // front so the failure can report the file, line, column and
-            // reason without the line itself.
-            if let Ok(raw) = std::fs::read_to_string(&resolved_config_path)
-                && let Err(parse) = raw.parse::<toml_edit::DocumentMut>()
-            {
-                return Err(anyhow::anyhow!(
-                    "loading configuration (config file = {}): {}",
-                    resolved_config_path.display(),
-                    toml_parse_error_message(&raw, &parse)
-                ));
-            }
-            figment = figment.merge(Toml::file(&resolved_config_path));
+        if let Some(raw) = &config_text {
+            figment = figment.merge(Toml::string(raw));
         }
         figment = figment.merge(Env::prefixed("AI_MEMORY_").split("__"));
         // The environment is read once, here, and passed down as data —
@@ -2448,12 +2636,34 @@ impl Config {
                 .as_deref(),
         );
 
-        let mut config: Config = figment.extract().with_context(|| {
+        let mut config: Config = match figment.extract().with_context(|| {
             format!(
                 "loading configuration (config file = {})",
                 resolved_config_path.display()
             )
-        })?;
+        }) {
+            Ok(config) => config,
+            // The cause that reaches stderr is the figment error itself:
+            // its display prints the value it found
+            // (`found signed int `123456789012``) — a numeric
+            // `[auth].bearer_token` saved without quotes is the confirmed
+            // leak — so reword it with the key and the expected type only.
+            Err(err) => {
+                // `downcast_ref` borrows, so the original error still stands
+                // when no link rewords; the chain walk runs over a clone
+                // (outermost first), which only the error path pays.
+                let Some(fer) = err.downcast_ref::<figment::error::Error>() else {
+                    return Err(err);
+                };
+                let Some(rewritten) = reword_figment_error(fer.clone()) else {
+                    return Err(err);
+                };
+                return Err(anyhow::anyhow!(
+                    "loading configuration (config file = {}): {rewritten}",
+                    resolved_config_path.display()
+                ));
+            }
+        };
 
         if let Some(token) = runtime_env.auth_token.clone() {
             config.auth.bearer_token = Some(token);
@@ -2464,10 +2674,11 @@ impl Config {
         // default URL itself, so the file is asked for the key rather than
         // the loaded value being compared against the default.
         let explicit_server_url = runtime_env.server_url.is_some()
-            || (resolved_config_path.exists()
-                && Figment::from(Toml::file(&resolved_config_path))
+            || config_text.as_ref().is_some_and(|raw| {
+                Figment::from(Toml::string(raw))
                     .find_value("server_url")
-                    .is_ok());
+                    .is_ok()
+            });
         config.server_url_explicit = explicit_server_url;
         if let Some(server_url) = runtime_env.server_url.clone() {
             config.server_url = server_url;
@@ -2499,6 +2710,14 @@ impl Config {
         );
         apply_hook_spool_max_attempts_env(&mut config, runtime_env.hook_spool_max_attempts());
         apply_run_require_server_env(&mut config, runtime_env.run_require_server());
+        // The flat spelling would otherwise resolve to `run_exit_prompt`,
+        // not `run.exit_prompt`, through figment's `__` split.
+        if let Some(raw) = runtime_env.var_os("AI_MEMORY_RUN_EXIT_PROMPT") {
+            config.run.exit_prompt = raw
+                .to_str()
+                .and_then(|value| value.trim().parse().ok())
+                .context("AI_MEMORY_RUN_EXIT_PROMPT must be true or false")?;
+        }
 
         // Home is captured once in RuntimeEnv (config-read-path invariant);
         // threaded to the resolver guard and startup heal so neither reads the
@@ -2512,10 +2731,11 @@ impl Config {
         // equal to the default still counts as chosen.
         config.data_dir_explicit = cli_data_dir.is_some()
             || runtime_env.data_dir.is_some()
-            || (resolved_config_path.exists()
-                && Figment::from(Toml::file(&resolved_config_path))
+            || config_text.as_ref().is_some_and(|raw| {
+                Figment::from(Toml::string(raw))
                     .find_value("data_dir")
-                    .is_ok());
+                    .is_ok()
+            });
         // CLI override always wins (figment doesn't see it because clap has
         // already parsed the flag into `cli_data_dir`).
         if let Some(dir) = cli_data_dir {
@@ -2642,6 +2862,24 @@ impl Config {
             )
             .map_err(|message| anyhow::anyhow!(message))?,
         );
+        // One scorer per gate: an operator who set both meant one of them, and
+        // silently ignoring the builtin (as the gate does) would leave a config
+        // that reads as if it ran both (#1638).
+        let eval = &config.auto_improve.eval;
+        if !eval.builtin.trim().is_empty() && !eval.command.trim().is_empty() {
+            anyhow::bail!(
+                "auto_improve.eval.builtin and auto_improve.eval.command are mutually exclusive; \
+                 remove one (builtin `structure` runs in-process, a command runs your own scorer)"
+            );
+        }
+        let builtin = eval.builtin.trim();
+        if !builtin.is_empty() && builtin != "structure" {
+            anyhow::bail!(
+                "auto_improve.eval.builtin `{builtin}` is not a known scorer; the only one is \
+                 `structure`"
+            );
+        }
+
         // A4 entropy filter thresholds: reject an unusable threshold at startup
         // rather than silently ignoring it on the first experience pass.
         if let Err(message) = config
@@ -2770,6 +3008,15 @@ impl Config {
         if config.llm_max_input_tokens.is_some() && !config.llm_fallbacks.is_empty() {
             anyhow::bail!(
                 "llm_max_input_tokens requires one model; fallback tokenizers may differ"
+            );
+        }
+        // Zero would time out every rerank before the provider is called,
+        // silently turning reranking off while it still reports as enabled.
+        if config.rerank_timeout_secs == 0 {
+            anyhow::bail!(
+                "rerank_timeout_secs must be at least 1 second (got {}); \
+                 AI_MEMORY_RERANK_TIMEOUT_SECS is read in seconds",
+                config.rerank_timeout_secs
             );
         }
         // Parsed (and discarded) here so a malformed header list is rejected
@@ -3398,7 +3645,7 @@ impl Config {
         }
         tracing::warn!(
             provider = provider.name(),
-            base_url = ambient,
+            base_url = %crate::http_client::display_url(ambient),
             "ignoring ambient LLM_BASE_URL: this provider talks to a fixed vendor \
              endpoint. Set llm_base_url (or AI_MEMORY_LLM_BASE_URL) to point it \
              somewhere else on purpose."
@@ -3722,13 +3969,16 @@ fn default_patchable_page_prefixes() -> Vec<String> {
         .collect()
 }
 
-fn default_data_dir() -> PathBuf {
+/// The data dir every entry point falls back to with no `--data-dir`, no
+/// `AI_MEMORY_DATA_DIR` and no config override. The hook resolves the same
+/// path, which lets `install-hooks` leave the flag out of a command (#1949).
+pub(crate) fn default_data_dir() -> PathBuf {
     dirs::data_local_dir()
         .unwrap_or_else(|| PathBuf::from("."))
         .join("ai-memory")
 }
 
-fn canonicalise_or_keep(p: &Path) -> PathBuf {
+pub(crate) fn canonicalise_or_keep(p: &Path) -> PathBuf {
     if let Ok(canon) = p.canonicalize() {
         return canon;
     }
@@ -4667,6 +4917,214 @@ mod tests {
         assert!(!message.contains('|'), "{message}");
     }
 
+    /// A wrong-typed value may hold `[auth].bearer_token` (a numeric bearer
+    /// saved without quotes is the confirmed leak), so the diagnostic keeps
+    /// the key and the expected type — never the value, which figment's own
+    /// display would print (``found signed int `123` ``).
+    #[test]
+    fn a_type_error_names_the_key_and_expected_type_without_the_value() {
+        let cases = [
+            (
+                "[auth]\nbearer_token = 123456789012\n",
+                "123456789012",
+                "bearer_token",
+                "a string",
+            ),
+            (
+                "[auth]\nbearer_token = [\"FAKEfakeFAKEfakeFAKEfakeFAKEfake000\"]\n",
+                "FAKEfake",
+                "bearer_token",
+                "a string",
+            ),
+            (
+                "[sanitize]\nallowlist = \"FAKEfakeFAKEfakeFAKEfakeFAKEfake000\"\n",
+                "FAKEfake",
+                "allowlist",
+                "a sequence",
+            ),
+        ];
+        for (toml, secret, key, expected) in cases {
+            let tmp = TempDir::new().unwrap();
+            let err = load_auth(tmp.path(), toml, None)
+                .expect_err("a wrong-typed value must fail the load");
+            let message = format!("{err:?}");
+            assert!(!message.contains(secret), "{toml} -> {message}");
+            assert!(message.contains(key), "{toml} -> {message}");
+            assert!(message.contains(expected), "{toml} -> {message}");
+            assert!(
+                message.contains("loading configuration"),
+                "the context prefix must survive the rewrite: {message}"
+            );
+            assert!(!message.contains('|'), "no parser margin: {message}");
+        }
+    }
+
+    /// The reported position must be the parser's own display position, also
+    /// at end of file — where the old clamp to `len - 1` shifted the column
+    /// back — and an empty parser message must never come out blank.
+    #[test]
+    fn a_toml_error_position_matches_the_parser_display() {
+        // `(line, column)` from the parser's own `TOML parse error at line
+        // X, column Y` header.
+        fn parser_position(parse: &toml_edit::TomlError) -> (usize, usize) {
+            let display = format!("{parse}");
+            let header = display.lines().next().unwrap();
+            let after_line = &header[header.find("line ").unwrap() + 5..];
+            let line: usize = after_line
+                .split(',')
+                .next()
+                .unwrap()
+                .trim()
+                .parse()
+                .unwrap();
+            let after_column = &header[header.find("column ").unwrap() + 7..];
+            let column: usize = after_column
+                .split(|c: char| !c.is_ascii_digit())
+                .next()
+                .unwrap()
+                .parse()
+                .unwrap();
+            (line, column)
+        }
+        let cases = [
+            "bearer_token = ",               // missing value at EOF, empty message
+            "bearer_token = \"abc\u{e9}",    // unclosed string, multibyte at EOF
+            "a = 1\r\nb = ",                 // CRLF line endings, EOF on line 2
+            "bearer_token = \"x\" trailing", // mid-line error, control
+        ];
+        // The table must exercise the empty-message branch.
+        assert!(
+            cases.iter().any(|raw| raw
+                .parse::<toml_edit::DocumentMut>()
+                .unwrap_err()
+                .message()
+                .is_empty()),
+            "the table needs an empty-message case"
+        );
+        for raw in cases {
+            let parse = raw
+                .parse::<toml_edit::DocumentMut>()
+                .expect_err("must fail to parse");
+            let (line, column) = parser_position(&parse);
+            let message = toml_parse_error_message(raw, &parse);
+            assert!(
+                message.contains(&format!("line {line}, column {column}")),
+                "{raw:?} -> {message} (parser: line {line}, column {column})"
+            );
+            if parse.message().is_empty() {
+                assert!(
+                    message.contains("invalid TOML syntax"),
+                    "an empty parser message must name a failure class: {raw:?} -> {message}"
+                );
+            }
+            assert!(
+                !message.trim_end().ends_with(':'),
+                "the reason must never come out blank: {raw:?} -> {message:?}"
+            );
+        }
+    }
+
+    /// A directory named as the config path keeps being ignored, and a
+    /// non-UTF-8 file fails with the IO error — never the file's content.
+    #[test]
+    fn a_directory_config_is_ignored_and_a_non_utf8_file_fails_without_content() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().join("config-dir");
+        std::fs::create_dir(&dir).unwrap();
+        let config = Config::load_with_runtime_env(
+            Some(&dir),
+            Some(tmp.path().to_path_buf()),
+            RuntimeEnv::default(),
+        )
+        .expect("a directory named as the config path must be ignored, as an absent one is");
+        assert!(
+            !config.server_url_explicit,
+            "an ignored path must not count as a choice"
+        );
+
+        let tmp = TempDir::new().unwrap();
+        let config_path = tmp.path().join("config.toml");
+        std::fs::write(&config_path, b"[auth]\nbearer_token = \xff\xfe\n").unwrap();
+        let err = Config::load_with_runtime_env(
+            Some(&config_path),
+            Some(tmp.path().to_path_buf()),
+            RuntimeEnv::default(),
+        )
+        .expect_err("a non-UTF-8 config file must fail the load");
+        let message = format!("{err:?}");
+        assert!(
+            message.contains("loading configuration (config file = ")
+                && message.contains("config.toml"),
+            "the context prefix must name the path: {message}"
+        );
+        assert!(
+            message.contains("UTF-8"),
+            "the IO error must carry through: {message}"
+        );
+        assert!(
+            !message.contains("bearer_token"),
+            "no file content: {message}"
+        );
+    }
+
+    /// The disk is read exactly once: the pre-parse check, the figment merge
+    /// and the explicit-key lookups all work on the bytes `load_config_text`
+    /// read, so a file replaced on disk cannot put the credential on an
+    /// error path the check never saw. The load runs from the already-read
+    /// text; nothing else touches the file.
+    #[test]
+    fn the_disk_is_read_once_and_a_replaced_file_cannot_reach_the_error_path() {
+        let tmp = TempDir::new().unwrap();
+        let config_path = tmp.path().join("config.toml");
+        std::fs::write(&config_path, "server_url = \"http://localhost:1\"\n").unwrap();
+
+        // The single disk read: one pre-parse check over those bytes.
+        let raw =
+            Config::load_config_text(&config_path).expect("a valid file must read and pre-parse");
+
+        // Replace the file with one that holds a bearer token after a syntax
+        // break: the load below must not see it — the error path is built
+        // from `raw` only.
+        std::fs::write(
+            &config_path,
+            "[auth]\nbearer_token = \"FAKEfakeFAKEfakeFAKEfakeFAKEfake000\" trailing\n",
+        )
+        .unwrap();
+
+        let config = Config::load_from_text(
+            &config_path,
+            Some(raw),
+            Some(tmp.path().to_path_buf()),
+            RuntimeEnv::default(),
+        )
+        .expect("the load must use the bytes read once, not re-read the disk");
+        assert_eq!(
+            config.server_url.as_str(),
+            "http://localhost:1",
+            "the value must come from the single read"
+        );
+        assert!(
+            config.server_url_explicit,
+            "the explicit-key lookup uses the same bytes"
+        );
+        assert!(
+            config.auth.bearer_token.is_none(),
+            "the replaced file's token must not have been loaded"
+        );
+
+        // The same bytes fed through the syntax-error path report the break
+        // with the line and column and none of the offending line.
+        let err = Config::load_config_text(&config_path)
+            .expect_err("the replaced file is a syntax error and must fail the pre-parse");
+        let message = format!("{err:?}");
+        assert!(
+            !message.contains("FAKEfake"),
+            "the replaced file's line must not reach the error: {message}"
+        );
+        assert!(message.contains("line 2"), "{message}");
+        assert!(!message.contains('|'), "{message}");
+    }
+
     /// `AI_MEMORY_AUTH_TOKEN` wins over the file, as it wins over the inline
     /// key, and then counts as an inline (renderable) token as before.
     #[test]
@@ -4821,6 +5279,24 @@ mod tests {
         )
         .unwrap();
         assert_eq!(overridden.hook_spool.max_attempts, 0);
+    }
+
+    #[test]
+    fn run_exit_prompt_rejects_invalid_environment_values() {
+        let tmp = TempDir::new().unwrap();
+        for raw in ["", "not-a-bool"] {
+            let error = Config::load_with_runtime_env(
+                Some(&tmp.path().join("config.toml")),
+                Some(tmp.path().to_path_buf()),
+                RuntimeEnv::with_process_env_for_tests(&[("AI_MEMORY_RUN_EXIT_PROMPT", raw)]),
+            )
+            .unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("AI_MEMORY_RUN_EXIT_PROMPT must be true or false")
+            );
+        }
     }
 
     #[test]
@@ -5294,6 +5770,27 @@ mod tests {
         assert_eq!(cfg.decay.ledger_retention().months, 12);
     }
 
+    #[test]
+    fn query_answer_budget_defaults_off_and_loads_explicit_limits() {
+        assert_eq!(Config::default().query_answer.max_context_tokens, None);
+        for limit in [0usize, 1, 16_000] {
+            let tmp = TempDir::new().unwrap();
+            let path = tmp.path().join("config.toml");
+            std::fs::write(
+                &path,
+                format!("[query_answer]\nmax_context_tokens = {limit}\n"),
+            )
+            .unwrap();
+            let config = Config::load_with_runtime_env(
+                Some(&path),
+                Some(tmp.path().to_path_buf()),
+                RuntimeEnv::default(),
+            )
+            .unwrap();
+            assert_eq!(config.query_answer.max_context_tokens, Some(limit));
+        }
+    }
+
     /// The consolidation budget must be big enough to leave room for
     /// observations after the fixed system prompt and page conventions.
     /// Below the floor every consolidation would be evidence-free, so it
@@ -5487,6 +5984,57 @@ input_token_safety_margin = {margin}
     /// `[ingest]` is read once into the validated drop list the hook router
     /// checks, and an out-of-bounds entry fails startup instead of being
     /// silently ignored (#1241).
+    /// `[ingest] record_tool_names` is off unless the file turns it on.
+    #[test]
+    fn ingest_record_tool_names_defaults_off_and_loads_from_file() {
+        let tmp = TempDir::new().unwrap();
+        let config_path = tmp.path().join("config.toml");
+        std::fs::write(&config_path, "").unwrap();
+        let config = Config::load(Some(&config_path), Some(tmp.path().to_path_buf())).unwrap();
+        assert!(!config.ingest.record_tool_names);
+
+        std::fs::write(&config_path, "[ingest]\nrecord_tool_names = true\n").unwrap();
+        let config = Config::load(Some(&config_path), Some(tmp.path().to_path_buf())).unwrap();
+        assert!(config.ingest.record_tool_names);
+    }
+
+    /// The env form of `[ingest] record_tool_names`. Same child-process marker
+    /// pattern as `ingest_drop_events_env_overrides_default`.
+    #[test]
+    fn ingest_record_tool_names_env_turns_it_on() {
+        const CHILD_MARKER: &str = "AI_MEMORY_TEST_RECORD_TOOL_NAMES_CHILD";
+        if std::env::var_os(CHILD_MARKER).is_some() {
+            let tmp = TempDir::new().unwrap();
+            let config_path = tmp.path().join("config.toml");
+            std::fs::write(&config_path, "[ingest]\n").unwrap();
+            let config = Config::load(Some(&config_path), Some(tmp.path().to_path_buf())).unwrap();
+            assert!(config.ingest.record_tool_names);
+            println!("record-tool-names-env-applied");
+            return;
+        }
+
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .arg("--exact")
+            .arg("config::tests::ingest_record_tool_names_env_turns_it_on")
+            .arg("--test-threads=1")
+            .arg("--nocapture")
+            .env(CHILD_MARKER, "1")
+            .env("AI_MEMORY_INGEST__RECORD_TOOL_NAMES", "true")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "child test failed:\nstdout: {}\nstderr: {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            String::from_utf8_lossy(&output.stdout).contains("record-tool-names-env-applied"),
+            "child stdout: {}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+    }
+
     #[test]
     fn ingest_drop_lists_load_into_the_router_list_and_reject_bad_entries() {
         let tmp = TempDir::new().unwrap();
@@ -5773,6 +6321,37 @@ input_token_safety_margin = {margin}
             .expect_err("a sub-second timeout must fail closed");
         assert!(
             error.to_string().contains("llm_timeout_secs"),
+            "unexpected error: {error:#}"
+        );
+    }
+
+    /// `AI_MEMORY_RERANK_TIMEOUT_SECS` (figment maps it to this field) lets a
+    /// slow free-tier fallback chain finish a rerank; unset keeps the 20s
+    /// budget the reranker always had.
+    #[test]
+    fn load_defaults_and_round_trips_the_rerank_timeout() {
+        let tmp = TempDir::new().unwrap();
+        let config_path = tmp.path().join("config.toml");
+        std::fs::write(&config_path, "").unwrap();
+        let cfg = Config::load(Some(&config_path), Some(tmp.path().to_path_buf())).unwrap();
+        assert_eq!(
+            cfg.rerank_timeout_secs,
+            ai_memory_llm::reranker::RERANK_TIMEOUT.as_secs()
+        );
+        std::fs::write(&config_path, "rerank_timeout_secs = 60\n").unwrap();
+        let cfg = Config::load(Some(&config_path), Some(tmp.path().to_path_buf())).unwrap();
+        assert_eq!(cfg.rerank_timeout_secs, 60);
+    }
+
+    #[test]
+    fn load_rejects_a_zero_rerank_timeout() {
+        let tmp = TempDir::new().unwrap();
+        let config_path = tmp.path().join("config.toml");
+        std::fs::write(&config_path, "rerank_timeout_secs = 0\n").unwrap();
+        let error = Config::load(Some(&config_path), Some(tmp.path().to_path_buf()))
+            .expect_err("a zero rerank budget must fail closed");
+        assert!(
+            error.to_string().contains("rerank_timeout_secs"),
             "unexpected error: {error:#}"
         );
     }
@@ -6088,6 +6667,45 @@ input_token_safety_margin = {margin}
         assert!(cfg.auto_improve.include_raw_fallback);
         assert_eq!(cfg.auto_improve.proposal_actor, "review_bot");
         assert_eq!(cfg.auto_improve.pending_path, "_pending/review-bot");
+    }
+
+    /// One scorer per gate: setting both is a startup error, not a config
+    /// where the builtin silently loses (#1638).
+    #[test]
+    fn an_eval_gate_rejects_both_a_builtin_and_a_command() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let write = |toml: &str| {
+            let path = tmp.path().join("config.toml");
+            std::fs::write(&path, toml).unwrap();
+            Config::load(Some(&path), Some(tmp.path().to_path_buf()))
+        };
+        let both = write(
+            "[auto_improve.eval]\nenabled = true\nbuiltin = \"structure\"\n\
+             command = \"sh score.sh\"\n",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            both.contains("mutually exclusive"),
+            "unexpected error: {both}"
+        );
+
+        let unknown = write("[auto_improve.eval]\nenabled = true\nbuiltin = \"vibes\"\n")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            unknown.contains("not a known scorer"),
+            "unexpected error: {unknown}"
+        );
+
+        let builtin =
+            write("[auto_improve.eval]\nenabled = true\nbuiltin = \"structure\"\n").unwrap();
+        assert_eq!(builtin.auto_improve.eval.builtin, "structure");
+        assert!(builtin.auto_improve.eval.command.is_empty());
+
+        let command =
+            write("[auto_improve.eval]\nenabled = true\ncommand = \"sh score.sh\"\n").unwrap();
+        assert!(command.auto_improve.eval.builtin.is_empty());
     }
 
     #[test]

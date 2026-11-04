@@ -171,6 +171,74 @@ fn setup_plan_json_prints_the_plan_and_changes_nothing() {
     assert_eq!(sandbox.snapshot(), before, "a refused setup wrote");
 }
 
+/// An SPA can answer every unknown route with HTML and HTTP 200. It is not
+/// an existing ai-memory install, and its MCP/admin errors are not useful
+/// setup diagnostics.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn setup_identifies_a_foreign_listener_in_the_plan_and_self_check() {
+    let sandbox = Sandbox::new();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let paths = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let seen = paths.clone();
+    let app = axum::Router::new().fallback(move |uri: axum::http::Uri| {
+        seen.lock().unwrap().push(uri.path().to_owned());
+        async { axum::response::Html("<!doctype html><title>Another service</title>") }
+    });
+    let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+    let planned = sandbox
+        .cmd(Some(port))
+        .args(["setup", "--plan", "--json"])
+        .output()
+        .unwrap();
+    assert!(planned.status.success(), "{}", text(&planned));
+    let plan: serde_json::Value = serde_json::from_slice(&planned.stdout).unwrap();
+    assert_eq!(plan["service"]["action"], "skip", "{plan}");
+    let reason = plan["service"]["reason"].as_str().unwrap();
+    assert!(
+        reason.contains("did not return ai-memory's /healthz"),
+        "{reason}"
+    );
+    assert!(reason.contains(&format!("127.0.0.1:{port}")), "{reason}");
+    assert!(
+        reason.contains("config.toml") && reason.contains("bind"),
+        "{reason}"
+    );
+
+    let applied = sandbox
+        .cmd(Some(port))
+        .args(["setup", "--yes"])
+        .output()
+        .unwrap();
+    server.abort();
+    assert!(!applied.status.success(), "{}", text(&applied));
+    let stdout = String::from_utf8_lossy(&applied.stdout);
+    assert!(!stdout.contains("healthz: ok"), "{}", text(&applied));
+    assert!(
+        stdout.contains("did not return ai-memory's /healthz"),
+        "{}",
+        text(&applied)
+    );
+    let requested_paths = paths.lock().unwrap().clone();
+    assert!(
+        requested_paths.iter().all(|path| path == "/healthz"),
+        "setup sent unrelated probes to the foreign listener: {requested_paths:?}"
+    );
+    assert!(
+        !sandbox
+            .home
+            .join("Library/LaunchAgents/com.github.akitaonrails.ai-memory.plist")
+            .exists()
+    );
+    assert!(
+        !sandbox
+            .home
+            .join(".config/systemd/user/ai-memory.service")
+            .exists()
+    );
+}
+
 /// The generic `opencode` agent, named or found by the session store both
 /// majors share, is wired in the major `opencode --version` reports: OpenCode
 /// 2 gets the `{ id, setup }` plugin and the nested `mcp.servers` entry, not
@@ -298,14 +366,19 @@ fn setup_web_serves_the_plan_and_applies_the_picked_agent() {
     }
     let stdout = child.stdout.take().unwrap();
     let mut child = Kill(child);
+    let mut lines = std::io::BufReader::new(stdout).lines();
     let mut url = String::new();
-    for line in std::io::BufReader::new(stdout).lines() {
+    for line in lines.by_ref() {
         let line = line.unwrap();
         if let Some(found) = line.trim().strip_prefix("http://127.0.0.1:") {
             url = format!("http://127.0.0.1:{found}");
             break;
         }
     }
+    // Keep the pipe open and drained after the readiness line. Dropping it
+    // here races the child's following informational println!, whose
+    // broken-pipe panic resets the listening socket before axum::serve starts.
+    std::thread::spawn(move || for _ in lines {});
     assert!(url.ends_with('/'), "no address printed: {url:?}");
     let authority = url
         .trim_start_matches("http://")
@@ -406,11 +479,16 @@ fn setup_web_stops_when_its_stdin_closes_only_when_asked() {
             .spawn()
             .unwrap();
         let stdout = child.stdout.take().unwrap();
-        for line in std::io::BufReader::new(stdout).lines() {
+        let mut lines = std::io::BufReader::new(stdout).lines();
+        for line in lines.by_ref() {
             if line.unwrap().trim().starts_with("http://127.0.0.1:") {
                 break;
             }
         }
+        // Keep the pipe open and drained after the readiness line. Dropping
+        // it here races the child's following informational println!, whose
+        // broken-pipe panic can look like an stdin-triggered shutdown.
+        std::thread::spawn(move || for _ in lines {});
         child
     };
     let wait = |child: &mut std::process::Child, within: std::time::Duration| {

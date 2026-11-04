@@ -48,9 +48,10 @@ use ai_memory_core::{
     ActorContext, PageEvidence, PageEvidenceKind, PageId, PagePath, ProjectId, Tier, WorkspaceId,
 };
 use ai_memory_store::{
-    DecayCandidate, DecayParams, ReaderPool, WriterHandle, retention_score_with_breadth,
+    DecayCandidate, DecayParams, PagePrecondition, ReaderPool, WriterHandle,
+    retention_score_with_breadth,
 };
-use ai_memory_wiki::{Wiki, WritePageRequest};
+use ai_memory_wiki::{ConditionalBatchWrite, Wiki, WritePageRequest};
 use jiff::Timestamp;
 use serde::Serialize;
 use thiserror::Error;
@@ -446,10 +447,11 @@ pub async fn run_sweep_with_options(
 /// Run a sweep with the breadth coefficient, the observation prune, and the
 /// opt-in A2 extractive tier-down (`compact_cold_episodic`).
 ///
-/// With `compact_cold_episodic = false` (the default everywhere) this is
-/// byte-for-byte the historical sweep: a cold episodic page is evicted
-/// (tombstoned). With it `true`, a cold episodic page that has NOT already been
-/// compacted is tiered DOWN instead — rewritten through the wiki layer to keep
+/// With `compact_cold_episodic = false` (the default everywhere) this is the
+/// historical sweep for every page that carries no V65 marker: a cold episodic
+/// page is evicted (tombstoned). With it `true`, a cold episodic page that has
+/// NOT already been compacted is tiered DOWN instead — rewritten through the
+/// wiki layer to keep
 /// its L0 abstract, an L1 summary and the L2 keep-token set, dropping the prose
 /// — and reported under [`SweepReport::compacted`] rather than `evicted`. The
 /// original full body stays reachable via supersession + git (reversible,
@@ -503,6 +505,8 @@ pub async fn run_sweep_with_compaction(
 /// [`run_sweep_with_compaction`]. With no embeddings for the configured triple —
 /// or no embedder configured at all — A3 is a clean no-op (invariant #13: it
 /// reads only already-stored vectors, never a provider).
+/// The whole dedup batch is conditional on the selected source versions: a
+/// concurrent edit leaves every planned merge unapplied for this sweep.
 ///
 /// # Errors
 /// Same as [`run_sweep_with_options`].
@@ -669,15 +673,21 @@ pub(crate) async fn run_sweep_at(
         if deduped.contains(&entry.id) {
             continue;
         }
+        // An already-compacted page (its V65 marker set) is terminal for the
+        // decay pass on BOTH arms. The durable residue is what we chose to
+        // keep, so evicting it would destroy exactly what tier-down preserved,
+        // and re-compacting it is a no-op loop. Skip it entirely.
+        //
+        // This guard cannot sit inside the `compact_cold_episodic` arm: the
+        // marker is stamped by passes with their OWN flags — the A3 dedup
+        // merge-note stub and the B2 dream pass both write `compacted: true`,
+        // from which `compacted_at` is derived at the single write choke point
+        // — so residues exist with A2 off, which is the default everywhere.
+        if entry.compacted_at_us.is_some() {
+            continue;
+        }
         if compact_cold_episodic {
-            // A2 tier-down replaces eviction for cold episodic pages. An
-            // already-compacted page (its V65 marker set) is terminal — the
-            // durable residue is what we chose to keep, so re-evicting it
-            // would destroy exactly what tier-down preserved, and
-            // re-compacting it is a no-op loop. Skip it entirely.
-            if entry.compacted_at_us.is_some() {
-                continue;
-            }
+            // A2 tier-down replaces eviction for cold episodic pages.
             compacted.push(CompactedPage {
                 id: entry.id,
                 path: entry.path.as_str().to_string(),
@@ -723,14 +733,21 @@ pub(crate) async fn run_sweep_at(
             match wiki {
                 Some(wiki) => {
                     let requests = std::mem::take(&mut dedup_requests);
-                    match wiki.apply_batch(requests).await {
-                        Ok(new_ids) => {
+                    match wiki.apply_batch_if(requests).await {
+                        Ok(ConditionalBatchWrite::Written(new_ids)) => {
                             for (cluster, &req_idx) in
                                 merged.iter_mut().zip(dedup_survivor_req_index.iter())
                             {
                                 cluster.applied = true;
                                 cluster.new_survivor_id = new_ids.get(req_idx).copied();
                             }
+                        }
+                        Ok(ConditionalBatchWrite::Mismatch { index, current }) => {
+                            tracing::debug!(
+                                index,
+                                ?current,
+                                "forget sweep: source changed during dedup; skipping batch"
+                            );
                         }
                         Err(error) => tracing::warn!(
                             %error,
@@ -784,7 +801,7 @@ pub(crate) async fn run_sweep_at(
         if !compacted.is_empty() {
             match wiki {
                 Some(wiki) => {
-                    let mut requests: Vec<WritePageRequest> = Vec::new();
+                    let mut requests: Vec<(WritePageRequest, PagePrecondition)> = Vec::new();
                     let mut request_index: Vec<usize> = Vec::new();
                     for (i, page) in compacted.iter().enumerate() {
                         let path = match PagePath::new(page.path.clone()) {
@@ -804,29 +821,39 @@ pub(crate) async fn run_sweep_at(
                         };
                         let (frontmatter, body) =
                             build_compacted_markdown(&markdown.frontmatter, &markdown.body);
-                        requests.push(WritePageRequest {
-                            workspace_id,
-                            project_id,
-                            path,
-                            frontmatter,
-                            body,
-                            tier: Tier::Episodic,
-                            pinned: false,
-                            title: None,
-                            admission_ctx: None,
-                            author_id: None,
-                            actor: ActorContext::anonymous(),
-                            evidence: Vec::new(),
-                        });
+                        requests.push((
+                            WritePageRequest {
+                                workspace_id,
+                                project_id,
+                                path,
+                                frontmatter,
+                                body,
+                                tier: Tier::Episodic,
+                                pinned: false,
+                                title: None,
+                                admission_ctx: None,
+                                author_id: None,
+                                actor: ActorContext::anonymous(),
+                                evidence: Vec::new(),
+                            },
+                            PagePrecondition::Latest(page.id),
+                        ));
                         request_index.push(i);
                     }
                     if !requests.is_empty() {
-                        match wiki.apply_batch(requests).await {
-                            Ok(new_ids) => {
+                        match wiki.apply_batch_if(requests).await {
+                            Ok(ConditionalBatchWrite::Written(new_ids)) => {
                                 for (slot, new_id) in request_index.into_iter().zip(new_ids) {
                                     compacted[slot].compacted = true;
                                     compacted[slot].new_id = Some(new_id);
                                 }
+                            }
+                            Ok(ConditionalBatchWrite::Mismatch { index, current }) => {
+                                tracing::debug!(
+                                    index,
+                                    ?current,
+                                    "forget sweep: page changed during compaction; retrying batch on next sweep"
+                                );
                             }
                             Err(error) => tracing::warn!(
                                 %error,
@@ -1206,7 +1233,7 @@ pub(crate) async fn materialize_cold_set(
 struct DedupPlan {
     report: Vec<MergedCluster>,
     claimed: HashSet<PageId>,
-    requests: Vec<WritePageRequest>,
+    requests: Vec<(WritePageRequest, PagePrecondition)>,
     /// For each entry in `report`, the index into `requests` of that cluster's
     /// survivor write, so the applied `new_survivor_id` can be mapped back.
     survivor_req_index: Vec<usize>,
@@ -1337,7 +1364,7 @@ async fn plan_cold_cluster_dedup(
         };
         let mut union_body = survivor_md.body.clone();
         let mut loser_paths: Vec<String> = Vec::new();
-        let mut loser_requests: Vec<WritePageRequest> = Vec::new();
+        let mut loser_requests: Vec<(WritePageRequest, PagePrecondition)> = Vec::new();
         let mut evidence: Vec<PageEvidence> = Vec::new();
         let mut read_failed = false;
         for (pos, member) in member_entries.iter().enumerate() {
@@ -1390,20 +1417,23 @@ async fn plan_cold_cluster_dedup(
                 "merged_into".to_string(),
                 serde_json::Value::String(survivor.path.as_str().to_string()),
             );
-            loser_requests.push(WritePageRequest {
-                workspace_id,
-                project_id,
-                path: member.path.clone(),
-                frontmatter: serde_json::Value::Object(stub_fm),
-                body: stub_body,
-                tier: Tier::Episodic,
-                pinned: false,
-                title: None,
-                admission_ctx: None,
-                author_id: None,
-                actor: ActorContext::anonymous(),
-                evidence: Vec::new(),
-            });
+            loser_requests.push((
+                WritePageRequest {
+                    workspace_id,
+                    project_id,
+                    path: member.path.clone(),
+                    frontmatter: serde_json::Value::Object(stub_fm),
+                    body: stub_body,
+                    tier: Tier::Episodic,
+                    pinned: false,
+                    title: None,
+                    admission_ctx: None,
+                    author_id: None,
+                    actor: ActorContext::anonymous(),
+                    evidence: Vec::new(),
+                },
+                PagePrecondition::Latest(member.id),
+            ));
         }
         if read_failed || loser_paths.is_empty() {
             continue;
@@ -1448,7 +1478,8 @@ async fn plan_cold_cluster_dedup(
         // Record. Survivor write goes first in this cluster's slice, so its
         // index is the current request length.
         let survivor_req_index = plan.requests.len();
-        plan.requests.push(survivor_request);
+        plan.requests
+            .push((survivor_request, PagePrecondition::Latest(survivor.id)));
         plan.requests.extend(loser_requests);
         plan.claimed.insert(survivor.id);
         for member in &member_entries {

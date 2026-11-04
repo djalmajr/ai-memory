@@ -316,9 +316,25 @@ fn preview_without_a_token_announces_none() {
 /// A syntax error in `config.toml` used to fail with the parser's snippet
 /// on stderr, echoing the offending line — which may hold
 /// `[auth].bearer_token`. Both subcommands must exit 1 with the line and
-/// column and none of the source line.
+/// column and none of the source line. A wrong-typed value must exit 1 with
+/// the key and the expected type and none of the value — figment's own
+/// display prints it (``found signed int `123456789012` ``), and a numeric
+/// bearer saved without quotes is the confirmed leak.
 #[test]
 fn config_syntax_error_exits_one_without_echoing_the_line() {
+    let installs: [(&str, &[&str]); 2] = [
+        (
+            "install-hooks",
+            &[
+                "install-hooks",
+                "--agent",
+                "opencode2",
+                "--server-url",
+                SERVER_URL,
+            ],
+        ),
+        ("install-mcp", &["install-mcp", "--server-url", SERVER_URL]),
+    ];
     let bodies = [
         (
             "trailing text after the closing quote",
@@ -332,19 +348,6 @@ fn config_syntax_error_exits_one_without_echoing_the_line() {
     for (what, body) in bodies {
         let sandbox = Sandbox::new();
         sandbox.write_config(&body);
-        let installs: [(&str, &[&str]); 2] = [
-            (
-                "install-hooks",
-                &[
-                    "install-hooks",
-                    "--agent",
-                    "opencode2",
-                    "--server-url",
-                    SERVER_URL,
-                ],
-            ),
-            ("install-mcp", &["install-mcp", "--server-url", SERVER_URL]),
-        ];
         for (subcommand, args) in installs {
             let mut cmd = sandbox.command();
             cmd.args(args);
@@ -370,6 +373,110 @@ fn config_syntax_error_exits_one_without_echoing_the_line() {
             );
         }
     }
+
+    // A wrong-typed value: the diagnostic keeps the key and the expected
+    // type without the value itself.
+    let type_bodies = [
+        (
+            "integer bearer",
+            "[auth]\nbearer_token = 123456789012\n",
+            "123456789012",
+        ),
+        (
+            "sequence bearer",
+            "[auth]\nbearer_token = [\"FAKEfake0123456789\"]\n",
+            "FAKEfake",
+        ),
+    ];
+    for (what, body, secret) in type_bodies {
+        let sandbox = Sandbox::new();
+        sandbox.write_config(body);
+        for (subcommand, args) in installs {
+            let mut cmd = sandbox.command();
+            cmd.args(args);
+            let output = cmd.output().unwrap();
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert_eq!(
+                output.status.code(),
+                Some(1),
+                "{what} + {subcommand}: expected exit 1:\n{stdout}\n{stderr}"
+            );
+            assert!(
+                !stdout.contains(secret) && !stderr.contains(secret),
+                "{what} + {subcommand} printed the value:\n{stdout}\n{stderr}"
+            );
+            assert!(
+                stderr.contains("bearer_token") && stderr.contains("a string"),
+                "{what} + {subcommand} lost the key or the expected type:\n{stderr}"
+            );
+            assert!(
+                !stderr.contains('|'),
+                "{what} + {subcommand} printed a parser margin:\n{stderr}"
+            );
+        }
+    }
+
+    // A numeric-looking bearer in the environment is parsed as a number by
+    // the env layer and fails the type check; the rewritten diagnostic must
+    // keep the value out there too.
+    let sandbox = Sandbox::new();
+    sandbox.write_config("");
+    let mut cmd = sandbox.command();
+    cmd.env("AI_MEMORY_AUTH__BEARER_TOKEN", "123456789012");
+    cmd.args([
+        "install-hooks",
+        "--agent",
+        "opencode2",
+        "--server-url",
+        SERVER_URL,
+    ]);
+    let output = cmd.output().unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "a numeric env bearer must fail the type check:\n{stdout}\n{stderr}"
+    );
+    assert!(
+        !stdout.contains("123456789012") && !stderr.contains("123456789012"),
+        "the numeric env bearer must stay out of the output:\n{stdout}\n{stderr}"
+    );
+    assert!(
+        stderr.contains("bearer_token") && stderr.contains("expected a string"),
+        "the env type error keeps the key and the expected type:\n{stderr}"
+    );
+
+    // Control: a non-numeric env bearer is a valid string value, so the
+    // load succeeds and the preview keeps withholding it.
+    let sandbox = Sandbox::new();
+    sandbox.write_config("");
+    let mut cmd = sandbox.command();
+    cmd.env("AI_MEMORY_AUTH__BEARER_TOKEN", "FAKEfakeEnvBearer12345");
+    cmd.args([
+        "install-hooks",
+        "--agent",
+        "opencode2",
+        "--server-url",
+        SERVER_URL,
+    ]);
+    let output = cmd.output().unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "a non-numeric env bearer is a valid value:\n{stdout}\n{stderr}"
+    );
+    assert!(
+        stdout.contains(TS_NOTE),
+        "the preview must omit the token: {stdout}"
+    );
+    assert!(
+        !stdout.contains("FAKEfakeEnvBearer12345") && !stderr.contains("FAKEfakeEnvBearer12345"),
+        "the env bearer must stay out of the output:\n{stdout}\n{stderr}"
+    );
 
     // Control: a valid config still loads and previews.
     let sandbox = Sandbox::new();

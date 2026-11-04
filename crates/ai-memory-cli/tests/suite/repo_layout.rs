@@ -119,6 +119,7 @@ fn codeql_model_targets_exist() {
             "ai_memory_client",
             repo_root.join("companions/ai-memory-client/src"),
         ),
+        ("ai_memory_wiki", crates_dir().join("ai-memory-wiki/src")),
     ];
     let models_dir = repo_root.join(".github/codeql/extensions/ai-memory-models/models");
     let mut targets = 0;
@@ -165,4 +166,50 @@ fn codeql_model_targets_exist() {
         "stale CodeQL model targets:\n{}",
         problems.join("\n")
     );
+}
+
+/// CodeQL's Rust extractor does not currently materialize an `Ok(0)` field
+/// barrier for source-defined `Result<PathBuf, _>` functions. A narrower model
+/// silently matches no flow node and reopens every confinement false positive.
+#[test]
+fn codeql_path_barriers_model_the_realized_return_node() {
+    let model = fs::read_to_string(
+        crates_dir()
+            .parent()
+            .expect("crates/ lives in the repository root")
+            .join(".github/codeql/extensions/ai-memory-models/models/path-barriers.model.yml"),
+    )
+    .expect("read path barrier model");
+
+    assert!(model.contains("\"ReturnValue\", \"path-injection\""));
+    assert!(
+        !model.contains("ReturnValue.Field[core::result::Result::Ok(0)]"),
+        "Rust Result field barriers are not realized for these source functions"
+    );
+}
+
+/// Advanced CodeQL setup does not reliably auto-load repository-local model
+/// packs. Keep the explicit Rust analysis path wired to the checked-in pack.
+#[test]
+fn codeql_workflow_loads_local_models() {
+    let workflow = fs::read_to_string(
+        crates_dir()
+            .parent()
+            .expect("crates/ lives in the repository root")
+            .join(".github/workflows/codeql.yml"),
+    )
+    .expect("read CodeQL workflow");
+    for required in [
+        "skip-queries: ${{ matrix.language == 'rust' }}",
+        "--additional-packs=.github/codeql/extensions",
+        "--model-packs=akitaonrails/ai-memory-models",
+        "--ram=\"$CODEQL_RAM\"",
+        "--threads=\"$CODEQL_THREADS\"",
+        "codeql/rust-queries:codeql-suites/rust-code-scanning.qls",
+    ] {
+        assert!(
+            workflow.contains(required),
+            "CodeQL workflow omitted {required}"
+        );
+    }
 }

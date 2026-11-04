@@ -187,6 +187,85 @@ pub(crate) fn mcp_tool_name(name: &str) -> Option<McpToolName> {
     })
 }
 
+/// Longest harness tool name kept by `[ingest] record_tool_names`, the same
+/// bound as an MCP tool name: every documented harness tool name fits.
+const MAX_TOOL_NAME_CHARS: usize = 64;
+
+/// Longest skill or subagent identifier kept by `[ingest] record_tool_names`.
+/// Plugin skills carry a `plugin:skill` prefix, so this is wider than a name.
+const MAX_TOOL_DESCRIPTOR_CHARS: usize = 128;
+
+/// A closed-tool call's own name, plus the one identifier that says which
+/// skill or subagent it ran. Kept only when the operator opts in with
+/// `[ingest] record_tool_names`; [`crate::HookEnvelope::record_tool_name`]
+/// writes it into the observation.
+///
+/// Never an argument. A shell command, a prompt, a path or a URL stays out:
+/// the name and the two descriptors are kept only when they are short
+/// identifiers, so free text a harness put in those fields is refused whole.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct RecordedToolName {
+    pub(crate) name: String,
+    /// `tool_input.skill` of Claude Code's `Skill` tool.
+    pub(crate) skill: Option<String>,
+    /// `tool_input.subagent_type` of Claude Code's `Agent` (formerly `Task`)
+    /// tool.
+    pub(crate) subagent_type: Option<String>,
+}
+
+/// The tool name a closed-tool event carries, read from the same adapter
+/// fields [`tool_observation_metadata`] uses, and refused unless it is at most
+/// 64 ASCII letters, digits, `_` or `-`.
+///
+/// The skill and subagent identifiers are Claude Code's own `tool_input`
+/// fields (<https://code.claude.com/docs/en/hooks>, "PreToolUse input": the
+/// `Agent` tool's `subagent_type`; the `Skill` tool's `skill`), so they are
+/// read for Claude Code only. Each is kept when it is at most 128 ASCII
+/// letters, digits, `_`, `-`, `.` or `:`.
+pub(crate) fn recorded_tool_name(agent: AgentKind, raw: &Value) -> Option<RecordedToolName> {
+    let (name, _) = tool_payload_fields(agent, raw)?;
+    if !valid_tool_name(name) {
+        return None;
+    }
+    let input = if agent == AgentKind::ClaudeCode {
+        raw.get("tool_input")
+    } else {
+        None
+    };
+    let descriptor = |key: &str| {
+        input
+            .and_then(|input| input.get(key))
+            .and_then(Value::as_str)
+            .filter(|value| valid_tool_descriptor(value))
+            .map(str::to_owned)
+    };
+    Some(RecordedToolName {
+        name: name.to_owned(),
+        skill: (name == "Skill").then(|| descriptor("skill")).flatten(),
+        subagent_type: matches!(name, "Agent" | "Task")
+            .then(|| descriptor("subagent_type"))
+            .flatten(),
+    })
+}
+
+/// A harness tool name as `[ingest] record_tool_names` keeps it: an
+/// identifier, never free text.
+pub(crate) fn valid_tool_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= MAX_TOOL_NAME_CHARS
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+}
+
+fn valid_tool_descriptor(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= MAX_TOOL_DESCRIPTOR_CHARS
+        && value
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.' | b':'))
+}
+
 /// Safe outcome class for a completed tool call.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ToolOutcome {
@@ -203,6 +282,36 @@ impl ToolOutcome {
             Self::Unknown => "unknown",
         }
     }
+}
+
+/// Cline CLI/SDK hooks nest the call at `tool_call` / `tool_result` (`name`,
+/// `id`, `input`; live Cline CLI 3.0.74 in #1950). The VS Code extension's
+/// documented envelope uses `preToolUse` / `postToolUse` with `toolName` (or
+/// the older `tool`) and `parameters` (ClineignoreGuard.sh handles both).
+/// Prefer the nested call when it names the tool so the call id is kept.
+fn cline_tool_fields(object: &Map<String, Value>) -> Option<(&str, Option<&str>, Option<&Value>)> {
+    let nested = object
+        .get("tool_call")
+        .or_else(|| object.get("tool_result"))
+        .and_then(Value::as_object);
+    if let Some(tool) = nested
+        && let Some(name) = tool.get("name").and_then(Value::as_str)
+    {
+        return Some((
+            name,
+            tool.get("id").and_then(Value::as_str),
+            tool.get("input"),
+        ));
+    }
+    let envelope = object
+        .get("preToolUse")
+        .or_else(|| object.get("postToolUse"))
+        .and_then(Value::as_object)?;
+    let name = envelope
+        .get("toolName")
+        .or_else(|| envelope.get("tool"))
+        .and_then(Value::as_str)?;
+    Some((name, None, envelope.get("parameters")))
 }
 
 /// The raw tool name and tool-call id of a tool payload, per agent.
@@ -247,7 +356,8 @@ pub(crate) fn tool_payload_fields(agent: AgentKind, raw: &Value) -> Option<(&str
         | AgentKind::CodeBuddy
         | AgentKind::IbmBob
         | AgentKind::Dsh
-        | AgentKind::QwenCode => (
+        | AgentKind::QwenCode
+        | AgentKind::Qoder => (
             object.get("tool_name")?.as_str()?,
             object.get("tool_use_id").and_then(Value::as_str),
         ),
@@ -264,6 +374,10 @@ pub(crate) fn tool_payload_fields(agent: AgentKind, raw: &Value) -> Option<(&str
         // Kiro v2/v3 tool hooks use `tool_name` + `tool_input`. Unknown payload
         // shapes fail safe to metadata-only under an active policy.
         AgentKind::KiroCli => (object.get("tool_name")?.as_str()?, None),
+        // Gemini CLI's BeforeTool and AfterTool carry `tool_name` and
+        // `tool_input` but no tool-call id (docs/hooks/reference.md and
+        // `hookEventHandler.ts`, v0.66.0).
+        AgentKind::GeminiCli => (object.get("tool_name")?.as_str()?, None),
         AgentKind::AntigravityCli => (object.get("toolCall")?.get("name")?.as_str()?, None),
         AgentKind::Hermes => (
             object.get("tool_name")?.as_str()?,
@@ -284,14 +398,8 @@ pub(crate) fn tool_payload_fields(agent: AgentKind, raw: &Value) -> Option<(&str
         // #1240).
         AgentKind::Droid => (object.get("tool_name")?.as_str()?, None),
         AgentKind::Cline => {
-            let tool = object
-                .get("tool_call")
-                .or_else(|| object.get("tool_result"))?
-                .as_object()?;
-            (
-                tool.get("name")?.as_str()?,
-                tool.get("id").and_then(Value::as_str),
-            )
+            let (name, id, _) = cline_tool_fields(object)?;
+            (name, id)
         }
         _ => return None,
     };
@@ -312,10 +420,8 @@ pub(crate) fn tool_observation_metadata(
     let has_args = !require_input
         || match agent {
             AgentKind::AntigravityCli => object.get("toolCall")?.get("args").is_some(),
-            AgentKind::Cline => object
-                .get("tool_call")
-                .and_then(Value::as_object)
-                .and_then(|tool| tool.get("input"))
+            AgentKind::Cline => cline_tool_fields(object)
+                .and_then(|(_, _, input)| input)
                 .is_some(),
             _ => object
                 .get(
@@ -337,7 +443,9 @@ pub(crate) fn tool_observation_metadata(
                             | AgentKind::CodeBuddy
                             | AgentKind::IbmBob
                             | AgentKind::Dsh
+                            | AgentKind::GeminiCli
                             | AgentKind::QwenCode
+                            | AgentKind::Qoder
                     ) {
                         "tool_input"
                     } else {
@@ -368,15 +476,30 @@ pub(crate) fn tool_observation_outcome(agent: AgentKind, raw: &Value) -> ToolOut
             Some(false) => ToolOutcome::Success,
             None => ToolOutcome::Unknown,
         },
-        AgentKind::Cline => match raw
-            .get("tool_result")
-            .and_then(Value::as_object)
-            .and_then(|tool| tool.get("error"))
-        {
-            Some(Value::Null) | None => ToolOutcome::Success,
-            Some(Value::String(error)) if error.is_empty() => ToolOutcome::Success,
-            Some(_) => ToolOutcome::Error,
-        },
+        AgentKind::Cline => {
+            if raw.get("tool_result").is_some() {
+                match raw
+                    .get("tool_result")
+                    .and_then(Value::as_object)
+                    .and_then(|tool| tool.get("error"))
+                {
+                    Some(Value::Null) | None => ToolOutcome::Success,
+                    Some(Value::String(error)) if error.is_empty() => ToolOutcome::Success,
+                    Some(_) => ToolOutcome::Error,
+                }
+            } else {
+                match raw
+                    .get("postToolUse")
+                    .and_then(Value::as_object)
+                    .and_then(|tool| tool.get("success"))
+                    .and_then(Value::as_bool)
+                {
+                    Some(true) => ToolOutcome::Success,
+                    Some(false) => ToolOutcome::Error,
+                    None => ToolOutcome::Success,
+                }
+            }
+        }
         AgentKind::KiroCli => match raw
             .get("tool_response")
             .and_then(|response| response.get("success"))
@@ -384,6 +507,17 @@ pub(crate) fn tool_observation_outcome(agent: AgentKind, raw: &Value) -> ToolOut
         {
             Some(true) => ToolOutcome::Success,
             Some(false) => ToolOutcome::Error,
+            None => ToolOutcome::Unknown,
+        },
+        // Gemini CLI's AfterTool `tool_response` has an `error` object only
+        // when the call failed: "If this property is present, the tool call
+        // is considered a failure" (`ToolResult`, packages/core/src/tools/
+        // tools.ts, v0.66.0). A payload without `tool_response` proves nothing.
+        AgentKind::GeminiCli => match raw.get("tool_response").and_then(Value::as_object) {
+            Some(response) => match response.get("error") {
+                None | Some(Value::Null) => ToolOutcome::Success,
+                Some(_) => ToolOutcome::Error,
+            },
             None => ToolOutcome::Unknown,
         },
         AgentKind::AntigravityCli
@@ -402,7 +536,15 @@ pub(crate) fn tool_observation_outcome(agent: AgentKind, raw: &Value) -> ToolOut
         // Meta Muse Code's `PostToolUseFailure` has the same `error` string
         // (captured offline on Muse Code 1.4.7); its `PostToolUse` proves no
         // outcome.
-        AgentKind::Zcode | AgentKind::Muse | AgentKind::QwenCode
+        // Claude Code's `PostToolUseFailure` carries the same `error` string
+        // (<https://code.claude.com/docs/en/hooks>); an aborted call
+        // (`is_interrupt`) did not succeed either. Its `PostToolUse` fires
+        // only on success and has no `error` key.
+        AgentKind::Zcode
+        | AgentKind::Muse
+        | AgentKind::QwenCode
+        | AgentKind::Qoder
+        | AgentKind::ClaudeCode
             if raw
                 .get("error")
                 .and_then(Value::as_str)
@@ -428,6 +570,26 @@ pub(crate) fn tool_observation_outcome(agent: AgentKind, raw: &Value) -> ToolOut
                 .get("error")
                 .and_then(Value::as_str)
                 .is_some_and(|error| !error.is_empty()) =>
+            {
+                ToolOutcome::Error
+            }
+            None => ToolOutcome::Unknown,
+        },
+        // Cursor fires `postToolUseFailure` "when a tool fails, times out, or
+        // is denied", with an `error_message` and a `failure_type` of
+        // `error`, `timeout` or `permission_denied`
+        // (<https://cursor.com/docs/agent/hooks>). An error or a timeout is a
+        // failed call; a denied call is not a tool failure, as for Copilot
+        // CLI, and a future type proves nothing. A message with no type
+        // still names a failure. Its `postToolUse` stays unknown, as Claude
+        // Code's does.
+        AgentKind::Cursor => match raw.get("failure_type").and_then(Value::as_str) {
+            Some("error" | "timeout") => ToolOutcome::Error,
+            Some(_) => ToolOutcome::Unknown,
+            None if raw
+                .get("error_message")
+                .and_then(Value::as_str)
+                .is_some_and(|message| !message.is_empty()) =>
             {
                 ToolOutcome::Error
             }
@@ -1162,11 +1324,7 @@ fn extract(agent: AgentKind, raw: &Value) -> Extracted<'_> {
             .get("toolCall")
             .and_then(Value::as_object)
             .and_then(|call| Some((call.get("name")?.as_str()?, call.get("args")))),
-        AgentKind::Cline => object
-            .get("tool_call")
-            .or_else(|| object.get("tool_result"))
-            .and_then(Value::as_object)
-            .and_then(|call| Some((call.get("name")?.as_str()?, call.get("input")))),
+        AgentKind::Cline => cline_tool_fields(object).map(|(name, _, input)| (name, input)),
         AgentKind::Grok => object
             .get("tool_name")
             .or_else(|| object.get("toolName"))
@@ -1187,6 +1345,7 @@ fn extract(agent: AgentKind, raw: &Value) -> Extracted<'_> {
         | AgentKind::Cursor
         | AgentKind::GeminiCli
         | AgentKind::QwenCode
+        | AgentKind::Qoder
         | AgentKind::Devin
         | AgentKind::Hermes
         | AgentKind::KiroCli
@@ -1232,6 +1391,8 @@ fn extract(agent: AgentKind, raw: &Value) -> Extracted<'_> {
                     && MUSE_MEMORY_TOOL_NAMES.contains(&name.to_ascii_lowercase().as_str())
                 {
                     muse_memory_paths(value)
+                } else if agent == AgentKind::Cline {
+                    extract_paths(name, value).or_else(|| cline_file_paths(value))
                 } else {
                     extract_paths(name, value)
                 }
@@ -1239,7 +1400,15 @@ fn extract(agent: AgentKind, raw: &Value) -> Extracted<'_> {
         })
         .flatten();
     let command = (family == ToolFamily::NonFile)
-        .then(|| args.and_then(shell_command))
+        .then(|| {
+            args.and_then(|value| {
+                if agent == AgentKind::Cline {
+                    cline_shell_command(value).or_else(|| shell_command(value))
+                } else {
+                    shell_command(value)
+                }
+            })
+        })
         .flatten();
     let search_paths = (family == ToolFamily::SearchList)
         .then(|| args.and_then(|value| search_direct_paths(agent, value.as_object()?)))
@@ -1356,6 +1525,20 @@ fn agent_family(agent: AgentKind, name: &str) -> ToolFamily {
         // `Execute` already carry shared names.
         match name.to_ascii_lowercase().as_str() {
             "create" | "applypatch" => return ToolFamily::File,
+            _ => {}
+        }
+    }
+    if agent == AgentKind::Cline {
+        // ClineCore built-ins (https://docs.cline.bot/tools-reference/all-cline-tools,
+        // Cline CLI 3.0.74). Shared names (`read_file`, `apply_patch`,
+        // `write_to_file`) stay with [`family`]. Agent-only names stay here so
+        // a same-named tool of another agent is not reclassified (`editor`,
+        // `skills`).
+        match name.to_ascii_lowercase().as_str() {
+            "read_files" | "editor" | "replace_in_file" => return ToolFamily::File,
+            "search_codebase" => return ToolFamily::SearchList,
+            "run_commands" | "execute_command" | "fetch_web_content" | "skills" | "use_skill"
+            | "ask_question" | "submit_and_exit" => return ToolFamily::NonFile,
             _ => {}
         }
     }
@@ -2429,6 +2612,41 @@ fn muse_memory_paths(args: &Value) -> Option<Vec<String>> {
     Some(vec![format!(".agents/memory/{path}")])
 }
 
+/// ClineCore `read_files` names files in `files[].path` (ReadFilesInputSchema
+/// and ClineignoreGuard.sh). Shared `path` / `paths` for `editor` already go
+/// through [`extract_paths`].
+fn cline_file_paths(args: &Value) -> Option<Vec<String>> {
+    let object = args.as_object()?;
+    let mut paths = direct_paths(object).unwrap_or_default();
+    if let Some(files) = object.get("files") {
+        let entries = files.as_array()?;
+        if entries.len() > MAX_CAPTURE_CANDIDATES
+            || paths.len().checked_add(entries.len())? > MAX_CAPTURE_CANDIDATES
+        {
+            return None;
+        }
+        for entry in entries {
+            match entry {
+                Value::String(path) => paths.push(path.clone()),
+                Value::Object(obj) => {
+                    let path = obj
+                        .get("path")
+                        .or_else(|| obj.get("file_path"))
+                        .or_else(|| obj.get("filePath"))?
+                        .as_str()?;
+                    paths.push(path.to_owned());
+                }
+                _ => return None,
+            }
+        }
+    }
+    (!paths.is_empty()
+        && paths.iter().all(|path| {
+            !path.trim().is_empty() && path.chars().count() <= MAX_CANDIDATE_PATH_CHARS
+        }))
+    .then_some(paths)
+}
+
 /// Directory arguments of Factory Droid's search/list tools: `LS` lists
 /// `directory_path` and `Glob` searches below `folder` (#1240).
 const DROID_SEARCH_ROOT_KEYS: [&str; 2] = ["directory_path", "folder"];
@@ -3061,6 +3279,35 @@ fn shell_command(args: &Value) -> Option<ShellCommand<'_>> {
             .map(Value::as_str)
             .collect::<Option<Vec<_>>>()
             .map(ShellCommand::Argv),
+        _ => None,
+    }
+}
+
+/// ClineCore `run_commands` takes `{commands: ["ls", ...]}` (CLI 3.0.74 live
+/// payload in #1950 and `RunCommandsInputSchema`). Each entry is a complete
+/// command string, or an object with a `command` field. Shared `command` /
+/// `cmd` keys still go through [`shell_command`].
+fn cline_shell_command(args: &Value) -> Option<ShellCommand<'_>> {
+    match args.get("commands") {
+        Some(Value::Array(items)) => {
+            if items.is_empty() || items.len() > MAX_CAPTURE_CANDIDATES {
+                return None;
+            }
+            let mut lines = Vec::with_capacity(items.len());
+            for item in items {
+                let line = match item {
+                    Value::String(s) => s.as_str(),
+                    Value::Object(obj) => obj.get("command")?.as_str()?,
+                    _ => return None,
+                };
+                if line.trim().is_empty() {
+                    return None;
+                }
+                lines.push(line);
+            }
+            Some(ShellCommand::Argv(lines))
+        }
+        Some(Value::String(s)) if !s.trim().is_empty() => Some(ShellCommand::Line(s)),
         _ => None,
     }
 }
@@ -4709,6 +4956,7 @@ mod tests {
             AgentKind::Muse,
             AgentKind::CodeBuddy,
             AgentKind::QwenCode,
+            AgentKind::Qoder,
             AgentKind::OpenCode,
             AgentKind::Omp,
             AgentKind::Pi,
@@ -5230,6 +5478,71 @@ mod tests {
         );
     }
 
+    /// Gemini CLI's BeforeTool and AfterTool carry `tool_name` and
+    /// `tool_input` but no tool-call id, so the observation metadata reads the
+    /// name alone, and only a BeforeTool with `tool_input` proves its input.
+    #[test]
+    fn gemini_cli_tool_payload_fields_have_no_call_id() {
+        let before = json!({
+            "session_id": "gemini-session",
+            "hook_event_name": "BeforeTool",
+            "tool_name": "run_shell_command",
+            "tool_input": {"command": "ls", "dir_path": "src"}
+        });
+        assert_eq!(
+            tool_payload_fields(AgentKind::GeminiCli, &before),
+            Some(("run_shell_command", None))
+        );
+        let metadata = tool_observation_metadata(AgentKind::GeminiCli, &before, true).unwrap();
+        assert_eq!(metadata.tool_family, ToolFamily::NonFile);
+        assert_eq!(metadata.tool_call_id, None);
+        let no_input = json!({"tool_name": "read_file"});
+        assert!(tool_observation_metadata(AgentKind::GeminiCli, &no_input, true).is_none());
+        let after = tool_observation_metadata(AgentKind::GeminiCli, &no_input, false).unwrap();
+        assert_eq!(after.tool_family, ToolFamily::File);
+    }
+
+    /// A Gemini CLI `tool_response` proves its outcome by the presence of
+    /// `error`; a payload without a `tool_response` proves nothing.
+    #[test]
+    fn gemini_cli_tool_response_error_decides_the_outcome() {
+        let failed = json!({
+            "hook_event_name": "AfterTool",
+            "tool_name": "read_file",
+            "tool_input": {"file_path": "missing.md"},
+            "tool_response": {
+                "llmContent": "File not found: missing.md",
+                "returnDisplay": "File not found.",
+                "error": {"message": "File not found: missing.md", "type": "FILE_NOT_FOUND"}
+            }
+        });
+        assert_eq!(
+            tool_observation_outcome(AgentKind::GeminiCli, &failed),
+            ToolOutcome::Error
+        );
+        let succeeded = json!({
+            "hook_event_name": "AfterTool",
+            "tool_name": "read_file",
+            "tool_input": {"file_path": "README.md"},
+            "tool_response": {"llmContent": "# Title", "returnDisplay": ""}
+        });
+        assert_eq!(
+            tool_observation_outcome(AgentKind::GeminiCli, &succeeded),
+            ToolOutcome::Success
+        );
+        let null_error = json!({"tool_response": {"llmContent": "ok", "error": null}});
+        assert_eq!(
+            tool_observation_outcome(AgentKind::GeminiCli, &null_error),
+            ToolOutcome::Success
+        );
+        // Control: a BeforeTool has no `tool_response`.
+        let before = json!({"tool_name": "read_file", "tool_input": {"file_path": "README.md"}});
+        assert_eq!(
+            tool_observation_outcome(AgentKind::GeminiCli, &before),
+            ToolOutcome::Unknown
+        );
+    }
+
     /// Droid hook payloads carry no tool-call id, so the drop list and the
     /// observation metadata read the tool name alone (#1240).
     #[test]
@@ -5304,6 +5617,198 @@ mod tests {
             ToolOutcome::Error
         );
         assert_eq!(tool_payload_fields(AgentKind::Other, &pre), None);
+    }
+
+    /// ClineCore built-in names (Cline CLI 3.0.74, docs.cline.bot tools
+    /// reference) are not on the shared family lists, so they classified as
+    /// unknown and closed-tool observations stored `tool unknown` with no
+    /// output (#1950). The CLI nests the call at `tool_call`; the VS Code
+    /// extension uses `preToolUse.toolName` + `parameters` (ClineignoreGuard).
+    #[test]
+    fn cline_core_tool_names_are_classified_and_honor_capture_exclusions() {
+        for (tool, expected) in [
+            ("read_files", ToolFamily::File),
+            ("editor", ToolFamily::File),
+            ("replace_in_file", ToolFamily::File),
+            ("apply_patch", ToolFamily::File),
+            ("read_file", ToolFamily::File),
+            ("search_codebase", ToolFamily::SearchList),
+            ("run_commands", ToolFamily::NonFile),
+            ("execute_command", ToolFamily::NonFile),
+            ("fetch_web_content", ToolFamily::NonFile),
+            ("skills", ToolFamily::NonFile),
+            ("use_skill", ToolFamily::NonFile),
+            ("ask_question", ToolFamily::NonFile),
+            ("submit_and_exit", ToolFamily::NonFile),
+        ] {
+            assert_eq!(agent_family(AgentKind::Cline, tool), expected, "{tool}");
+        }
+        // Cline-only names keep their classification for other agents.
+        assert_eq!(
+            agent_family(AgentKind::ClaudeCode, "read_files"),
+            ToolFamily::Unknown
+        );
+        assert_eq!(
+            agent_family(AgentKind::ClaudeCode, "editor"),
+            ToolFamily::Unknown
+        );
+        assert_eq!(
+            agent_family(AgentKind::ClaudeCode, "run_commands"),
+            ToolFamily::Unknown
+        );
+        assert_eq!(
+            agent_family(AgentKind::ClaudeCode, "skills"),
+            ToolFamily::Unknown
+        );
+
+        // Live Cline CLI 3.0.74 PreToolUse: both envelopes, `run_commands`
+        // with `commands[0]` (#1950).
+        let live = json!({
+            "hookName": "PreToolUse",
+            "taskId": "cline-task-1",
+            "preToolUse": {
+                "toolName": "run_commands",
+                "parameters": {"commands": ["cat docs/adr/1.md"]}
+            },
+            "tool_call": {
+                "id": "toolu_01live",
+                "name": "run_commands",
+                "input": {"commands": ["cat docs/adr/1.md"]}
+            }
+        });
+        assert_eq!(
+            tool_payload_fields(AgentKind::Cline, &live),
+            Some(("run_commands", Some("toolu_01live")))
+        );
+        let metadata = tool_observation_metadata(AgentKind::Cline, &live, true).unwrap();
+        assert_eq!(metadata.tool_family, ToolFamily::NonFile);
+        assert_eq!(metadata.tool_call_id.as_deref(), Some("toolu_01live"));
+
+        // Documented VS Code envelope with no `tool_call`.
+        let documented = json!({
+            "preToolUse": {
+                "toolName": "read_files",
+                "parameters": {"files": [{"path": "src/lib.rs"}]}
+            }
+        });
+        assert_eq!(
+            tool_payload_fields(AgentKind::Cline, &documented),
+            Some(("read_files", None))
+        );
+        let documented_meta =
+            tool_observation_metadata(AgentKind::Cline, &documented, true).unwrap();
+        assert_eq!(documented_meta.tool_family, ToolFamily::File);
+        assert_eq!(documented_meta.tool_call_id, None);
+
+        let older_tool_key = json!({
+            "preToolUse": {
+                "tool": "write_to_file",
+                "parameters": {"path": "src/config.ts"}
+            }
+        });
+        assert_eq!(
+            tool_payload_fields(AgentKind::Cline, &older_tool_key),
+            Some(("write_to_file", None))
+        );
+
+        let documented_failure = json!({
+            "postToolUse": {
+                "toolName": "run_commands",
+                "parameters": {"commands": ["ls"]},
+                "result": "denied",
+                "success": false
+            }
+        });
+        assert_eq!(
+            tool_observation_outcome(AgentKind::Cline, &documented_failure),
+            ToolOutcome::Error
+        );
+        let documented_success = json!({
+            "postToolUse": {
+                "toolName": "run_commands",
+                "result": "ok",
+                "success": true
+            }
+        });
+        assert_eq!(
+            tool_observation_outcome(AgentKind::Cline, &documented_success),
+            ToolOutcome::Success
+        );
+
+        let policy = CapturePolicy::resolve(
+            CaptureSource::Parsed(&CaptureConfig {
+                ignore_paths: vec!["docs/adr/**".into()],
+            }),
+            "/repo",
+            None,
+        );
+        let disposition = |raw: &Value| {
+            policy
+                .inspect(AgentKind::Cline, raw, "/repo")
+                .protocol()
+                .clone()
+        };
+        let call = |name: &str, input: Value| {
+            json!({
+                "tool_call": {
+                    "id": "toolu_01policy",
+                    "name": name,
+                    "input": input,
+                }
+            })
+        };
+        assert_eq!(
+            disposition(&call(
+                "run_commands",
+                json!({"commands": ["cat docs/adr/1.md"]})
+            ))
+            .disposition(),
+            CaptureDisposition::Drop
+        );
+        assert_eq!(
+            disposition(&call(
+                "run_commands",
+                json!({"commands": ["cat src/lib.rs"]})
+            ))
+            .disposition(),
+            CaptureDisposition::Keep
+        );
+        assert_eq!(
+            disposition(&call(
+                "read_files",
+                json!({"files": [{"path": "docs/adr/1.md"}]})
+            ))
+            .disposition(),
+            CaptureDisposition::Drop
+        );
+        assert_eq!(
+            disposition(&call(
+                "read_files",
+                json!({"files": [{"path": "src/lib.rs"}]})
+            ))
+            .disposition(),
+            CaptureDisposition::Keep
+        );
+        assert_eq!(
+            disposition(&call("editor", json!({"path": "docs/adr/1.md"}))).disposition(),
+            CaptureDisposition::Drop
+        );
+        assert_eq!(
+            disposition(&call("search_codebase", json!({"query": "TODO"}))).disposition(),
+            CaptureDisposition::Drop
+        );
+        // Without the Cline mapping the same payloads stay unrecognized.
+        assert_eq!(
+            policy
+                .inspect(
+                    AgentKind::Other,
+                    &call("run_commands", json!({"commands": ["cat docs/adr/1.md"]}),),
+                    "/repo",
+                )
+                .protocol()
+                .disposition(),
+            CaptureDisposition::Keep
+        );
     }
 
     /// Meta Muse Code's tool calls, in the shapes captured offline from Muse
@@ -5654,6 +6159,56 @@ mod tests {
         assert!(tool_observation_metadata(AgentKind::Grizzybot, &no_input, false).is_some());
     }
 
+    /// Claude Code's documented `PostToolUseFailure` payload proves an error;
+    /// its success payload proves nothing.
+    #[test]
+    fn claude_code_post_tool_use_failure_error_maps_to_error_outcome() {
+        let failure = json!({
+            "hook_event_name": "PostToolUseFailure",
+            "tool_name": "Bash",
+            "tool_input": {"command": "npm test", "description": "Run test suite"},
+            "tool_use_id": "toolu_01ABC123",
+            "error": "Exit code 1
+        Error: Cannot find module 'express'",
+            "is_interrupt": false,
+            "duration_ms": 4187
+        });
+        assert_eq!(
+            tool_observation_outcome(AgentKind::ClaudeCode, &failure),
+            ToolOutcome::Error
+        );
+        // An abort is still a call that did not succeed.
+        let interrupted = json!({
+            "hook_event_name": "PostToolUseFailure",
+            "tool_name": "Bash",
+            "tool_input": {"command": "sleep 100"},
+            "error": "Command aborted",
+            "is_interrupt": true
+        });
+        assert_eq!(
+            tool_observation_outcome(AgentKind::ClaudeCode, &interrupted),
+            ToolOutcome::Error
+        );
+        // Control: a success and an empty `error` stay unknown.
+        let success = json!({
+            "hook_event_name": "PostToolUse",
+            "tool_name": "Bash",
+            "tool_input": {"command": "npm test"},
+            "tool_response": {"stdout": "ok", "stderr": "", "interrupted": false}
+        });
+        assert_eq!(
+            tool_observation_outcome(AgentKind::ClaudeCode, &success),
+            ToolOutcome::Unknown
+        );
+        assert_eq!(
+            tool_observation_outcome(
+                AgentKind::ClaudeCode,
+                &json!({"tool_name": "Bash", "error": ""})
+            ),
+            ToolOutcome::Unknown
+        );
+    }
+
     #[test]
     fn zcode_post_tool_use_failure_error_maps_to_error_outcome() {
         // Live-captured PostToolUseFailure payload (run 10, real model, #512):
@@ -5702,6 +6257,72 @@ mod tests {
             ToolOutcome::Error
         );
         assert_eq!(outcome(json!({"tool_name": "bash"})), ToolOutcome::Unknown);
+    }
+
+    /// Cursor's documented `postToolUseFailure` payload
+    /// (<https://cursor.com/docs/agent/hooks>) proves an error when the call
+    /// failed or timed out; a denied call, an undocumented failure type and
+    /// the `postToolUse` payload prove nothing.
+    #[test]
+    fn cursor_post_tool_use_failure_maps_to_error_outcome() {
+        let outcome = |raw: Value| tool_observation_outcome(AgentKind::Cursor, &raw);
+        let failure = |failure_type: &str, error_message: &str| {
+            json!({
+                "conversation_id": "conv-1",
+                "hook_event_name": "postToolUseFailure",
+                "cursor_version": "3.24.9",
+                "tool_name": "Shell",
+                "tool_input": {"command": "npm test"},
+                "tool_use_id": "abc123",
+                "cwd": "/project",
+                "error_message": error_message,
+                "failure_type": failure_type,
+                "duration": 5000,
+                "is_interrupt": false
+            })
+        };
+        assert_eq!(
+            outcome(failure("error", "Exit code 1: Cannot find module")),
+            ToolOutcome::Error
+        );
+        assert_eq!(
+            outcome(failure("timeout", "Command timed out after 30s")),
+            ToolOutcome::Error
+        );
+        // A denied call is not a tool failure, and a future type proves
+        // nothing.
+        assert_eq!(
+            outcome(failure("permission_denied", "Denied by the user")),
+            ToolOutcome::Unknown
+        );
+        assert_eq!(
+            outcome(failure("cancelled", "Stopped")),
+            ToolOutcome::Unknown
+        );
+        // A message with no type still names a failure; an empty one does not.
+        assert_eq!(
+            outcome(json!({"tool_name": "Shell", "error_message": "Exit code 1"})),
+            ToolOutcome::Error
+        );
+        assert_eq!(
+            outcome(json!({"tool_name": "Shell", "error_message": ""})),
+            ToolOutcome::Unknown
+        );
+        // Control: the success payload stays unknown.
+        assert_eq!(
+            outcome(json!({
+                "conversation_id": "conv-1",
+                "hook_event_name": "postToolUse",
+                "cursor_version": "3.24.9",
+                "tool_name": "Shell",
+                "tool_input": {"command": "npm test"},
+                "tool_output": "{\"exitCode\":0,\"stdout\":\"All tests passed\"}",
+                "tool_use_id": "abc123",
+                "cwd": "/project",
+                "duration": 5432
+            })),
+            ToolOutcome::Unknown
+        );
     }
 
     #[test]
