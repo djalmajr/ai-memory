@@ -12,6 +12,17 @@ use axum::{
 };
 use tower::ServiceExt;
 
+fn review_feature_state(json: &serde_json::Value) -> &str {
+    json["features"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|v| v["id"] == "review")
+        .unwrap()["state"]
+        .as_str()
+        .unwrap()
+}
+
 fn mounted(store: &Store, wiki: Wiki, runtime: Option<RuntimeFeatures>) -> axum::Router {
     split_web_routers(
         true,
@@ -150,6 +161,75 @@ async fn contextual_states_report_effective_configuration_and_mask_admin_setting
             .unwrap()["state"],
         "Scheduled"
     );
+}
+
+#[tokio::test]
+async fn contextual_review_feature_reports_prefix_only_approval_policy() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = Store::open(tmp.path()).unwrap();
+    let wiki = Wiki::new(tmp.path(), store.writer.clone()).unwrap();
+
+    // Default: no global switch, no active prefixes -> automatic approval.
+    let app = mounted(&store, wiki.clone(), Some(RuntimeFeatures::default()));
+    let (status, body) = get(&app, "/api/v1/docs/features/status", AuthLevel::Root, None).await;
+    assert_eq!(status, StatusCode::OK);
+    let json: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(
+        review_feature_state(&json),
+        "Automatic approval configured",
+        "the default keeps automatic approval"
+    );
+
+    // Prefix-only retention: no global switch, at least one active prefix.
+    let app = mounted(
+        &store,
+        wiki.clone(),
+        Some(RuntimeFeatures {
+            review_approval_prefixes: vec!["_rules/".to_string(), "procedures/".to_string()],
+            ..RuntimeFeatures::default()
+        }),
+    );
+    let (status, body) = get(&app, "/api/v1/docs/features/status", AuthLevel::Root, None).await;
+    assert_eq!(status, StatusCode::OK);
+    let json: serde_json::Value = serde_json::from_str(&body).unwrap();
+    let review_state = review_feature_state(&json);
+    assert_eq!(
+        review_state, "Manual approval for: _rules/, procedures/",
+        "prefix-only retention lists the configured prefixes"
+    );
+    assert!(
+        !review_state.contains("Automatic"),
+        "the review state must not claim automatic approval: {review_state}"
+    );
+
+    // A blank-only prefix list changes nothing: the policy stays automatic.
+    let app = mounted(
+        &store,
+        wiki.clone(),
+        Some(RuntimeFeatures {
+            review_approval_prefixes: vec!["".to_string(), "  ".to_string()],
+            ..RuntimeFeatures::default()
+        }),
+    );
+    let (status, body) = get(&app, "/api/v1/docs/features/status", AuthLevel::Root, None).await;
+    assert_eq!(status, StatusCode::OK);
+    let json: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(review_feature_state(&json), "Automatic approval configured");
+
+    // Global switch wins over the prefixes.
+    let app = mounted(
+        &store,
+        wiki,
+        Some(RuntimeFeatures {
+            review_requires_approval: true,
+            review_approval_prefixes: vec!["_rules/".to_string()],
+            ..RuntimeFeatures::default()
+        }),
+    );
+    let (status, body) = get(&app, "/api/v1/docs/features/status", AuthLevel::Root, None).await;
+    assert_eq!(status, StatusCode::OK);
+    let json: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(review_feature_state(&json), "Manual approval required");
 }
 
 #[tokio::test]

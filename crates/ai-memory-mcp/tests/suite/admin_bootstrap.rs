@@ -59,6 +59,7 @@ async fn make_admin_state(tmp: &TempDir) -> AdminState {
         wiki,
         llm: None, // no LLM — bootstrap report path only
         auto_improve_require_approval: false,
+        auto_improve_require_approval_prefixes: Vec::new(),
         auto_improve_review_config: Default::default(),
         embedder: None,
         provider_health: ai_memory_llm::ProviderHealth::default(),

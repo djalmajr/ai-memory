@@ -101,6 +101,7 @@ async fn make_admin_state(tmp: &TempDir, llm: Option<Arc<dyn LlmProvider>>) -> A
         wiki,
         llm,
         auto_improve_require_approval: false,
+        auto_improve_require_approval_prefixes: Vec::new(),
         auto_improve_review_config: Default::default(),
         embedder: None,
         provider_health: ai_memory_llm::ProviderHealth::default(),
