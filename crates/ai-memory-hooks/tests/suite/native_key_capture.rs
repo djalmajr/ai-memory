@@ -146,6 +146,7 @@ async fn harness() -> (TempDir, Store, HookState) {
         mid_session_routing: ai_memory_core::MidSessionRouting::default(),
         profile: ai_memory_core::profile::ProfileSettings::default(),
         ingest_drop_list: crate::drop_list::IngestDropList::default(),
+        record_tool_names: false,
         skip_wiki_checkpoints: true,
     };
     (tmp, store, state)
