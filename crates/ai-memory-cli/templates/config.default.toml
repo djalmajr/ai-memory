@@ -102,6 +102,11 @@ log_level = "info"
 # queries keep local order. Env equivalent: `AI_MEMORY_RERANKER=llm`.
 # reranker = "llm"
 
+# Seconds one reranker call may take before memory_query keeps its pre-rerank
+# order. Raise it when an LLM fallback chain answers slowly. Must be at least 1.
+# Env equivalent: `AI_MEMORY_RERANK_TIMEOUT_SECS`.
+# rerank_timeout_secs = 20
+
 # --- LLM provider (consolidation, auto-improve, reranker) -----------------
 # Unset = zero-LLM: session pages are written heuristically and search needs no
 # provider. Setting a provider turns on the LLM features that need one. Each key
@@ -378,6 +383,15 @@ ledger_retention_months = 0        # 0 = never delete hook event ledgers
 # default (nothing dropped).
 # Env equivalent: AI_MEMORY_INGEST__DROP_EVENTS=pre-tool-use
 # drop_events = ["pre-tool-use"]
+#
+# Name each tool call in its observation instead of only its family: the title
+# `tool non-file` becomes `tool non-file: Bash`, and a Claude Code `Skill` or
+# `Agent` call also keeps the skill or subagent type it ran. Session pages and
+# handoffs then count calls by name. Only identifiers are kept, never a tool's
+# arguments (a shell command, a prompt, a path), and a call a capture policy
+# reduced to metadata stays unnamed. Off by default.
+# Env equivalent: AI_MEMORY_INGEST__RECORD_TOOL_NAMES=true
+# record_tool_names = true
 
 # Privacy strip.
 #
@@ -529,14 +543,18 @@ pending_path = "_pending/auto-improve"
 # max_rejection_context = 50
 # rejection_context_days = 180
 
-# Optional executable evaluation gate for selected proposal targets. Disabled by
-# default; operators supply the command and scoring policy. The command is run
-# directly (not through a shell), split on whitespace, with JSON on stdin. Use a
-# wrapper script for paths with spaces, custom environment, or multiple commands.
-# It must print JSON such as { "score_before": 0.72, "score_after": 0.76, "passed": true }.
+# Optional evaluation gate for selected proposal targets. Disabled by default;
+# choose either the built-in structural scorer or an external command. A command
+# is run directly (not through a shell), split on whitespace, with JSON on stdin.
+# Use a wrapper script for paths with spaces, custom environment, or multiple
+# commands. It must print JSON such as
+# { "score_before": 0.72, "score_after": 0.76, "passed": true }.
+# Set builtin = "structure" to run the built-in checks in process instead;
+# builtin and command are mutually exclusive.
 [auto_improve.eval]
 enabled = false
 command = ""
+builtin = ""
 timeout_secs = 120
 targets = ["_rules", "procedures"]
 min_delta = 0.0
@@ -617,8 +635,13 @@ mid_session = "follow-cwd"
 # (docs/managed-workstreams.md). Off by default. The `--require-server` flag
 # requests it for one launch, and `AI_MEMORY_RUN_REQUIRE_SERVER=true` for an
 # environment; the variable can only turn it on.
+#
+# exit_prompt offers the switch and rerun menu after a successful interactive
+# session. On by default; `run --no-exit-prompt` skips it for one launch and
+# `AI_MEMORY_RUN_EXIT_PROMPT=false` for an environment.
 # [run]
 # require_server = false
+# exit_prompt = true
 
 # Client-side hook spool retry policy. max_attempts is the number of failed
 # drain passes before a spooled hook event is dropped. 0 disables the limit.
@@ -722,6 +745,14 @@ mid_session = "follow-cwd"
 # equivalent: `AI_MEMORY_SEARCH_FTS_STOPWORDS=a,b,c`; a blank value is ignored.
 # [search.fts]
 #   stopwords = ["e", "é", "de", "que", "em", "uma"]
+
+# Estimated token budget for the evidence memory_query(answer=true) sends to
+# the model, counting each UTF-8 byte as one token. Unset (the default) admits
+# every hit. Evidence that does not fit is reported in answer_context, and zero
+# or a too-small value prevents synthesis. Env equivalent:
+# `AI_MEMORY_QUERY_ANSWER__MAX_CONTEXT_TOKENS`.
+# [query_answer]
+#   max_context_tokens = 16000
 
 # Cross-project profile: how you usually work, delivered to every project as
 # defaults below the repository's rules file (docs/cross-project-profile.md).

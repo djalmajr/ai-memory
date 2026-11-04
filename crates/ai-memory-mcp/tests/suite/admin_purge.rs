@@ -1137,6 +1137,7 @@ async fn purge_project_removes_raw_workstream_segments() {
     let prepared = store
         .writer
         .prepare_workstream_run(PrepareWorkstreamRun {
+            scope_by_id: false,
             workspace_id,
             project_id,
             repo_fingerprint: "repo".into(),
@@ -1825,6 +1826,7 @@ async fn purge_project_dry_run_conflicts_on_a_live_managed_run_without_force() {
     store
         .writer
         .prepare_workstream_run(PrepareWorkstreamRun {
+            scope_by_id: false,
             workspace_id,
             project_id,
             repo_fingerprint: "repo".into(),

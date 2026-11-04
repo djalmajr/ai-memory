@@ -28,6 +28,7 @@ Defaults that come from a named constant or from another crate say so in the Def
 | `strip_root_combinators` | `false` | `AI_MEMORY_STRIP_ROOT_COMBINATORS` | Strip root level `anyOf`, `oneOf` and `allOf` from MCP tool input schemas on every `tools/list`. |
 | `gemini_safe_schemas` | `false` | `AI_MEMORY_GEMINI_SAFE_SCHEMAS` | Serve MCP tool schemas in the subset Vertex and Gemini accept. Implies `strip_root_combinators`. |
 | `reranker` | unset | `AI_MEMORY_RERANKER` | Post-fusion reranker for `memory_query`. The only value is `llm`, which needs an LLM provider. |
+| `rerank_timeout_secs` | `20` (`ai_memory_llm::reranker::RERANK_TIMEOUT`) | `AI_MEMORY_RERANK_TIMEOUT_SECS` | Seconds one rerank call may take before `memory_query` keeps the pre-rerank order. Must be at least 1. |
 | `llm_provider` | unset | `AI_MEMORY_LLM_PROVIDER` | LLM provider: `anthropic`, `openai`, `gemini`, `openai-compat`, `openai-oauth`, `anthropic-oauth`, `codex`, `copilot`, `opencode` or `cursor`. |
 | `llm_model` | unset | `AI_MEMORY_LLM_MODEL` | Model override for the LLM provider. |
 | `llm_base_url` | unset | `AI_MEMORY_LLM_BASE_URL` | Endpoint override for the LLM provider. Required for `openai-compat`. |
@@ -76,6 +77,7 @@ An array of tables, defined by `WebhookConfig` in `ai-memory-wiki`. The default 
 | Key | Default | Env equivalent | Purpose |
 | --- | --- | --- | --- |
 | `require_server` | `false` | `AI_MEMORY_RUN_REQUIRE_SERVER` | Fail a managed launch when the server is unreachable. The variable can only turn it on. |
+| `exit_prompt` | `true` | `AI_MEMORY_RUN_EXIT_PROMPT` | Offer the switch and rerun menu after a successful interactive session. `ai-memory run --no-exit-prompt` skips it for one launch. |
 | `profiles.<name>.env` | none | - | Named table of string environment overrides, selected with `ai-memory run --profile <name>`. |
 
 Profile names use 1 to 64 ASCII letters, digits, `.`, `_` or `-`. A config holds at most 128 profiles, each with at most 128 entries. A key is at most 256 bytes and a value at most 64 KiB.
@@ -160,6 +162,12 @@ The defaults come from `ai_memory_store::RetrievalTuning::default()`.
 | --- | --- | --- | --- |
 | `stopwords` | unset (the built-in English list) | `AI_MEMORY_SEARCH_FTS_STOPWORDS` (comma separated, blank ignored) | Words dropped from a bare natural-language query. `[]` turns the filter off. A list replaces the built-in one. |
 
+## `[query_answer]`
+
+| Key | Default | Env equivalent | Purpose |
+| --- | --- | --- | --- |
+| `max_context_tokens` | unset (no limit) | `AI_MEMORY_QUERY_ANSWER__MAX_CONTEXT_TOKENS` | Estimated token budget for the evidence `memory_query(answer=true)` sends to the model. Each UTF-8 byte counts as one token. Omitted or clipped evidence is reported in `answer_context`, and zero or a too-small value prevents synthesis. |
+
 ## `[slots]`
 
 | Key | Default | Env equivalent | Purpose |
@@ -208,8 +216,9 @@ The defaults named `DEFAULT_AUTO_IMPROVE_*` are constants in `ai-memory-consolid
 
 | Key | Default | Env equivalent | Purpose |
 | --- | --- | --- | --- |
-| `enabled` | `false` | `AI_MEMORY_AUTO_IMPROVE__EVAL__ENABLED` | Turn on the external eval command gate. |
+| `enabled` | `false` | `AI_MEMORY_AUTO_IMPROVE__EVAL__ENABLED` | Turn on the proposal evaluation gate. |
 | `command` | empty | `AI_MEMORY_AUTO_IMPROVE__EVAL__COMMAND` | Executable plus whitespace-separated arguments, run directly without a shell. |
+| `builtin` | empty | `AI_MEMORY_AUTO_IMPROVE__EVAL__BUILTIN` | Scorer run in process instead of `command`. The only value is `structure`. Set `builtin` or `command`, not both. |
 | `timeout_secs` | `120` | `AI_MEMORY_AUTO_IMPROVE__EVAL__TIMEOUT_SECS` | Timeout per proposal eval command. |
 | `targets` | `["_rules", "procedures"]` (`default_auto_improve_eval_targets`) | `AI_MEMORY_AUTO_IMPROVE__EVAL__TARGETS` | Wiki path prefixes that require the eval when it is enabled. |
 | `min_delta` | `0.0` | `AI_MEMORY_AUTO_IMPROVE__EVAL__MIN_DELTA` | Required `score_after` minus `score_before` when scores are present. |
@@ -275,6 +284,7 @@ Defined by `SanitizeConfig` in `ai-memory-core`. Built-in redaction patterns alw
 | `drop_tool_use_id_prefixes` | `[]` | `AI_MEMORY_INGEST__DROP_TOOL_USE_ID_PREFIXES` | Drop a tool event whose `tool_use_id` starts with one of these. |
 | `drop_tool_names` | `[]` | `AI_MEMORY_INGEST__DROP_TOOL_NAMES` | Drop a tool event whose tool name equals one of these exactly. |
 | `drop_events` | `[]` | `AI_MEMORY_INGEST__DROP_EVENTS` | Drop whole hook event kinds. `session-start` and `session-end` are rejected at load. |
+| `record_tool_names` | `false` | `AI_MEMORY_INGEST__RECORD_TOOL_NAMES` | Name each tool call in its observation (`tool non-file: Bash`, plus a Claude Code skill or subagent type) instead of only its family. Never a tool's arguments. |
 
 ## `[hook_spool]`
 

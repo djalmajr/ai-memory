@@ -17,6 +17,7 @@ use rusqlite::{Connection, TransactionBehavior};
 mod api_credentials;
 mod auto_improve;
 pub mod belief;
+mod dashboard;
 pub mod decay;
 mod error;
 mod fts_query;
@@ -26,6 +27,8 @@ mod migrations;
 mod ops;
 pub mod password;
 mod profile;
+mod provenance;
+pub use provenance::{PageDisagreement, PageProvenance, PageSource};
 mod project_authz;
 mod project_coordinates;
 mod reader;
@@ -50,6 +53,7 @@ pub use auto_improve::{
     StagedAutoImproveRun, StagedAutoImproveRunReport, artifact_path_for,
 };
 pub use belief::{BeliefInputs, CONFIDENCE_CAP, confidence};
+pub use dashboard::{AgentUsage, RegisteredAgent};
 pub use decay::{
     DecayParams, SALIENCE_MAX, SALIENCE_MIN, SALIENCE_STEP, TierLambdas,
     lambda_from_half_life_days, retention_score, retention_score_with_breadth,
@@ -65,16 +69,16 @@ pub use ops::{
     ConditionalUpsert, ConsolidationChunkRecord, DateOnlyTtlPage, DeleteWorkspaceSummary,
     EmbedOutcome, EmbeddingWrite, EntityBackfillSummary, HookSessionAdmission, IdentityResolution,
     IdleEndAction, IdleEndCandidate, IdleEndResult, IngestObservationOutcome,
-    LifecycleOnlyEndOutcome, MAX_PENDING_INBOX_MESSAGES, MoveSessionSummary, MoveSummary,
-    ObservationPruneOutcome, OkfMigratedPage, PAGE_WINDOW_BACKFILL_BATCH, PagePrecondition,
-    PageWindowBackfillSummary, PagesMode, ProjectAliasWriteResolution, PurgeMode,
-    PurgeSessionSummary, PurgeSummary, ReorgSummary, RepairSessionTimesSummary,
-    RepairedSessionTimes, SessionTimesCandidate, SessionTimesSkipReason, SkippedSessionTimes,
-    StaleAfterRepair, backfill_entity_index, backfill_page_windows,
+    LifecycleOnlyEndOutcome, MAX_PENDING_INBOX_MESSAGES, MergeProjectPage, MergeProjectSummary,
+    MoveSessionSummary, MoveSummary, ObservationPruneOutcome, OkfMigratedPage,
+    PAGE_WINDOW_BACKFILL_BATCH, PagePrecondition, PageWindowBackfillSummary, PagesMode,
+    ProjectAliasWriteResolution, PurgeMode, PurgeSessionSummary, PurgeSummary, ReorgSummary,
+    RepairSessionTimesSummary, RepairedSessionTimes, SessionTimesCandidate, SessionTimesSkipReason,
+    SkippedSessionTimes, StaleAfterRepair, backfill_entity_index, backfill_page_windows,
     backfill_page_windows_in_batches, purge_session, record_embed_failure,
 };
 pub use profile::{
-    NewProfileCandidate, PROFILE_CANDIDATES_LIMIT, PROFILE_ENTRIES_LIMIT, PROFILE_HARVEST_BATCH,
+    NewProfileCandidate, PROFILE_CANDIDATES_LIMIT, PROFILE_DIGEST_READ_CAP, PROFILE_HARVEST_BATCH,
     ProfileCandidateRow, ProfileDigestInputs, ProfileHarvestMark, ProfileHarvestProject,
     ProfileLedgerEntry, ProfileOptOut, ProfilePageRow, ProfilePromptRow, ProfileScopePage,
     ProjectProfileFlags,
@@ -84,14 +88,15 @@ pub use project_authz::{
     RESTRICTED_PROJECT_FORBIDDEN, authorize_project, resolve_project_authz,
 };
 pub use reader::{
-    ActivityWindow, AgentSessionCount, AuditEvent, AuditLogFilter, AutoImproveCandidateSession,
-    AutoImproveParkedClaim, BriefPageBody, BriefingPage, BriefingSnapshot, ClientActivity,
-    ContaminationFinding, ContaminationReport, ContaminationSummary, ContradictionEdge,
-    CrossProjectEdge, DecayCandidate, DecayTombstone, DerivedIndexStatus, EmbeddingTripleCount,
-    FTS_HIGHLIGHT_END, FTS_HIGHLIGHT_START, FeedbackFinding, GraphVia, HealthDetail, HealthPage,
-    HybridSearch, HybridSearchOutcome, IdleOpenSession, InboxCount, InboxEntry, LinkGraph,
-    LinkGraphEdge, LinkGraphNode, ObservationHit, ObservationOrder, ObservationPage,
-    ObservationPageResult, ObservationProjectionTotals, ObservationRecord, OpenSession, PAGE_KINDS,
+    ActivityWindow, AgentSessionCount, AnswerEvidenceMeta, AuditEvent, AuditLogFilter,
+    AutoImproveCandidateSession, AutoImproveParkedClaim, BriefPageBody, BriefingPage,
+    BriefingSnapshot, ClientActivity, ContaminationFinding, ContaminationReport,
+    ContaminationSummary, ContradictionEdge, CrossProjectEdge, DecayCandidate, DecayTombstone,
+    DerivedIndexStatus, EmbeddingTripleCount, FTS_HIGHLIGHT_END, FTS_HIGHLIGHT_START,
+    FeedbackFinding, GraphVia, HealthDetail, HealthPage, HybridSearch, HybridSearchOutcome,
+    IdleOpenSession, InboxCount, InboxEntry, InterruptedSessionCandidate, LinkGraph, LinkGraphEdge,
+    LinkGraphNode, ObservationHit, ObservationOrder, ObservationPage, ObservationPageResult,
+    ObservationProjectionTotals, ObservationRecord, OpenSession, PAGE_KINDS,
     PAGE_VERSIONS_MAX_LIMIT, PROJECT_LINK_GRAPH_MAX_NODES, PageAuthor, PageFilter, PageHit,
     PageHitWithMeta, PageLinks, PageLinksPreview, PageMeta, PageSummary, PageVersion,
     PageVersionBody, PageVersions, ProjectCoordinateCollisionReason, ProjectCoordinateDiagnostic,
@@ -100,9 +105,11 @@ pub use reader::{
     SESSION_LINE_TITLE_CHARS, SUBSTANTIVE_OBSERVATION_KIND_SQL, ScopeRow, SearchExplain,
     SessionActivity, SessionConsolidationQueue, SessionConsolidationSummary, SessionDependentRows,
     SessionEndDisposition, SessionKindSummary, SessionLine, SessionObservationSnapshot,
-    SessionPromptTitles, SessionSummary, SessionToolTitles, SettledPage, StatusCounts,
-    StorageStatus, StoredEmbedding, StoredPageBody, StreamTimings, VectorQuery, WorkspaceScopeRow,
+    SessionPromptTitles, SessionSummary, SessionToolTitles, SessionUsageView, SettledPage,
+    StatusCounts, StorageStatus, StoredEmbedding, StoredPageBody, StreamTimings, TokenCallOrder,
+    TokenCallQuery, TokenCallView, TokenUsageReport, VectorQuery, WorkspaceScopeRow,
     WorkspaceSummary, f32_vec_to_bytes, highlighted_snippet_html, plain_snippet,
+    project_name_fold_key,
 };
 pub use retrieval_tuning::{RetrievalTuning, is_session_recall_query};
 pub use scope::{
@@ -111,7 +118,7 @@ pub use scope::{
     create_explicit_scope, create_explicit_scope_guarded, create_global_scope,
     create_profile_scope, lookup_existing_scope, lookup_existing_scope_guarded,
     lookup_existing_workspace, lookup_global_scope, lookup_profile_scope,
-    resolve_many_existing_scopes, resolve_many_existing_scopes_guarded,
+    lookup_project_id_guarded, resolve_many_existing_scopes, resolve_many_existing_scopes_guarded,
 };
 pub use session_consolidation::{
     SESSION_CONSOLIDATION_MAX_ATTEMPTS, SessionConsolidationJob, enqueue_in_tx,
@@ -119,11 +126,12 @@ pub use session_consolidation::{
 pub use users::{LoginUser, TOKEN_HASH_LEN, TOKEN_RAW_LEN, TokenPepper, hash_token};
 pub use web_sessions::{LiveWebSession, WebSession, hash_session_secret};
 pub use workstream::{
-    FinishWorkstreamRun, FinishedWorkstreamRun, LinkManagedRunSessionInScope,
-    LinkOrAdoptManagedRunSession, ManagedRunAuthority, ManagedRunContext, ManagedRunSessionLink,
-    OperationalWorkstreamSummary, PrepareWorkstreamRun, PreparedWorkstreamRun, RenameWorkstream,
-    RenamedWorkstream, StoredManagedRunStatus, StoredWorkstreamSummary,
-    WorkstreamOperationalStatus, WorkstreamSelection, WorkstreamSelector,
+    ClaudeSessionBoundary, FinishWorkstreamRun, FinishedWorkstreamRun,
+    LinkManagedRunSessionInScope, LinkOrAdoptManagedRunSession, ManagedRunAuthority,
+    ManagedRunContext, ManagedRunHookIdentity, ManagedRunSessionLink, OperationalWorkstreamSummary,
+    PrepareWorkstreamRun, PreparedWorkstreamRun, RenameWorkstream, RenamedWorkstream,
+    StoredManagedRunStatus, StoredWorkstreamSummary, WorkstreamOperationalStatus,
+    WorkstreamSelection, WorkstreamSelector,
 };
 pub use writer::{StartupContextAcceptance, WriterHandle};
 
@@ -2832,6 +2840,89 @@ mod tests {
             .unwrap();
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].path.as_str(), "hyphen.md");
+    }
+
+    const DIRECTORY_PATH_BODY: &str =
+        "edited crates/ai-memory-store/src/reader.rs for the writer_actor in ai-memory";
+    const DIRECTORY_PATH_QUERIES: [&str; 5] = [
+        "reader.rs",
+        "reader",
+        "src/reader.rs",
+        // Control: identifiers must still match as whole tokens.
+        "ai-memory",
+        "writer_actor",
+    ];
+
+    #[tokio::test]
+    async fn search_finds_a_page_naming_a_file_with_its_directory() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let (ws, proj) = open_managed_scope(&store, "proj").await;
+        store
+            .writer
+            .upsert_page(sample_page(ws, proj, "notes/edit.md", DIRECTORY_PATH_BODY))
+            .await
+            .unwrap();
+
+        for query in DIRECTORY_PATH_QUERIES {
+            let hits = store
+                .reader
+                .search_pages_for_project(ws, proj, query.into(), 10, None)
+                .await
+                .unwrap();
+            assert_eq!(hits.len(), 1, "query {query:?}");
+            assert_eq!(hits[0].path.as_str(), "notes/edit.md", "query {query:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn search_finds_an_observation_naming_a_file_with_its_directory() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let (ws, proj) = open_managed_scope(&store, "proj").await;
+        let session_id = SessionId::new();
+        store
+            .writer
+            .begin_session(NewSession {
+                occurred_at: None,
+                id: session_id,
+                workspace_id: ws,
+                project_id: proj,
+                agent_kind: AgentKind::ClaudeCode,
+                cwd: None,
+                actor_user: None,
+            })
+            .await
+            .unwrap();
+        store
+            .writer
+            .insert_observation(Sanitized::new(
+                NewObservation {
+                    occurred_at: None,
+                    session_id,
+                    workspace_id: ws,
+                    project_id: proj,
+                    kind: ObservationKind::PostToolUse,
+                    extension: None,
+                    source_event: None,
+                    title: "tool file".into(),
+                    body: DIRECTORY_PATH_BODY.into(),
+                    importance: 5,
+                },
+                &Sanitizer::builtin(),
+            ))
+            .await
+            .unwrap();
+
+        for query in DIRECTORY_PATH_QUERIES {
+            let hits = store
+                .reader
+                .search_observations_for_project(ws, proj, query.into(), 5)
+                .await
+                .unwrap();
+            assert_eq!(hits.len(), 1, "query {query:?}");
+            assert_eq!(hits[0].session_id, session_id, "query {query:?}");
+        }
     }
 
     #[tokio::test]
@@ -5766,6 +5857,7 @@ mod tests {
             .await
             .unwrap();
         let prepare = PrepareWorkstreamRun {
+            scope_by_id: false,
             workspace_id: ws,
             project_id: project,
             repo_fingerprint: "repo".into(),
@@ -5943,6 +6035,7 @@ mod tests {
             .await
             .unwrap();
         let prepare = PrepareWorkstreamRun {
+            scope_by_id: false,
             workspace_id: ws,
             project_id: project,
             repo_fingerprint: "repo".into(),
@@ -6206,6 +6299,7 @@ mod tests {
             .await
             .unwrap();
         let prepare = PrepareWorkstreamRun {
+            scope_by_id: false,
             workspace_id: workspace,
             project_id: project,
             repo_fingerprint: "repo".into(),
@@ -6262,6 +6356,7 @@ mod tests {
             .await
             .unwrap();
         let prepare = |agent, owner: &str| PrepareWorkstreamRun {
+            scope_by_id: false,
             workspace_id: workspace,
             project_id: project,
             repo_fingerprint: "repo".into(),
@@ -6429,6 +6524,7 @@ mod tests {
             .await
             .unwrap();
         let base = |agent, owner: &str| PrepareWorkstreamRun {
+            scope_by_id: false,
             workspace_id: workspace,
             project_id: project,
             repo_fingerprint: "repo".into(),
@@ -6506,6 +6602,7 @@ mod tests {
             let run = store
                 .writer
                 .prepare_workstream_run(PrepareWorkstreamRun {
+                    scope_by_id: false,
                     workspace_id: workspace,
                     project_id: project,
                     repo_fingerprint: "same-repository".into(),
@@ -6588,6 +6685,7 @@ mod tests {
         owner: &str,
     ) -> PrepareWorkstreamRun {
         PrepareWorkstreamRun {
+            scope_by_id: false,
             workspace_id: ws,
             project_id: proj,
             repo_fingerprint: "repo".into(),
@@ -6785,6 +6883,57 @@ mod tests {
                 .heartbeat_managed_run(cancelled.run_id)
                 .await
                 .unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_lapsed_active_run_boundary_remains_retryable_after_heartbeat() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let (ws, proj) = open_managed_scope(&store, "managed-lapsed-boundary").await;
+        let mut input = managed_prepare_input(ws, proj, "test:lapsed-boundary");
+        input.scope_by_id = true;
+        let run = store.writer.prepare_workstream_run(input).await.unwrap();
+        let identity = ManagedRunHookIdentity {
+            run_id: run.run_id,
+            agent: AgentKind::Codex,
+            cwd: Some("/repo".into()),
+            native_session_id: "native-session".into(),
+            owner_user: None,
+            session_start: true,
+            claude_boundary: ClaudeSessionBoundary::Other,
+        };
+
+        set_managed_run_lease(store.db_path(), run.run_id, 1);
+        let err = store
+            .reader
+            .managed_run_pinned_scope(identity)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, StoreError::ManagedRunLeaseLapsed));
+
+        assert!(
+            store
+                .writer
+                .heartbeat_managed_run(run.run_id)
+                .await
+                .unwrap()
+        );
+        assert_eq!(
+            store
+                .reader
+                .managed_run_pinned_scope(ManagedRunHookIdentity {
+                    run_id: run.run_id,
+                    agent: AgentKind::Codex,
+                    cwd: Some("/repo".into()),
+                    native_session_id: "native-session".into(),
+                    owner_user: None,
+                    session_start: true,
+                    claude_boundary: ClaudeSessionBoundary::Other,
+                })
+                .await
+                .unwrap(),
+            Some((ws, proj))
         );
     }
 
@@ -7677,6 +7826,7 @@ mod tests {
         let store = Store::open(tmp.path()).unwrap();
         let (ws, proj) = open_managed_scope(&store, "managed-selection").await;
         let prepare = |selection| PrepareWorkstreamRun {
+            scope_by_id: false,
             selection,
             ..managed_prepare_input(ws, proj, "test:1")
         };
@@ -7736,6 +7886,7 @@ mod tests {
         let store = Store::open(tmp.path()).unwrap();
         let (ws, proj) = open_managed_scope(&store, "managed-list").await;
         let prepare = |name: &str, agent| PrepareWorkstreamRun {
+            scope_by_id: false,
             agent,
             selection: WorkstreamSelection::New(name.into()),
             ..managed_prepare_input(ws, proj, name)
@@ -7777,6 +7928,7 @@ mod tests {
         let claude = store
             .writer
             .prepare_workstream_run(PrepareWorkstreamRun {
+                scope_by_id: false,
                 agent: AgentKind::ClaudeCode,
                 selection: WorkstreamSelection::Named("current".into()),
                 ..managed_prepare_input(ws, proj, "claude")
@@ -7835,6 +7987,7 @@ mod tests {
         let hidden = store
             .writer
             .prepare_workstream_run(PrepareWorkstreamRun {
+                scope_by_id: false,
                 repo_fingerprint: "other-repo".into(),
                 worktree_fingerprint: "other-worktree".into(),
                 selection: WorkstreamSelection::New("hidden".into()),
@@ -7919,6 +8072,7 @@ mod tests {
             store
                 .writer
                 .prepare_workstream_run(PrepareWorkstreamRun {
+                    scope_by_id: false,
                     selection: WorkstreamSelection::New(name.into()),
                     ..managed_prepare_input(ws, proj, name)
                 })
@@ -7957,6 +8111,7 @@ mod tests {
             let prepared = store
                 .writer
                 .prepare_workstream_run(PrepareWorkstreamRun {
+                    scope_by_id: false,
                     selection: WorkstreamSelection::New((*name).into()),
                     ..managed_prepare_input(ws, proj, name)
                 })
@@ -8032,6 +8187,7 @@ mod tests {
             store
                 .writer
                 .prepare_workstream_run(PrepareWorkstreamRun {
+                    scope_by_id: false,
                     selection: WorkstreamSelection::Named(name.into()),
                     ..managed_prepare_input(ws, proj, name)
                 })

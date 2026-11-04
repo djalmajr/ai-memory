@@ -364,6 +364,10 @@ fn docker_source_build_uses_vendored_tailwind() {
         "the source builder must copy files embedded by ai-memory-cli"
     );
     assert!(
+        dockerfile.contains("COPY CHANGELOG.md ./"),
+        "the source builder must include bundled release notes"
+    );
+    assert!(
         !dockerfile.contains("TAILWIND"),
         "the vendored stylesheet is the default; the image build must not opt into a regeneration"
     );

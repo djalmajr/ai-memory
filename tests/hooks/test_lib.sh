@@ -524,6 +524,43 @@ assert_eq "marker_qs forwards [profile] contribute and consume" \
 assert_eq "marker_qs sends explicit [profile] defaults when a marker omits the keys" \
     "&cwd=$(ai_memory_url_encode "$TMP/profile-only")&workspace=outer&profile_contribute=1&profile_consume=1" \
     "$(ai_memory_marker_qs "$TMP/profile-only")"
+# `[handoff] deliver_on_session_start = false` is sent as &handoff=0 only when
+# explicitly falsy, and a [handoff]-only marker is a settings boundary.
+mkdir -p "$TMP/handoff-off/inner" "$TMP/handoff-on"
+printf 'workspace = "outer"\n' >"$TMP/handoff-off/.ai-memory.toml"
+printf '[handoff]\ndeliver_on_session_start = "false"\n' >"$TMP/handoff-off/inner/.ai-memory.toml"
+printf '[handoff]\ndeliver_on_session_start = true\n' >"$TMP/handoff-on/.ai-memory.toml"
+assert_eq "handoff-only marker is a settings boundary" \
+    "$TMP/handoff-off/inner/.ai-memory.toml" "$(ai_memory_find_settings_marker "$TMP/handoff-off/inner")"
+assert_eq "marker_qs forwards the [handoff] opt-out" \
+    "&cwd=$(ai_memory_url_encode "$TMP/handoff-off/inner")&profile_contribute=1&profile_consume=1&handoff=0" \
+    "$(ai_memory_marker_qs "$TMP/handoff-off/inner")"
+assert_eq "marker_qs omits handoff for a sibling project and for a truthy value" \
+    "&cwd=$(ai_memory_url_encode "$TMP/handoff-off")&workspace=outer&profile_contribute=1&profile_consume=1" \
+    "$(ai_memory_marker_qs "$TMP/handoff-off")"
+assert_eq "marker_qs omits handoff when deliver_on_session_start is true" \
+    "&cwd=$(ai_memory_url_encode "$TMP/handoff-on")&profile_contribute=1&profile_consume=1" \
+    "$(ai_memory_marker_qs "$TMP/handoff-on")"
+# `[briefing] inject_on_subagent_start` alone is a settings boundary too, and
+# only the subagent-start query forwards it; the session-start opt-in stays
+# its own.
+mkdir -p "$TMP/subagent-only/inner" "$TMP/subagent-key-only/inner" "$TMP/session-brief-only"
+printf 'workspace = "outer"\n' >"$TMP/subagent-only/.ai-memory.toml"
+printf '[briefing]\ninject_on_subagent_start = true\nmax_chars = 6000\n' >"$TMP/subagent-only/inner/.ai-memory.toml"
+printf 'workspace = "outer"\n' >"$TMP/subagent-key-only/.ai-memory.toml"
+printf '[briefing]\ninject_on_subagent_start = true\n' >"$TMP/subagent-key-only/inner/.ai-memory.toml"
+printf '[briefing]\ninject_on_session_start = true\n' >"$TMP/session-brief-only/.ai-memory.toml"
+assert_eq "subagent-brief-only marker is a settings boundary" \
+    "$TMP/subagent-key-only/inner/.ai-memory.toml" "$(ai_memory_find_settings_marker "$TMP/subagent-key-only/inner")"
+assert_eq "the subagent briefing query forwards its own opt-in" \
+    "&briefing=true&briefing_budget=6000" "$(ai_memory_subagent_briefing_qs "$TMP/subagent-only/inner")"
+assert_eq "the session-start briefing query ignores the subagent opt-in" \
+    "" "$(ai_memory_briefing_qs "$TMP/subagent-only/inner")"
+assert_eq "the subagent briefing query ignores the session-start opt-in" \
+    "" "$(ai_memory_subagent_briefing_qs "$TMP/session-brief-only")"
+HF_PS=$(grep -q 'deliver_on_session_start' hooks/lib/ai-memory-hook.ps1 \
+    && grep -q '&handoff=0' hooks/lib/ai-memory-hook.ps1 && printf 'ok' || printf 'missing')
+assert_eq "powershell marker query forwards the [handoff] opt-out (static)" "ok" "$HF_PS"
 PSH=""
 if command -v pwsh >/dev/null 2>&1; then
     PSH=$(command -v pwsh)
@@ -545,6 +582,20 @@ else
         && grep -q '&profile_consume=' hooks/lib/ai-memory-hook.ps1 \
         && printf 'ok' || printf 'missing')
     assert_eq "powershell marker query forwards [profile] flags (static)" "ok" "$PS_PROFILE"
+fi
+if [ -n "$PSH" ]; then
+    PS_SUB_CWD=$(host_path "$TMP/subagent-only/inner")
+    PS_SUB_MARKER=$(host_path "$TMP/subagent-key-only/inner/.ai-memory.toml")
+    PS_SUB=$(HOME="$TMP" "$PSH" -NoProfile -ExecutionPolicy Bypass -Command \
+        ". '$PS_LIB'; (Get-AiMemoryBriefingQuery -Cwd '$PS_SUB_CWD' -Key 'inject_on_subagent_start') + '|' + (Get-AiMemoryBriefingQuery -Cwd '$PS_SUB_CWD') + '|' + (Test-AiMemoryMarkerDeclaresSettings -File '$PS_SUB_MARKER')")
+    assert_eq "powershell forwards only the subagent opt-in, a settings boundary" \
+        "&briefing=true&briefing_budget=6000||True" "$PS_SUB"
+else
+    PS_SUB=$(grep -q '"inject_on_subagent_start"' hooks/lib/ai-memory-hook.ps1 \
+        && grep -q '/brief?agent=' hooks/lib/ai-memory-hook.ps1 \
+        && grep -q 'SubagentStartBrief' hooks/claude-code/subagent-start.ps1 \
+        && printf 'ok' || printf 'missing')
+    assert_eq "powershell delivers the subagent brief (static)" "ok" "$PS_SUB"
 fi
 
 # A capture-only marker with no scope-declaring ancestor: still transparent,
@@ -1253,6 +1304,57 @@ done
 # otherwise pass with nothing checked.
 assert_eq "all handoff-fetching scripts were checked for briefing" "13" "$BRIEF_SCRIPTS"
 
+# --- the subagent-start bundle hands the subagent its brief --------------
+# `[briefing] inject_on_subagent_start` gives each subagent the
+# project brief from the read-only `/brief` route, as the native hook does,
+# and never asks `/handoff`, whose fetch claims the parent session's baton.
+# Without that opt-in (the session-start one alone included) the bundle
+# replies `{}` as it always did.
+SUB_CURL_BIN="$TMP/fake-brief-curl-bin"
+mkdir -p "$SUB_CURL_BIN"
+cat >"$SUB_CURL_BIN/curl" <<'EOF'
+#!/bin/sh
+printf '%s\n' "$*" >>"$AI_MEMORY_CURL_LOG"
+case "$*" in
+    *'/brief?'*) printf 'subagent-brief-context' ;;
+    *'/handoff?'*) printf 'parent-handoff' ;;
+esac
+EOF
+chmod +x "$SUB_CURL_BIN/curl"
+SUB_REPO="$TMP/subagent-brief-on"
+mkdir -p "$SUB_REPO"
+printf '[briefing]\ninject_on_subagent_start = true\nmax_chars = 6000\n' >"$SUB_REPO/.ai-memory.toml"
+
+# Runs the subagent-start.sh bundle from repository "$1" and prints its stdout.
+subagent_start_output() {
+    rm -rf "$TMP/subagent-data" "$FAKE_CURL_LOG"
+    printf '{"cwd":"%s","session_id":"parent-s","hook_event_name":"SubagentStart","agent_id":"agent-1","agent_type":"Explore"}' "$1" \
+        | PATH="$SUB_CURL_BIN:$PATH" AI_MEMORY_CURL_LOG="$FAKE_CURL_LOG" \
+            AI_MEMORY_DATA_DIR="$TMP/subagent-data" AI_MEMORY_HOOK_URL='http://memory.test' \
+            sh "$(dirname "$0")/../../hooks/claude-code/subagent-start.sh" 2>/dev/null
+}
+
+assert_eq "the subagent-start bundle injects the opted-in brief" \
+    '{"hookSpecificOutput":{"hookEventName":"SubagentStart","additionalContext":"subagent-brief-context"}}' \
+    "$(subagent_start_output "$SUB_REPO")"
+assert_eq "the subagent brief GET carries the opt-in and the budget" "yes" \
+    "$(grep -q '/brief?agent=claude-code&cwd=.*&briefing=true&briefing_budget=6000' "$FAKE_CURL_LOG" && printf 'yes' || printf 'no')"
+assert_eq "a subagent start never fetches the handoff" "no" \
+    "$(grep -q '/handoff?' "$FAKE_CURL_LOG" && printf 'yes' || printf 'no')"
+assert_eq "a subagent start without the subagent opt-in replies {}" "{}" \
+    "$(subagent_start_output "$BRIEF_REPO")"
+assert_eq "a subagent start without the subagent opt-in asks for no brief" "no" \
+    "$(grep -q '/brief?' "$FAKE_CURL_LOG" 2>/dev/null && printf 'yes' || printf 'no')"
+# Hook scripts run without `set -e`; this suite's would end the substitution at
+# the auth-header lookup's non-zero status.
+rm -f "$FAKE_CURL_LOG"
+assert_eq "get_brief refuses a URL without cwd" "" \
+    "$(set +e; export PATH="$SUB_CURL_BIN:$PATH" AI_MEMORY_CURL_LOG="$FAKE_CURL_LOG"
+        ai_memory_get_brief 'http://memory.test/brief?agent=claude-code&briefing=true')"
+assert_eq "get_brief fetches a URL with cwd" "subagent-brief-context" \
+    "$(set +e; export PATH="$SUB_CURL_BIN:$PATH" AI_MEMORY_CURL_LOG="$FAKE_CURL_LOG"
+        ai_memory_get_brief 'http://memory.test/brief?agent=claude-code&cwd=%2Frepo&briefing=true')"
+
 # --- a handoff is never claimed without a project directory -------------
 # `GET /handoff` claims the newest open handoff in whatever project the server
 # resolves. A payload that names no directory sent no `cwd`, so the server fell
@@ -1337,7 +1439,7 @@ if [ -n "$PSH" ]; then
         rm -f "$TMP/ps-scope.log"
         printf '%s' "$1" | (cd "$SCOPE_ELSEWHERE" && HOME="$TMP" AI_MEMORY_DATA_DIR="$TMP/ps-scope-data-$2" \
             AI_MEMORY_TEST_LOG="$(host_path "$TMP/ps-scope.log")" "$PSH" -NoProfile -ExecutionPolicy Bypass -Command \
-            ". '$PS_LIB'; function Invoke-WebRequest { param([switch] \$UseBasicParsing, [int] \$TimeoutSec, [string] \$Method = 'Get', [string] \$Uri, \$Headers, [string] \$ContentType, \$Body) Add-Content -LiteralPath \$env:AI_MEMORY_TEST_LOG -Value ('{0} {1}' -f \$Method.ToUpperInvariant(), \$Uri); if (\$Method -eq 'Post') { return \$null }; return [pscustomobject]@{ Content = 'HANDOFF' } }; Invoke-AiMemoryHook -Event 'session-start' -Agent 'claude-code' -FetchHandoff") >/dev/null 2>&1 || true
+            ". '$PS_LIB'; function Invoke-WebRequest { param([switch] \$UseBasicParsing, [switch] \$NoProxy, [int] \$TimeoutSec, [int] \$MaximumRedirection, [string] \$Method = 'Get', [string] \$Uri, \$Headers, [string] \$ContentType, \$Body) Add-Content -LiteralPath \$env:AI_MEMORY_TEST_LOG -Value ('{0} {1}' -f \$Method.ToUpperInvariant(), \$Uri); if (\$Method -eq 'Post') { return \$null }; return [pscustomobject]@{ Content = 'HANDOFF'; StatusCode = 200 } }; Invoke-AiMemoryHook -Event 'session-start' -Agent 'claude-code' -FetchHandoff") >/dev/null 2>&1 || true
         grep '/handoff?' "$TMP/ps-scope.log" 2>/dev/null || true
     }
     assert_eq "powershell: no project directory claims no handoff" "" \
@@ -1356,6 +1458,37 @@ PS_BRIEF_STATIC=$(grep -Fq 'if ($Event -eq "session-start" -and -not $BriefingOn
             END {exit !ok}' hooks/lib/ai-memory-hook.ps1 \
     && printf 'ok' || printf 'missing')
 assert_eq "powershell session-start handoff GET carries the briefing keys" "ok" "$PS_BRIEF_STATIC"
+
+# The PowerShell subagent-start brief, with Invoke-WebRequest shadowed: the
+# subagent opt-in reads `/brief`, never `/handoff`, and prints the
+# SubagentStart envelope; the session-start opt-in alone asks for nothing.
+if [ -n "$PSH" ]; then
+    ps_subagent_start() {
+        rm -f "$TMP/ps-subagent.log"
+        printf '{"session_id":"ps-sub","cwd":"%s","hook_event_name":"SubagentStart","agent_id":"a-1","agent_type":"Explore"}' \
+            "$(host_path "$1" | sed 's/\\/\\\\/g')" \
+            | (HOME="$TMP" AI_MEMORY_DATA_DIR="$TMP/ps-subagent-data" \
+                AI_MEMORY_TEST_LOG="$(host_path "$TMP/ps-subagent.log")" "$PSH" -NoProfile -ExecutionPolicy Bypass -Command \
+                ". '$PS_LIB'; function Invoke-WebRequest { param([switch] \$UseBasicParsing, [switch] \$NoProxy, [int] \$TimeoutSec, [int] \$MaximumRedirection, [string] \$Method = 'Get', [string] \$Uri, \$Headers, [string] \$ContentType, \$Body) Add-Content -LiteralPath \$env:AI_MEMORY_TEST_LOG -Value ('{0} {1}' -f \$Method.ToUpperInvariant(), \$Uri); if (\$Method -eq 'Post') { return \$null }; return [pscustomobject]@{ Content = 'SUBAGENT-BRIEF'; StatusCode = 200 } }; Invoke-AiMemoryHook -Event 'subagent-start' -Agent 'claude-code' -SubagentStartBrief") 2>/dev/null
+    }
+    PS_SUB_OUT=$(ps_subagent_start "$SUB_REPO")
+    case "$PS_SUB_OUT" in
+        *'"hookEventName":"SubagentStart"'*) case "$PS_SUB_OUT" in
+            *'"additionalContext":"SUBAGENT-BRIEF"'*) PS_SUB_ENVELOPE=ok ;;
+            *) PS_SUB_ENVELOPE="got: $PS_SUB_OUT" ;;
+        esac ;;
+        *) PS_SUB_ENVELOPE="got: $PS_SUB_OUT" ;;
+    esac
+    assert_eq "powershell: a subagent start injects the opted-in brief" "ok" "$PS_SUB_ENVELOPE"
+    assert_eq "powershell: the subagent brief GET carries the opt-in" "yes" \
+        "$(grep -q 'GET .*/brief?agent=claude-code&cwd=.*&briefing=true&briefing_budget=6000' "$TMP/ps-subagent.log" && printf 'yes' || printf 'no')"
+    assert_eq "powershell: a subagent start never fetches the handoff" "no" \
+        "$(grep -q '/handoff?' "$TMP/ps-subagent.log" && printf 'yes' || printf 'no')"
+    assert_eq "powershell: a subagent start without the subagent opt-in prints nothing" "" \
+        "$(ps_subagent_start "$BRIEF_REPO")"
+    assert_eq "powershell: a subagent start without the subagent opt-in asks for no brief" "no" \
+        "$(grep -q '/brief?' "$TMP/ps-subagent.log" 2>/dev/null && printf 'yes' || printf 'no')"
+fi
 
 # --- client marker header on every request ------------------------------
 # An unauthenticated server reached through a non-loopback host name refuses
@@ -1481,6 +1614,10 @@ assert_eq "powershell: every request call site found" "yes" \
 # PowerShell 7 reads HTTP_PROXY/HTTPS_PROXY/ALL_PROXY for Invoke-WebRequest;
 # `Get-AiMemoryNoProxy` supplies -NoProxy there, like the curl branches above.
 assert_eq "powershell: every request skips environment proxies" "$PS_REQUESTS" "$PS_REQUESTS_NO_PROXY"
+# MaximumRedirection 0 matches the native hook: Invoke-WebRequest follows
+# five hops by default, so a 302 login page counted as delivery.
+assert_eq "powershell: the request splat refuses redirects" "ok" \
+    "$(grep -Fq 'MaximumRedirection = 0' "$PS_HELPER" && grep -Fq 'function Get-AiMemoryResponseStatus' "$PS_HELPER" && printf ok || printf missing)"
 
 # A spooled fixture event names this run's temp tree or targets the fake
 # `memory.test` host. Live sessions share the spool and may mention that host

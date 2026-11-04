@@ -191,6 +191,25 @@ inject_on_session_start = "true"
 # defaults to 4000.
 max_chars = 4000
 
+# Optional. Hand the same brief to each `claude-code` subagent when it starts
+# (`SubagentStart`), so a delegated task begins with the project's rules and
+# slots too. Independent of `inject_on_session_start`; `max_chars` bounds it,
+# and that agent's 10,000-character hook context limit caps it. It comes
+# from the read-only `GET /brief`, which never reads or claims a handoff, so a
+# subagent cannot take its parent session's baton; a server without that
+# route answers 404 and the subagent starts without a brief. Off by default:
+# every subagent pays for the brief in tokens, so opt in per repo.
+inject_on_subagent_start = "true"
+
+# Optional. Stop delivering this project's handoff at session start. Only an
+# explicit false / "no" / "off" / "0" turns it off; the default is to deliver.
+# Handoffs are still created when a session ends, and stay open (an agent can
+# still take one with `memory_handoff_accept`), so only the automatic delivery
+# stops. The brief, the profile digest and everything else on start are
+# unchanged.
+[handoff]
+deliver_on_session_start = false
+
 # Optional. The cross-project profile (docs/cross-project-profile.md): your
 # usual choices from other projects, delivered at session start as defaults
 # below this repository's rules file. Both keys default to on.
@@ -293,6 +312,14 @@ values are ignored and behave like the default `basename(cwd)` strategy.
 falsy (`false` / `0` / `no` / `off`, quoted or bare). A marker that sets only
 `[profile]` keys is a settings boundary, like one with `[briefing]` keys.
 
+`[handoff] deliver_on_session_start` is on unless the value is explicitly falsy
+(`false` / `0` / `no` / `off`, quoted or bare). Clients send `handoff=0` on the
+session-start fetch only when the marker turns it off, so the server reads
+nothing, claims nothing and adds no handoff or continuity notice for that
+project. A marker that sets only `[handoff]` is a settings boundary, like one
+with `[briefing]` or `[profile]` keys. Use it for projects whose automatic
+handoffs are mostly noise, such as a bot fleet driven by routines and webhooks.
+
 `[recall] default_global` applies to an agent's unscoped `memory_query` and
 `memory_recent` calls. On `memory_query`, an explicit `global: false` keeps
 the resolved project, even when the marker enables global recall. Explicit
@@ -305,7 +332,7 @@ scoped to the current project and cover every project only when you pass
 [usage.md](usage.md#search-from-the-terminal) and
 [usage.md](usage.md#recent-pages-from-the-terminal)).
 
-`default_global` and `inject_on_session_start` accept a truthy value
+`default_global`, `inject_on_session_start` and `inject_on_subagent_start` accept a truthy value
 (`true` / `1` / `yes` / `on`, quoted or bare; section-style keys are
 parsed leniently); anything else behaves as absent. `max_chars` is a
 plain integer.
@@ -1023,7 +1050,10 @@ undeclared checkout with a remote, or a checkout with an explicit
   are one project.
 - An existing project with that name and no identity yet is **claimed in
   place** by the first capture that may write to it, so upgrading moves no
-  memory.
+  memory. A linked worktree (`git worktree add`) claims the project named
+  after its main checkout's folder, so it does not matter which checkout
+  captures first. The server finds the main checkout from the worktree's git
+  metadata, so this needs a server that can read the checkout.
 - If the name already belongs to a different identity, the new repository
   gets its own project, named from its owner (`github.com/orgb/api` →
   `orgb-api`, then `orgb-api-2`, …).
@@ -1196,6 +1226,15 @@ shell command text is never reinterpreted as a project routing instruction;
 only the structured `workdir` field counts. This changes raw observation
 attribution only; the session row and its compiled session page remain in the
 project where the session began.
+
+Before that lookup, a Hermes event takes `TERMINAL_CWD` (the session's
+`terminal.cwd`) in place of the process directory. A multiplexing Hermes
+gateway exports only its default profile's `terminal.cwd`, so a gateway event
+of a named profile routes instead by a marker in that profile's own Hermes
+home, `~/.hermes/profiles/<name>/.ai-memory.toml` (under the gateway's
+`HERMES_HOME` when set). It is a normal local marker: `workspace`, `project`,
+`[capture]` and `server` all apply. Without it the event keeps the gateway's
+directory. See [install.md](install.md#hermes-agent-nous-research).
 
 Independently of this setting, under `project_strategy = "repo-root"` a
 mid-session event whose cwd is outside any git repo *and* any marker (agent

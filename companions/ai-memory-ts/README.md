@@ -117,6 +117,7 @@ scope. Arguments are the server's wire names in camelCase
 |---|---|
 | `pages.write` | `memory_write_page` |
 | `pages.update` | `memory_write_page`, `memory_read_page` |
+| `pages.patch` | `memory_patch_page` |
 | `pages.read` | `memory_read_page` |
 | `pages.delete` | `memory_delete_page` |
 | `query` | `memory_query` |

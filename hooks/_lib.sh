@@ -101,8 +101,8 @@ ai_memory_profile_flag() {
 # Whether "$1" (a marker file) declares anything beyond a `[capture]`
 # section: any root-level scope key (workspace/project/project_strategy), or
 # any of the other settings ai_memory_marker_qs / ai_memory_briefing_qs
-# forward (drop_subagent_captures, default_global, [briefing] and [profile]
-# keys). Mirrors
+# forward (drop_subagent_captures, default_global, [briefing], [profile] and
+# [handoff] keys). Mirrors
 # `declares_more_than_capture` in marker.rs. A marker with any of these is a
 # resolution boundary; only a marker whose only content is `[capture]` (e.g.
 # ignore_paths) is scope/settings-transparent (#668).
@@ -115,7 +115,7 @@ ai_memory_marker_declares_settings() {
     ai_memory_strip_utf8_bom <"$file" \
         | LC_ALL=C grep -Eq '^[[:space:]]*aliases[[:space:]]*=' && return 0
     ai_memory_marker_declares_server "$file" && return 0
-    for key in default_global inject_on_session_start max_chars contribute consume; do
+    for key in default_global inject_on_session_start inject_on_subagent_start max_chars contribute consume deliver_on_session_start; do
         [ -n "$(ai_memory_parse_toml_flag "$file" "$key")" ] && return 0
     done
     return 1
@@ -719,6 +719,7 @@ ai_memory_marker_qs() {
     isty=""
     pcon=""
     pcons=""
+    hoff=""
     aliases=""
     routed=""
     # The nearest marker that declares more than `[capture]` (#668): a nested
@@ -762,6 +763,9 @@ ai_memory_marker_qs() {
         # what it stored.
         pcon=$(ai_memory_profile_flag "$(ai_memory_parse_toml_flag "$marker" contribute)")
         pcons=$(ai_memory_profile_flag "$(ai_memory_parse_toml_flag "$marker" consume)")
+        # `[handoff] deliver_on_session_start = false` is sent only when
+        # explicitly falsy; an absent key leaves the request unchanged.
+        [ "$(ai_memory_profile_flag "$(ai_memory_parse_toml_flag "$marker" deliver_on_session_start)")" = 0 ] && hoff=0
         [ -n "$pr" ] && ps="marker"
     fi
     # Before repo-root can fill `pr`: a repo-root name is an inference, while
@@ -807,13 +811,15 @@ ai_memory_marker_qs() {
     [ -n "$dg" ] && qs="${qs}&default_global=$(ai_memory_url_encode "$dg")"
     [ -n "$pcon" ] && qs="${qs}&profile_contribute=$(ai_memory_url_encode "$pcon")"
     [ -n "$pcons" ] && qs="${qs}&profile_consume=$(ai_memory_url_encode "$pcons")"
+    [ -n "$hoff" ] && qs="${qs}&handoff=0"
     qs="${qs}$(ai_memory_managed_qs)"
     printf '%s' "$qs"
 }
 
 # Build `&briefing=<v>[&briefing_budget=<v>]` from the `[briefing]` section
-# of the marker walked up from "$1" (inject_on_session_start + optional
-# max_chars). Prints nothing when cwd is absent or the repo did not opt in.
+# of the marker walked up from "$1" (the opt-in key "$2", by default
+# inject_on_session_start, + optional max_chars). Prints nothing when cwd is
+# absent or the repo did not opt in.
 # NOT part of ai_memory_marker_qs on purpose: agents that deliver the brief
 # once per session (kimi-code, via the first user prompt — kimi discards
 # SessionStart hook stdout) append this only on the first fetch, so the
@@ -821,13 +827,14 @@ ai_memory_marker_qs() {
 # is decided server-side.
 ai_memory_briefing_qs() {
     cwd="$1"
+    _ambkey="${2:-inject_on_session_start}"
     [ -z "$cwd" ] && return 0
     # Settings walk (#668): a nested capture-only marker must not shadow an
     # outer marker's [briefing] opt-in.
     marker=$(ai_memory_find_settings_marker "$cwd")
     [ -n "$marker" ] || return 0
     qs=""
-    briefing=$(ai_memory_parse_toml_flag "$marker" inject_on_session_start)
+    briefing=$(ai_memory_parse_toml_flag "$marker" "$_ambkey")
     case "$(printf '%s' "$briefing" | tr '[:upper:]' '[:lower:]')" in
         1|true|yes|on) ;;
         *) return 0 ;;
@@ -836,6 +843,13 @@ ai_memory_briefing_qs() {
     qs="&briefing=$(ai_memory_url_encode "$briefing")"
     [ -n "$budget" ] && qs="${qs}&briefing_budget=$(ai_memory_url_encode "$budget")"
     printf '%s' "$qs"
+}
+
+# The `[briefing] inject_on_subagent_start` pair for cwd "$1": the query a
+# subagent start sends to `/brief`. Prints nothing without that
+# opt-in, whatever `inject_on_session_start` says.
+ai_memory_subagent_briefing_qs() {
+    ai_memory_briefing_qs "$1" inject_on_subagent_start
 }
 
 # Path of the once-per-session "brief delivered" marker for "$1" (a session
@@ -1034,6 +1048,14 @@ ai_memory_get_handoff() {
     else
         curl -s --noproxy '*' --max-time 1.0 -H "X-AI-Memory-Client: hook-sh" "$1"
     fi
+}
+
+# GET the read-only subagent brief at URL "$1", with ai_memory_get_handoff's
+# guards: a URL without `cwd`, or for a server-routed repository, is never
+# sent. It keeps a name of its own because `/brief` claims nothing, while
+# every ai_memory_get_handoff caller claims a baton.
+ai_memory_get_brief() {
+    ai_memory_get_handoff "$1"
 }
 
 # Encode stdin as a JSON string (with surrounding quotes). Used by hooks

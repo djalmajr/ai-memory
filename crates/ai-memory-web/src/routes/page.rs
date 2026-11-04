@@ -25,6 +25,8 @@ const NAMESPACE_PAGE_SIZE: usize = 25;
 /// default instead of becoming axum's 400.
 #[derive(Default, serde::Deserialize)]
 pub(crate) struct NamespaceQuery {
+    #[serde(flatten)]
+    knowledge: crate::knowledge::KnowledgeQuery,
     sort: Option<String>,
     page: Option<String>,
 }
@@ -33,6 +35,7 @@ pub(crate) struct NamespaceQuery {
 pub(crate) async fn handler(
     State(state): State<Arc<WebState>>,
     viewer: Option<axum::Extension<ai_memory_core::AuthorizedViewer>>,
+    actor: Option<axum::Extension<ai_memory_core::ActorContext>>,
     Path((workspace, project, path)): Path<(String, String, String)>,
     query: Result<Query<NamespaceQuery>, QueryRejection>,
 ) -> Response {
@@ -114,6 +117,20 @@ pub(crate) async fn handler(
         outline
     };
 
+    let knowledge = match crate::knowledge::view(
+        &state,
+        &meta,
+        &workspace,
+        &project,
+        viewer_id,
+        super::api::owner_filter_for(actor),
+        &query.knowledge,
+    )
+    .await
+    {
+        Ok(v) => v,
+        Err(status) => return status.into_response(),
+    };
     let project_href = project_href(&workspace, &project);
     let supersedes_path = meta.supersedes.unwrap_or_default();
     let supersedes_href = if supersedes_path.is_empty() {
@@ -135,6 +152,7 @@ pub(crate) async fn handler(
 
     let history_href = history_href(&workspace, &project, &path);
     match (PageView {
+        knowledge,
         workspace,
         project,
         project_href,
@@ -250,6 +268,7 @@ async fn namespace_or_not_found(
             title: p.title,
             kind: p.kind,
             updated_relative: humanize(&p.updated_at),
+            agent_label: None,
         })
         .collect();
     // Resolved against the injected `<base href>`, so a bare `?sort=`

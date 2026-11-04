@@ -11,9 +11,9 @@ use ai_memory_core::{
 use ai_memory_llm::Embedder;
 use ai_memory_store::{
     ApproveAutoImproveProposal, ApproveAutoImproveProposalResult, AutoImproveProposalDetail,
-    ConditionalBatchUpsert, ConditionalUpsert, FailAutoImproveProposal, MoveSessionSummary,
-    MoveSummary, PagePrecondition, PagesMode, PurgeSessionSummary, ReaderPool, ScopeRow,
-    WriterHandle, artifact_path_for, f32_vec_to_bytes,
+    ConditionalBatchUpsert, ConditionalUpsert, FailAutoImproveProposal, MergeProjectPage,
+    MoveSessionSummary, MoveSummary, PagePrecondition, PagesMode, PurgeSessionSummary, ReaderPool,
+    ScopeRow, WriterHandle, artifact_path_for, f32_vec_to_bytes,
 };
 use tokio::sync::RwLock;
 
@@ -45,6 +45,72 @@ pub struct EventLedgerFile {
     pub file_name: String,
     /// Size on disk, in bytes.
     pub bytes: u64,
+}
+
+/// One source page prepared for [`Wiki::merge_project`].
+#[derive(Debug, Clone)]
+pub struct MergeProjectFile {
+    /// Store-level compare-and-write and merged-version plan.
+    pub store: MergeProjectPage,
+    /// Fully emitted Markdown for a same-path collision. `None` means the
+    /// source file is installed unchanged at the target path.
+    pub merged_markdown: Option<String>,
+}
+
+fn copy_tree(git: &GitAdapter, source: &Path, target: &Path) -> WikiResult<()> {
+    if !source.exists() {
+        return Ok(());
+    }
+    std::fs::create_dir_all(target)?;
+    for entry in std::fs::read_dir(source)? {
+        let entry = entry?;
+        let metadata = entry.file_type()?;
+        if metadata.is_symlink() {
+            return Err(WikiError::Io(std::io::Error::other(format!(
+                "refusing symlink while copying project tree: {}",
+                entry.path().display()
+            ))));
+        }
+        let destination = target.join(entry.file_name());
+        if metadata.is_dir() {
+            copy_tree(git, &entry.path(), &destination)?;
+        } else if metadata.is_file() {
+            git.write_atomic(&destination, &std::fs::read(entry.path())?)?;
+        }
+    }
+    Ok(())
+}
+
+fn copy_tree_missing(git: &GitAdapter, source: &Path, target: &Path) -> WikiResult<()> {
+    if !source.exists() {
+        return Ok(());
+    }
+    std::fs::create_dir_all(target)?;
+    for entry in std::fs::read_dir(source)? {
+        let entry = entry?;
+        let metadata = entry.file_type()?;
+        if metadata.is_symlink() {
+            return Err(WikiError::Io(std::io::Error::other(format!(
+                "refusing symlink while merging project tree: {}",
+                entry.path().display()
+            ))));
+        }
+        let destination = target.join(entry.file_name());
+        if metadata.is_dir() {
+            copy_tree_missing(git, &entry.path(), &destination)?;
+        } else if metadata.is_file() && !destination.exists() {
+            git.write_atomic(&destination, &std::fs::read(entry.path())?)?;
+        } else if metadata.is_file()
+            && entry
+                .file_name()
+                .to_str()
+                .is_some_and(|name| name.starts_with("log-") && name.ends_with(".md"))
+        {
+            let bytes = std::fs::read(entry.path())?;
+            git.append(&destination, &bytes)?;
+        }
+    }
+    Ok(())
 }
 
 fn event_ledger_metadata(abs: &Path) -> WikiResult<Option<std::fs::Metadata>> {
@@ -311,6 +377,103 @@ impl Wiki {
     #[must_use]
     pub fn sanitizer(&self) -> &Sanitizer {
         &self.sanitizer
+    }
+
+    /// Send a browser-composed message through sanitization, admission and
+    /// the single writer. Callers must authorize both project coordinates.
+    pub async fn send_agent_message(
+        &self,
+        mut message: ai_memory_core::NewAgentMessage,
+        actor: ActorContext,
+    ) -> WikiResult<ai_memory_core::MessageId> {
+        message.body = self
+            .sanitizer
+            .scrub(&message.body)
+            .chars()
+            .take(8_000)
+            .collect();
+        message.subject = message
+            .subject
+            .map(|s| self.sanitizer.scrub(&s).chars().take(200).collect());
+        let admission = self
+            .authorize_operation(
+                message.to_workspace_id,
+                message.to_project_id,
+                AdmissionOp::MessageSend,
+                actor,
+                Vec::new(),
+            )
+            .await?;
+        let id = self.writer.insert_message(message).await?;
+        if let Some(ctx) = admission.as_ref() {
+            self.notify_operation_observers(ctx);
+        }
+        Ok(id)
+    }
+
+    /// Take a pending message out of its recipient's queue so its sender can
+    /// edit it. Until it is saved or released no harness can collect it.
+    /// Returns `None` when the message is not pending in that project.
+    /// Callers must authorize both project coordinates.
+    pub async fn begin_agent_message_edit(
+        &self,
+        to_workspace_id: ai_memory_core::WorkspaceId,
+        to_project_id: ai_memory_core::ProjectId,
+        id: ai_memory_core::MessageId,
+    ) -> WikiResult<Option<ai_memory_core::AgentMessage>> {
+        Ok(self
+            .writer
+            .begin_message_edit(to_workspace_id, to_project_id, id)
+            .await?)
+    }
+
+    /// Return a held message to the queue unchanged. Returns `false` when it
+    /// is not being edited in that project.
+    pub async fn release_agent_message_edit(
+        &self,
+        to_workspace_id: ai_memory_core::WorkspaceId,
+        to_project_id: ai_memory_core::ProjectId,
+        id: ai_memory_core::MessageId,
+    ) -> WikiResult<bool> {
+        Ok(self
+            .writer
+            .finish_message_edit(to_workspace_id, to_project_id, id, None)
+            .await?)
+    }
+
+    /// Save new text for a held message and return it to the queue. The text
+    /// goes through the same sanitization, size caps and `message_send`
+    /// admission as a new message. Returns `false` when the message is not
+    /// being edited in that project.
+    pub async fn save_agent_message_edit(
+        &self,
+        to_workspace_id: ai_memory_core::WorkspaceId,
+        to_project_id: ai_memory_core::ProjectId,
+        id: ai_memory_core::MessageId,
+        subject: Option<String>,
+        body: String,
+        actor: ActorContext,
+    ) -> WikiResult<bool> {
+        let body: String = self.sanitizer.scrub(&body).chars().take(8_000).collect();
+        let subject =
+            subject.map(|s| -> String { self.sanitizer.scrub(&s).chars().take(200).collect() });
+        let admission = self
+            .authorize_operation(
+                to_workspace_id,
+                to_project_id,
+                AdmissionOp::MessageSend,
+                actor,
+                Vec::new(),
+            )
+            .await?;
+        let saved = self
+            .writer
+            .finish_message_edit(to_workspace_id, to_project_id, id, Some((subject, body)))
+            .await?;
+        if saved && let Some(ctx) = admission.as_ref() {
+            self.notify_operation_observers(ctx);
+        }
+        Ok(saved)
     }
 
     /// Attach an embedder. When set, every page-writing path (`write_page`,
@@ -580,6 +743,180 @@ impl Wiki {
         }
     }
 
+    /// Merge a source project tree into a target project in the same
+    /// workspace while [`WriterHandle::merge_project`] atomically re-homes the
+    /// indexed history. The target tree is snapshotted before files change and
+    /// restored if the writer refuses, so disk never remains ahead of SQLite.
+    ///
+    /// # Errors
+    /// Returns [`WikiError`] for an unsafe tree, I/O failure, admission
+    /// rejection, or store precondition failure.
+    pub async fn merge_project(
+        &self,
+        workspace_id: WorkspaceId,
+        source_project: ProjectId,
+        target_project: ProjectId,
+        pages: Vec<MergeProjectFile>,
+        admission_ctx: Option<AdmissionContext>,
+    ) -> WikiResult<ai_memory_store::MergeProjectSummary> {
+        let _guard = self.mutation_lock.write().await;
+        self.inspect_project_tree(workspace_id, source_project)?;
+        self.inspect_project_tree(workspace_id, target_project)?;
+        let resolved_ctx = if let Some(chain) = &self.admission_chain {
+            let mut ctx = admission_ctx.unwrap_or_default();
+            ctx.op = AdmissionOp::MoveProject;
+            self.resolve_admission_names(workspace_id, source_project, &mut ctx)
+                .await;
+            chain.notify(None, &ctx).await?;
+            Some(ctx)
+        } else {
+            None
+        };
+
+        let source = self.confined_project_root(workspace_id, source_project, Prepare::Inspect)?;
+        let target = self.confined_project_root(workspace_id, target_project, Prepare::Parents)?;
+        let backup = target.with_file_name(format!(
+            ".ai-memory-tmp.merge-{}-{}",
+            target_project,
+            PageId::new()
+        ));
+        let parked_source = source.with_file_name(format!(
+            ".ai-memory-tmp.merge-source-{}-{}",
+            source_project,
+            PageId::new()
+        ));
+        if backup.exists() {
+            return Err(WikiError::DestinationExists(backup.display().to_string()));
+        }
+        if parked_source.exists() {
+            return Err(WikiError::DestinationExists(
+                parked_source.display().to_string(),
+            ));
+        }
+        if target.exists()
+            && let Err(error) = copy_tree(&self.git, &target, &backup)
+        {
+            if backup.exists()
+                && let Err(cleanup) = self.git.remove_dir_all(&backup)
+            {
+                tracing::warn!(
+                    %cleanup,
+                    path = %backup.display(),
+                    "merge-project target snapshot failed and partial backup cleanup failed"
+                );
+            }
+            return Err(error);
+        }
+        if source.exists()
+            && let Err(error) = self.git.rename(&source, &parked_source)
+        {
+            if backup.exists()
+                && let Err(cleanup) = self.git.remove_dir_all(&backup)
+            {
+                tracing::warn!(
+                    %cleanup,
+                    path = %backup.display(),
+                    "merge-project source park failed and target backup cleanup failed"
+                );
+            }
+            return Err(error.into());
+        }
+
+        let result = async {
+            // Preserve non-page project artifacts too. Existing target files
+            // win here; the explicit page plan below then installs every
+            // source page or combined collision deterministically.
+            if parked_source.exists() {
+                copy_tree_missing(&self.git, &parked_source, &target)?;
+            }
+            for page in &pages {
+                let destination = self.confined_page_path(
+                    workspace_id,
+                    target_project,
+                    &page.store.path,
+                    Prepare::Parents,
+                )?;
+                if let Some(rendered) = &page.merged_markdown {
+                    self.git.write_atomic(&destination, rendered.as_bytes())?;
+                } else {
+                    let source_path = parked_source.join(page.store.path.as_str());
+                    let bytes = std::fs::read(source_path)?;
+                    self.git.write_atomic(&destination, &bytes)?;
+                }
+            }
+            self.writer
+                .merge_project(
+                    workspace_id,
+                    source_project,
+                    target_project,
+                    pages.iter().map(|page| page.store.clone()).collect(),
+                    true,
+                )
+                .await
+                .map_err(WikiError::Store)
+        }
+        .await;
+
+        match result {
+            Ok(summary) => {
+                if parked_source.exists()
+                    && let Err(error) = self.git.remove_dir_all(&parked_source)
+                {
+                    tracing::warn!(
+                        %error,
+                        path = %parked_source.display(),
+                        "merge-project committed but watcher-ignored source cleanup failed"
+                    );
+                }
+                if backup.exists()
+                    && let Err(error) = self.git.remove_dir_all(&backup)
+                {
+                    tracing::warn!(
+                        %error,
+                        path = %backup.display(),
+                        "merge-project committed but watcher-ignored target backup cleanup failed"
+                    );
+                }
+                if let (Some(chain), Some(ctx)) = (&self.admission_chain, &resolved_ctx) {
+                    chain.dispatch_async(None, &serde_json::Value::Null, "", ctx);
+                }
+                Ok(summary)
+            }
+            Err(error) => {
+                let mut rollback_errors = Vec::new();
+                if parked_source.exists()
+                    && let Err(rollback) = self.git.rename(&parked_source, &source)
+                {
+                    rollback_errors
+                        .push(format!("restore source {}: {rollback}", source.display()));
+                }
+                if target.exists()
+                    && let Err(rollback) = self.git.remove_dir_all(&target)
+                {
+                    rollback_errors.push(format!(
+                        "remove staged target {}: {rollback}",
+                        target.display()
+                    ));
+                }
+                if backup.exists()
+                    && !target.exists()
+                    && let Err(rollback) = self.git.rename(&backup, &target)
+                {
+                    rollback_errors
+                        .push(format!("restore target {}: {rollback}", target.display()));
+                }
+                if rollback_errors.is_empty() {
+                    Err(error)
+                } else {
+                    Err(WikiError::Io(std::io::Error::other(format!(
+                        "INCONSISTENT STATE: merge-project failed ({error}) and rollback was incomplete: {}",
+                        rollback_errors.join("; ")
+                    ))))
+                }
+            }
+        }
+    }
+
     /// Move one session to another project: relocate its `sessions/<id>.md`
     /// file on disk and re-stamp its store rows in one transaction
     /// ([`WriterHandle::move_session`]).
@@ -833,6 +1170,65 @@ impl Wiki {
         parse(&raw)
     }
 
+    /// Build one compare-and-write file plan for a same-workspace project
+    /// merge from the Markdown source of truth.
+    pub fn prepare_project_merge_file(
+        &self,
+        workspace_id: WorkspaceId,
+        source_project: ProjectId,
+        target_project: ProjectId,
+        mut store: MergeProjectPage,
+        source_label: &str,
+    ) -> WikiResult<MergeProjectFile> {
+        if store.target_page_id.is_none() {
+            return Ok(MergeProjectFile {
+                store,
+                merged_markdown: None,
+            });
+        }
+        let path = &store.path;
+        let source = self.read_page(workspace_id, source_project, path)?;
+        let target = self.read_page(workspace_id, target_project, path)?;
+        let mut frontmatter = target.frontmatter;
+        if (source.frontmatter.get("expires_at").is_none()
+            || frontmatter.get("expires_at").is_none())
+            && let Some(object) = frontmatter.as_object_mut()
+        {
+            object.remove("expires_at");
+            object.remove("stale_after");
+        }
+        let body = format!(
+            "{}\n\n<!-- ai-memory:merged-from {source_label} -->\n\n{}",
+            target.body, source.body
+        );
+        let metadata = derive_index_metadata(path, &frontmatter)?;
+        let title = derive_title(&frontmatter, &body, path);
+        let markdown = Markdown {
+            frontmatter: frontmatter.clone(),
+            body: body.clone(),
+        };
+        let merged_page = NewPage {
+            workspace_id,
+            project_id: target_project,
+            path: path.clone(),
+            title,
+            body,
+            tier: metadata.tier,
+            frontmatter_json: frontmatter,
+            pinned: metadata.pinned,
+            links: crate::markdown::extract_all_links(&markdown.frontmatter, &markdown.body, path),
+            author_id: None,
+            expires_at: metadata.expires_at,
+            entities: metadata.entities,
+            evidence: Vec::new(),
+        };
+        store.merged_page = Some(merged_page);
+        Ok(MergeProjectFile {
+            store,
+            merged_markdown: Some(emit(&markdown)?),
+        })
+    }
+
     /// Whether the calling agent wrote `sessions/<session_id>.md` itself,
     /// through `memory_write_page` with that session's id: the page carries
     /// `consolidated_by: agent`. The automatic session-page writers leave such
@@ -974,7 +1370,64 @@ impl Wiki {
                 path.as_str()
             )))
         })?;
-        let mut md = parse(&raw)?;
+        let md = parse(&raw)?;
+        self.restore_page_markdown(workspace_id, project_id, path, md, true)
+            .await
+    }
+
+    /// Restore one retained SQLite page version as the new latest version.
+    /// This complements checkpoint restore for histories that moved from
+    /// another project path during `merge-project`.
+    pub async fn restore_page_from_version(
+        &self,
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+        path: PagePath,
+        version_id: PageId,
+    ) -> WikiResult<PageId> {
+        let reader = self
+            .store_reader
+            .as_ref()
+            .ok_or_else(|| ai_memory_wiki_error("page-version restore requires a store reader"))?;
+        let version = reader
+            .page_version_body(
+                workspace_id,
+                project_id,
+                path.as_str().to_owned(),
+                version_id,
+            )
+            .await?
+            .ok_or_else(|| {
+                WikiError::Store(ai_memory_store::StoreError::NotFound(
+                    "page version not found in the requested scope".into(),
+                ))
+            })?;
+        let tier = version
+            .tier
+            .parse::<Tier>()
+            .map_err(|error| ai_memory_wiki_error(&error.to_string()))?;
+        let frontmatter = canonicalize_index_frontmatter(version.frontmatter, tier, version.pinned);
+        self.restore_page_markdown(
+            workspace_id,
+            project_id,
+            path,
+            Markdown {
+                frontmatter,
+                body: version.body,
+            },
+            true,
+        )
+        .await
+    }
+
+    async fn restore_page_markdown(
+        &self,
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+        path: PagePath,
+        mut md: Markdown,
+        keep_own_generated_at: bool,
+    ) -> WikiResult<PageId> {
         let (id, body, abstract_text) = {
             let _guard = self.mutation_lock.read().await;
             // Restore shares the writer/reindex lock, including the disk read
@@ -996,7 +1449,12 @@ impl Wiki {
             // the disk holds a newer version and would leave only `now()`; an
             // already-conformant checkpoint keeps its own `generated.at` instead,
             // so it restores byte-exact whatever the clock.
-            conform_frontmatter_for_disk_keeping(&abs, path.as_str(), &mut md, true);
+            conform_frontmatter_for_disk_keeping(
+                &abs,
+                path.as_str(),
+                &mut md,
+                keep_own_generated_at,
+            );
             let raw = emit(&md)?;
             let title = derive_title(&md.frontmatter, &md.body, &path);
             let links = crate::markdown::extract_all_links(&md.frontmatter, &md.body, &path);

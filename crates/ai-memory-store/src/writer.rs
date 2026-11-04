@@ -13,8 +13,8 @@ use std::thread::{self, JoinHandle};
 use ai_memory_core::{
     AgentKind, AgentMessage, ApiCredentialId, HandoffAcceptance, HandoffId, IdentityKey,
     ManagedRunId, MessageClaim, MessageId, NewAgentMessage, NewHandoff, NewObservation, NewPage,
-    NewSession, NewUser, ObservationId, OwnerFilter, PageId, PagePath, ProjectId, Sanitized,
-    SessionId, UserId, UserRole, WorkspaceId,
+    NewSession, NewSessionUsage, NewUser, ObservationId, OwnerFilter, PageId, PagePath, ProjectId,
+    Sanitized, SessionId, UserId, UserRole, WorkspaceId,
 };
 use rusqlite::Connection;
 use tokio::sync::{mpsc, oneshot};
@@ -30,8 +30,8 @@ use crate::error::{StoreError, StoreResult};
 use crate::ops::{
     self, AdmittedSession, DeleteWorkspaceSummary, EmbeddingWrite, HookSessionAdmission,
     IdleEndCandidate, IdleEndResult, IngestObservationOutcome, LifecycleOnlyEndOutcome,
-    MoveSessionSummary, MoveSummary, ObservationPruneOutcome, PagesMode, PurgeSummary,
-    ReorgSummary,
+    MergeProjectPage, MergeProjectSummary, MoveSessionSummary, MoveSummary,
+    ObservationPruneOutcome, PagesMode, PurgeSummary, ReorgSummary,
 };
 use crate::session_consolidation::SessionConsolidationJob;
 use crate::users::{self, TOKEN_HASH_LEN};
@@ -248,6 +248,15 @@ pub(crate) enum WriteCmd {
         session_id: SessionId,
         reply: oneshot::Sender<StoreResult<LifecycleOnlyEndOutcome>>,
     },
+    UpsertTokenCalls {
+        session_id: SessionId,
+        calls: Vec<ai_memory_core::TokenCall>,
+        reply: oneshot::Sender<StoreResult<()>>,
+    },
+    UpsertSessionUsage {
+        usage: NewSessionUsage,
+        reply: oneshot::Sender<StoreResult<()>>,
+    },
     EndIdleSessions {
         candidates: Vec<IdleEndCandidate>,
         enqueue_consolidation: bool,
@@ -267,6 +276,10 @@ pub(crate) enum WriteCmd {
     SweepHollowProjects {
         min_age_days: u32,
         reply: oneshot::Sender<StoreResult<Vec<String>>>,
+    },
+    CloseAbandonedSessions {
+        cutoff_us: i64,
+        reply: oneshot::Sender<StoreResult<u64>>,
     },
     InsertObservation {
         obs: NewObservation,
@@ -395,6 +408,21 @@ pub(crate) enum WriteCmd {
         claim: MessageClaim,
         specific_id: Option<MessageId>,
         reply: oneshot::Sender<StoreResult<Option<AgentMessage>>>,
+    },
+    /// Take a pending message out of the queue so its sender can edit it.
+    BeginMessageEdit {
+        to_workspace_id: WorkspaceId,
+        to_project_id: ProjectId,
+        message_id: MessageId,
+        reply: oneshot::Sender<StoreResult<Option<AgentMessage>>>,
+    },
+    /// Return an `editing` message to the queue, with new text or unchanged.
+    FinishMessageEdit {
+        to_workspace_id: WorkspaceId,
+        to_project_id: ProjectId,
+        message_id: MessageId,
+        replacement: Option<(Option<String>, String)>,
+        reply: oneshot::Sender<StoreResult<bool>>,
     },
     /// Retract still-pending outbox messages a project has sent.
     CancelMessages {
@@ -591,6 +619,16 @@ pub(crate) enum WriteCmd {
         from_workspace: WorkspaceId,
         to_workspace: WorkspaceId,
         reply: oneshot::Sender<StoreResult<MoveSummary>>,
+    },
+    /// Merge one project id into another in the same workspace. The wiki
+    /// layer supplies a compare-and-write plan for every latest source page.
+    MergeProject {
+        workspace_id: WorkspaceId,
+        source_project: ProjectId,
+        target_project: ProjectId,
+        pages: Vec<MergeProjectPage>,
+        commit: bool,
+        reply: oneshot::Sender<StoreResult<MergeProjectSummary>>,
     },
     /// Re-stamp one session and its dependent rows (observations, handoffs,
     /// consolidation jobs, auto-improve runs and claim, session page) into
@@ -841,6 +879,7 @@ pub(crate) enum WriteCmd {
     },
     LinkOrAdoptManagedRunSession {
         input: LinkOrAdoptManagedRunSession,
+        boundary: crate::workstream::ClaudeSessionBoundary,
         reply: oneshot::Sender<StoreResult<ManagedRunSessionLink>>,
     },
     LinkManagedRunSessionInScope {
@@ -1567,6 +1606,37 @@ impl WriterHandle {
         rx.await.map_err(|_| StoreError::WriterClosed)?
     }
 
+    /// Record native response usage and refresh its session total atomically.
+    pub async fn upsert_token_calls(
+        &self,
+        session_id: SessionId,
+        calls: Vec<ai_memory_core::TokenCall>,
+    ) -> StoreResult<()> {
+        let (tx, rx) = oneshot::channel();
+        self.send(WriteCmd::UpsertTokenCalls {
+            session_id,
+            calls,
+            reply: tx,
+        })
+        .await?;
+        rx.await.map_err(|_| StoreError::WriterClosed)?
+    }
+
+    /// Record a session's reported cumulative token usage (token-cost
+    /// visibility). Idempotent-safe: the upsert keeps `MAX(existing,
+    /// reported)` per column, so calling this twice with the same or an
+    /// older report never lowers a stored total.
+    ///
+    /// # Errors
+    /// Returns [`StoreError::WriterClosed`] or propagates SQL/state errors
+    /// (including the FK violation from an unknown `usage.session_id`).
+    pub async fn upsert_session_usage(&self, usage: NewSessionUsage) -> StoreResult<()> {
+        let (tx, rx) = oneshot::channel();
+        self.send(WriteCmd::UpsertSessionUsage { usage, reply: tx })
+            .await?;
+        rx.await.map_err(|_| StoreError::WriterClosed)?
+    }
+
     /// Atomically end a session and insert its automatic handoff.
     ///
     /// # Errors
@@ -1662,6 +1732,23 @@ impl WriterHandle {
         let (tx, rx) = oneshot::channel();
         self.send(WriteCmd::SweepHollowProjects {
             min_age_days,
+            reply: tx,
+        })
+        .await?;
+        rx.await.map_err(|_| StoreError::WriterClosed)?
+    }
+
+    /// Close every session, in every scope, open with no activity since
+    /// before `cutoff_us` (safety net). No usage, no
+    /// consolidation — see [`ops::close_abandoned_sessions`] for why.
+    /// Returns the number of sessions closed.
+    ///
+    /// # Errors
+    /// Propagates store failures.
+    pub async fn close_abandoned_sessions(&self, cutoff_us: i64) -> StoreResult<u64> {
+        let (tx, rx) = oneshot::channel();
+        self.send(WriteCmd::CloseAbandonedSessions {
+            cutoff_us,
             reply: tx,
         })
         .await?;
@@ -2112,6 +2199,55 @@ impl WriterHandle {
         self.send(WriteCmd::PopMessage {
             claim,
             specific_id,
+            reply: tx,
+        })
+        .await?;
+        rx.await.map_err(|_| StoreError::WriterClosed)?
+    }
+
+    /// Take a pending message out of its recipient's queue so it can be
+    /// edited. Returns the message to edit, or `None` when it is no longer
+    /// pending in that project (already collected, held, or not there).
+    ///
+    /// # Errors
+    /// Returns [`StoreError::WriterClosed`] or propagates SQL errors.
+    pub async fn begin_message_edit(
+        &self,
+        to_workspace_id: WorkspaceId,
+        to_project_id: ProjectId,
+        message_id: MessageId,
+    ) -> StoreResult<Option<AgentMessage>> {
+        let (tx, rx) = oneshot::channel();
+        self.send(WriteCmd::BeginMessageEdit {
+            to_workspace_id,
+            to_project_id,
+            message_id,
+            reply: tx,
+        })
+        .await?;
+        rx.await.map_err(|_| StoreError::WriterClosed)?
+    }
+
+    /// Return an `editing` message to the queue. With `replacement` the
+    /// subject and body are replaced; without it the message returns
+    /// unchanged. Returns `false` when the message is not in `editing` in that
+    /// project.
+    ///
+    /// # Errors
+    /// Returns [`StoreError::WriterClosed`] or propagates SQL errors.
+    pub async fn finish_message_edit(
+        &self,
+        to_workspace_id: WorkspaceId,
+        to_project_id: ProjectId,
+        message_id: MessageId,
+        replacement: Option<(Option<String>, String)>,
+    ) -> StoreResult<bool> {
+        let (tx, rx) = oneshot::channel();
+        self.send(WriteCmd::FinishMessageEdit {
+            to_workspace_id,
+            to_project_id,
+            message_id,
+            replacement,
             reply: tx,
         })
         .await?;
@@ -2711,6 +2847,28 @@ impl WriterHandle {
             project_id,
             from_workspace,
             to_workspace,
+            reply: tx,
+        })
+        .await?;
+        rx.await.map_err(|_| StoreError::WriterClosed)?
+    }
+
+    /// Atomically merge one project id into another in the same workspace.
+    pub async fn merge_project(
+        &self,
+        workspace_id: WorkspaceId,
+        source_project: ProjectId,
+        target_project: ProjectId,
+        pages: Vec<MergeProjectPage>,
+        commit: bool,
+    ) -> StoreResult<MergeProjectSummary> {
+        let (tx, rx) = oneshot::channel();
+        self.send(WriteCmd::MergeProject {
+            workspace_id,
+            source_project,
+            target_project,
+            pages,
+            commit,
             reply: tx,
         })
         .await?;
@@ -3693,8 +3851,32 @@ impl WriterHandle {
         input: LinkOrAdoptManagedRunSession,
     ) -> StoreResult<ManagedRunSessionLink> {
         let (tx, rx) = oneshot::channel();
-        self.send(WriteCmd::LinkOrAdoptManagedRunSession { input, reply: tx })
-            .await?;
+        self.send(WriteCmd::LinkOrAdoptManagedRunSession {
+            input,
+            boundary: crate::workstream::ClaudeSessionBoundary::Other,
+            reply: tx,
+        })
+        .await?;
+        rx.await.map_err(|_| StoreError::WriterClosed)?
+    }
+
+    /// Relink an ID-selected Claude run after an authorized SessionStart
+    /// `clear` (to a never-seen native id) or `resume` (to one this
+    /// workstream held and no other live run holds). Rechecks the checkout,
+    /// operator, live lease and native-session boundary in the same
+    /// transaction that publishes the new current session.
+    pub async fn relink_managed_claude_session(
+        &self,
+        input: LinkOrAdoptManagedRunSession,
+        boundary: crate::workstream::ClaudeSessionBoundary,
+    ) -> StoreResult<ManagedRunSessionLink> {
+        let (tx, rx) = oneshot::channel();
+        self.send(WriteCmd::LinkOrAdoptManagedRunSession {
+            input,
+            boundary,
+            reply: tx,
+        })
+        .await?;
         rx.await.map_err(|_| StoreError::WriterClosed)?
     }
 
@@ -4208,6 +4390,18 @@ fn worker_loop(mut conn: Connection, mut rx: mpsc::Receiver<WriteCmd>) {
                 let result = ops::end_session(&mut conn, &session_id, summary_page_id.as_ref());
                 send_or_warn(reply, result, "end_session");
             }
+            WriteCmd::UpsertTokenCalls {
+                session_id,
+                calls,
+                reply,
+            } => {
+                let result = ops::upsert_token_calls(&mut conn, session_id, &calls);
+                send_or_warn(reply, result, "upsert_token_calls");
+            }
+            WriteCmd::UpsertSessionUsage { usage, reply } => {
+                let result = ops::upsert_session_usage(&conn, &usage);
+                send_or_warn(reply, result, "upsert_session_usage");
+            }
             WriteCmd::EndSessionWithHandoff {
                 session_id,
                 summary_page_id,
@@ -4256,6 +4450,10 @@ fn worker_loop(mut conn: Connection, mut rx: mpsc::Receiver<WriteCmd>) {
             } => {
                 let result = ops::sweep_hollow_projects(&mut conn, min_age_days);
                 send_or_warn(reply, result, "sweep_hollow_projects");
+            }
+            WriteCmd::CloseAbandonedSessions { cutoff_us, reply } => {
+                let result = ops::close_abandoned_sessions(&conn, cutoff_us);
+                send_or_warn(reply, result, "close_abandoned_sessions");
             }
             WriteCmd::InsertObservation { obs, reply } => {
                 let result = ops::insert_observation(&mut conn, &obs);
@@ -4472,6 +4670,38 @@ fn worker_loop(mut conn: Connection, mut rx: mpsc::Receiver<WriteCmd>) {
             } => {
                 let result = ops::pop_message(&mut conn, &claim, specific_id);
                 send_or_warn(reply, result, "pop_message");
+            }
+            WriteCmd::BeginMessageEdit {
+                to_workspace_id,
+                to_project_id,
+                message_id,
+                reply,
+            } => {
+                let result = ops::begin_message_edit(
+                    &mut conn,
+                    &to_workspace_id,
+                    &to_project_id,
+                    message_id,
+                );
+                send_or_warn(reply, result, "begin_message_edit");
+            }
+            WriteCmd::FinishMessageEdit {
+                to_workspace_id,
+                to_project_id,
+                message_id,
+                replacement,
+                reply,
+            } => {
+                let result = ops::finish_message_edit(
+                    &mut conn,
+                    &to_workspace_id,
+                    &to_project_id,
+                    message_id,
+                    replacement
+                        .as_ref()
+                        .map(|(subject, body)| (subject.as_deref(), body.as_str())),
+                );
+                send_or_warn(reply, result, "finish_message_edit");
             }
             WriteCmd::CancelMessages {
                 from_workspace_id,
@@ -4759,6 +4989,24 @@ fn worker_loop(mut conn: Connection, mut rx: mpsc::Receiver<WriteCmd>) {
                     &to_workspace,
                 );
                 send_or_warn(reply, result, "move_project_workspace");
+            }
+            WriteCmd::MergeProject {
+                workspace_id,
+                source_project,
+                target_project,
+                pages,
+                commit,
+                reply,
+            } => {
+                let result = ops::merge_project(
+                    &mut conn,
+                    workspace_id,
+                    source_project,
+                    target_project,
+                    &pages,
+                    commit,
+                );
+                send_or_warn(reply, result, "merge_project");
             }
             WriteCmd::MoveSession {
                 session_id,
@@ -5204,8 +5452,13 @@ fn worker_loop(mut conn: Connection, mut rx: mpsc::Receiver<WriteCmd>) {
                 );
                 send_or_warn(reply, result, "link_managed_run_session");
             }
-            WriteCmd::LinkOrAdoptManagedRunSession { input, reply } => {
-                let result = crate::workstream::link_or_adopt_native_session(&mut conn, &input);
+            WriteCmd::LinkOrAdoptManagedRunSession {
+                input,
+                boundary,
+                reply,
+            } => {
+                let result =
+                    crate::workstream::link_or_adopt_native_session(&mut conn, &input, boundary);
                 send_or_warn(reply, result, "link_or_adopt_managed_run_session");
             }
             WriteCmd::LinkManagedRunSessionInScope { input, reply } => {

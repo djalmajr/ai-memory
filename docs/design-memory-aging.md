@@ -246,16 +246,17 @@ Everything in A works with no provider and does not require ranking changes.
 - *Failure modes:* filters a terse-but-important note → tune threshold low; keep it
   advisory (skip-from-consolidation, not delete).
 
-**A5. Zero-LLM `contradicts` edges via similarity band.**
-- *What:* detect likely contradictions between pages in the 0.4–0.75 cosine band
-  (mcp-memory-service's heuristic) and record a `contradicts` edge resolved by
-  timestamp (newer wins), feeding the existing `memory_lint`.
-- *Why:* surfaces stale/conflicting knowledge without a provider; lint already
-  exists to consume it.
-- *Mechanism:* pairwise within cold clusters (bounded); emit an edge + a lint
-  finding. Timestamp resolution only *flags*, never auto-deletes.
-- *Schema delta:* reuse `page_evidence`/edge tables; add a `contradicts` edge kind
-  if not present (V66 if needed).
+**A5. Zero-LLM similarity candidates.**
+- *What:* surface cold page pairs in the 0.4–0.75 cosine band
+  (mcp-memory-service's heuristic) as `similarity_candidate` lint findings.
+  Similarity alone does not establish contradiction or supersession.
+- *Why:* gives an operator a bounded review queue without overstating what the
+  embedding evidence proves. Explicit `contradicts` edges remain separate
+  `contradiction` findings.
+- *Mechanism:* pairwise within cold clusters (bounded); emit an advisory lint
+  finding only. Never infer an ordering from timestamps.
+- *Schema delta:* none; the candidate is computed at lint time and no edge is
+  persisted.
 - *Invariants:* #13; lint stays advisory (#16: a contradiction is not a delete).
 - *R2 bar:* none for detection; if the edge later feeds *rank* (per
   `design-hindsight-borrowings.md` §4) that step is R2-gated separately.
@@ -271,14 +272,14 @@ current classification, including compatible pairs inside the band and a
 conflicting pair above it; they do not estimate production precision or propose
 a new response contract.
 
-A prediction is any `contradiction` finding, including an advisory similarity
-candidate. Positives contain incompatible simultaneous values for the same
-setting and scope; compatible active pairs are negatives. Superseded, expired
-and foreign-project pairs test eligibility separately and do not enter the
-classification metrics. The declared-edge control contains conflicting
-prose and has no embeddings. Expected counts document the current behavior;
-labels should remain independent when an approved classifier change updates
-those counts.
+A contradiction prediction is only a `contradiction` finding;
+`similarity_candidate` findings are counted separately. Positives contain
+incompatible simultaneous values for the same setting and scope; compatible
+active pairs are negatives. Superseded, expired and foreign-project pairs test
+eligibility separately and do not enter the classification metrics. The
+declared-edge control contains conflicting prose and has no embeddings.
+Expected counts document the current behavior; labels remain independent of
+the classifier output.
 
 ```bash
 cargo test -p ai-memory-consolidate labeled_evidence_pairs_record_current_classification -- --nocapture
@@ -290,7 +291,7 @@ false-positive/false-negative rates and checks repeated classification parity.
 The optional second command reports lint p50/p95 over 20 runs per isolated pair after a
 warm-up, excluding fixture creation. Both run offline without an LLM. Timing has
 no pass threshold and is not a benchmark of a full store. Neither changes lint's
-public classification; that decision remains in the RFC.
+classification while it runs.
 
 ### Bucket B — LLM "dream" pass (opt-in, OFF by default, R2-gated)
 

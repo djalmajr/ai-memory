@@ -10,6 +10,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Pinned TypeDoc's transitive `minimatch` to 11.0.3, which fixes
+  GHSA-g3hv-75wg-m249 while preserving the generated API documentation on
+  Node 22 and 24.
+
 - Capability initialization is owned by the client rather than its first
   caller. Concurrent callers now wait with independent abort signals and
   deadlines; cancelling one does not fail or delay the others. (#1815)
@@ -20,8 +24,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Decoded optional query-answer context admission receipts as `answerContext` (#1684).
+
 - `query` takes the server's `memory_query` page filters: `kind`, `tier`,
   `pathPrefix` and `tag`, in every search mode.
+
+- `messages.pop` takes `agent`, the harness claiming harness-addressed mail,
+  and `Message` carries `toAgent` (`null` for shared project mail), matching
+  the server's new `to_agent` addressing.
+
+- `pages.read` takes `maxChars`, and `Page` carries `truncated` and
+  `totalChars`, matching the server's new `memory_read_page` size cap. Both are
+  `undefined` against a server that predates it. The documented `observations`
+  defaults are now 20 rows of 1000 characters.
 
 ## [0.1.0]
 

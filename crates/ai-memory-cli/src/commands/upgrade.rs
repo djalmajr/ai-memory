@@ -6,7 +6,7 @@
 //! `docs/macos.md`, Windows zip in `docs/windows.md` Scenario C): download the
 //! matching archive + `.sha256`, verify, replace the on-disk binary (and sibling
 //! `hooks/` when present), then re-run `install-hooks --apply` for every staged
-//! agent.
+//! agent and every existing ai-memory-owned generated TypeScript integration.
 //!
 //! Client-only: never claims to upgrade a remote/homelab server.
 //!
@@ -30,6 +30,7 @@
 use std::fs;
 use std::io::Cursor;
 use std::path::{Component, Path, PathBuf};
+use std::process::{Command, Stdio};
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
@@ -64,7 +65,7 @@ const UNIX_EXECUTABLE_MODE: u32 = 0o755;
 type StagedAgentList = Vec<(String, AgentChoice)>;
 
 /// Run the `upgrade` subcommand.
-pub async fn run(config: &Config, args: UpgradeArgs) -> Result<()> {
+pub async fn run(config: &Config, config_path: Option<&Path>, args: UpgradeArgs) -> Result<()> {
     let exe = resolve_current_exe()?;
     ensure_supported_install(&exe)?;
 
@@ -79,13 +80,49 @@ pub async fn run(config: &Config, args: UpgradeArgs) -> Result<()> {
     let extract_root = download_and_extract_release(&fetcher, &base, &tag).await?;
     apply_extracted_release(extract_root.path(), &exe)?;
 
-    // Sync FS after await is intentional for this CLI one-shot path.
-    refresh_staged_hooks(config)?;
+    // The running process still contains the old release's embedded templates.
+    // Re-enter through the replacement executable so every generated hook is
+    // rendered by the version that was just installed.
+    run_replacement_refresh(&exe, &config.data_dir, config_path)?;
     refresh_plugins(config, &super::user_service::SystemRunner);
     warn_remote_server(config);
     println!("✓ upgraded to {tag}");
     info!(%tag, path = %exe.display(), "native upgrade complete");
     Ok(())
+}
+
+/// Refresh staged and generated integrations from the replacement process.
+/// This is reached only through the hidden `upgrade-refresh-hooks` command.
+pub(crate) fn refresh_after_replace(config: &Config) -> Result<()> {
+    refresh_staged_hooks(config)?;
+    refresh_generated_integrations(config);
+    Ok(())
+}
+
+fn run_replacement_refresh(exe: &Path, data_dir: &Path, config_path: Option<&Path>) -> Result<()> {
+    let mut command = replacement_refresh_command(exe, data_dir, config_path);
+    let status = command
+        .status()
+        .with_context(|| format!("starting replacement executable {}", exe.display()))?;
+    if !status.success() {
+        bail!(
+            "the new binary was installed, but its hook refresh exited with {status}; \
+             run `{} --data-dir {} upgrade-refresh-hooks`",
+            exe.display(),
+            data_dir.display()
+        );
+    }
+    Ok(())
+}
+
+fn replacement_refresh_command(exe: &Path, data_dir: &Path, config_path: Option<&Path>) -> Command {
+    let mut command = Command::new(exe);
+    command.arg("--data-dir").arg(data_dir);
+    if let Some(path) = config_path {
+        command.arg("--config").arg(path);
+    }
+    command.arg("upgrade-refresh-hooks").stdin(Stdio::null());
+    command
 }
 
 fn resolve_current_exe() -> Result<PathBuf> {
@@ -652,18 +689,31 @@ fn replace_file_atomic(src: &Path, dest: &Path) -> Result<()> {
     }
 }
 
+/// Linear backoff, 100 ms + 200 ms + … + 1.2 s: a scanner holds a fresh
+/// 100 MB binary for a few seconds.
+#[cfg(windows)]
+const SWAP_RETRY_ATTEMPTS: u32 = 12;
+#[cfg(windows)]
+const SWAP_RETRY_BASE_DELAY: Duration = Duration::from_millis(100);
+
 /// Windows allows renaming a running image aside, but not overwriting it.
 /// Stage to `.new`, move live `dest` → `.old`, promote `.new` → `dest`, then
 /// best-effort delete `.old` (often fails while this process still maps it).
+///
+/// Both renames retry a sharing violation: a scanner holding the running
+/// binary or the fresh `.new` used to fail the upgrade.
 #[cfg(windows)]
 fn replace_file_windows_rename_aside(tmp: &Path, dest: &Path) -> Result<()> {
+    let rename = |from: &Path, to: &Path| {
+        ai_memory_wiki::rename_with_retry(from, to, SWAP_RETRY_ATTEMPTS, SWAP_RETRY_BASE_DELAY)
+    };
     let old = dest.with_extension("old");
     if old.exists() {
         let _ = fs::remove_file(&old);
     }
     let had_dest = dest.exists();
     if had_dest {
-        fs::rename(dest, &old).with_context(|| {
+        rename(dest, &old).with_context(|| {
             format!(
                 "moving running binary aside {} -> {}",
                 dest.display(),
@@ -671,9 +721,9 @@ fn replace_file_windows_rename_aside(tmp: &Path, dest: &Path) -> Result<()> {
             )
         })?;
     }
-    if let Err(err) = fs::rename(tmp, dest) {
+    if let Err(err) = rename(tmp, dest) {
         if had_dest {
-            let _ = fs::rename(&old, dest);
+            let _ = rename(&old, dest);
         }
         return Err(err).with_context(|| {
             format!(
@@ -805,6 +855,66 @@ fn refresh_staged_hooks(config: &Config) -> Result<()> {
     }
     refresh_agent_list(config, &agents);
     Ok(())
+}
+
+const GENERATED_INTEGRATIONS: &[(&str, AgentChoice)] = &[
+    ("opencode", AgentChoice::OpenCode),
+    ("opencode2", AgentChoice::OpenCode2),
+    ("omp", AgentChoice::Omp),
+    ("pi", AgentChoice::Pi),
+    ("openclaw", AgentChoice::Openclaw),
+];
+
+fn refresh_generated_integrations(config: &Config) {
+    for &(name, agent) in GENERATED_INTEGRATIONS {
+        let path = match default_generated_integration_path(agent) {
+            Ok(path) => path,
+            Err(err) => {
+                println!("  (skipping generated {name} integration — {err:#})");
+                continue;
+            }
+        };
+        let owned = fs::read_to_string(&path).is_ok_and(|content| {
+            install_hooks::generated_integration_content_is_owned(agent, &content)
+        });
+        if !owned {
+            continue;
+        }
+
+        println!("→ refreshing generated {name} integration");
+        let mut args = apply_hooks_args(agent);
+        args.config_file = if agent == AgentChoice::Openclaw {
+            path.parent().map(Path::to_path_buf)
+        } else {
+            Some(path.clone())
+        };
+        let result = if agent == AgentChoice::OpenCode {
+            install_hooks::run_with_opencode_dialect(
+                config,
+                args,
+                Some(ai_memory_workstream::OpenCodeDialect::V1),
+            )
+        } else {
+            install_hooks::run(config, args)
+        };
+        if let Err(err) = result {
+            println!(
+                "      (skipped — {err:#}; re-run `ai-memory install-hooks --agent {name} --apply`)"
+            );
+        }
+    }
+}
+
+fn default_generated_integration_path(agent: AgentChoice) -> Result<PathBuf> {
+    match agent {
+        AgentChoice::OpenCode => install_hooks::opencode_plugin_path(),
+        AgentChoice::OpenCode2 => install_hooks::opencode2_plugin_path(),
+        AgentChoice::Omp => install_hooks::omp_extension_path(None),
+        AgentChoice::Pi => install_hooks::pi_extension_path(),
+        AgentChoice::Openclaw => Ok(crate::commands::openclaw_plugin::default_plugin_dir()?
+            .join(crate::commands::openclaw_plugin::ENTRYPOINT_TS)),
+        _ => bail!("not a generated TypeScript integration: {agent:?}"),
+    }
 }
 
 /// Keep the marketplace plugins in step with the binary (#1166). Claude Code
@@ -1079,6 +1189,36 @@ mod tests {
     use tar::Header;
     use zip::ZipWriter;
     use zip::write::SimpleFileOptions;
+
+    #[test]
+    fn replacement_binary_refresh_receives_the_loaded_config_coordinates() {
+        let exe = Path::new("/opt/ai memory/bin/ai-memory");
+        let data = Path::new("/srv/memory data");
+        let config = Path::new("/etc/ai memory/config.toml");
+        let command = replacement_refresh_command(exe, data, Some(config));
+
+        assert_eq!(command.get_program(), exe.as_os_str());
+        assert_eq!(
+            command.get_args().collect::<Vec<_>>(),
+            [
+                "--data-dir".as_ref(),
+                data.as_os_str(),
+                "--config".as_ref(),
+                config.as_os_str(),
+                "upgrade-refresh-hooks".as_ref(),
+            ]
+        );
+
+        let command = replacement_refresh_command(exe, data, None);
+        assert_eq!(
+            command.get_args().collect::<Vec<_>>(),
+            [
+                "--data-dir".as_ref(),
+                data.as_os_str(),
+                "upgrade-refresh-hooks".as_ref(),
+            ]
+        );
+    }
 
     /// `upgrade` keeps an installed Claude Code plugin in step with the
     /// binary: marketplace update, then plugin update. Without the plugin,
@@ -1592,6 +1732,43 @@ mod tests {
         if old.exists() {
             assert_eq!(fs::read(&old)?, b"old");
         }
+        Ok(())
+    }
+
+    /// A scanner holds the running binary when the swap moves it aside; the
+    /// swap waits it out. Fails without the retry.
+    #[cfg(windows)]
+    #[test]
+    fn replace_file_atomic_waits_out_a_transient_hold_on_the_running_binary() -> Result<()> {
+        use std::os::windows::fs::OpenOptionsExt as _;
+        const FILE_SHARE_READ: u32 = 1;
+
+        let dir = tempfile::tempdir()?;
+        let dest = dir.path().join(shipped_binary_name());
+        let src = dir.path().join("fresh");
+        fs::write(&dest, b"old")?;
+        fs::write(&src, b"new")?;
+        let holder = fs::OpenOptions::new()
+            .read(true)
+            .share_mode(FILE_SHARE_READ)
+            .open(&dest)?;
+        assert_eq!(
+            fs::rename(&dest, dest.with_extension("probe"))
+                .unwrap_err()
+                .raw_os_error(),
+            Some(32),
+            "the hold must be a real sharing violation"
+        );
+        let release = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(400));
+            drop(holder);
+        });
+
+        replace_file_atomic(&src, &dest)?;
+
+        release.join().expect("release thread");
+        assert_eq!(fs::read(&dest)?, b"new");
+        assert!(!dest.with_extension("new").exists());
         Ok(())
     }
 
