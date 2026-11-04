@@ -180,12 +180,15 @@ fn secret_patterns() -> &'static [RedactionRule] {
             },
             // Same rule and label as the server's: `aim_`, `amk_` and `ams_`
             // credentials in the captured text, including right after a
-            // JSON-escaped line break or tab. The escape is captured so the
-            // replacement keeps it, and the ASCII word boundary rejects
+            // serialized control character — the one-letter escapes the
+            // serializers use (\b \t \n \f \r), the numeric spellings
+            // (\uXXXX, \xNN), the ANSI CSI escape that follows a serialized
+            // ESC and the percent-encoded forms. The escape is captured so
+            // the replacement keeps it, and the ASCII word boundary rejects
             // `claim_…` without treating `é` as one.
             RedactionRule {
                 regex: Regex::new(
-                    r"((?:\\[nrtbf])|(?-u:\b))(?:aim|amk|ams)_[A-Za-z0-9_\-]{22,}",
+                    r"((?:\\(?:[nrtbf]|u[0-9A-Fa-f]{4}|x[0-9A-Fa-f]{2})(?:\[[0-9;?]*[ -/]*[@-~])?|%[0-9A-Fa-f]{2})|(?-u:\b))(?:aim|amk|ams)_[A-Za-z0-9_\-]{22,}",
                 )
                 .unwrap(),
                 replacement: "$1[REDACTED:ai_memory_token]",

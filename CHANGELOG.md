@@ -120,14 +120,15 @@ version in [`docs/changelog/`](docs/changelog/):
   show `TOKEN` as `null`, and hook configs show `<redacted>`. What `--apply` writes
   is unchanged. Rotate a token that a preview printed before this release. (#TBD)
 - Added a sanitizer rule that redacts ai-memory's own `aim_`, `amk_` and `ams_`
-  credentials in captured text, including right after a JSON-escaped line break
-  or tab, as `[REDACTED:ai_memory_token]`; only a `Bearer` header was covered
-  before. `ai-memory-client` redacts the same keys in the external text it
-  scrubs. Text stored before this release is not rewritten, so a key already
-  captured stays in the store until it is purged. (#TBD)
-- Stopped a syntax error in `config.toml` from echoing the offending line, which
-  could hold `[auth].bearer_token`, on every subcommand. The error keeps the
-  file, line and column. (#TBD)
+  credentials in captured text, including right after a serialized control
+  character, an ANSI color code or a URL-encoded byte, as
+  `[REDACTED:ai_memory_token]`; only a `Bearer` header was covered before.
+  `ai-memory-client` redacts the same keys in the external text it scrubs.
+  Text stored before this release is not rewritten, so a key already captured
+  stays in the store until it is purged. (#TBD)
+- Stopped `config.toml` errors from echoing values, which could hold
+  `[auth].bearer_token`, on every subcommand. A syntax error keeps the file, line
+  and column, and a type error keeps the key and the expected type. (#TBD)
 
 ## [3.2.2] - 2026-10-22
 

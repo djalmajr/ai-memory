@@ -188,6 +188,36 @@ const BUILTIN_PATTERNS: &[(&str, &str)] = &[
     ),
     // Bearer-style tokens.
     (r#"(?i)bearer\s+[A-Za-z0-9._\-+/=]{16,}"#, "bearer_token"),
+    // ai-memory's own credentials: `aim_` API keys and `ams_` web sessions
+    // are these prefixes plus 43 base64url characters; external `amk_` keys
+    // come from mcp-auth, so their length is not known here. The floor is the
+    // 22 base64url characters of a 128-bit secret. It sits above snake_case
+    // names that happen to start with a prefix (`ams_session_token_hash`),
+    // and the leading word boundary rejects `claim_…` — ASCII, so a
+    // non-ASCII word character glued to the key (`éaim_…`) is not mistaken
+    // for one. This rule runs before the vendor-prefixed rules below,
+    // because a key body may contain a fragment one of their patterns
+    // matches (`sk-…`): running it last would redact the fragment and leave
+    // the prefix behind.
+    //
+    // The pipeline compact-serializes a structured tool response before this
+    // pass runs: a real control character survives as the literal escape text
+    // of the serializer, and that text is not a word boundary — the escaped
+    // letters are word characters — so the boundary alone cannot see the key.
+    // `strip_control` only removes REAL control characters, so the serialized
+    // spellings are matched here, outside the `secret` group, so the
+    // redaction keeps them: the one-letter escapes the serializers use (\b
+    // \t \n \f \r), the numeric spellings of a control character
+    // (\uXXXX, \xNN), the ANSI escape that follows a serialized ESC — the
+    // CSI parameters, intermediates and final byte — and the
+    // percent-encoded forms. A `\u0041`-style escape of a word character
+    // also breaks the key; that is accepted cost, like the `C:\temp\naim_…`
+    // false positive. No trailing boundary: base64url can end in `-`, which
+    // would otherwise be left behind.
+    (
+        r"(?:(?:\\(?:[nrtbf]|u[0-9A-Fa-f]{4}|x[0-9A-Fa-f]{2})(?:\[[0-9;?]*[ -/]*[@-~])?|%[0-9A-Fa-f]{2})|(?-u:\b))(?P<secret>(?:aim|amk|ams)_[A-Za-z0-9_\-]{22,})",
+        "ai_memory_token",
+    ),
     // Vendor-prefixed API keys.
     (r"sk-[A-Za-z0-9_\-]{16,}", "api_key"),
     // Stripe secret *and* restricted keys. `rk_live_` is scoped rather than
@@ -254,23 +284,6 @@ const BUILTIN_PATTERNS: &[(&str, &str)] = &[
     // Slack tokens (bot/user/admin/app-level/refresh).
     (r"xox[abprs]-[A-Za-z0-9\-]{10,}", "slack_token"),
     (r"xapp-[A-Za-z0-9\-]{10,}", "slack_token"),
-    // ai-memory's own credentials: `aim_` API keys and `ams_` web sessions are
-    // these prefixes plus 43 base64url characters; external `amk_` keys come
-    // from mcp-auth, so their length is not known here. The floor is the 22
-    // base64url characters of a 128-bit secret. It sits above snake_case names
-    // that happen to start with a prefix (`ams_session_token_hash`), and the
-    // leading word boundary rejects `claim_…` — ASCII, so a non-ASCII word
-    // character glued to the key (`éaim_…`) is not mistaken for one. The hook
-    // compact-serializes a structured tool response before this pass runs,
-    // where a line break or tab becomes the two characters `\` plus the
-    // letter, and that escaped letter is a word character that defeats the
-    // boundary; the escape is matched instead, outside the `secret` group so
-    // the redaction keeps it. No trailing boundary: base64url can end in `-`,
-    // which would otherwise be left behind.
-    (
-        r"(?:(?:\\[nrtbf])|(?-u:\b))(?P<secret>(?:aim|amk|ams)_[A-Za-z0-9_\-]{22,})",
-        "ai_memory_token",
-    ),
     // JWTs (three base64url segments separated by dots).
     (
         r"eyJ[A-Za-z0-9_\-]{16,}\.[A-Za-z0-9_\-]{16,}\.[A-Za-z0-9_\-]{16,}",
@@ -984,6 +997,53 @@ mod tests {
         let (head, tail) = key.split_at(10);
         let out = s().scrub(&format!("title\\n{head}\u{200b}{tail}"));
         assert_eq!(out, "title\\n[REDACTED:ai_memory_token]");
+    }
+
+    /// A native key whose base64url body contains `sk-` must be matched whole
+    /// by the native rule, which runs before the generic `sk-` suffix rule:
+    /// without that order the suffix rule eats the tail and the leading
+    /// fragment of the key stays in clear.
+    #[test]
+    fn a_native_key_with_an_sk_suffix_in_its_body_leaves_no_fragment() {
+        let marker = "[REDACTED:ai_memory_token]";
+        // `sk-` after 5, 21 and 22 body characters; the tail after it stays
+        // long enough for the `sk-` rule to want it.
+        let bodies = [
+            format!("abcde{}{}", "sk-", "Z".repeat(22)),
+            format!("a{}{}{}", "a".repeat(21), "sk-", "Z".repeat(16)),
+            format!("b{}{}{}", "b".repeat(22), "sk-", "Z".repeat(16)),
+        ];
+        for (index, body) in bodies.iter().enumerate() {
+            let key = format!("aim_{body}");
+            let out = s().scrub(&format!("token {key} end"));
+            assert_eq!(
+                out,
+                format!("token {marker} end"),
+                "case {index} (body {body:?}): {out:?}"
+            );
+            for fragment in [key.as_str(), body.as_str(), "sk-"] {
+                assert!(
+                    !out.contains(fragment),
+                    "case {index} (body {body:?}): fragment {fragment:?} in {out:?}"
+                );
+            }
+            // The router scrubs and then `Sanitized::new` scrubs again: the
+            // second pass must be a no-op, not a fresh fragment.
+            assert_eq!(s().scrub(&out), out, "second pass: {out:?}");
+        }
+    }
+
+    /// A raw colour code (real ESC + CSI) before a native key: `strip_control`
+    /// removes the sequence whole before the patterns run, and the key must
+    /// still be redacted at the boundary the removal leaves.
+    #[test]
+    fn a_raw_esc_code_before_a_native_key_is_still_redacted() {
+        let key = native_key("aim_");
+        for prefix in ["\u{1b}[32m", "\u{1b}[0m", "\u{1b}"] {
+            let out = s().scrub(&format!("{prefix}{key}"));
+            assert_eq!(out, "[REDACTED:ai_memory_token]", "{prefix:?} -> {out:?}");
+            assert_eq!(s().scrub(&out), out, "second pass: {prefix:?}");
+        }
     }
 
     #[test]

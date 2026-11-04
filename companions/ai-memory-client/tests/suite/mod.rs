@@ -398,6 +398,21 @@ fn shared_sanitizer_vectors_hold() {
     for text in strings("unchanged") {
         assert_eq!(sanitize_external_text(&text), text);
     }
+    // The structured tool-response cases the shared loop's `key … end`
+    // wrap cannot express: exact input, exact output, and idempotency.
+    // The core runs the same block first, so the two copies cannot drift on
+    // the serialized-control spellings either.
+    for case in vectors["native_key_cases"].as_array().unwrap() {
+        let input = case["input"].as_str().unwrap();
+        let expected = case["output"].as_str().unwrap();
+        let out = sanitize_external_text(input);
+        assert_eq!(out, expected, "{input:?}");
+        assert_eq!(
+            sanitize_external_text(&out),
+            out,
+            "{input:?} must be a no-op twice"
+        );
+    }
 }
 
 #[test]
