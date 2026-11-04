@@ -29,6 +29,7 @@ mod logging;
 mod marker;
 mod process_guard;
 mod proxy_env;
+pub mod runtime_flavor;
 mod server_profiles;
 mod terminal;
 
@@ -81,7 +82,7 @@ pub async fn run() -> Result<()> {
 
     info!(
         version = env!("CARGO_PKG_VERSION"),
-        server_url = %config.server_url,
+        server_url = %http_client::display_url(&config.server_url),
         data_dir = %commands::path_util::display_path(&config.data_dir),
         bind = %config.bind,
         "ai-memory starting",
@@ -194,9 +195,13 @@ pub async fn run() -> Result<()> {
         Command::PurgeSession(args) => commands::purge_session::run(&config, args).await,
         Command::RenameProject(args) => commands::rename_project::run(&config, args).await,
         Command::MoveProject(args) => commands::move_project::run(&config, args).await,
+        Command::MergeProject(args) => commands::merge_project::run(&config, args).await,
         Command::MoveSession(args) => commands::move_session::run(&config, args).await,
         Command::Uninstall(args) => commands::uninstall::run(&config, args),
-        Command::Upgrade(args) => commands::upgrade::run(&config, args).await,
+        Command::Upgrade(args) => {
+            commands::upgrade::run(&config, config_path.as_deref(), args).await
+        }
+        Command::UpgradeRefreshHooks => commands::upgrade::refresh_after_replace(&config),
         Command::Auth(args) => commands::auth::run(&config, args, config_path.as_deref()).await,
         Command::User(args) => commands::user::run(&config, args).await,
         Command::ApiKey(args) => commands::api_key::run(&config, args).await,

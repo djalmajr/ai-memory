@@ -386,8 +386,11 @@ function postPreCompact(event: any, ctx: any): void {{
     // backlog.
     // Tracked in pendingHookRequests so session_end can await a bounded
     // flush instead of letting teardown kill the in-flight fetch (#676).
+    // A redirect rejects and spools the event: followed, a gateway's login
+    // page would count as a delivery.
     const request = fetch(url, {{
       proxy: false,
+      redirect: "error",
       method: "POST",
       headers: {{ "Content-Type": "application/json", ...authHeaders() }},
       body: JSON.stringify(policy.payload),
@@ -409,12 +412,20 @@ async function fetchHandoff(event: any, ctx: any): Promise<string | undefined> {
   const currentCwd = cwd(event, ctx);
   if (!currentCwd) return undefined;
   if (captureServerRouted(currentCwd)) return undefined;
+  // An allowlist build captures only marked repositories, and the native hook
+  // returns before its handoff GET for any other (`hook.rs`). Do the same: the
+  // server resolves the directory into a project to look the baton up, so a
+  // request from an unmarked one leaves an empty project behind.
+  if (CAPTURE_MODE === "allowlist" && !findMarker(currentCwd)) return undefined;
   const url = new URL(`${{SERVER}}/handoff`);
   url.searchParams.set("agent", AGENT);
   if (!applyMarkerParams(url, currentCwd)) return undefined;
   try {{
+    // The body is prepended to the prompt, so a redirect is refused: a
+    // gateway's login page must never arrive as the handoff.
     const response = await fetch(url, {{
       proxy: false,
+      redirect: "error",
       headers: authHeaders(),
       signal: timeoutSignal(1000),
     }});
@@ -1040,6 +1051,21 @@ mod tests {
             .find("if (captureServerRouted(currentCwd)) return undefined;")
             .expect("handoff fetch must be gated");
         assert!(guard < handoff.find("/handoff`").unwrap());
+    }
+
+    /// The handoff GET makes the server resolve the directory into a project,
+    /// creating it, so an allowlist build must not send it for an unmarked
+    /// repository either: the native hook returns before that request too.
+    #[test]
+    fn openclaw_allowlist_build_fetches_no_handoff_outside_a_marked_repository() {
+        let plugin = build_plugin("http://127.0.0.1:49374", Some("tok"), None, "allowlist");
+        let handoff = plugin.split_once("async function fetchHandoff(").unwrap().1;
+        let gate = handoff
+            .find(
+                "if (CAPTURE_MODE === \"allowlist\" && !findMarker(currentCwd)) return undefined;",
+            )
+            .expect("handoff fetch must honour the allowlist");
+        assert!(gate < handoff.find("/handoff`").unwrap());
     }
 
     #[test]

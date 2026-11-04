@@ -18,6 +18,7 @@ use tar::{Builder, Header};
 use tracing::info;
 
 use crate::cli::{AgentBackupScope, BackupAgentsArgs, McpClient};
+use crate::commands::backup::human_bytes;
 use crate::commands::path_util::{claude_config_dir, home_dir};
 use crate::config::Config;
 
@@ -505,6 +506,43 @@ pub fn discover_assets(
         }
     }
 
+    // 4c. Qoder CLI and IDE
+    if filter_agent(AgentKind::Qoder) {
+        if want_global {
+            push_if_file(
+                &mut assets,
+                AgentKind::Qoder,
+                AgentAssetKind::McpConfig,
+                AgentAssetScope::Global,
+                home.join(".qoder").join("settings.json"),
+                ".qoder/settings.json",
+                "qoder/settings.json",
+            );
+            if !filter_agent(AgentKind::Codex) && !filter_agent(AgentKind::QwenCode) {
+                collect_dir_assets(
+                    &mut assets,
+                    AgentKind::Qoder,
+                    AgentAssetKind::Skill,
+                    AgentAssetScope::Global,
+                    &home.join(".agents").join("skills"),
+                    ".agents/skills",
+                    "qoder/skills/agents",
+                )?;
+            }
+        }
+        if want_project && !filter_agent(AgentKind::Codex) && !filter_agent(AgentKind::QwenCode) {
+            push_if_file(
+                &mut assets,
+                AgentKind::Qoder,
+                AgentAssetKind::Instruction,
+                AgentAssetScope::Project,
+                cwd.join("AGENTS.md"),
+                "AGENTS.md",
+                "project/qoder/AGENTS.md",
+            );
+        }
+    }
+
     // 4. Cursor
     if filter_agent(AgentKind::Cursor) {
         if want_global {
@@ -986,21 +1024,6 @@ fn portable_mode(path: &Path) -> Result<Option<u32>> {
     {
         let _ = path;
         Ok(None)
-    }
-}
-
-fn human_bytes(n: u64) -> String {
-    const UNITS: &[&str] = &["B", "KiB", "MiB", "GiB"];
-    let mut value = n as f64;
-    let mut unit = 0;
-    while value >= 1024.0 && unit + 1 < UNITS.len() {
-        value /= 1024.0;
-        unit += 1;
-    }
-    if unit == 0 {
-        format!("{n} {}", UNITS[0])
-    } else {
-        format!("{value:.2} {}", UNITS[unit])
     }
 }
 

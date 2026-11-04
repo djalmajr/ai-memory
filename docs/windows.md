@@ -200,8 +200,9 @@ container, which has no host CLIs.
   sets `AI_MEMORY_RUN_AUTOWIRE=false` for the intercepted commands unless you
   set the variable yourself). Export `AI_MEMORY_RUN_AUTOWIRE=true` to let
   `run` rewire a harness around the native client instead.
-- Upgrading in this scenario: `ai-memory upgrade` pulls the image only. It
-  does not refresh the wrapper or install a native client. Refresh the
+- Upgrading in this scenario: `ai-memory upgrade` pulls the image only,
+  including when `--config` or `--data-dir` precedes `upgrade`. It does not
+  refresh the wrapper or install a native client. Refresh the
   wrapper scripts by re-running the install block at the top of this
   scenario, and the native client with its own `ai-memory.exe upgrade`
   ([Scenario C](#scenario-c-prebuilt-release-binary-no-toolchain)). Then
@@ -296,9 +297,13 @@ ai-memory upgrade --force
 That downloads `ai-memory-windows-x86_64.zip` + `.sha256`, verifies the
 checksum, replaces `ai-memory.exe` via rename-aside (Windows cannot overwrite
 a running image), refreshes a sibling `hooks/` tree when present, then
-re-stages hooks for agents already under the data-dir hooks tree. Keep the
-manual zip download above as a fallback if the install directory is not
-writable (for example under Program Files).
+re-stages hooks for agents already under the data-dir hooks tree. It also
+re-renders existing ai-memory-owned OpenCode, OpenCode 2, OMP, Pi, and OpenClaw
+TypeScript integrations from the newly installed binary's templates at their
+default or active-profile paths; absent and user-owned files are left untouched.
+Keep the manual zip download above as a
+fallback if the install directory is not writable (for example under Program
+Files).
 
 The zip mirrors the Linux release tarball, minus the Linux-only service
 assets: it contains `ai-memory.exe`, the full `hooks/` bundle (`.ps1` +

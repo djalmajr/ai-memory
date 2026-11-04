@@ -260,6 +260,10 @@ pub(crate) fn prepare_cjk_fts5_query(raw: &str) -> Option<String> {
     }
     let mut phrases = Vec::new();
     for token in bounded.split_whitespace() {
+        // Grouping must not turn `(title:term)` into an unqualified match.
+        // Like prepare_fts5_token, peel opening parentheses before the column:
+        // https://www.sqlite.org/fts5.html#fts5_column_filters
+        let token = token.trim_start_matches('(');
         let (column, text) = match token.split_once(':') {
             Some((column @ ("title" | "body"), text)) => (Some(column), text),
             _ => (None, token),
@@ -472,11 +476,11 @@ fn quote_fts5_token(token: &str) -> String {
     // Otherwise emit BOTH the whole token and a punctuation-stripped sub-token
     // phrase, OR'd, because the content tokenizer and the path index disagree
     // on punctuation:
-    //   tokenize = "unicode61 remove_diacritics 2 tokenchars '/_-'"
-    // keeps `/ _ -` INSIDE tokens (so a body mention of `ai-memory` indexes as
+    //   tokenize = "unicode61 remove_diacritics 2 tokenchars '_-'"
+    // keeps `_ -` INSIDE tokens (so a body mention of `ai-memory` indexes as
     // the single token `ai-memory`), while `ops::path_search_text` pre-expands
     // `/ . - _` to spaces in the path index (so a path `ui-refresh-…` indexes
-    // the sub-tokens `ui`, `refresh`, …). `.` is a separator either way.
+    // the sub-tokens `ui`, `refresh`, …). `/` and `.` are separators either way.
     // Neither form alone matches both: `"ai-memory"` matches the content token
     // but not the split path index; `"ai memory"` matches the path but not the
     // content token. OR-ing the two makes a search for `ai-memory` / `ui-refresh`
@@ -571,9 +575,22 @@ mod tests {
         let title = prepare_cjk_fts5_query("title:支付服务").unwrap();
         assert_eq!(title, "title:\"支付 付服 服务\"");
         assert_parses(&title);
+        for query in ["(title:支付服务)", "((title:支付服务))"] {
+            let grouped = prepare_cjk_fts5_query(query).unwrap();
+            assert_eq!(grouped, title, "query={query}");
+            assert_parses(&grouped);
+        }
         let body = prepare_cjk_fts5_query("body:支付服务").unwrap();
         assert_eq!(body, "body:\"支付 付服 服务\"");
         assert_parses(&body);
+        for query in ["(body:支付服务)", "((body:支付服务))"] {
+            let grouped = prepare_cjk_fts5_query(query).unwrap();
+            assert_eq!(grouped, body, "query={query}");
+            assert_parses(&grouped);
+        }
+        let alternatives = prepare_cjk_fts5_query("((title:支付服务) OR (body:支付服务))").unwrap();
+        assert_eq!(alternatives, format!("{title} OR {body}"));
+        assert_parses(&alternatives);
         let single = prepare_cjk_fts5_query("title:支").unwrap();
         assert_eq!(single, "title:\"支\"");
         assert_parses(&single);

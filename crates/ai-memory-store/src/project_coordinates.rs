@@ -106,9 +106,26 @@ pub(crate) fn matches(
     requested: &str,
     repository: Option<&RepositoryIdentity>,
 ) -> StoreResult<Vec<ProjectCoordinateMatch>> {
+    matches_bounded(
+        conn,
+        workspace_id,
+        requested,
+        repository,
+        MAX_COORDINATE_ROWS,
+    )
+}
+
+/// The same indexed coordinate match with a caller-owned result bound.
+pub(crate) fn matches_bounded(
+    conn: &Connection,
+    workspace_id: WorkspaceId,
+    requested: &str,
+    repository: Option<&RepositoryIdentity>,
+    max_rows: usize,
+) -> StoreResult<Vec<ProjectCoordinateMatch>> {
     let identity = repository.map_or("", |repository| repository.identity.as_str());
     let canonical = repository.and_then(path_style_name).unwrap_or_default();
-    let limit = i64::try_from(MAX_COORDINATE_ROWS).unwrap_or(i64::MAX);
+    let limit = i64::try_from(max_rows).unwrap_or(i64::MAX);
     let mut statement = conn.prepare(MATCH_SQL)?;
     let rows = statement
         .query_map(
@@ -172,6 +189,19 @@ pub(crate) fn matches(
             },
         )
         .collect()
+}
+
+/// Whether this connection's schema carries the derived coordinate keys
+/// (`canonical_name`/`legacy_name`, V76).
+///
+/// Every project-coordinate query indexes those columns, so it cannot run
+/// against a store an in-flight migration has not reached yet — which is what
+/// the migration fixtures do when they build a project row on the old schema.
+/// The lookup falls back to a plain insert there, exactly as it always did.
+pub(crate) fn supports_coordinates(conn: &Connection) -> StoreResult<bool> {
+    Ok(conn
+        .prepare_cached("SELECT 1 FROM pragma_table_info('projects') WHERE name = 'legacy_name'")?
+        .exists([])?)
 }
 
 pub(crate) fn resolve(

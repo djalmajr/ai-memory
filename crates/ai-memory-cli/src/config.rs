@@ -332,10 +332,9 @@ pub struct Config {
     /// CLI commands prepend it to every `/admin/*` request so deployments
     /// hosted behind a reverse proxy under a subpath don't 404. Settable via
     /// `AI_MEMORY_BASE_PATH`. Empty for root-mounted deployments (the
-    /// default). The `serve` subcommand reads the same env var via clap and
-    /// nests its router accordingly; this field is what the thin-client
-    /// path needs to discover the same prefix without a second
-    /// `std::env::var` call (invariant: one config-read path).
+    /// default). The `serve` subcommand uses this value unless an explicit
+    /// flag or env override wins, so it mounts the same prefix thin clients
+    /// resolve without another environment read (invariant: one config-read path).
     #[serde(default)]
     pub base_path: String,
     /// Operator home directory, captured once here (the single config-read
@@ -402,9 +401,10 @@ pub struct Config {
     /// OpenCode asks callers for `x-opencode-session` plus a specific
     /// `User-Agent` and reports traffic carrying neither as an unknown
     /// client. Set with
-    /// `AI_MEMORY_LLM_HEADERS=x-opencode-session=…,user-agent=…` (comma
-    /// separated, so a header *value* cannot contain a comma — use
-    /// `llm_headers` in `config.toml` for those) or `llm_headers = [...]`.
+    /// `AI_MEMORY_LLM_HEADERS='["x-opencode-session=…","user-agent=…"]'` (a
+    /// JSON array of `Name: Value` / `Name=Value` strings; a bare comma
+    /// separated string is rejected at config load) or
+    /// `llm_headers = [...]` in `config.toml`.
     ///
     /// Headers ai-memory sets itself (`authorization`, `content-type`,
     /// `x-api-key`, …) are refused at startup: `reqwest` appends rather than
@@ -478,7 +478,8 @@ pub struct Config {
     /// per harness and config home. Turn off with `AI_MEMORY_RUN_AUTOWIRE=false` /
     /// `run_autowire = false`, or per launch with `ai-memory run --no-autowire`.
     pub run_autowire: bool,
-    /// Named, env-only presets for `ai-memory run --profile NAME`.
+    /// Managed-launch settings, including the exit menu and named, env-only
+    /// presets for `ai-memory run --profile NAME`.
     /// Profiles deliberately do not carry executable paths, native argv, or
     /// permission-bypass flags. Configure them under `[run.profiles.<name>.env]`.
     #[serde(default)]
@@ -526,6 +527,12 @@ pub struct Config {
     /// preserves the fused, authority-adjusted order. Set with
     /// `AI_MEMORY_RERANKER=llm`.
     pub reranker: Option<String>,
+    /// Wall-clock budget, in seconds, for one rerank call before the search
+    /// answers from the pre-rerank order. Defaults to
+    /// `ai_memory_llm::reranker::RERANK_TIMEOUT` (20s). Raise it when the
+    /// LLM chain falls back across slow free-tier candidates (a hosted 503
+    /// can take ~20s alone). Set with `AI_MEMORY_RERANK_TIMEOUT_SECS`.
+    pub rerank_timeout_secs: u64,
     /// Optional embedding provider (`openai`, `voyage`, `google` / `gemini`,
     /// or `openai-compat`).
     pub embedding_provider: Option<String>,
@@ -622,6 +629,8 @@ pub struct Config {
     /// LLM consolidation prompt limits. Defaults are sized for a model with a
     /// 200k-token context window.
     pub consolidation: ConsolidationSettings,
+    /// Optional context admission for query answer synthesis.
+    pub query_answer: QueryAnswerSettings,
     /// Auto-improvement reviewer. The scheduler launches background review for
     /// newly completed sessions; manual CLI/admin/MCP runs remain available.
     /// Both approve validated proposals by default unless `require_approval` is
@@ -1357,6 +1366,12 @@ pub struct IngestSettings {
     /// (`AI_MEMORY_INGEST__DROP_EVENTS=pre-tool-use`).
     #[serde(default, deserialize_with = "deserialize_string_or_vec")]
     pub drop_events: Vec<String>,
+    /// Name each tool call in its observation: `tool non-file: Bash` instead
+    /// of `tool non-file`, plus the skill (`Skill`) or subagent type
+    /// (`Agent`) a Claude Code call ran. Only identifiers are kept, never a
+    /// tool's arguments, and a call a capture policy reduced to metadata stays
+    /// unnamed. Off by default (`AI_MEMORY_INGEST__RECORD_TOOL_NAMES`).
+    pub record_tool_names: bool,
     /// The validated list the hook router checks. Set by [`Config::load`];
     /// never read from or written to a config file. Kept off the `Config`
     /// stack frame because that value is constructed in short-stack CLI
@@ -1436,6 +1451,7 @@ impl Default for Config {
             strip_root_combinators: false,
             gemini_safe_schemas: false,
             reranker: None,
+            rerank_timeout_secs: ai_memory_llm::reranker::RERANK_TIMEOUT.as_secs(),
             embedding_provider: None,
             embedding_model: None,
             embedding_dim: None,
@@ -1452,6 +1468,7 @@ impl Default for Config {
             search: SearchSettings::default(),
             slots: SlotSettings::default(),
             consolidation: ConsolidationSettings::default(),
+            query_answer: QueryAnswerSettings::default(),
             auto_improve: AutoImproveSettings::default(),
             handoff: HandoffSettings::default(),
             profile: ai_memory_core::profile::ProfileSettings::default(),
@@ -1472,9 +1489,13 @@ impl Default for Config {
 }
 
 /// `[run]` settings for the managed harness launcher.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct RunSettings {
+    /// Offer the switch/rerun menu after a successful interactive session.
+    /// On by default; `AI_MEMORY_RUN_EXIT_PROMPT=false` or
+    /// `run --no-exit-prompt` disables it.
+    pub exit_prompt: bool,
     /// Persisted env-only launch profiles, selected with `run --profile`.
     pub profiles: BTreeMap<String, RunProfile>,
     /// Fail a managed launch when the server is unreachable instead of
@@ -1483,6 +1504,16 @@ pub struct RunSettings {
     /// `AI_MEMORY_RUN_REQUIRE_SERVER=true` request it per launch or per
     /// environment.
     pub require_server: bool,
+}
+
+impl Default for RunSettings {
+    fn default() -> Self {
+        Self {
+            exit_prompt: true,
+            profiles: BTreeMap::new(),
+            require_server: false,
+        }
+    }
 }
 
 /// One named managed-launch preset.
@@ -1553,6 +1584,16 @@ fn validate_run_profiles(run: &RunSettings) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// Optional query-answer context admission. Omitted means unlimited admission.
+/// The limit counts each UTF-8 input byte as one estimated token and reserves
+/// schema, 1024 envelope units and the requested output token allowance.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct QueryAnswerSettings {
+    /// Conservative combined context target; not a tokenizer-exact guarantee.
+    pub max_context_tokens: Option<usize>,
 }
 
 /// `[consolidation]` LLM consolidation prompt sizing.
@@ -1723,6 +1764,9 @@ pub struct AutoImproveEvalSettings {
     pub enabled: bool,
     /// Executable command plus whitespace-separated args. Executed directly, not through a shell.
     pub command: String,
+    /// Built-in scorer, run in-process. `structure` is the only one; it is
+    /// mutually exclusive with `command` (#1638).
+    pub builtin: String,
     /// Timeout per proposal eval command.
     pub timeout_secs: u64,
     /// Wiki path prefixes that require eval when enabled.
@@ -1736,6 +1780,7 @@ impl Default for AutoImproveEvalSettings {
         Self {
             enabled: false,
             command: String::new(),
+            builtin: String::new(),
             timeout_secs: 120,
             targets: ai_memory_consolidate::default_auto_improve_eval_targets(),
             min_delta: 0.0,
@@ -2665,6 +2710,14 @@ impl Config {
         );
         apply_hook_spool_max_attempts_env(&mut config, runtime_env.hook_spool_max_attempts());
         apply_run_require_server_env(&mut config, runtime_env.run_require_server());
+        // The flat spelling would otherwise resolve to `run_exit_prompt`,
+        // not `run.exit_prompt`, through figment's `__` split.
+        if let Some(raw) = runtime_env.var_os("AI_MEMORY_RUN_EXIT_PROMPT") {
+            config.run.exit_prompt = raw
+                .to_str()
+                .and_then(|value| value.trim().parse().ok())
+                .context("AI_MEMORY_RUN_EXIT_PROMPT must be true or false")?;
+        }
 
         // Home is captured once in RuntimeEnv (config-read-path invariant);
         // threaded to the resolver guard and startup heal so neither reads the
@@ -2809,6 +2862,24 @@ impl Config {
             )
             .map_err(|message| anyhow::anyhow!(message))?,
         );
+        // One scorer per gate: an operator who set both meant one of them, and
+        // silently ignoring the builtin (as the gate does) would leave a config
+        // that reads as if it ran both (#1638).
+        let eval = &config.auto_improve.eval;
+        if !eval.builtin.trim().is_empty() && !eval.command.trim().is_empty() {
+            anyhow::bail!(
+                "auto_improve.eval.builtin and auto_improve.eval.command are mutually exclusive; \
+                 remove one (builtin `structure` runs in-process, a command runs your own scorer)"
+            );
+        }
+        let builtin = eval.builtin.trim();
+        if !builtin.is_empty() && builtin != "structure" {
+            anyhow::bail!(
+                "auto_improve.eval.builtin `{builtin}` is not a known scorer; the only one is \
+                 `structure`"
+            );
+        }
+
         // A4 entropy filter thresholds: reject an unusable threshold at startup
         // rather than silently ignoring it on the first experience pass.
         if let Err(message) = config
@@ -2937,6 +3008,15 @@ impl Config {
         if config.llm_max_input_tokens.is_some() && !config.llm_fallbacks.is_empty() {
             anyhow::bail!(
                 "llm_max_input_tokens requires one model; fallback tokenizers may differ"
+            );
+        }
+        // Zero would time out every rerank before the provider is called,
+        // silently turning reranking off while it still reports as enabled.
+        if config.rerank_timeout_secs == 0 {
+            anyhow::bail!(
+                "rerank_timeout_secs must be at least 1 second (got {}); \
+                 AI_MEMORY_RERANK_TIMEOUT_SECS is read in seconds",
+                config.rerank_timeout_secs
             );
         }
         // Parsed (and discarded) here so a malformed header list is rejected
@@ -3565,7 +3645,7 @@ impl Config {
         }
         tracing::warn!(
             provider = provider.name(),
-            base_url = ambient,
+            base_url = %crate::http_client::display_url(ambient),
             "ignoring ambient LLM_BASE_URL: this provider talks to a fixed vendor \
              endpoint. Set llm_base_url (or AI_MEMORY_LLM_BASE_URL) to point it \
              somewhere else on purpose."
@@ -3889,13 +3969,16 @@ fn default_patchable_page_prefixes() -> Vec<String> {
         .collect()
 }
 
-fn default_data_dir() -> PathBuf {
+/// The data dir every entry point falls back to with no `--data-dir`, no
+/// `AI_MEMORY_DATA_DIR` and no config override. The hook resolves the same
+/// path, which lets `install-hooks` leave the flag out of a command (#1949).
+pub(crate) fn default_data_dir() -> PathBuf {
     dirs::data_local_dir()
         .unwrap_or_else(|| PathBuf::from("."))
         .join("ai-memory")
 }
 
-fn canonicalise_or_keep(p: &Path) -> PathBuf {
+pub(crate) fn canonicalise_or_keep(p: &Path) -> PathBuf {
     if let Ok(canon) = p.canonicalize() {
         return canon;
     }
@@ -5199,6 +5282,24 @@ mod tests {
     }
 
     #[test]
+    fn run_exit_prompt_rejects_invalid_environment_values() {
+        let tmp = TempDir::new().unwrap();
+        for raw in ["", "not-a-bool"] {
+            let error = Config::load_with_runtime_env(
+                Some(&tmp.path().join("config.toml")),
+                Some(tmp.path().to_path_buf()),
+                RuntimeEnv::with_process_env_for_tests(&[("AI_MEMORY_RUN_EXIT_PROMPT", raw)]),
+            )
+            .unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("AI_MEMORY_RUN_EXIT_PROMPT must be true or false")
+            );
+        }
+    }
+
+    #[test]
     fn run_require_server_config_and_runtime_env() {
         let tmp = TempDir::new().unwrap();
         let config_path = tmp.path().join("config.toml");
@@ -5669,6 +5770,27 @@ mod tests {
         assert_eq!(cfg.decay.ledger_retention().months, 12);
     }
 
+    #[test]
+    fn query_answer_budget_defaults_off_and_loads_explicit_limits() {
+        assert_eq!(Config::default().query_answer.max_context_tokens, None);
+        for limit in [0usize, 1, 16_000] {
+            let tmp = TempDir::new().unwrap();
+            let path = tmp.path().join("config.toml");
+            std::fs::write(
+                &path,
+                format!("[query_answer]\nmax_context_tokens = {limit}\n"),
+            )
+            .unwrap();
+            let config = Config::load_with_runtime_env(
+                Some(&path),
+                Some(tmp.path().to_path_buf()),
+                RuntimeEnv::default(),
+            )
+            .unwrap();
+            assert_eq!(config.query_answer.max_context_tokens, Some(limit));
+        }
+    }
+
     /// The consolidation budget must be big enough to leave room for
     /// observations after the fixed system prompt and page conventions.
     /// Below the floor every consolidation would be evidence-free, so it
@@ -5862,6 +5984,57 @@ input_token_safety_margin = {margin}
     /// `[ingest]` is read once into the validated drop list the hook router
     /// checks, and an out-of-bounds entry fails startup instead of being
     /// silently ignored (#1241).
+    /// `[ingest] record_tool_names` is off unless the file turns it on.
+    #[test]
+    fn ingest_record_tool_names_defaults_off_and_loads_from_file() {
+        let tmp = TempDir::new().unwrap();
+        let config_path = tmp.path().join("config.toml");
+        std::fs::write(&config_path, "").unwrap();
+        let config = Config::load(Some(&config_path), Some(tmp.path().to_path_buf())).unwrap();
+        assert!(!config.ingest.record_tool_names);
+
+        std::fs::write(&config_path, "[ingest]\nrecord_tool_names = true\n").unwrap();
+        let config = Config::load(Some(&config_path), Some(tmp.path().to_path_buf())).unwrap();
+        assert!(config.ingest.record_tool_names);
+    }
+
+    /// The env form of `[ingest] record_tool_names`. Same child-process marker
+    /// pattern as `ingest_drop_events_env_overrides_default`.
+    #[test]
+    fn ingest_record_tool_names_env_turns_it_on() {
+        const CHILD_MARKER: &str = "AI_MEMORY_TEST_RECORD_TOOL_NAMES_CHILD";
+        if std::env::var_os(CHILD_MARKER).is_some() {
+            let tmp = TempDir::new().unwrap();
+            let config_path = tmp.path().join("config.toml");
+            std::fs::write(&config_path, "[ingest]\n").unwrap();
+            let config = Config::load(Some(&config_path), Some(tmp.path().to_path_buf())).unwrap();
+            assert!(config.ingest.record_tool_names);
+            println!("record-tool-names-env-applied");
+            return;
+        }
+
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .arg("--exact")
+            .arg("config::tests::ingest_record_tool_names_env_turns_it_on")
+            .arg("--test-threads=1")
+            .arg("--nocapture")
+            .env(CHILD_MARKER, "1")
+            .env("AI_MEMORY_INGEST__RECORD_TOOL_NAMES", "true")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "child test failed:\nstdout: {}\nstderr: {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            String::from_utf8_lossy(&output.stdout).contains("record-tool-names-env-applied"),
+            "child stdout: {}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+    }
+
     #[test]
     fn ingest_drop_lists_load_into_the_router_list_and_reject_bad_entries() {
         let tmp = TempDir::new().unwrap();
@@ -6148,6 +6321,37 @@ input_token_safety_margin = {margin}
             .expect_err("a sub-second timeout must fail closed");
         assert!(
             error.to_string().contains("llm_timeout_secs"),
+            "unexpected error: {error:#}"
+        );
+    }
+
+    /// `AI_MEMORY_RERANK_TIMEOUT_SECS` (figment maps it to this field) lets a
+    /// slow free-tier fallback chain finish a rerank; unset keeps the 20s
+    /// budget the reranker always had.
+    #[test]
+    fn load_defaults_and_round_trips_the_rerank_timeout() {
+        let tmp = TempDir::new().unwrap();
+        let config_path = tmp.path().join("config.toml");
+        std::fs::write(&config_path, "").unwrap();
+        let cfg = Config::load(Some(&config_path), Some(tmp.path().to_path_buf())).unwrap();
+        assert_eq!(
+            cfg.rerank_timeout_secs,
+            ai_memory_llm::reranker::RERANK_TIMEOUT.as_secs()
+        );
+        std::fs::write(&config_path, "rerank_timeout_secs = 60\n").unwrap();
+        let cfg = Config::load(Some(&config_path), Some(tmp.path().to_path_buf())).unwrap();
+        assert_eq!(cfg.rerank_timeout_secs, 60);
+    }
+
+    #[test]
+    fn load_rejects_a_zero_rerank_timeout() {
+        let tmp = TempDir::new().unwrap();
+        let config_path = tmp.path().join("config.toml");
+        std::fs::write(&config_path, "rerank_timeout_secs = 0\n").unwrap();
+        let error = Config::load(Some(&config_path), Some(tmp.path().to_path_buf()))
+            .expect_err("a zero rerank budget must fail closed");
+        assert!(
+            error.to_string().contains("rerank_timeout_secs"),
             "unexpected error: {error:#}"
         );
     }
@@ -6463,6 +6667,45 @@ input_token_safety_margin = {margin}
         assert!(cfg.auto_improve.include_raw_fallback);
         assert_eq!(cfg.auto_improve.proposal_actor, "review_bot");
         assert_eq!(cfg.auto_improve.pending_path, "_pending/review-bot");
+    }
+
+    /// One scorer per gate: setting both is a startup error, not a config
+    /// where the builtin silently loses (#1638).
+    #[test]
+    fn an_eval_gate_rejects_both_a_builtin_and_a_command() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let write = |toml: &str| {
+            let path = tmp.path().join("config.toml");
+            std::fs::write(&path, toml).unwrap();
+            Config::load(Some(&path), Some(tmp.path().to_path_buf()))
+        };
+        let both = write(
+            "[auto_improve.eval]\nenabled = true\nbuiltin = \"structure\"\n\
+             command = \"sh score.sh\"\n",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            both.contains("mutually exclusive"),
+            "unexpected error: {both}"
+        );
+
+        let unknown = write("[auto_improve.eval]\nenabled = true\nbuiltin = \"vibes\"\n")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            unknown.contains("not a known scorer"),
+            "unexpected error: {unknown}"
+        );
+
+        let builtin =
+            write("[auto_improve.eval]\nenabled = true\nbuiltin = \"structure\"\n").unwrap();
+        assert_eq!(builtin.auto_improve.eval.builtin, "structure");
+        assert!(builtin.auto_improve.eval.command.is_empty());
+
+        let command =
+            write("[auto_improve.eval]\nenabled = true\ncommand = \"sh score.sh\"\n").unwrap();
+        assert!(command.auto_improve.eval.builtin.is_empty());
     }
 
     #[test]

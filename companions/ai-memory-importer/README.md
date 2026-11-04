@@ -55,7 +55,9 @@ Two routes read what agentmemory exports. Both write through the MCP
 `memory_write_page` tool with explicit `workspace` and `project`, every write
 conditional: `create_only` for a page's first version and `expected_page_id`
 for each later one. They refuse a server older than ai-memory 3.0, which would
-ignore those arguments. Pages land under `--dest-prefix` (default
+ignore those arguments. The client performs the MCP initialization handshake,
+so these routes work with both the default stateless transport and
+`serve --http-stateful`. Pages land under `--dest-prefix` (default
 `imported/agentmemory`), never under ai-memory's own `sessions/` or any other
 reserved family.
 
@@ -135,7 +137,10 @@ The page records the source file's basename, format, SHA-256 digest, and
 extractor version, followed by sanitized text. Its path includes the full
 source digest, and its last line carries a deterministic provenance marker.
 A rerun therefore performs no duplicate write. If another page already owns
-that path, the import refuses to replace it.
+that path, the import refuses to replace it. The rerun compares the whole
+stored page, read through `memory_read_page`, which returns at most 64,000
+characters of a body; a page longer than that cannot be compared, so its
+rerun fails with that reason instead of being reported as present.
 
 This is text extraction, not a media pipeline. Image-only PDFs need OCR before
 import. Images, raw audio/video, and proprietary media transcription are not
@@ -145,8 +150,16 @@ by formatting may still be extracted; deleted revisions and field instructions
 are excluded. Review `--show-body` before every live import of a document whose
 visibility rules matter.
 
-VTT/SRT files accept LF, CRLF, or CR line endings. WebVTT comments are omitted;
-identifiers such as `NOTE123` keep their cue text.
+DOCX and PPTX extraction preserves explicit run-level line breaks, including
+DOCX carriage returns and formatted PPTX breaks, and DOCX tabs. Paired XML
+start/end tags and self-closing tags produce the same separators.
+Paragraph tab-stop definitions are formatting and do not insert text.
+
+VTT/SRT files accept LF, CRLF, or CR line endings and any number of blank lines
+between cues. WebVTT comments are omitted; identifiers such as `NOTE123` keep
+their cue text. WebVTT character references such as `&amp;` and `&#233;` are
+decoded once before sanitization. Escaped tags remain literal text, and SRT
+character references retain their original spelling.
 
 ## Safety contract
 
@@ -203,8 +216,9 @@ The agentmemory routes keep the same dry-run default, `--apply` plus
 `--manifest-out`, auth and path rules, with these differences:
 
 - Writes use MCP `memory_write_page` only, each conditional, so the server
-  refuses a page that appears or changes during the import. A destination page this import did not write is never
-  replaced; the run stops and names it.
+  refuses a page that appears or changes after the version read. A resume
+  accepts an existing page only when its complete body matches a planned
+  version; a different body stops the run and names the page.
 - `--dest-prefix` must be relative and portable. `..`, absolute paths, a
   Windows drive, and a first segment that is reserved (`sessions`,
   `session-logs`, `procedures`, `decisions`, `gotchas`, `profile`) or starts
@@ -217,10 +231,16 @@ The agentmemory routes keep the same dry-run default, `--apply` plus
   the manifest or any request exists. Record ids that look like credentials
   are refused.
 - Each record has a stable ingest key, a UUIDv5 of its agentmemory id, written
-  on the page's last line. A rerun finds the key in the page the server
-  already holds and skips it, so an interrupted import resumes without
-  duplicates and a finished one writes nothing. The manifest records each
-  version as `written`, `present` (already there) or `failed`.
+  on the page's last line. A rerun compares the entire sanitized planned body,
+  including that line, with the page the server already holds before skipping
+  it. `memory_read_page` returns at most 64,000 characters of a body, so a
+  longer page cannot be compared and stops the run with that reason. Editing the body while keeping its attribution footer therefore cannot
+  authorize a later imported version to replace the edit. Server-side
+  sanitation that changes the body also stops automatic resumption. This
+  comparison covers the body, not frontmatter-only edits; a later imported
+  version still applies its planned metadata. An identical interrupted import
+  resumes without duplicates and a finished one writes nothing. The manifest
+  records each version as `written`, `present` (already there) or `failed`.
 - Without `--create-destination`, every destination must already exist; the
   check is a read, which never creates a scope.
 
