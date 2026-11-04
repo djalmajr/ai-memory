@@ -105,7 +105,7 @@ version in [`docs/changelog/`](docs/changelog/):
   resumed run reuses them instead of paying for the same calls again, and
   `purge-session`, `purge-project` and workspace deletion now remove them, where
   they used to stay in the database. Rows left behind by earlier purges are not
-  swept. (#TBD)
+  swept. (#21)
 
 ## [3.3.3] - 2026-11-03
 
