@@ -23,15 +23,16 @@ fn escape_sequences() -> &'static Regex {
     RE.get_or_init(|| Regex::new(ESCAPE_SEQUENCES).unwrap())
 }
 
-/// A native key right after a word character and something removed below.
-/// Removing that alone would glue the key to the word and hide it from the
-/// native rule's word boundary, here and on the server, so the match becomes
-/// `$1 $2` first. Mirrors the server's sanitizer.
+/// A native key prefix right after a word character and something removed
+/// below. Removing that alone would glue the key to the word and hide it from
+/// the native rule's word boundary, here and on the server, so the match becomes
+/// `$1 $2` first. The prefix is enough: the key's body can hold a removed
+/// character too. Mirrors the server's sanitizer.
 fn native_key_after_stripped() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
     RE.get_or_init(|| {
         Regex::new(&format!(
-            r"([0-9A-Za-z_])(?:{ESCAPE_SEQUENCES}|[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x{{9f}}\x{{202a}}-\x{{202e}}\x{{2066}}-\x{{2069}}\x{{2061}}-\x{{2064}}\x{{feff}}\x{{e0000}}-\x{{e007f}}])+((?:aim|amk|ams)_[A-Za-z0-9_\-]{{22,}})"
+            r"([0-9A-Za-z_])(?:{ESCAPE_SEQUENCES}|[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x{{9f}}\x{{202a}}-\x{{202e}}\x{{2066}}-\x{{2069}}\x{{2061}}-\x{{2064}}\x{{feff}}\x{{e0000}}-\x{{e007f}}])+((?:aim|amk|ams)_)"
         ))
         .unwrap()
     })

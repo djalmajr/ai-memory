@@ -81,16 +81,15 @@ const ESCAPE_SEQUENCES: &str =
 /// as a regex class.
 const STRIPPED_CHARS: &str = r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x{9f}\x{202a}-\x{202e}\x{2066}-\x{2069}\x{2061}-\x{2064}\x{feff}\x{e0000}-\x{e007f}]";
 
-/// A native key right after a word character and something `strip_control`
-/// removes. Removing that alone would glue the key to the word (`title` + ESC
-/// `[32m` + `aim_...` becomes `titleaim_...`), and the native rule's word
-/// boundary could no longer see it, so the key would be stored whole. The
-/// match becomes `$1 $2` first, which keeps the boundary. Only for a whole key:
-/// any other text around a removed character stays joined as before.
+/// A native key prefix right after a word character and something
+/// `strip_control` removes. Removing that alone would glue the key to the word
+/// (`title` + ESC `[32m` + `aim_...` becomes `titleaim_...`), and the native
+/// rule's word boundary could no longer see it, so the key would be stored
+/// whole. The match becomes `$1 $2` first, which keeps the boundary. The prefix
+/// is enough: the key's body can hold a removed character too, so it may not be
+/// whole yet. Any other text around a removed character stays joined as before.
 fn native_key_after_stripped() -> String {
-    format!(
-        r"([0-9A-Za-z_])(?:{ESCAPE_SEQUENCES}|{STRIPPED_CHARS})+((?:aim|amk|ams)_[A-Za-z0-9_\-]{{22,}})"
-    )
+    format!(r"([0-9A-Za-z_])(?:{ESCAPE_SEQUENCES}|{STRIPPED_CHARS})+((?:aim|amk|ams)_)")
 }
 
 /// C0 and C1 controls except tab, newline and carriage return, DEL, and the

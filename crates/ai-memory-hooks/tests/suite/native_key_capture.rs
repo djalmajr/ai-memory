@@ -241,6 +241,9 @@ async fn a_native_key_after_a_serialized_control_reaches_sqlite_redacted() {
         ("real line break", format!("title\n{KEY}")),
     ]
     .map(|(what, stdout)| (what, serde_json::json!({ "stdout": stdout })));
+    // Short of the native rule's floor on its own, so only the whole key, put
+    // back together by the removal, can be seen.
+    let (head, tail) = KEY.split_at(10);
     let plain = [
         (
             "plain string, ESC + CSI after a word",
@@ -249,6 +252,10 @@ async fn a_native_key_after_a_serialized_control_reaches_sqlite_redacted() {
         (
             "plain string, BEL after a word",
             serde_json::json!(format!("title\u{7}{KEY}")),
+        ),
+        (
+            "plain string, BEL after a word and NUL inside the key",
+            serde_json::json!(format!("title\u{7}{head}\0{tail}")),
         ),
     ];
     for (index, (what, tool_response)) in structured.into_iter().chain(plain).enumerate() {

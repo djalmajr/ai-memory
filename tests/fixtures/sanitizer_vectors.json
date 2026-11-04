@@ -323,7 +323,27 @@
     },
     {
       "input": "title\u0007aim_short",
-      "output": "titleaim_short"
+      "output": "title aim_short"
+    },
+    {
+      "input": "title\u0007aim_FAKEfake\u0000-FAKEfake_FAKEfakeFAKEfakeFAKEfake000",
+      "output": "title [REDACTED:ai_memory_token]"
+    },
+    {
+      "input": "title\u0007aim_FAKEfake\u200b-FAKEfake_FAKEfakeFAKEfakeFAKEfake000",
+      "output": "title [REDACTED:ai_memory_token]"
+    },
+    {
+      "input": "title\u001b[32maim_FAKEfake\u200b-FAKEfake_FAKEfakeFAKEfakeFAKEfake000",
+      "output": "title [REDACTED:ai_memory_token]"
+    },
+    {
+      "input": "title\u001b[32maim_FAKEfake\u0007-FAKEfake_FAKEfakeFAKEfakeFAKEfake000",
+      "output": "title [REDACTED:ai_memory_token]"
+    },
+    {
+      "input": "title\u0007aimless",
+      "output": "titleaimless"
     },
     {
       "input": "title\u0007claim_session_consolidation_jobs",
