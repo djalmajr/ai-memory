@@ -61,7 +61,7 @@ async fn list(config: &Config, ep: &ServerEndpoint, args: PendingWritesListArgs)
     if args.json {
         println!("{}", serde_json::to_string_pretty(&proposals)?);
     } else if proposals.is_empty() {
-        println!("(no pending writes)");
+        println!("(no pending writes in {workspace}/{project})");
     } else {
         for p in proposals {
             println!("{}  {}  {}  {}", p.id, p.status, p.operation, p.target_path);
