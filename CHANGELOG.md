@@ -85,6 +85,9 @@ version in [`docs/changelog/`](docs/changelog/):
   job. (#18)
 
 ### Fixed
+- `ai-memory pending-writes list` now names the scope it consulted when it finds
+  nothing. It reads one workspace and project, and the bare `(no pending writes)`
+  read as an empty queue everywhere while other projects had proposals waiting. (#27)
 - Fixed the fork's deploy image build, which stopped compiling after the v3.3.3
   sync because `deploy/Dockerfile` did not copy `docs/` and `CHANGELOG.md`. (#22)
 - Timeout and ambiguous 499/5xx LLM failures now receive at most one replay
