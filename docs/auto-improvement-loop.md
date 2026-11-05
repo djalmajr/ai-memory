@@ -346,8 +346,8 @@ Default-available auto-improvement must not surprise existing installs:
    failed scheduled sessions. A session the abandoned-session sweep closes
    (open with no activity for 48 hours and no `SessionEnd`) also gets a parked
    claim in the same transaction, so the sweep itself never queues a review:
-   a real `SessionEnd` with new observations un-parks the claim, a `SessionEnd`
-   without new observations answers `AlreadyEnded` and leaves it parked, and
+   a real `SessionEnd` with new observations or a handoff that reopens the
+   session un-parks the claim, a `SessionEnd` without new observations answers `AlreadyEnded` and leaves it parked, and
    `experience_pass_due` does not count sweep-parked sessions. Manual
    `ai-memory auto-improve --session-id` reviews a sweep-closed session either
    way.

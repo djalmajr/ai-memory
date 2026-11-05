@@ -87,8 +87,9 @@ version in [`docs/changelog/`](docs/changelog/):
 ### Fixed
 - Fixed the abandoned-session sweep queuing an LLM auto-improvement review for
   every session it closes: the sweep now parks a claim for each closed session
-  in the same transaction, a real `SessionEnd` with new observations un-parks
-  it, and `experience_pass_due` no longer counts sweep-parked sessions. A
+  in the same transaction, a real `SessionEnd` with new observations or a
+  handoff that reopens the session un-parks it, and `experience_pass_due` no
+  longer counts sweep-parked sessions. A
   `SessionEnd` without new observations stays parked, and manual
   auto-improve for a sweep-closed session remains available.
 - Fixed the fork's deploy image build, which stopped compiling after the v3.3.3
