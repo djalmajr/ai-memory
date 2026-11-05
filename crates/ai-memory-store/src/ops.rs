@@ -2689,7 +2689,10 @@ pub fn end_session(
     session_id: &SessionId,
     summary_page_id: Option<&PageId>,
 ) -> StoreResult<()> {
-    end_session_row(conn, session_id, summary_page_id, None)
+    let tx = conn.transaction()?;
+    end_session_row(&tx, session_id, summary_page_id, None)?;
+    tx.commit()?;
+    Ok(())
 }
 
 /// Atomically end a lifecycle-only session and return its startup handoff to
@@ -2792,6 +2795,19 @@ fn end_session_row(
          WHERE id = ?3",
         params![now, page_blob, session_id.as_bytes()],
     )?;
+    // A real end un-parks the claim the abandoned-session sweep left behind,
+    // so a session that is resumed and then truly finished returns to the
+    // auto-improvement queue. Only the sweep's marker error is deleted: a
+    // claim parked by a genuine review failure keeps its error and its
+    // attempts. Runs in the caller's transaction with the end stamp.
+    conn.execute(
+        "DELETE FROM auto_improve_scheduler_claims \
+         WHERE session_id = ?1 AND last_error = ?2",
+        params![
+            session_id.as_bytes(),
+            crate::auto_improve::ABANDONED_SWEEP_CLAIM_ERROR
+        ],
+    )?;
     Ok(())
 }
 
@@ -2814,10 +2830,43 @@ fn end_session_row(
 /// One batched `UPDATE`, no per-scope iteration (invariant #2). Returns the
 /// number of sessions closed.
 ///
+/// In the same transaction the sweep parks an auto-improvement claim for
+/// every session it closes (exhausted `attempts`, `last_error` marked with
+/// [`crate::auto_improve::ABANDONED_SWEEP_CLAIM_ERROR`]): closing a session
+/// is what makes it a candidate for the auto-improvement scheduler, and a
+/// blind sweep must not queue an LLM review for a session it only guessed
+/// was over. An existing claim — in flight, retryable or parked by a
+/// genuine failure — is left untouched (`ON CONFLICT(session_id) DO
+/// NOTHING`). A real `SessionEnd` with new observations un-parks the claim
+/// in [`end_session_row`]; manual auto-improve stays available either way.
+///
 /// # Errors
 /// Propagates any SQL error.
-pub fn close_abandoned_sessions(conn: &Connection, cutoff_us: i64) -> StoreResult<u64> {
-    let changed = conn.execute(
+pub fn close_abandoned_sessions(conn: &mut Connection, cutoff_us: i64) -> StoreResult<u64> {
+    let tx = conn.transaction()?;
+    // The claims are inserted BEFORE the UPDATE, with the exact same
+    // selection predicate: once the UPDATE has run the sessions no longer
+    // match (`ended_at IS NULL` is gone), so they would no longer be
+    // identifiable.
+    let now = Timestamp::now().as_microsecond();
+    tx.execute(
+        "INSERT INTO auto_improve_scheduler_claims \
+             (workspace_id, project_id, session_id, claimed_at, attempts, last_error, last_failed_at) \
+         SELECT s.workspace_id, s.project_id, s.id, ?2, ?3, ?4, ?2 \
+         FROM sessions s \
+         WHERE s.ended_at IS NULL \
+           AND COALESCE( \
+                 (SELECT MAX(o.created_at) FROM observations o WHERE o.session_id = s.id), \
+                 s.started_at) < ?1 \
+         ON CONFLICT(session_id) DO NOTHING",
+        params![
+            cutoff_us,
+            now,
+            crate::auto_improve::AUTO_IMPROVE_CLAIM_MAX_ATTEMPTS,
+            crate::auto_improve::ABANDONED_SWEEP_CLAIM_ERROR,
+        ],
+    )?;
+    let changed = tx.execute(
         "UPDATE sessions \
          SET ended_at = COALESCE( \
                  (SELECT MAX(o.created_at) FROM observations o WHERE o.session_id = sessions.id), \
@@ -2831,6 +2880,7 @@ pub fn close_abandoned_sessions(conn: &Connection, cutoff_us: i64) -> StoreResul
                  started_at) < ?1",
         params![cutoff_us],
     )?;
+    tx.commit()?;
     Ok(u64::try_from(changed).unwrap_or(0))
 }
 
@@ -20833,7 +20883,7 @@ pub(crate) mod tests {
             .unwrap();
 
         let cutoff_us = now - one_day_us;
-        let closed = close_abandoned_sessions(&conn, cutoff_us).unwrap();
+        let closed = close_abandoned_sessions(&mut conn, cutoff_us).unwrap();
         assert_eq!(closed, 1, "only the stale open session must close");
 
         let (ended_at, summary_page_id): (Option<i64>, Option<Vec<u8>>) = conn
