@@ -5438,13 +5438,6 @@ pub(crate) fn accept_handoff_in_transaction(
                     "UPDATE sessions SET ended_at = NULL WHERE id = ?1",
                     params![accepting_session.as_bytes()],
                 )?;
-                // The reopen clears the sweep's parked claim in this same
-                // transaction: the session is open again, the stale
-                // generation the sweep closed is over, and its new work must
-                // be reviewable when it ends — including by the idle-end,
-                // which never goes through `end_session_row`. A claim parked
-                // by a genuine review failure is untouched.
-                clear_abandoned_sweep_claim(tx, accepting_session)?;
             } else {
                 // For every other agent an ended session is final: a late or
                 // out-of-order startup fetch must not rebind it to a new
@@ -5535,6 +5528,14 @@ pub(crate) fn accept_handoff_in_transaction(
     };
     // Only a real state transition ('open' -> 'accepted') is audited.
     if changed > 0 {
+        // The receiver took a baton, so the generation the sweep closed is
+        // over and its new work must be reviewable when it ends, including
+        // through the idle-end, which never reaches `end_session_row`. This
+        // waits for the transition because a refused accept also commits: a
+        // session that lost the race resumed nothing and stays parked.
+        if let Some(accepting_session) = accepting_session {
+            clear_abandoned_sweep_claim(tx, accepting_session)?;
+        }
         audit(
             tx,
             "accept_handoff",
@@ -20958,6 +20959,54 @@ pub(crate) mod tests {
         .unwrap()
     }
 
+    /// Another receiver can take the baton after startup selected it. The
+    /// late accept returns `false` and its transaction still commits, so the
+    /// marker has to survive: nothing was delivered, and removing it would
+    /// let a later idle-end queue the swept generation for review.
+    #[test]
+    fn refused_handoff_accept_keeps_the_sweep_marker() {
+        let (_tmp, mut conn, ws, proj) = fresh_db();
+        let now = Timestamp::now().as_microsecond();
+        let hour = 3_600_000_000;
+        let mut session = hook_session(SessionId::new(), ws, proj, None);
+        session.agent_kind = AgentKind::Grok;
+        session.occurred_at = Some(now - 49 * hour);
+        begin_session(&mut conn, &session).unwrap();
+        assert_eq!(
+            close_abandoned_sessions(&mut conn, now - 48 * hour).unwrap(),
+            1
+        );
+
+        let id = insert_handoff(
+            &mut conn,
+            &NewHandoff {
+                workspace_id: ws,
+                project_id: proj,
+                from_session_id: None,
+                from_agent: AgentKind::Grok,
+                to_agent: None,
+                cwd: None,
+                summary: "already taken".into(),
+                open_questions: vec![],
+                next_steps: vec![],
+                files_touched: vec![],
+                owner_user: None,
+            },
+        )
+        .unwrap();
+        assert!(accept_handoff(&mut conn, &handoff_acceptance(id, ws, proj)).unwrap());
+
+        let mut late = handoff_acceptance(id, ws, proj);
+        late.accepting_agent = AgentKind::Grok;
+        late.accepting_session = Some(session.id);
+        assert!(!accept_handoff(&mut conn, &late).unwrap());
+
+        assert!(
+            sweep_parked(&conn, &session),
+            "a refused accept must keep the sweep's marker"
+        );
+    }
+
     /// A Grok session the sweep closed is reopened by a handoff accept, gains
     /// new work, and is then ended by a substantive idle-end — a path that
     /// never goes through `end_session_row`, so only the reopen's delete of
@@ -21215,8 +21264,7 @@ pub(crate) mod tests {
         );
         let error = "auto-improve failed: class=provider status=500";
         let attempts =
-            crate::auto_improve::record_claim_failure(&conn, ws, proj, session.id, error)
-                .unwrap();
+            crate::auto_improve::record_claim_failure(&conn, ws, proj, session.id, error).unwrap();
         assert_eq!(attempts, 1);
         let before: (String, i64) = conn
             .query_row(
