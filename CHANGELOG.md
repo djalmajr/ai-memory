@@ -120,7 +120,7 @@ version in [`docs/changelog/`](docs/changelog/):
   handoff that reopens the session un-parks it, and `experience_pass_due` no
   longer counts sweep-parked sessions. A
   `SessionEnd` without new observations stays parked, and manual
-  auto-improve for a sweep-closed session remains available.
+  auto-improve for a sweep-closed session remains available. (#28)
 
 ### Security
 - Stopped `install-hooks` without `--apply` from printing the bearer token, which
