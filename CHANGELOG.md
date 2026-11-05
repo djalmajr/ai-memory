@@ -95,6 +95,10 @@ version in [`docs/changelog/`](docs/changelog/):
   so a same-size edit landing within the filesystem's timestamp granularity
   is not missed. The first pass after startup still reads every page
   (upstream #1975).
+- A skipped `relations:` entry on a stored page now names the page in its log
+  warning, so an operator can find the page to fix. Together with the skip
+  above, a page with an invalid target warns when it is indexed, not on every
+  30-second pass.
 - Fixed the fork's deploy image build, which stopped compiling after the v3.3.3
   sync because `deploy/Dockerfile` did not copy `docs/` and `CHANGELOG.md`. (#22)
 - Timeout and ambiguous 499/5xx LLM failures now receive at most one replay

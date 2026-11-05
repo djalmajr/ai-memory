@@ -343,6 +343,7 @@ dependencies = [
  "tokio",
  "tower",
  "tracing",
+ "tracing-subscriber",
  "winapi-util",
 ]
 

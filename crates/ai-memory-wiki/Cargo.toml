@@ -44,6 +44,8 @@ axum.workspace = true
 tower.workspace = true
 # Direct DB access to fabricate legacy (pre-OKF) stores in migration tests.
 rusqlite.workspace = true
+# Asserts on what reaches the log, as the operator sees it.
+tracing-subscriber.workspace = true
 
 [lints]
 workspace = true
