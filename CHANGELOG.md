@@ -85,6 +85,20 @@ version in [`docs/changelog/`](docs/changelog/):
   job. (#18)
 
 ### Fixed
+- An idle `serve` no longer spends 25-40% of a core on a large wiki. The
+  watcher's 30-second reconcile pass reindexed every page file on every tick,
+  which cost two or three store round trips per page even when nothing had
+  changed: 10 to 20 seconds of work per tick on a 43,000-page wiki. The pass
+  now skips a file whose size, mtime, inode and change time match the pass
+  that last indexed it, so an idle tick only walks the tree. A file whose
+  timestamps are less than five seconds older than the pass is still reread,
+  so a same-size edit landing within the filesystem's timestamp granularity
+  is not missed. The first pass after startup still reads every page
+  (upstream #1975).
+- A skipped `relations:` entry on a stored page now names the page in its log
+  warning, so an operator can find the page to fix. Together with the skip
+  above, a page with an invalid target warns when it is indexed, not on every
+  30-second pass. (#26)
 - `ai-memory pending-writes list` now names the scope it consulted when it finds
   nothing. It reads one workspace and project, and the bare `(no pending writes)`
   read as an empty queue everywhere while other projects had proposals waiting. (#27)
