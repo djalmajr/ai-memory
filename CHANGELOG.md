@@ -85,13 +85,9 @@ version in [`docs/changelog/`](docs/changelog/):
   job. (#18)
 
 ### Fixed
-- Fixed the abandoned-session sweep queuing an LLM auto-improvement review for
-  every session it closes: the sweep now parks a claim for each closed session
-  in the same transaction, a real `SessionEnd` with new observations or a
-  handoff that reopens the session un-parks it, and `experience_pass_due` no
-  longer counts sweep-parked sessions. A
-  `SessionEnd` without new observations stays parked, and manual
-  auto-improve for a sweep-closed session remains available.
+- `ai-memory pending-writes list` now names the scope it consulted when it finds
+  nothing. It reads one workspace and project, and the bare `(no pending writes)`
+  read as an empty queue everywhere while other projects had proposals waiting. (#27)
 - Fixed the fork's deploy image build, which stopped compiling after the v3.3.3
   sync because `deploy/Dockerfile` did not copy `docs/` and `CHANGELOG.md`. (#22)
 - Timeout and ambiguous 499/5xx LLM failures now receive at most one replay
@@ -118,6 +114,13 @@ version in [`docs/changelog/`](docs/changelog/):
   `purge-session`, `purge-project` and workspace deletion now remove them, where
   they used to stay in the database. Rows left behind by earlier purges are not
   swept. (#21)
+- Fixed the abandoned-session sweep queuing an LLM auto-improvement review for
+  every session it closes: the sweep now parks a claim for each closed session
+  in the same transaction, a real `SessionEnd` with new observations or a
+  handoff that reopens the session un-parks it, and `experience_pass_due` no
+  longer counts sweep-parked sessions. A
+  `SessionEnd` without new observations stays parked, and manual
+  auto-improve for a sweep-closed session remains available.
 
 ### Security
 - Stopped `install-hooks` without `--apply` from printing the bearer token, which
