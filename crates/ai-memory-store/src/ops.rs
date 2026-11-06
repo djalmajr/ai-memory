@@ -6329,6 +6329,18 @@ pub fn reorg_sessions(
             ],
         )?;
         sessions_moved += rows;
+        // A claim is keyed to the session's project: left behind, it would
+        // cascade away with that project once it is empty, and a session the
+        // abandoned-session sweep parked would become reviewable again.
+        tx.execute(
+            "UPDATE auto_improve_scheduler_claims SET project_id = ?1 \
+             WHERE session_id = ?2 AND workspace_id = ?3",
+            params![
+                new_project_id.as_bytes(),
+                session_id.as_bytes(),
+                workspace_id.as_bytes()
+            ],
+        )?;
         // Update observations whose session_id matches, keeping project_id
         // in sync with the session row we just moved.
         let obs_rows = tx.execute(
@@ -21005,6 +21017,141 @@ pub(crate) mod tests {
             sweep_parked(&conn, &session),
             "a refused accept must keep the sweep's marker"
         );
+    }
+
+    /// A claim row the way an operator or the scheduler would read it: the
+    /// project it is keyed to, what it last failed with, and how many times
+    /// it was tried.
+    fn claim_row(conn: &Connection, session: SessionId) -> (ProjectId, String, u32) {
+        let (bytes, last_error, attempts): (Vec<u8>, Option<String>, u32) = conn
+            .query_row(
+                "SELECT project_id, last_error, attempts FROM auto_improve_scheduler_claims \
+                 WHERE session_id = ?1",
+                params![session.as_bytes()],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .expect("the claim row must exist");
+        (
+            ProjectId::from_slice(&bytes).expect("the claim's project id must be a valid id"),
+            last_error.expect("the claim carries its last error"),
+            attempts,
+        )
+    }
+
+    /// A claim is keyed to the session's project. If reorg moved the session
+    /// but left the claim behind, a later hollow-project sweep would delete
+    /// the now-empty source project and the claim would cascade away with it
+    /// — a session the abandoned-session sweep parked would become
+    /// reviewable again. The sweep's parked claim and a genuine failure's
+    /// claim must both move with the session, keeping `attempts` and
+    /// `last_error` intact. A plan that names another workspace must move
+    /// nothing, claim included.
+    #[test]
+    fn reorg_moves_a_parked_claim_with_its_session() {
+        let (_tmp, mut conn, ws, proj) = fresh_db();
+        let now = Timestamp::now().as_microsecond();
+        let hour = 3_600_000_000;
+        let dest = get_or_create_project(&mut conn, &ws, "reorg-dest", None).unwrap();
+
+        // One session the abandoned-session sweep just parked.
+        let swept = SessionId::new();
+        let mut swept_session = hook_session(swept, ws, proj, None);
+        swept_session.occurred_at = Some(now - 49 * hour);
+        begin_session(&mut conn, &swept_session).unwrap();
+        assert_eq!(
+            close_abandoned_sessions(&mut conn, now - 48 * hour).unwrap(),
+            1
+        );
+        let (swept_project, swept_error, swept_attempts) = claim_row(&conn, swept);
+        assert_eq!(
+            swept_project, proj,
+            "the claim starts on the session's project"
+        );
+        assert_eq!(
+            swept_error,
+            crate::auto_improve::ABANDONED_SWEEP_CLAIM_ERROR
+        );
+        assert_eq!(
+            swept_attempts,
+            crate::auto_improve::AUTO_IMPROVE_CLAIM_MAX_ATTEMPTS
+        );
+
+        // One session whose claim carries a genuine review failure — the
+        // sweep's un-park must never touch it, so reorg has to keep it.
+        let failed = SessionId::new();
+        begin_session(&mut conn, &hook_session(failed, ws, proj, None)).unwrap();
+        conn.execute(
+            "INSERT INTO auto_improve_scheduler_claims \
+             (workspace_id, project_id, session_id, claimed_at, attempts, last_error, last_failed_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?4)",
+            params![
+                ws.as_bytes(),
+                proj.as_bytes(),
+                failed.as_bytes(),
+                now,
+                2u32,
+                "auto-improve failed: class=provider status=500"
+            ],
+        )
+        .unwrap();
+
+        // The control session: a plan that names another workspace must not
+        // move it, nor the claim keyed to it.
+        let foreign = SessionId::new();
+        begin_session(&mut conn, &hook_session(foreign, ws, proj, None)).unwrap();
+        conn.execute(
+            "INSERT INTO auto_improve_scheduler_claims \
+             (workspace_id, project_id, session_id, claimed_at, attempts, last_error, last_failed_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?4)",
+            params![
+                ws.as_bytes(),
+                proj.as_bytes(),
+                foreign.as_bytes(),
+                now,
+                1u32,
+                "auto-improve failed: class=provider status=429"
+            ],
+        )
+        .unwrap();
+
+        let summary = reorg_sessions(&mut conn, &ws, &[(swept, dest), (failed, dest)]).unwrap();
+        assert_eq!(summary.sessions_moved, 2);
+
+        let (project, error, attempts) = claim_row(&conn, swept);
+        assert_eq!(project, dest, "the parked claim must follow the session");
+        assert_eq!(
+            error, swept_error,
+            "the sweep's marker must survive the move"
+        );
+        assert_eq!(
+            attempts, swept_attempts,
+            "the parked attempts must survive the move"
+        );
+
+        let (project, error, attempts) = claim_row(&conn, failed);
+        assert_eq!(
+            project, dest,
+            "a genuine failure's claim must follow the session"
+        );
+        assert_eq!(error, "auto-improve failed: class=provider status=500");
+        assert_eq!(attempts, 2, "the failure's attempts must survive the move");
+
+        // Adversarial control: a plan naming another workspace must leave
+        // the foreign session and its claim where they were.
+        let other_ws = get_or_create_workspace(&mut conn, "other").unwrap();
+        let other_dest = get_or_create_project(&mut conn, &other_ws, "reorg-dest", None).unwrap();
+        let summary = reorg_sessions(&mut conn, &other_ws, &[(foreign, other_dest)]).unwrap();
+        assert_eq!(
+            summary.sessions_moved, 0,
+            "a plan naming another workspace must not move the session"
+        );
+        let (project, error, attempts) = claim_row(&conn, foreign);
+        assert_eq!(
+            project, proj,
+            "the claim must stay with the session's real project"
+        );
+        assert_eq!(error, "auto-improve failed: class=provider status=429");
+        assert_eq!(attempts, 1);
     }
 
     /// A Grok session the sweep closed is reopened by a handoff accept, gains

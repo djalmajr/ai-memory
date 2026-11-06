@@ -1453,54 +1453,9 @@ mod tests {
             .unwrap();
 
         let now = jiff::Timestamp::now().as_microsecond();
-        let one_hour_us = 3_600 * 1_000_000;
 
         // Stale session the sweep is about to close.
-        let swept = SessionId::new();
-        store
-            .writer
-            .begin_session(NewSession {
-                occurred_at: Some(now - 49 * one_hour_us),
-                id: swept,
-                workspace_id: ws,
-                project_id: project,
-                agent_kind: AgentKind::Other,
-                cwd: None,
-                actor_user: None,
-            })
-            .await
-            .unwrap();
-        for i in 0..3 {
-            store
-                .writer
-                .insert_observation(Sanitized::new(
-                    NewObservation {
-                        occurred_at: Some(now - 49 * one_hour_us + i as i64),
-                        session_id: swept,
-                        workspace_id: ws,
-                        project_id: project,
-                        kind: if i == 0 {
-                            ObservationKind::SessionStart
-                        } else {
-                            ObservationKind::UserPrompt
-                        },
-                        extension: None,
-                        source_event: None,
-                        title: format!("event {i}"),
-                        body: "run the full gate before release".into(),
-                        importance: 5,
-                    },
-                    &Sanitizer::builtin(),
-                ))
-                .await
-                .unwrap();
-        }
-        let closed = store
-            .writer
-            .close_abandoned_sessions(now - 48 * one_hour_us)
-            .await
-            .unwrap();
-        assert_eq!(closed, 1, "the stale session must be closed by the sweep");
+        let swept = seed_swept_session(&store, ws, project, now).await;
 
         // Normally ended session, same project.
         let control = seed_reviewable_session(&store, ws, project).await;
@@ -1517,7 +1472,6 @@ mod tests {
             },
             require_approval: true,
             require_approval_prefixes: Vec::new(),
-
             min_session_age_secs: 0,
             max_sessions_per_tick: 10,
             experience: None,
@@ -1539,6 +1493,121 @@ mod tests {
         // The sweep-closed session stays parked, and its claim carries the
         // sweep's marker — not a review failure.
         let (last_error, attempts) = claim_row(store.db_path(), ws, project, swept);
+        assert_eq!(attempts, ai_memory_store::AUTO_IMPROVE_CLAIM_MAX_ATTEMPTS);
+        assert_eq!(
+            last_error,
+            ai_memory_store::ABANDONED_SWEEP_CLAIM_ERROR,
+            "the claim must mark the sweep, not a review failure"
+        );
+
+        // The control session actually got a review.
+        let conn = rusqlite::Connection::open(store.db_path()).unwrap();
+        let runs: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM auto_improve_runs WHERE session_id = ?1",
+                rusqlite::params![control.as_bytes()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(runs, 1, "the real end must have a persisted review run");
+    }
+
+    /// Reorg moves a sweep-closed session out of the project that the
+    /// hollow-project sweep is about to delete. The sweep's parked claim is
+    /// keyed to the session's project: left behind, it would cascade away
+    /// with the deleted project and the parked session would become
+    /// reviewable again in its new scope. The claim must move with the
+    /// session and keep the scheduler out of it.
+    #[tokio::test]
+    async fn abandoned_sweep_session_moved_by_reorg_is_not_reviewed() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let wiki = Wiki::new(tmp.path(), store.writer.clone()).unwrap();
+        let ws = store
+            .writer
+            .get_or_create_workspace("default")
+            .await
+            .unwrap();
+        let project = store
+            .writer
+            .get_or_create_project(ws, "sweep-tick", None)
+            .await
+            .unwrap();
+        // The destination must exist before the scheduler scopes are
+        // initialized: the state seed parks its watermark at the newest
+        // already-ended session (none yet), exactly like a scope created at
+        // startup.
+        let destination = store
+            .writer
+            .get_or_create_project(ws, "destination", None)
+            .await
+            .unwrap();
+        initialize_auto_improve_scheduler_scopes(&store.reader, &store.writer)
+            .await
+            .unwrap();
+
+        let now = jiff::Timestamp::now().as_microsecond();
+        // Stale session the sweep is about to close.
+        let swept = seed_swept_session(&store, ws, project, now).await;
+
+        // Age the source past the hollow sweep's minimum, move the session
+        // out and delete the emptied project — the sequence that used to
+        // cascade the parked claim away with the project.
+        {
+            let conn = rusqlite::Connection::open(store.db_path()).unwrap();
+            conn.execute(
+                "UPDATE projects SET created_at = ?1 WHERE id = ?2",
+                rusqlite::params![now - 10 * 24 * 3_600 * 1_000_000, project.as_bytes()],
+            )
+            .unwrap();
+        }
+        store
+            .writer
+            .reorg_sessions(ws, vec![(swept, destination)])
+            .await
+            .unwrap();
+        let deleted = store.writer.sweep_hollow_projects(7).await.unwrap();
+        assert!(
+            deleted.iter().any(|name| name == "sweep-tick"),
+            "the emptied source project must be deleted"
+        );
+
+        // A normally ended session in the destination: the one real review.
+        let control = seed_reviewable_session(&store, ws, destination).await;
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let llm: Arc<dyn LlmProvider> = Arc::new(CountingLlm {
+            calls: Arc::clone(&calls),
+        });
+        let settings = ScheduledAutoImproveSettings {
+            review: AutoImproveReviewConfig {
+                min_observations: 3,
+                min_session_duration_secs: 0,
+                ..AutoImproveReviewConfig::default()
+            },
+            require_approval: true,
+            require_approval_prefixes: Vec::new(),
+            min_session_age_secs: 0,
+            max_sessions_per_tick: 10,
+            experience: None,
+        };
+
+        let outcome =
+            run_auto_improve_scheduler_tick(&store.reader, &store.writer, &wiki, &llm, &settings)
+                .await
+                .unwrap();
+        assert_eq!(outcome.scopes_with_candidates, 1);
+        assert_eq!(outcome.reviewed, 1, "only the real end was reviewed");
+        assert_eq!(outcome.errors, 0);
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "exactly one LLM call: the real end, never the sweep-closed session the reorg moved"
+        );
+
+        // The moved session's claim followed it to the destination and still
+        // carries the sweep's marker — not a review failure.
+        let (last_error, attempts) = claim_row(store.db_path(), ws, destination, swept);
         assert_eq!(attempts, ai_memory_store::AUTO_IMPROVE_CLAIM_MAX_ATTEMPTS);
         assert_eq!(
             last_error,
@@ -2161,6 +2230,64 @@ mod tests {
                 }))
             })
         }
+    }
+
+    /// Open a stale session in `proj` and let the abandoned-session sweep
+    /// close it: the session ends with no page and the sweep's claim parked
+    /// (exhausted attempts, the sweep's marker error). Returns the session.
+    async fn seed_swept_session(
+        store: &Store,
+        ws: WorkspaceId,
+        proj: ProjectId,
+        now: i64,
+    ) -> SessionId {
+        let one_hour_us = 3_600 * 1_000_000;
+        let swept = SessionId::new();
+        store
+            .writer
+            .begin_session(NewSession {
+                occurred_at: Some(now - 49 * one_hour_us),
+                id: swept,
+                workspace_id: ws,
+                project_id: proj,
+                agent_kind: AgentKind::Other,
+                cwd: None,
+                actor_user: None,
+            })
+            .await
+            .unwrap();
+        for i in 0..3 {
+            store
+                .writer
+                .insert_observation(Sanitized::new(
+                    NewObservation {
+                        occurred_at: Some(now - 49 * one_hour_us + i as i64),
+                        session_id: swept,
+                        workspace_id: ws,
+                        project_id: proj,
+                        kind: if i == 0 {
+                            ObservationKind::SessionStart
+                        } else {
+                            ObservationKind::UserPrompt
+                        },
+                        extension: None,
+                        source_event: None,
+                        title: format!("event {i}"),
+                        body: "run the full gate before release".into(),
+                        importance: 5,
+                    },
+                    &Sanitizer::builtin(),
+                ))
+                .await
+                .unwrap();
+        }
+        let closed = store
+            .writer
+            .close_abandoned_sessions(now - 48 * one_hour_us)
+            .await
+            .unwrap();
+        assert_eq!(closed, 1, "the stale session must be closed by the sweep");
+        swept
     }
 
     async fn seed_reviewable_session(store: &Store, ws: WorkspaceId, proj: ProjectId) -> SessionId {
