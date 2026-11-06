@@ -135,6 +135,9 @@ version in [`docs/changelog/`](docs/changelog/):
   longer counts sweep-parked sessions. A
   `SessionEnd` without new observations stays parked, and manual
   auto-improve for a sweep-closed session remains available. (#28)
+- Fixed `reorg` losing the abandoned-session sweep's parked claim:
+  `reorg_sessions` now moves a session's claim with it, so removing the emptied
+  old project no longer makes a parked session reviewable. (#29)
 
 ### Security
 - Stopped `install-hooks` without `--apply` from printing the bearer token, which
