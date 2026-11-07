@@ -65,6 +65,7 @@ pub use error::{
 };
 pub use grants::{GrantFilter, GrantListing, GrantOutcome, ProjectGrant};
 pub use maintenance::MaintenanceJob;
+pub use migrations::{SchemaStatus, schema_status};
 pub use ops::{
     AdmittedSession, AdoptedProjectIdentity, BootstrapChunkRecord, CompactSummary, Compaction,
     ConditionalBatchUpsert, ConditionalUpsert, ConsolidationChunkRecord, DateOnlyTtlPage,

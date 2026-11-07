@@ -13,6 +13,14 @@
 //! — the moment a restore fails is the moment the operator has no other
 //! copy, so the previous state must survive it.
 //!
+//! The boot-time pre-migration package tars the whole data dir, so its
+//! archive also carries the `pre-migration-backup.json` receipt at the
+//! root, the server's `logs/` directory, and the `auth-tokens/` directory
+//! when auth is on. Those are not data a restore replaces: they are
+//! accepted as safe and skipped without being extracted, never writing
+//! them to the destination (a stale root bearer written to the new data
+//! dir would be wrong).
+//!
 //! A backup's `config.toml` is code-bearing: it can name commands the server
 //! runs (`[auto_improve.eval]`), where consolidated memory is sent (provider
 //! URLs and headers, admission webhooks) and how much is redacted
@@ -491,18 +499,29 @@ fn remove_path(path: &Path) -> std::io::Result<()> {
 
 /// Extract every allowed entry into `data_dir` and return the wiki git files
 /// left out ([`wiki_git_entry_kept`]). When the archive carried the wiki's
-/// `.git`, its config is replaced by a freshly generated one.
+/// `.git`, its config is replaced by a freshly generated one. The
+/// pre-migration package's non-data entries (the root receipt, the root
+/// `logs/` tree, the root `auth-tokens/` tree) are skipped without being
+/// extracted, counted and reported.
 fn unpack_checked_archive<R: std::io::Read>(
     archive: &mut tar::Archive<R>,
     data_dir: &Path,
 ) -> Result<Vec<PathBuf>> {
     archive.set_preserve_permissions(false);
     let mut left_out = Vec::new();
+    let mut skipped = 0_usize;
     for entry in archive.entries()? {
         let mut entry = entry?;
         let path = entry.path()?.into_owned();
         let entry_type = entry.header().entry_type();
-        validate_restore_entry(&path, entry_type)?;
+        if matches!(
+            validate_restore_entry(&path, entry_type)?,
+            RestoreEntryDisposition::Skip
+        ) {
+            // Not data a restore replaces: never written to the destination.
+            skipped += 1;
+            continue;
+        }
         if !wiki_git_entry_kept(&path, entry_type) {
             left_out.push(path);
             continue;
@@ -510,6 +529,12 @@ fn unpack_checked_archive<R: std::io::Read>(
         entry
             .unpack_in(data_dir)
             .with_context(|| format!("extracting {}", path.display()))?;
+    }
+    if skipped > 0 {
+        info!(
+            count = skipped,
+            "restore skipped the pre-migration package's non-data entries (receipt, logs, auth-tokens)"
+        );
     }
     let git_dir = data_dir.join("wiki").join(".git");
     if git_dir.is_dir() {
@@ -593,7 +618,34 @@ fn is_regular_file(entry_type: tar::EntryType) -> bool {
     entry_type.is_file() || entry_type == tar::EntryType::GNUSparse
 }
 
-fn validate_restore_entry(path: &Path, entry_type: tar::EntryType) -> Result<()> {
+/// What a validated backup entry may do to the restore destination.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RestoreEntryDisposition {
+    /// Extract into the staging directory.
+    Extract,
+    /// A pre-migration-package entry that is not data: accepted as safe but
+    /// skipped without being extracted, so nothing of it is written.
+    Skip,
+}
+
+/// Validate one backup entry against the allowed restore layout.
+///
+/// Safety is checked first and applies everywhere — unsafe paths, links and
+/// unsupported entry types are refused even inside the skip set — and only
+/// then the layout: data entries are [`RestoreEntryDisposition::Extract`],
+/// and the non-data entries the boot-time pre-migration package writes
+/// beside the data set are [`RestoreEntryDisposition::Skip`]. That package
+/// tars the whole data dir, so its archive also carries the
+/// `pre-migration-backup.json` receipt at the root, the server's `logs/`
+/// directory, and the `auth-tokens/` directory when auth is on: none of
+/// them is data a restore replaces (the receipt points at an archive that
+/// no longer exists at the destination, the logs are the old server's, and
+/// writing the old root bearer into the new data dir would be wrong), so all
+/// three are accepted and skipped without being extracted.
+fn validate_restore_entry(
+    path: &Path,
+    entry_type: tar::EntryType,
+) -> Result<RestoreEntryDisposition> {
     if !path.components().all(|c| matches!(c, Component::Normal(_))) {
         bail!("backup contains unsafe path: {}", path.display());
     }
@@ -604,6 +656,20 @@ fn validate_restore_entry(path: &Path, entry_type: tar::EntryType) -> Result<()>
         bail!("backup contains unsupported entry type: {}", path.display());
     }
     let path_str = path.to_string_lossy();
+    // Skip set: the root receipt as a regular file only (a directory or
+    // link with that name falls through to the layout refusal below), and
+    // the root `logs/` and `auth-tokens/` directories with everything under
+    // them. An `auth-tokens` as a file, or a `logs`/`auth-tokens` inside the
+    // wiki, is not the skip shape and keeps the layout rules.
+    if !entry_type.is_dir() && path_str == "pre-migration-backup.json" {
+        return Ok(RestoreEntryDisposition::Skip);
+    }
+    if (entry_type.is_dir() && path_str == "logs") || path_str.starts_with("logs/") {
+        return Ok(RestoreEntryDisposition::Skip);
+    }
+    if (entry_type.is_dir() && path_str == "auth-tokens") || path_str.starts_with("auth-tokens/") {
+        return Ok(RestoreEntryDisposition::Skip);
+    }
     let allowed = if entry_type.is_dir() {
         path_str == "wiki" || path_str.starts_with("wiki/") || path_str == "db"
     } else {
@@ -612,7 +678,7 @@ fn validate_restore_entry(path: &Path, entry_type: tar::EntryType) -> Result<()>
     if !allowed {
         bail!("backup contains unexpected path: {}", path.display());
     }
-    Ok(())
+    Ok(RestoreEntryDisposition::Extract)
 }
 
 #[cfg(test)]
@@ -723,6 +789,228 @@ mod tests {
             err.to_string().contains("unexpected path"),
             "unexpected error for {path}: {err}"
         );
+    }
+
+    /// Control: the boot-time pre-migration package tars the whole data dir,
+    /// so a real archive carries the receipt, the server logs and the root
+    /// bearer beside the data set. The restore succeeds and none of them
+    /// lands in the destination — with a skip removed the restore refuses
+    /// the archive instead, so this test fails if a skip is undone.
+    #[tokio::test]
+    async fn restore_accepts_the_pre_migration_packages_non_data_entries() {
+        let data = tempfile::TempDir::new().unwrap();
+        let scratch = tempfile::TempDir::new().unwrap();
+        let db = migrated_sqlite_bytes();
+        let from = write_tarball(
+            scratch.path(),
+            "pre-migration.tar.gz",
+            &gz_tarball(&[
+                (
+                    "pre-migration-backup.json",
+                    b"{\"archive_path\":\"/tmp/gone.tar.gz\"}",
+                ),
+                ("logs/serve.log", b"old server boot lines"),
+                ("auth-tokens/default", b"old root bearer"),
+                ("wiki/a.md", b"page"),
+                ("db/memory.sqlite", db.as_slice()),
+            ]),
+        );
+
+        restore_data_dir(
+            &ai_memory_core::i18n::Localizer::default(),
+            data.path(),
+            &from,
+            false,
+            false,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            std::fs::read(data.path().join("wiki/a.md")).unwrap(),
+            b"page"
+        );
+        assert!(data.path().join("db/memory.sqlite").is_file());
+        assert!(
+            !data.path().join("pre-migration-backup.json").exists(),
+            "the receipt must not be written to the destination"
+        );
+        assert!(
+            !data.path().join("logs").exists(),
+            "the archived logs must not be written to the destination"
+        );
+        assert!(
+            !data.path().join("auth-tokens").exists(),
+            "the archived root bearer must not be written to the destination"
+        );
+        assert!(restore_scratch_dirs(data.path()).is_empty());
+    }
+
+    /// The skip set is exact: the root receipt as a regular file only, and
+    /// the root `logs/` and `auth-tokens/` directories with everything under
+    /// them. The same names in any other shape or place stay refused, and a
+    /// `logs` or `auth-tokens` inside the wiki is page content that keeps
+    /// extracting.
+    #[test]
+    fn validate_restore_entry_skips_the_pre_migration_packages_non_data_entries() {
+        let file = tar::EntryType::file();
+        let dir = tar::EntryType::dir();
+        for (path, entry_type) in [
+            ("pre-migration-backup.json", file),
+            ("logs", dir),
+            ("logs/serve.log", file),
+            ("logs/rotated/app.log", file),
+            ("auth-tokens", dir),
+            ("auth-tokens/default", file),
+            ("auth-tokens/nested/tok", file),
+        ] {
+            assert_eq!(
+                validate_restore_entry(Path::new(path), entry_type).unwrap(),
+                RestoreEntryDisposition::Skip,
+                "{path} must be skipped without being extracted"
+            );
+        }
+
+        for (path, entry_type, needle) in [
+            ("logs/../db/memory.sqlite", file, "unsafe path"),
+            ("auth-tokens/../db/memory.sqlite", file, "unsafe path"),
+            (
+                "logs/evil",
+                tar::EntryType::symlink(),
+                "unsupported link entry",
+            ),
+            (
+                "logs/evil",
+                tar::EntryType::hard_link(),
+                "unsupported link entry",
+            ),
+            (
+                "auth-tokens/evil",
+                tar::EntryType::symlink(),
+                "unsupported link entry",
+            ),
+            (
+                "auth-tokens/evil",
+                tar::EntryType::hard_link(),
+                "unsupported link entry",
+            ),
+            ("x/pre-migration-backup.json", file, "unexpected path"),
+            ("pre-migration-backup.json/evil", file, "unexpected path"),
+            ("pre-migration-backup.json.tmp", file, "unexpected path"),
+            ("logsx/a", file, "unexpected path"),
+            ("auth-tokensx/a", file, "unexpected path"),
+            ("auth-tokens", file, "unexpected path"),
+            ("x/auth-tokens", dir, "unexpected path"),
+            ("pre-migration-backup.json", dir, "unexpected path"),
+            (
+                "pre-migration-backup.json",
+                tar::EntryType::symlink(),
+                "unsupported link entry",
+            ),
+            (
+                "pre-migration-backup.json",
+                tar::EntryType::hard_link(),
+                "unsupported link entry",
+            ),
+            ("logs", file, "unexpected path"),
+            (
+                "logs/evil",
+                tar::EntryType::character_special(),
+                "unsupported entry type",
+            ),
+            (
+                "auth-tokens/evil",
+                tar::EntryType::character_special(),
+                "unsupported entry type",
+            ),
+        ] {
+            let err = validate_restore_entry(Path::new(path), entry_type).unwrap_err();
+            assert!(
+                err.to_string().contains(needle),
+                "unexpected error for {path} ({entry_type:?}): {err}"
+            );
+        }
+
+        // A logs or auth-tokens directory inside the wiki is page content,
+        // not the server's: it keeps extracting.
+        assert_eq!(
+            validate_restore_entry(Path::new("wiki/default/project/logs/a.md"), file).unwrap(),
+            RestoreEntryDisposition::Extract
+        );
+        assert_eq!(
+            validate_restore_entry(Path::new("wiki/default/project/auth-tokens/a.md"), file,)
+                .unwrap(),
+            RestoreEntryDisposition::Extract
+        );
+    }
+
+    /// The same refusals through the unpack loop itself: a single-entry
+    /// archive per bad shape, built the same way `archive_with_entry` builds
+    /// them, and none of them may be extracted or left behind. (`..` paths
+    /// are covered by the validator call above: the tar crate refuses to
+    /// build such a header, so they cannot reach the loop from a built
+    /// archive in the first place.)
+    #[test]
+    fn restore_refuses_the_pre_migration_skips_in_bad_shapes() {
+        for (path, entry_type, needle) in [
+            (
+                "logs/evil",
+                tar::EntryType::symlink(),
+                "unsupported link entry",
+            ),
+            (
+                "logs/evil",
+                tar::EntryType::hard_link(),
+                "unsupported link entry",
+            ),
+            (
+                "auth-tokens/evil",
+                tar::EntryType::symlink(),
+                "unsupported link entry",
+            ),
+            (
+                "auth-tokens/evil",
+                tar::EntryType::hard_link(),
+                "unsupported link entry",
+            ),
+            ("auth-tokensx/a", tar::EntryType::file(), "unexpected path"),
+            ("auth-tokens", tar::EntryType::file(), "unexpected path"),
+            ("x/auth-tokens", tar::EntryType::dir(), "unexpected path"),
+            (
+                "x/pre-migration-backup.json",
+                tar::EntryType::file(),
+                "unexpected path",
+            ),
+            (
+                "pre-migration-backup.json/evil",
+                tar::EntryType::file(),
+                "unexpected path",
+            ),
+            ("logsx/a", tar::EntryType::file(), "unexpected path"),
+            (
+                "pre-migration-backup.json",
+                tar::EntryType::dir(),
+                "unexpected path",
+            ),
+            (
+                "pre-migration-backup.json",
+                tar::EntryType::symlink(),
+                "unsupported link entry",
+            ),
+        ] {
+            let bytes = archive_with_entry(path, entry_type);
+            let restore_dir = tempfile::TempDir::new().unwrap();
+            let mut archive = tar::Archive::new(bytes.as_slice());
+            let err = unpack_checked_archive(&mut archive, restore_dir.path()).unwrap_err();
+            assert!(
+                err.to_string().contains(needle),
+                "unexpected error for {path} ({entry_type:?}): {err}"
+            );
+            assert!(
+                std::fs::read_dir(restore_dir.path()).unwrap().count() == 0,
+                "a refused entry must not be extracted"
+            );
+        }
     }
 
     #[cfg(target_os = "linux")]
