@@ -20,6 +20,7 @@ use serde::Serialize;
 use serde::de::DeserializeOwned;
 
 use crate::config::{Config, DEFAULT_SERVER_URL};
+use crate::server_profiles::Route;
 use ai_memory_web::normalize_prefix;
 
 /// [`ai_memory_hooks::CLIENT_MARKER_HEADER`] value for CLI subcommands.
@@ -28,6 +29,7 @@ const CLI_CLIENT_KIND: &str = "cli";
 /// Non-success response returned by the configured ai-memory server.
 #[derive(Debug)]
 pub(crate) struct ServerResponseError {
+    i18n: ai_memory_core::i18n::Localizer,
     method: reqwest::Method,
     path: String,
     status: reqwest::StatusCode,
@@ -48,23 +50,29 @@ impl ServerResponseError {
 
 impl fmt::Display for ServerResponseError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            formatter,
-            "{} {}: server returned {}: {}",
-            self.method, self.path, self.status, self.body
-        )
+        formatter.write_str(&self.i18n.format(
+            "cli-http-server-response",
+            &[
+                ("method", self.method.to_string()),
+                ("path", self.path.clone()),
+                ("status", self.status.to_string()),
+                ("detail", crate::commands::show::terminal_body(&self.body)),
+            ],
+        ))
     }
 }
 
 impl std::error::Error for ServerResponseError {}
 
 fn server_response_error(
+    i18n: &ai_memory_core::i18n::Localizer,
     method: reqwest::Method,
     url: &reqwest::Url,
     status: reqwest::StatusCode,
     body: String,
 ) -> anyhow::Error {
     ServerResponseError {
+        i18n: i18n.clone(),
         method,
         path: url.path().to_owned(),
         status,
@@ -81,6 +89,7 @@ pub(crate) fn server_response_error_for_test(
     body: String,
 ) -> anyhow::Error {
     ServerResponseError {
+        i18n: ai_memory_core::i18n::Localizer::default(),
         method,
         path: path.to_owned(),
         status,
@@ -96,6 +105,7 @@ pub(crate) fn server_response_error_for_test(
 /// credentials in the URL never land in a message. `reqwest` does not carry
 /// the request method on the response, so callers supply it.
 async fn require_success(
+    i18n: &ai_memory_core::i18n::Localizer,
     method: reqwest::Method,
     resp: reqwest::Response,
 ) -> Result<reqwest::Response> {
@@ -105,12 +115,14 @@ async fn require_success(
     }
     let url = resp.url().clone();
     let body = resp.text().await.unwrap_or_default();
-    Err(server_response_error(method, &url, status, body))
+    Err(server_response_error(i18n, method, &url, status, body))
 }
 
 /// Resolved server target — origin URL + base-path prefix + optional bearer token.
 #[derive(Debug, Clone)]
 pub struct ServerEndpoint {
+    /// Human error/output language inherited from the command.
+    pub i18n: ai_memory_core::i18n::Localizer,
     /// Origin only (scheme + authority), any trailing slash and path
     /// stripped, e.g. `http://127.0.0.1:49374` or `http://192.168.0.90:49374`.
     pub url: String,
@@ -148,12 +160,49 @@ impl ServerEndpoint {
             config.auth.bearer_token.as_deref(),
         )
         .await;
-        Self::build(
+        let mut endpoint = Self::build(
             Some(config.server_url.clone()),
             token,
             config.server_url_configured(),
             Some(config.base_path.clone()).filter(|s| !s.is_empty()),
-        )
+        );
+        endpoint.i18n = config.i18n.clone();
+        endpoint
+    }
+
+    /// Build the endpoint for a command that works on the checkout it runs
+    /// in (#2016): the server the hooks capture to from the same directory.
+    ///
+    /// Precedence: `AI_MEMORY_SERVER_URL` in the environment, then the server
+    /// profile the nearest marker selects (its URL and stored token, never the
+    /// config bearer, which belongs to another server), then config, as
+    /// [`Self::from_config_resolving_auth`]. `AI_MEMORY_IGNORE_MARKER` skips
+    /// the marker here as it does for scope.
+    ///
+    /// # Errors
+    /// A marker that selects a profile which does not resolve fails closed,
+    /// like the hook drops the event: falling back to config would send this
+    /// checkout's requests to another team's server.
+    pub(crate) async fn for_checkout(config: &Config) -> Result<Self> {
+        match checkout_route(config) {
+            Route::InstallDefault => Ok(Self::from_config_resolving_auth(config).await),
+            Route::Profile(profile) => {
+                let mut endpoint = Self::build(Some(profile.url), Some(profile.token), true, None);
+                endpoint.i18n = config.i18n.clone();
+                Ok(endpoint)
+            }
+            Route::Rejected { name, reason } => Err(anyhow::anyhow!(
+                "this checkout's .ai-memory.toml selects server profile {}, which was refused \
+                 ({}); nothing was sent. Run `ai-memory hook --check-capture` here or \
+                 `ai-memory server list` to see why, or set AI_MEMORY_SERVER_URL to choose \
+                 a server for this command",
+                name.map_or_else(
+                    || "(unreadable marker)".to_owned(),
+                    |name| format!("`{name}`")
+                ),
+                reason.as_str(),
+            )),
+        }
     }
 
     /// Build for a target the spawning hook already resolved: its URL
@@ -209,6 +258,7 @@ impl ServerEndpoint {
             normalize_prefix(&url_path)
         };
         Self {
+            i18n: ai_memory_core::i18n::Localizer::default(),
             url: origin,
             base_path,
             auth_token: token.filter(|s| !s.is_empty()),
@@ -249,6 +299,29 @@ impl ServerEndpoint {
             None => req,
         }
     }
+}
+
+/// The server route for the directory this command runs in; see
+/// [`ServerEndpoint::for_checkout`].
+pub(crate) fn checkout_route(config: &Config) -> Route {
+    let env = &config.runtime_env;
+    if env.server_url().is_some() || env.ignore_marker() {
+        return Route::InstallDefault;
+    }
+    let Some((_, lookup_cwd)) = crate::commands::scope_directories(config) else {
+        return Route::InstallDefault;
+    };
+    // The hooks route the harness's logical cwd, so match a profile's roots
+    // against the same spelling of this directory (#2016).
+    let lookup_cwd = crate::commands::path_util::logical_dir(
+        Path::new(&lookup_cwd),
+        env.var_os("PWD").as_deref(),
+    );
+    crate::server_profiles::route_for_cwd(
+        &config.data_dir,
+        &lookup_cwd.to_string_lossy(),
+        env.home_dir().map(Path::new),
+    )
 }
 
 /// Split a server URL into `(origin, path)` where `origin` is
@@ -348,7 +421,7 @@ pub async fn get_json<T: DeserializeOwned>(
         .send()
         .await
         .map_err(|e| augment_connect_error(e, endpoint, &url))?;
-    let resp = require_success(reqwest::Method::GET, resp).await?;
+    let resp = require_success(&endpoint.i18n, reqwest::Method::GET, resp).await?;
     resp.json::<T>()
         .await
         .with_context(|| format!("parsing JSON body from GET {}", display_url(&url)))
@@ -370,7 +443,7 @@ pub async fn patch_json<B: Serialize, T: DeserializeOwned>(
         .send()
         .await
         .map_err(|e| augment_connect_error(e, endpoint, &url))?;
-    let resp = require_success(reqwest::Method::PATCH, resp).await?;
+    let resp = require_success(&endpoint.i18n, reqwest::Method::PATCH, resp).await?;
     resp.json::<T>()
         .await
         .with_context(|| format!("parsing JSON body from PATCH {}", display_url(&url)))
@@ -401,7 +474,7 @@ pub async fn post_json_no_content<B: Serialize>(
         .send()
         .await
         .map_err(|e| augment_connect_error(e, endpoint, &url))?;
-    require_success(reqwest::Method::POST, resp).await?;
+    require_success(&endpoint.i18n, reqwest::Method::POST, resp).await?;
     Ok(())
 }
 
@@ -414,7 +487,7 @@ pub async fn post_empty(endpoint: &ServerEndpoint, path: &str) -> Result<()> {
         .send()
         .await
         .map_err(|e| augment_connect_error(e, endpoint, &url))?;
-    require_success(reqwest::Method::POST, resp).await?;
+    require_success(&endpoint.i18n, reqwest::Method::POST, resp).await?;
     Ok(())
 }
 
@@ -436,7 +509,7 @@ pub async fn post_json_with_query<B: Serialize, T: DeserializeOwned>(
         .send()
         .await
         .map_err(|e| augment_connect_error(e, endpoint, &url))?;
-    let resp = require_success(reqwest::Method::POST, resp).await?;
+    let resp = require_success(&endpoint.i18n, reqwest::Method::POST, resp).await?;
     resp.json::<T>()
         .await
         .with_context(|| format!("parsing JSON body from POST {}", display_url(&url)))
@@ -464,29 +537,19 @@ pub(crate) fn augment_connect_error(
     endpoint: &ServerEndpoint,
     url: &str,
 ) -> anyhow::Error {
+    let i18n = &endpoint.i18n;
     if error_chain_indicates_no_answer(&err) {
-        let hint = if endpoint.url_configured {
-            format!(
-                "\nAI_MEMORY_SERVER_URL is set to {} but nothing answered \
-                 (refused or timed out). Check the server is running, the \
-                 port is reachable from this host, and (if remote) any \
-                 firewall + bearer-token config matches.",
-                display_url(&endpoint.url)
-            )
-        } else {
-            format!(
-                "\nAI_MEMORY_SERVER_URL is NOT set; the CLI defaulted to \
-                 {} and nothing answered (refused or timed out). If your \
-                 server lives on another machine (e.g. a homelab), `export \
-                 AI_MEMORY_SERVER_URL=http://<server>:49374` and (if auth \
-                 is on) `export AI_MEMORY_AUTH_TOKEN=<token>` before \
-                 re-running.",
-                display_url(&endpoint.url)
-            )
-        };
-        anyhow::Error::new(err).context(format!("could not reach {}.{hint}", display_url(url)))
+        let hint = i18n.one(
+            if endpoint.url_configured {
+                "cli-http-configured-server-hint"
+            } else {
+                "cli-http-default-server-hint"
+            },
+            display_url(&endpoint.url),
+        );
+        anyhow::Error::new(err).context(i18n.two("cli-http-unreachable", display_url(url), hint))
     } else {
-        anyhow::Error::new(err).context(format!("HTTP request to {} failed", display_url(url)))
+        anyhow::Error::new(err).context(i18n.one("cli-http-request-failed", display_url(url)))
     }
 }
 
@@ -601,7 +664,7 @@ pub async fn post_to_file(endpoint: &ServerEndpoint, path: &str, dest: &Path) ->
         .send()
         .await
         .map_err(|e| augment_connect_error(e, endpoint, &url))?;
-    let mut resp = require_success(reqwest::Method::POST, resp).await?;
+    let mut resp = require_success(&endpoint.i18n, reqwest::Method::POST, resp).await?;
     let permissions = checked_output_permissions(dest)?;
     let mut temporary = private_output_file(dest)
         .with_context(|| format!("creating temporary output beside {}", dest.display()))?;
@@ -792,6 +855,7 @@ mod tests {
         )
         .expect("test URL parses");
         let error = server_response_error(
+            &ai_memory_core::i18n::Localizer::default(),
             reqwest::Method::POST,
             &url,
             reqwest::StatusCode::NOT_FOUND,
@@ -1246,6 +1310,160 @@ mod tests {
     fn probe_timeout_is_bounded_to_about_two_seconds() {
         assert!(PROBE_TIMEOUT <= Duration::from_secs(2));
         assert!(!PROBE_TIMEOUT.is_zero());
+    }
+
+    /// A checkout whose marker selects a server profile, the profile
+    /// registered with a token, and an install whose own server and bearer
+    /// are something else (#2016).
+    struct ProfiledCheckout {
+        _tmp: tempfile::TempDir,
+        home: std::path::PathBuf,
+        repo: std::path::PathBuf,
+        data_dir: std::path::PathBuf,
+    }
+
+    impl ProfiledCheckout {
+        fn new(marker: &str) -> Self {
+            let tmp = tempfile::tempdir().unwrap();
+            let home = tmp.path().join("home");
+            let repo = home.join("work").join("team-b").join("repo");
+            let data_dir = home.join("data");
+            std::fs::create_dir_all(&repo).unwrap();
+            std::fs::create_dir_all(&data_dir).unwrap();
+            std::fs::write(repo.join(".ai-memory.toml"), marker).unwrap();
+            let name = crate::server_profiles::ProfileName::parse("team-b").unwrap();
+            crate::server_profiles::add(
+                &data_dir,
+                &name,
+                "https://b.example/memory",
+                &[home
+                    .join("work")
+                    .join("team-b")
+                    .to_string_lossy()
+                    .into_owned()],
+                Some("PROFILE-TOKEN"),
+            )
+            .unwrap();
+            Self {
+                _tmp: tmp,
+                home,
+                repo,
+                data_dir,
+            }
+        }
+
+        fn config_in(&self, cwd: &Path, server_url: Option<&str>, ignore_marker: bool) -> Config {
+            let mut config = Config {
+                data_dir: self.data_dir.clone(),
+                server_url: server_url.unwrap_or("https://install.example").to_owned(),
+                runtime_env: crate::config::RuntimeEnv::for_checkout_tests(
+                    cwd.to_string_lossy(),
+                    self.home.to_string_lossy(),
+                    server_url,
+                    ignore_marker,
+                ),
+                ..Config::default()
+            };
+            config.auth.bearer_token = Some("INSTALL-TOKEN".to_owned());
+            config
+        }
+
+        fn config(&self, server_url: Option<&str>, ignore_marker: bool) -> Config {
+            self.config_in(&self.repo, server_url, ignore_marker)
+        }
+    }
+
+    /// The marker's profile decides the server and the bearer, the same way
+    /// the hook routes capture from this directory; the install's own bearer
+    /// never travels to the profile's server.
+    #[tokio::test]
+    async fn a_checkout_command_uses_the_marker_profile_like_the_hook() {
+        let checkout = ProfiledCheckout::new("server = \"team-b\"\n");
+        let config = checkout.config(None, false);
+        let hook = crate::server_profiles::route_for_cwd(
+            &checkout.data_dir,
+            &checkout.repo.to_string_lossy(),
+            Some(&checkout.home),
+        );
+        assert_eq!(hook.resolution(), "marker");
+
+        let ep = ServerEndpoint::for_checkout(&config).await.unwrap();
+        assert_eq!(ep.url, "https://b.example");
+        assert_eq!(ep.base_path, "/memory");
+        assert_eq!(ep.auth_token.as_deref(), Some("PROFILE-TOKEN"));
+
+        // A subdirectory inherits the routing.
+        let nested = checkout.repo.join("src");
+        std::fs::create_dir_all(&nested).unwrap();
+        let ep = ServerEndpoint::for_checkout(&checkout.config_in(&nested, None, false))
+            .await
+            .unwrap();
+        assert_eq!(ep.auth_token.as_deref(), Some("PROFILE-TOKEN"));
+    }
+
+    /// `AI_MEMORY_SERVER_URL` outranks the marker, and
+    /// `AI_MEMORY_IGNORE_MARKER` skips it; both keep the install's bearer.
+    /// Without a `server` key the command keeps its config.
+    #[tokio::test]
+    async fn explicit_env_and_unrouted_checkouts_keep_the_config_server() {
+        let checkout = ProfiledCheckout::new("server = \"team-b\"\n");
+        let ep = ServerEndpoint::for_checkout(&checkout.config(Some("https://env.example"), false))
+            .await
+            .unwrap();
+        assert_eq!(ep.url, "https://env.example");
+        assert_eq!(ep.auth_token.as_deref(), Some("INSTALL-TOKEN"));
+
+        let ep = ServerEndpoint::for_checkout(&checkout.config(None, true))
+            .await
+            .unwrap();
+        assert_eq!(ep.url, "https://install.example");
+        assert_eq!(ep.auth_token.as_deref(), Some("INSTALL-TOKEN"));
+
+        let unrouted = ProfiledCheckout::new("workspace = \"team-b\"\n");
+        let ep = ServerEndpoint::for_checkout(&unrouted.config(None, false))
+            .await
+            .unwrap();
+        assert_eq!(ep.url, "https://install.example");
+        assert_eq!(ep.auth_token.as_deref(), Some("INSTALL-TOKEN"));
+    }
+
+    /// A selection the hook would refuse fails the command closed; it never
+    /// falls back to the install's server with this checkout's request.
+    #[tokio::test]
+    async fn a_refused_marker_profile_fails_closed() {
+        for (marker, reason) in [
+            ("server = \"nobody\"\n", "rejected-unknown-profile"),
+            ("server = \"../x\"\n", "rejected-invalid-profile-name"),
+        ] {
+            let checkout = ProfiledCheckout::new(marker);
+            let error = ServerEndpoint::for_checkout(&checkout.config(None, false))
+                .await
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains(reason), "{error}");
+            assert!(!error.contains("install.example"), "{error}");
+            assert!(!error.contains("TOKEN"), "{error}");
+        }
+
+        // The profile's roots do not admit a checkout outside them.
+        let checkout = ProfiledCheckout::new("server = \"team-b\"\n");
+        let outside = checkout.home.join("work").join("team-c");
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join(".ai-memory.toml"), "server = \"team-b\"\n").unwrap();
+        let error = ServerEndpoint::for_checkout(&checkout.config_in(&outside, None, false))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("rejected-outside-roots"), "{error}");
+
+        // A profile without a stored token is refused too.
+        let checkout = ProfiledCheckout::new("server = \"team-b\"\n");
+        std::fs::remove_file(checkout.data_dir.join("auth-tokens").join("team-b")).unwrap();
+        let error = ServerEndpoint::for_checkout(&checkout.config(None, false))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("rejected-no-token"), "{error}");
     }
 
     #[tokio::test]

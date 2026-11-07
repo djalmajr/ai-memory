@@ -8,6 +8,7 @@ use std::path::Path;
 
 use anyhow::{Context, Result, anyhow, bail};
 
+use super::show::terminal_text;
 use crate::cli::{ServerAddArgs, ServerArgs, ServerCommand, ServerListArgs, ServerRemoveArgs};
 use crate::config::Config;
 use crate::server_profiles::{self, ProfileName};
@@ -34,10 +35,16 @@ pub fn run(config: &Config, args: ServerArgs) -> Result<()> {
             } else {
                 None
             };
-            add(&config.data_dir, args, stdin_token, &mut stdout)
+            add(
+                &config.i18n,
+                &config.data_dir,
+                args,
+                stdin_token,
+                &mut stdout,
+            )
         }
-        ServerCommand::List(args) => list(&config.data_dir, &args, &mut stdout),
-        ServerCommand::Remove(args) => remove(&config.data_dir, &args, &mut stdout),
+        ServerCommand::List(args) => list(&config.i18n, &config.data_dir, &args, &mut stdout),
+        ServerCommand::Remove(args) => remove(&config.i18n, &config.data_dir, &args, &mut stdout),
     }
 }
 
@@ -81,6 +88,7 @@ fn read_token_line(input: &mut impl std::io::BufRead) -> Result<String> {
 }
 
 fn add(
+    i18n: &ai_memory_core::i18n::Localizer,
     data_dir: &Path,
     args: ServerAddArgs,
     stdin_token: Option<String>,
@@ -89,24 +97,43 @@ fn add(
     let name = parse_name(&args.name)?;
     let token = stdin_token.or(args.auth_token);
     let outcome = server_profiles::add(data_dir, &name, &args.url, &args.roots, token.as_deref())?;
-    writeln!(out, "Registered server profile `{name}`.")?;
+    writeln!(
+        out,
+        "{}",
+        crate::localization::diagnostic(i18n, format!("Registered server profile `{name}`."))
+    )?;
     if outcome.roots_kept {
         writeln!(
             out,
-            "Kept the roots already registered for `{name}`; pass --root to replace them."
+            "{}",
+            crate::localization::diagnostic(
+                i18n,
+                format!(
+                    "Kept the roots already registered for `{name}`; pass --root to replace them."
+                )
+            )
         )?;
     }
     if outcome.token_discarded {
         writeln!(
             out,
-            "The URL changed, so the token stored for the previous URL was removed."
+            "{}",
+            i18n.diagnostic(
+                "The URL changed, so the token stored for the previous URL was removed."
+            )
         )?;
     }
     if server_profiles::read_token(data_dir, &name).is_none() {
         writeln!(
             out,
-            "No token is stored for `{name}`: repositories selecting it drop their capture \
+            "{}",
+            crate::localization::diagnostic(
+                i18n,
+                format!(
+                    "No token is stored for `{name}`: repositories selecting it drop their capture \
              until one is added with `ai-memory server add {name} --url … --auth-token-stdin`."
+                )
+            )
         )?;
     }
     let registry = server_profiles::load(data_dir)?;
@@ -119,15 +146,26 @@ fn add(
     if registry.profiles.len() > 1 && !unrooted.is_empty() {
         writeln!(
             out,
-            "Several profiles are registered, so a profile without --root is refused. \
+            "{}",
+            crate::localization::diagnostic(
+                i18n,
+                format!(
+                    "Several profiles are registered, so a profile without --root is refused. \
              Add roots to: {}",
-            unrooted.join(", ")
+                    unrooted.join(", ")
+                )
+            )
         )?;
     }
     Ok(())
 }
 
-fn list(data_dir: &Path, args: &ServerListArgs, out: &mut impl Write) -> Result<()> {
+fn list(
+    i18n: &ai_memory_core::i18n::Localizer,
+    data_dir: &Path,
+    args: &ServerListArgs,
+    out: &mut impl Write,
+) -> Result<()> {
     let registry = server_profiles::load(data_dir)?;
     if args.json {
         let rows: Vec<_> = registry
@@ -146,7 +184,7 @@ fn list(data_dir: &Path, args: &ServerListArgs, out: &mut impl Write) -> Result<
         return Ok(());
     }
     if registry.profiles.is_empty() {
-        writeln!(out, "No server profiles registered.")?;
+        writeln!(out, "{}", i18n.diagnostic("No server profiles registered."))?;
         return Ok(());
     }
     for (name, profile) in &registry.profiles {
@@ -157,9 +195,14 @@ fn list(data_dir: &Path, args: &ServerListArgs, out: &mut impl Write) -> Result<
         };
         writeln!(
             out,
-            "{name}\n  url:   {}\n  roots: {roots}\n  token: {}",
-            profile.url,
-            token_state(data_dir, name)
+            "{}",
+            i18n.diagnostic(&format!(
+                "{}\n  url:   {}\n  roots: {}\n  token: {}",
+                terminal_text(name.as_str()),
+                terminal_text(&profile.url),
+                terminal_text(&roots),
+                terminal_text(token_state(data_dir, name))
+            ))
         )?;
     }
     Ok(())
@@ -173,12 +216,25 @@ fn token_state(data_dir: &Path, name: &ProfileName) -> &'static str {
     }
 }
 
-fn remove(data_dir: &Path, args: &ServerRemoveArgs, out: &mut impl Write) -> Result<()> {
+fn remove(
+    i18n: &ai_memory_core::i18n::Localizer,
+    data_dir: &Path,
+    args: &ServerRemoveArgs,
+    out: &mut impl Write,
+) -> Result<()> {
     let name = parse_name(&args.name)?;
     if server_profiles::remove(data_dir, &name)? {
-        writeln!(out, "Removed server profile `{name}`.")?;
+        writeln!(
+            out,
+            "{}",
+            crate::localization::diagnostic(i18n, format!("Removed server profile `{name}`."))
+        )?;
     } else {
-        writeln!(out, "No server profile named `{name}`.")?;
+        writeln!(
+            out,
+            "{}",
+            crate::localization::diagnostic(i18n, format!("No server profile named `{name}`."))
+        )?;
     }
     Ok(())
 }
@@ -205,7 +261,15 @@ mod tests {
 
     /// `server add` that must succeed; returns what it printed.
     fn add_ok(data_dir: &Path, args: ServerAddArgs, stdin_token: Option<String>) -> String {
-        output(|out| add(data_dir, args, stdin_token, out))
+        output(|out| {
+            add(
+                &ai_memory_core::i18n::Localizer::default(),
+                data_dir,
+                args,
+                stdin_token,
+                out,
+            )
+        })
     }
 
     /// A profile named after the root bearer's file is refused while that
@@ -238,7 +302,14 @@ mod tests {
         );
 
         for json in [false, true] {
-            let listed = output(|out| list(dd.path(), &ServerListArgs { json }, out));
+            let listed = output(|out| {
+                list(
+                    &ai_memory_core::i18n::Localizer::default(),
+                    dd.path(),
+                    &ServerListArgs { json },
+                    out,
+                )
+            });
             assert!(!listed.contains("SECRET-B"), "{listed}");
             assert!(listed.contains("https://b.example"), "{listed}");
             assert!(listed.contains("stored"), "{listed}");
@@ -284,12 +355,29 @@ mod tests {
         let dd = tempfile::tempdir().unwrap();
         let mut out = Vec::new();
         let bad = add_args("../x", "https://a.example", &[], Some("t"));
-        assert!(add(dd.path(), bad, None, &mut out).is_err());
+        assert!(
+            add(
+                &ai_memory_core::i18n::Localizer::default(),
+                dd.path(),
+                bad,
+                None,
+                &mut out
+            )
+            .is_err()
+        );
         assert!(!dd.path().join("servers.toml").exists());
         let remove_bad = ServerRemoveArgs {
             name: "../x".into(),
         };
-        assert!(remove(dd.path(), &remove_bad, &mut out).is_err());
+        assert!(
+            remove(
+                &ai_memory_core::i18n::Localizer::default(),
+                dd.path(),
+                &remove_bad,
+                &mut out
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -301,7 +389,23 @@ mod tests {
             None,
         );
         let args = ServerRemoveArgs { name: "a".into() };
-        assert!(output(|out| remove(dd.path(), &args, out)).contains("Removed"));
-        assert!(output(|out| remove(dd.path(), &args, out)).contains("No server profile"));
+        assert!(
+            output(|out| remove(
+                &ai_memory_core::i18n::Localizer::default(),
+                dd.path(),
+                &args,
+                out
+            ))
+            .contains("Removed")
+        );
+        assert!(
+            output(|out| remove(
+                &ai_memory_core::i18n::Localizer::default(),
+                dd.path(),
+                &args,
+                out
+            ))
+            .contains("No server profile")
+        );
     }
 }

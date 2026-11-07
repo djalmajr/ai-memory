@@ -268,6 +268,16 @@ sign in, with no console window, and restarts if it fails. Details and the
 other Windows setups (WSL2, Docker Desktop, a real Windows service) are in
 [`docs/windows.md`](docs/windows.md).
 
+With [Scoop](https://scoop.sh) (ai-memory 3.4.0 or later):
+
+```powershell
+scoop bucket add akitaonrails https://github.com/akitaonrails/scoop-bucket
+scoop install ai-memory
+ai-memory setup
+```
+
+Update it with `scoop update ai-memory`.
+
 ### Arch Linux (AUR)
 
 For native Arch installs, use the AUR packages. They install
@@ -279,6 +289,20 @@ yay -S ai-memory-bin    # prebuilt Linux x86_64/aarch64 binary
 yay -S ai-memory        # builds from source
 ai-memory setup         # data dir, user service, agents, self-check
 ```
+
+### Homebrew (macOS and Linux)
+
+The tap installs the prebuilt binary and its hook sources on macOS and on
+Linux, including atomic distributions such as Bazzite or Fedora Silverblue
+where Homebrew is the usual way to add tools:
+
+```bash
+brew install akitaonrails/tap/ai-memory
+ai-memory setup         # data dir, user service, agents, self-check
+```
+
+Use either `ai-memory setup` or `brew services start ai-memory`, not both.
+Details are in [`docs/install.md`](docs/install.md#homebrew-macos-and-linux).
 
 ### Fedora (RPM)
 
@@ -642,6 +666,13 @@ readable wiki pages; the next session starts with a handoff.
 
 Search modes, entities, feedback, briefings, and the web API are covered in [`docs/usage.md`](docs/usage.md) and
 [`docs/use-cases.md`](docs/use-cases.md).
+
+### Interface language
+
+Use `ai-memory --language pt-BR status` or set `AI_MEMORY_LANGUAGE=pt-BR`
+for Brazilian Portuguese. The web interface follows the browser's language
+and offers an independent language selector. See [interface languages](docs/localization.md)
+for configuration, translation boundaries and contributor instructions.
 
 ## Teams and multiple machines
 

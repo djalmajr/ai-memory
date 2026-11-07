@@ -22,7 +22,7 @@ use tower::ServiceExt;
 
 use crate::router::{
     CwdProbes, DEFAULT_HOOK_INGEST_MAX_IN_FLIGHT, HookState, IngestGates, IngestRateLimiter,
-    ProjectCacheStore, SubagentSessionSet, hook_router,
+    ProjectCacheStore, SessionAgents, SubagentSessionSet, hook_router,
 };
 
 /// A synthetic key in the native `aim_` shape; built to be unmistakably fake.
@@ -141,6 +141,7 @@ async fn harness() -> (TempDir, Store, HookState) {
             DEFAULT_HOOK_INGEST_MAX_IN_FLIGHT,
         )),
         ingest_gates: IngestGates::default(),
+        session_agents: SessionAgents::default(),
         cwd_probes: CwdProbes::default(),
         per_user_slots: false,
         mid_session_routing: ai_memory_core::MidSessionRouting::default(),
@@ -148,6 +149,7 @@ async fn harness() -> (TempDir, Store, HookState) {
         ingest_drop_list: crate::drop_list::IngestDropList::default(),
         record_tool_names: false,
         skip_wiki_checkpoints: true,
+        index_file_paths: false,
     };
     (tmp, store, state)
 }

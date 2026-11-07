@@ -8924,6 +8924,7 @@ mod tests {
                         title: "t".into(),
                         body: body.clone(),
                         importance: 5,
+                        file_path: None,
                     },
                     &sanitizer,
                 ))

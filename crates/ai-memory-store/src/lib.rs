@@ -31,6 +31,7 @@ mod provenance;
 pub use provenance::{PageDisagreement, PageProvenance, PageSource};
 mod project_authz;
 mod project_coordinates;
+pub mod query_signals;
 mod reader;
 mod retrieval_tuning;
 mod scope;
@@ -65,16 +66,17 @@ pub use error::{
 pub use grants::{GrantFilter, GrantListing, GrantOutcome, ProjectGrant};
 pub use maintenance::MaintenanceJob;
 pub use ops::{
-    AdmittedSession, BootstrapChunkRecord, CompactSummary, Compaction, ConditionalBatchUpsert,
-    ConditionalUpsert, ConsolidationChunkRecord, DateOnlyTtlPage, DeleteWorkspaceSummary,
-    EmbedOutcome, EmbeddingWrite, EntityBackfillSummary, HookSessionAdmission, IdentityResolution,
-    IdleEndAction, IdleEndCandidate, IdleEndResult, IngestObservationOutcome,
-    LifecycleOnlyEndOutcome, MAX_PENDING_INBOX_MESSAGES, MergeProjectPage, MergeProjectSummary,
-    MoveSessionSummary, MoveSummary, ObservationPruneOutcome, OkfMigratedPage,
-    PAGE_WINDOW_BACKFILL_BATCH, PagePrecondition, PageWindowBackfillSummary, PagesMode,
-    ProjectAliasWriteResolution, PurgeMode, PurgeSessionSummary, PurgeSummary, ReorgSummary,
-    RepairSessionTimesSummary, RepairedSessionTimes, SessionTimesCandidate, SessionTimesSkipReason,
-    SkippedSessionTimes, StaleAfterRepair, backfill_entity_index, backfill_page_windows,
+    AdmittedSession, AdoptedProjectIdentity, BootstrapChunkRecord, CompactSummary, Compaction,
+    ConditionalBatchUpsert, ConditionalUpsert, ConsolidationChunkRecord, DateOnlyTtlPage,
+    DeleteWorkspaceSummary, EmbedOutcome, EmbeddingWrite, EntityBackfillSummary,
+    HookSessionAdmission, IdentityResolution, IdleEndAction, IdleEndCandidate, IdleEndResult,
+    IngestObservationOutcome, LifecycleOnlyEndOutcome, MAX_PENDING_INBOX_MESSAGES,
+    MergeProjectPage, MergeProjectSummary, MoveSessionSummary, MoveSummary,
+    ObservationPruneOutcome, OkfMigratedPage, PAGE_WINDOW_BACKFILL_BATCH, PagePrecondition,
+    PageWindowBackfillSummary, PagesMode, ProjectAliasWriteResolution, PurgeMode,
+    PurgeSessionSummary, PurgeSummary, ReorgSummary, RepairSessionTimesSummary,
+    RepairedSessionTimes, SessionTimesCandidate, SessionTimesSkipReason, SkippedSessionTimes,
+    StaleAfterRepair, backfill_entity_index, backfill_page_windows,
     backfill_page_windows_in_batches, purge_session, record_embed_failure,
 };
 pub use profile::{
@@ -87,16 +89,20 @@ pub use project_authz::{
     AccessMode, GrantLevel, ProjectAccess, ProjectAuthz, ProjectPrincipal,
     RESTRICTED_PROJECT_FORBIDDEN, authorize_project, resolve_project_authz,
 };
+pub use query_signals::{
+    QUERY_SIGNAL_COUNT_CAP, QUERY_SIGNAL_TEXT_MAX_CHARS, QuerySignalRow, normalize_query,
+    query_hash, query_signal_boost,
+};
 pub use reader::{
     ActivityWindow, AgentSessionCount, AnswerEvidenceMeta, AuditEvent, AuditLogFilter,
     AutoImproveCandidateSession, AutoImproveParkedClaim, BriefPageBody, BriefingPage,
     BriefingSnapshot, ClientActivity, ContaminationFinding, ContaminationReport,
     ContaminationSummary, ContradictionEdge, CrossProjectEdge, DecayCandidate, DecayTombstone,
     DerivedIndexStatus, EmbeddingTripleCount, FTS_HIGHLIGHT_END, FTS_HIGHLIGHT_START,
-    FeedbackFinding, GraphVia, HealthDetail, HealthPage, HybridSearch, HybridSearchOutcome,
-    IdleOpenSession, InboxCount, InboxEntry, InterruptedSessionCandidate, LinkGraph, LinkGraphEdge,
-    LinkGraphNode, ObservationHit, ObservationOrder, ObservationPage, ObservationPageResult,
-    ObservationProjectionTotals, ObservationRecord, OpenSession, PAGE_KINDS,
+    FeedbackFinding, FileSessionRef, GraphVia, HealthDetail, HealthPage, HybridSearch,
+    HybridSearchOutcome, IdleOpenSession, InboxCount, InboxEntry, InterruptedSessionCandidate,
+    LinkGraph, LinkGraphEdge, LinkGraphNode, ObservationHit, ObservationOrder, ObservationPage,
+    ObservationPageResult, ObservationProjectionTotals, ObservationRecord, OpenSession, PAGE_KINDS,
     PAGE_VERSIONS_MAX_LIMIT, PROJECT_LINK_GRAPH_MAX_NODES, PageAuthor, PageFilter, PageHit,
     PageHitWithMeta, PageLinks, PageLinksPreview, PageMeta, PageSummary, PageVersion,
     PageVersionBody, PageVersions, ProjectCoordinateCollisionReason, ProjectCoordinateDiagnostic,
@@ -128,10 +134,10 @@ pub use web_sessions::{LiveWebSession, WebSession, hash_session_secret};
 pub use workstream::{
     ClaudeSessionBoundary, FinishWorkstreamRun, FinishedWorkstreamRun,
     LinkManagedRunSessionInScope, LinkOrAdoptManagedRunSession, ManagedRunAuthority,
-    ManagedRunContext, ManagedRunHookIdentity, ManagedRunSessionLink, OperationalWorkstreamSummary,
-    PrepareWorkstreamRun, PreparedWorkstreamRun, RenameWorkstream, RenamedWorkstream,
-    StoredManagedRunStatus, StoredWorkstreamSummary, WorkstreamOperationalStatus,
-    WorkstreamSelection, WorkstreamSelector,
+    ManagedRunContext, ManagedRunHookIdentity, ManagedRunSessionLink, NativeSessionHolder,
+    OperationalWorkstreamSummary, PrepareWorkstreamRun, PreparedWorkstreamRun, RenameWorkstream,
+    RenamedWorkstream, StoredManagedRunStatus, StoredWorkstreamSummary,
+    WorkstreamOperationalStatus, WorkstreamSelection, WorkstreamSelector,
 };
 pub use writer::{StartupContextAcceptance, WriterHandle};
 
@@ -275,6 +281,21 @@ impl Store {
             tracing::info!(
                 projects = coordinate_keys,
                 "project coordinate keys backfilled"
+            );
+        }
+        for twin in project_coordinates::shadowing_empty_twins(&conn, 20)? {
+            tracing::warn!(
+                workspace = %twin.workspace,
+                project = %twin.name,
+                owner = %twin.owner,
+                "empty project '{}' holds the canonical name of '{}'; it is skipped when \
+                 resolving that name, and can be renamed out of the way with \
+                 `ai-memory rename-project --workspace {} --project-id {} --to {}-empty`",
+                twin.name,
+                twin.owner,
+                twin.workspace,
+                twin.id,
+                twin.name
             );
         }
         let cjk_backfill = ops::backfill_cjk_indexes(&mut conn)?;
@@ -2876,6 +2897,101 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn search_matches_the_parts_of_a_hyphenated_word() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let (ws, proj) = open_managed_scope(&store, "proj").await;
+        let body = format!(
+            "{DIRECTORY_PATH_BODY} the zebrafinch-marker-alpha tag and the zebra_finch_keeper log"
+        );
+        store
+            .writer
+            .upsert_page(sample_page(ws, proj, "markers.md", &body))
+            .await
+            .unwrap();
+
+        // #2013: the content tokenizer keeps `-` and `_` inside tokens, so a
+        // `zebrafinch-marker-alpha` mention indexed as one term and no
+        // component word could reach it. Each part must now match on its own,
+        // in the project scope and in the unscoped search alike.
+        for query in ["alpha", "marker", "zebrafinch", "keeper"] {
+            let hits = store
+                .reader
+                .search_pages_for_project(ws, proj, query.into(), 10, None)
+                .await
+                .unwrap();
+            assert_eq!(hits.len(), 1, "query {query:?}");
+            assert_eq!(hits[0].path.as_str(), "markers.md", "query {query:?}");
+
+            let global = store
+                .reader
+                .search_pages(query.into(), 10, None)
+                .await
+                .unwrap();
+            assert_eq!(global.len(), 1, "unscoped query {query:?}");
+        }
+
+        // The whole token keeps working as a single term (the reason the
+        // tokenizer was left alone), and an unrelated word still finds nothing.
+        for query in ["ai-memory", "zebrafinch-marker-alpha"] {
+            let hits = store
+                .reader
+                .search_pages_for_project(ws, proj, query.into(), 10, None)
+                .await
+                .unwrap();
+            assert_eq!(hits.len(), 1, "whole token {query:?}");
+        }
+        let misses = store
+            .reader
+            .search_pages_for_project(ws, proj, "zebrafinches".into(), 10, None)
+            .await
+            .unwrap();
+        assert!(
+            misses.is_empty(),
+            "no false positives from the split column"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_column_filter_matches_the_parts_of_a_hyphenated_word() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let (ws, proj) = open_managed_scope(&store, "proj").await;
+        let mut titled = sample_page(ws, proj, "titled.md", "nothing to see here");
+        titled.title = "my-payment-gateway".into();
+        store.writer.upsert_page(titled).await.unwrap();
+        store
+            .writer
+            .upsert_page(sample_page(
+                ws,
+                proj,
+                "bodied.md",
+                "the run-managed launcher",
+            ))
+            .await
+            .unwrap();
+
+        // #2013: `title:` and `body:` must reach the `_parts` twin, or a
+        // filter narrows away the very hit the bare word finds. Each filter
+        // keeps its own column: the title word does not match `body:`.
+        for (query, expected) in [
+            ("title:gateway", vec!["titled.md"]),
+            ("body:managed", vec!["bodied.md"]),
+            ("title:my-payment-gateway", vec!["titled.md"]),
+            ("body:gateway", Vec::new()),
+            ("title:managed", Vec::new()),
+        ] {
+            let hits = store
+                .reader
+                .search_pages_for_project(ws, proj, query.into(), 10, None)
+                .await
+                .unwrap();
+            let paths: Vec<_> = hits.iter().map(|hit| hit.path.as_str()).collect();
+            assert_eq!(paths, expected, "query {query:?}");
+        }
+    }
+
+    #[tokio::test]
     async fn search_finds_an_observation_naming_a_file_with_its_directory() {
         let tmp = TempDir::new().unwrap();
         let store = Store::open(tmp.path()).unwrap();
@@ -2908,6 +3024,7 @@ mod tests {
                     title: "tool file".into(),
                     body: DIRECTORY_PATH_BODY.into(),
                     importance: 5,
+                    file_path: None,
                 },
                 &Sanitizer::builtin(),
             ))
@@ -3770,6 +3887,7 @@ mod tests {
                     title: "prompt".into(),
                     body: "the raw-only zebra detail lives here".into(),
                     importance: 5,
+                    file_path: None,
                 },
                 &Sanitizer::builtin(),
             ))
@@ -3833,6 +3951,7 @@ mod tests {
                     body: "leaked Authorization: Bearer abcdef0123456789ABCDEF0123456789 in transcript"
                         .into(),
                     importance: 5,
+                    file_path: None,
                 },
                 &Sanitizer::builtin(),
             ))
@@ -3855,6 +3974,92 @@ mod tests {
                 "secret reached disk unscrubbed: {col}"
             );
         }
+    }
+
+    /// #1843: a keyed insert that fails leaves no `file_path` behind and frees
+    /// its key, so the redelivery stores the path (AGENTS.md: new disk+SQL
+    /// mutations need recovery tests).
+    #[tokio::test]
+    async fn a_failed_observation_insert_leaves_no_file_path_and_can_be_retried() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let ws = store
+            .writer
+            .get_or_create_workspace("default")
+            .await
+            .unwrap();
+        let proj = store
+            .writer
+            .get_or_create_project(ws, "project", None)
+            .await
+            .unwrap();
+        let session_id = SessionId::new();
+        store
+            .writer
+            .begin_session(NewSession {
+                occurred_at: None,
+                id: session_id,
+                workspace_id: ws,
+                project_id: proj,
+                agent_kind: AgentKind::ClaudeCode,
+                cwd: None,
+                actor_user: None,
+            })
+            .await
+            .unwrap();
+        let obs = || {
+            Sanitized::new(
+                NewObservation {
+                    occurred_at: None,
+                    session_id,
+                    workspace_id: ws,
+                    project_id: proj,
+                    kind: ObservationKind::PostToolUse,
+                    extension: None,
+                    source_event: None,
+                    title: "tool file".into(),
+                    body: "tool_family: file".into(),
+                    importance: 5,
+                    file_path: Some("src/lib.rs".into()),
+                },
+                &Sanitizer::builtin(),
+            )
+        };
+        let conn = rusqlite::Connection::open(tmp.path().join("db/memory.sqlite")).unwrap();
+        let rows_with_path = || -> i64 {
+            conn.query_row(
+                "SELECT COUNT(*) FROM observations WHERE file_path IS NOT NULL",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap()
+        };
+        conn.execute_batch(
+            "CREATE TRIGGER reject_file_path BEFORE INSERT ON observations \
+             WHEN NEW.file_path IS NOT NULL BEGIN SELECT RAISE(ABORT, 'injected failure'); END;",
+        )
+        .unwrap();
+        assert!(
+            store
+                .writer
+                .insert_observation_ingest(obs(), "entry-file".into())
+                .await
+                .is_err()
+        );
+        assert_eq!(rows_with_path(), 0, "the failed insert left a path behind");
+
+        conn.execute_batch("DROP TRIGGER reject_file_path;")
+            .unwrap();
+        let retried = store
+            .writer
+            .insert_observation_ingest(obs(), "entry-file".into())
+            .await
+            .unwrap();
+        assert!(
+            matches!(retried, IngestObservationOutcome::Inserted(_)),
+            "the rolled-back key is free for the redelivery"
+        );
+        assert_eq!(rows_with_path(), 1);
     }
 
     /// Ingest idempotency distinguishes pending and completed replays, scopes
@@ -3911,6 +4116,7 @@ mod tests {
             title: "prompt".into(),
             body: "hello".into(),
             importance: 5,
+            file_path: None,
         };
 
         let first = store
@@ -4275,6 +4481,7 @@ mod tests {
                     title: "first".into(),
                     body: "initial work".into(),
                     importance: 8,
+                    file_path: None,
                 },
                 &Sanitizer::builtin(),
             ))
@@ -4319,6 +4526,7 @@ mod tests {
                     title: "resumed".into(),
                     body: "new work".into(),
                     importance: 7,
+                    file_path: None,
                 },
                 &Sanitizer::builtin(),
             ))
@@ -4769,6 +4977,7 @@ mod tests {
                         title: format!("event {i}"),
                         body: "durable work".into(),
                         importance: 5,
+                        file_path: None,
                     },
                     &Sanitizer::builtin(),
                 ))
@@ -4928,6 +5137,7 @@ mod tests {
                     title: "resumed work".into(),
                     body: "more durable work".into(),
                     importance: 5,
+                    file_path: None,
                 },
                 &Sanitizer::builtin(),
             ))
@@ -5054,20 +5264,23 @@ mod tests {
             )
             .unwrap();
 
-        assert!(
-            store
-                .writer
-                .claim_auto_improve_scheduler_session(ws, proj, session, ended_at)
-                .await
-                .unwrap(),
-            "the claim must succeed for a real end past the watermark"
-        );
         let error = "auto-improve failed: class=provider status=400";
-        let attempts = store
-            .writer
-            .park_auto_improve_claim_failure(ws, proj, session, error)
-            .await
-            .unwrap();
+        let mut attempts = 0;
+        for _ in 0..AUTO_IMPROVE_CLAIM_MAX_ATTEMPTS {
+            assert!(
+                store
+                    .writer
+                    .claim_auto_improve_scheduler_session(ws, proj, session, ended_at)
+                    .await
+                    .unwrap(),
+                "the claim must succeed for a real end past the watermark"
+            );
+            attempts = store
+                .writer
+                .record_auto_improve_claim_failure(ws, proj, session, error)
+                .await
+                .unwrap();
+        }
         assert_eq!(attempts, AUTO_IMPROVE_CLAIM_MAX_ATTEMPTS);
 
         // A real end of the resumed session.
@@ -5085,6 +5298,7 @@ mod tests {
                     title: "resumed work".into(),
                     body: "more durable work".into(),
                     importance: 5,
+                    file_path: None,
                 },
                 &Sanitizer::builtin(),
             ))
@@ -5620,6 +5834,7 @@ mod tests {
                     title: "prompt".into(),
                     body: "upgrade observation survives".into(),
                     importance: 5,
+                    file_path: None,
                 },
             )
             .unwrap();

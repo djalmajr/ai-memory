@@ -54,7 +54,9 @@
 //! Standalone high-entropy strings (e.g. a 32-char random hex) cannot
 //! be safely redacted without knowing their structure — too many false
 //! positives. Operators who care about that level of paranoia should
-//! add a custom pattern via `extra_patterns`.
+//! add a custom pattern via `extra_patterns`. ai-memory's own root bearer
+//! is such a string: it is caught under a `token` key (a hook spool entry)
+//! or behind `Bearer`, not printed alone (`cat` of its token file).
 //!
 //! Look-alike characters (full-width `ｓｋ－…`, other confusables) are not
 //! folded: matching does not apply NFKC normalization.
@@ -481,12 +483,23 @@ const BUILTIN_PATTERNS: &[(&str, &str)] = &[
         r"(?:(?:\\(?:[nrtbf]|u[0-9A-Fa-f]{4}|x[0-9A-Fa-f]{2})(?:\[[0-9;?]*[ -/]*[@-~])?|%[0-9A-Fa-f]{2})|(?-u:\b))(?P<secret>(?:aim|amk|ams)_[A-Za-z0-9_\-]{22,})",
         "ai_memory_token",
     ),
-    // Vendor-prefixed API keys.
-    (r"sk-[A-Za-z0-9_\-]{16,}", "api_key"),
+    // Vendor-prefixed API keys. A letter right before the prefix means it
+    // ends a word (`task-…`, `disk-…`), so that is the one place a match may
+    // not start; only the `secret` group is redacted. A plain `\b` would also
+    // skip a key glued to `_`, a digit, a CJK character or a percent escape
+    // (`?key%3Dsk-…`), all of which a real key can follow.
+    (
+        r"(?:^|[^A-Za-z]|%[0-9A-Fa-f]{2})(?P<secret>sk-[A-Za-z0-9_\-]{16,})",
+        "api_key",
+    ),
     // Stripe secret *and* restricted keys. `rk_live_` is scoped rather than
     // full-access, but the scope is operator-chosen and routinely includes
-    // charges/refunds — not meaningfully safer than `sk_live_`.
-    (r"(?:sk|rk)_live_[A-Za-z0-9_\-]{16,}", "stripe_key"),
+    // charges/refunds — not meaningfully safer than `sk_live_`. Anchored like
+    // `api_key` above, so `task_live_…` and `network_live_…` stay intact.
+    (
+        r"(?:^|[^A-Za-z]|%[0-9A-Fa-f]{2})(?P<secret>(?:sk|rk)_live_[A-Za-z0-9_\-]{16,})",
+        "stripe_key",
+    ),
     // Every GitHub token prefix, not only personal-access: `gho_` (OAuth —
     // what `gh auth login` stores on disk), `ghu_` (user-to-server),
     // `ghs_` (server-to-server / Actions), `ghr_` (refresh).
@@ -589,6 +602,19 @@ const BUILTIN_PATTERNS: &[(&str, &str)] = &[
     // nested that deep is not covered (#1963).
     (
         r#"(?i)\b[A-Za-z0-9_-]*(?:authentication|authorization|credentials?|password|passwd|apikey|accountkey|authtoken|[a-z0-9]*(?:api|auth|access|secret|security|private|session|refresh|client|consumer|subscription|app|bearer)-(?:key|token))(?:\\*")?\s*[=:]\s*(?:\\*")?(?:(?:basic|bearer|digest|token|apikey)\s+)?"?[A-Za-z0-9._~+/=-]{8,}"#,
+        "auth_header",
+    ),
+    // A bare `token` key: the rule above needs an auth word before `token`,
+    // but a hook spool entry stores ai-memory's root bearer (64 hex
+    // characters from `generate-auth-token`) as `"token":"…"` (#1982), and
+    // Vault and many CLI config files use the same key. The key also names
+    // tokenizer output and short literals, so the value floor is 32: longer
+    // than a word, shorter than a generated credential. A `-` before the key
+    // makes it a header name such as `Continuation-Token`, which stays the
+    // rule above's call; the character before the key is context, not part
+    // of the redaction.
+    (
+        r#"(?i)(?:^|[^A-Za-z0-9_-])(?P<secret>token(?:\\*"|')?\s*[=:]\s*(?:\\*"|')?[A-Za-z0-9._~+/=-]{32,})"#,
         "auth_header",
     ),
     // Provider-specific env-var assignments (kept explicit for clarity
@@ -802,6 +828,17 @@ impl Sanitizer {
         out
     }
 
+    /// Whether `path` may be stored as a file index key: a valid key
+    /// ([`crate::valid_file_path_key`]) that scrubbing leaves unchanged.
+    /// Checked with a leading `/` because the credential-directory patterns
+    /// need a separator before the directory, so `.ssh/config` at the
+    /// checkout root would otherwise pass.
+    #[must_use]
+    pub fn admits_file_path(&self, path: &str) -> bool {
+        let rooted = format!("/{path}");
+        crate::valid_file_path_key(path) && self.scrub(&rooted) == rooted
+    }
+
     /// The spans of `text` one pattern matches, allowlisted matches left out:
     /// over `shadow` when there is one, each match mapped back to the span of
     /// `text` it covers, else over `text` itself.
@@ -930,6 +967,9 @@ impl Sanitized<NewObservation> {
         obs.title = truncate_for_title(&sanitizer.scrub(&obs.title));
         obs.body =
             truncate_utf8_bytes_head_tail(&sanitizer.scrub(&obs.body), OBSERVATION_BODY_MAX_BYTES);
+        obs.file_path = obs
+            .file_path
+            .filter(|path| sanitizer.admits_file_path(path));
         Self(obs)
     }
 }
@@ -1351,6 +1391,57 @@ mod tests {
     }
 
     #[test]
+    fn keeps_identifiers_that_merely_contain_a_sk_fragment() {
+        for keep in [
+            "procedures/triage-llama-server-connection-canceled-log-pair-task-release-lines-and-correlate-client-clock.md",
+            "branch bible-qa-web@task-19-query-expansion",
+            "_rules/organize-dotfiles-docs-by-task-and-strip-trivial-prose.md",
+            "background-task-indexing-after-return",
+            "storage-on-disk-reclaimable-pct",
+            "task_live_progress_tracking_handler",
+            "network_live_streaming_dashboard",
+        ] {
+            let scrubbed = s().scrub(keep);
+            assert_eq!(scrubbed, keep, "{keep}");
+        }
+    }
+
+    #[test]
+    fn redacts_a_vendor_key_in_a_delimited_context() {
+        for key in [
+            "key=sk-or-v1-deadbeefcafebabe1234567890abcdef",
+            r#"{"stdout":"sk-FAKEfake0123456789abcdef"}"#,
+            "sk-abcdefghijklmnopqrstuvwxyz at line start",
+            "foo_sk-abcdefghijklmnopqrstuvwxyz",
+            "日本sk-abcdefghijklmnopqrstuvwxyz",
+            "https://x.test/?api_key%3Dsk-abcdefghijklmnopqrstuvwxyz",
+            "Authorization:%20sk-abcdefghijklmnopqrstuvwxyz",
+            "9sk-abcdefghijklmnopqrstuvwxyz",
+        ] {
+            let scrubbed = s().scrub(key);
+            assert!(scrubbed.contains("[REDACTED:api_key]"), "{scrubbed}");
+            assert!(!scrubbed.contains("abcdefghijklmnop"), "{scrubbed}");
+        }
+        // Only the key is redacted; the character before it stays.
+        assert_eq!(
+            s().scrub("key=x sk-abcdefghijklmnopqrstuvwxyz"),
+            "key=x [REDACTED:api_key]"
+        );
+        assert_eq!(
+            s().scrub("?k%3Dsk-abcdefghijklmnopqrstuvwxyz"),
+            "?k%3D[REDACTED:api_key]"
+        );
+        for key in [
+            "stripe=rk_live_FAKEfakeFAKE1234",
+            "my_sk_live_FAKEfakeFAKE1234",
+            "?k%3Dsk_live_FAKEfakeFAKE1234",
+        ] {
+            let scrubbed = s().scrub(key);
+            assert!(scrubbed.contains("[REDACTED:stripe_key]"), "{scrubbed}");
+        }
+    }
+
+    #[test]
     fn scrubs_naked_google_api_key() {
         // Fixture is the AIzaSy… shape, NOT a real key. A previous
         // iteration of this file used a live value as the fixture; do not
@@ -1729,10 +1820,52 @@ mod tests {
             title: "OPENAI_API_KEY=sk-leak-1234567890abcdef".into(),
             body: "see /home/user/.ssh/id_ed25519".into(),
             importance: 5,
+            file_path: None,
         };
         let scrubbed = Sanitized::new(raw, &s()).into_inner();
         assert!(scrubbed.title.contains("[REDACTED:"));
         assert!(scrubbed.body.contains("[REDACTED:"));
+    }
+
+    /// The file index key reaches the store only through `Sanitized::new`,
+    /// which clears a rooted, `..`, over-long, credential-directory or
+    /// control-character path and keeps a plain checkout-relative one.
+    #[test]
+    fn observation_file_path_is_cleared_unless_admitted() {
+        let observation = |file_path: &str| NewObservation {
+            occurred_at: None,
+            session_id: SessionId::new(),
+            workspace_id: WorkspaceId::new(),
+            project_id: ProjectId::new(),
+            kind: ObservationKind::PostToolUse,
+            extension: None,
+            source_event: None,
+            title: "tool file".into(),
+            body: String::new(),
+            importance: 5,
+            file_path: Some(file_path.into()),
+        };
+        let longest = "a".repeat(crate::FILE_PATH_MAX_CHARS);
+        for kept in ["src/lib.rs", "docs/a b.md", longest.as_str()] {
+            let stored = Sanitized::new(observation(kept), &s()).into_inner();
+            assert_eq!(stored.file_path.as_deref(), Some(kept));
+        }
+        let too_long = "a".repeat(crate::FILE_PATH_MAX_CHARS + 1);
+        for refused in [
+            "",
+            "/etc/passwd",
+            "\\\\share\\x",
+            "C:/repo/x",
+            "src/../secret",
+            "..",
+            ".ssh/config",
+            "home/.aws/credentials",
+            "src/\u{1b}[31mx",
+            too_long.as_str(),
+        ] {
+            let stored = Sanitized::new(observation(refused), &s()).into_inner();
+            assert_eq!(stored.file_path, None, "{refused:?}");
+        }
     }
 
     #[test]
@@ -1752,6 +1885,7 @@ mod tests {
                 "é".repeat(OBSERVATION_BODY_MAX_BYTES)
             ),
             importance: 8,
+            file_path: None,
         };
         let scrubbed = Sanitized::new(raw, &s()).into_inner();
         assert!(scrubbed.body.len() <= OBSERVATION_BODY_MAX_BYTES);
@@ -1788,6 +1922,7 @@ mod tests {
             title: format!("{} {secret}", "x".repeat(70)),
             body: String::new(),
             importance: 5,
+            file_path: None,
         };
         let scrubbed = Sanitized::new(raw, &sanitizer).into_inner();
         assert!(
@@ -1986,6 +2121,17 @@ mod tests {
                     "{invisible:?} inside {secret}: {out:?}"
                 );
                 assert!(out.starts_with("key ") && out.ends_with(" end"), "{out:?}");
+            }
+        }
+        for field in vectors["credential_fields"].as_array().unwrap() {
+            let input = field["input"].as_str().unwrap();
+            let out = s().scrub(input);
+            assert!(
+                out.contains("[REDACTED:") && !out.contains(field["secret"].as_str().unwrap()),
+                "{input:?} -> {out:?}"
+            );
+            for kept in field["kept"].as_array().into_iter().flatten() {
+                assert!(out.contains(kept.as_str().unwrap()), "{input:?} -> {out:?}");
             }
         }
         let body_line = vectors["key_body_line"].as_str().unwrap();
@@ -2577,6 +2723,77 @@ mod tests {
         ] {
             let out = s().scrub(raw);
             assert_eq!(out, raw, "must be left alone: {raw}");
+        }
+    }
+
+    /// ai-memory's own credentials: the root bearer `generate-auth-token`
+    /// mints (64 hex characters) under the bare `token` key a hook spool
+    /// entry stores it in, and the `aim_`/`ams_` keys and session secrets.
+    /// An agent printing a spool entry while debugging delivery is how the
+    /// first reaches a tool result (#1982). The rest of the result is kept
+    /// and still parses.
+    #[test]
+    fn ai_memorys_own_credentials_are_redacted() {
+        // Fixtures are FAKE shapes, not real values.
+        let s = s();
+        let hex = "0123456789abcdef".repeat(4);
+        let key = format!("aim_{}", "FAKEfake0123-_xy".repeat(3));
+        let session = format!("ams_{}", "FAKEfake0123-_xy".repeat(3));
+        let spool = format!(
+            r#"{{"stdout":"{{\"url\":\"http://127.0.0.1:0/hook?event=post-tool-use\",\"body\":\"...\",\"created_ms\":0,\"auth_mode\":\"static\",\"token\":\"{hex}\",\"attempts\":0}}\n","stderr":"","interrupted":false}}"#
+        );
+        let out = s.scrub(&spool);
+        assert!(!out.contains(&hex), "{spool} -> {out}");
+        let parsed: serde_json::Value = serde_json::from_str(&out)
+            .unwrap_or_else(|e| panic!("redaction broke the JSON ({e}): {out}"));
+        let inner = parsed["stdout"].as_str().unwrap();
+        assert!(
+            inner.contains(r#""auth_mode":"static""#) && inner.contains(r#""attempts":0}"#),
+            "the fields around the token must survive: {out}"
+        );
+        assert_eq!(parsed["interrupted"], false, "{out}");
+
+        for (raw, secret) in [
+            (format!(r#"{{"token":"{hex}"}}"#), hex.as_str()),
+            (
+                format!(r#"{{"stdout":"{{\\\"token\\\":\\\"{hex}\\\"}}"}}"#),
+                hex.as_str(),
+            ),
+            (format!("token = \"{hex}\"\n"), hex.as_str()),
+            (format!("token: '{hex}'\n"), hex.as_str()),
+            (format!("TOKEN={hex}"), hex.as_str()),
+            (format!(r#"{{"token":"{key}","id":"k1"}}"#), key.as_str()),
+            (format!("$ cat hook-key\n{key}\n"), key.as_str()),
+            (
+                format!("Cookie: ai_memory_session={session}"),
+                session.as_str(),
+            ),
+        ] {
+            let out = s.scrub(&raw);
+            assert!(
+                out.contains("[REDACTED:") && !out.contains(secret),
+                "credential must be redacted: {raw} -> {out}"
+            );
+        }
+    }
+
+    /// The bare `token` key also names tokenizer output, counts and short
+    /// literals, and `aim_` starts ordinary identifiers; none of those carry
+    /// a credential, so the value floor and the key-prefix shape leave them
+    /// byte-identical.
+    #[test]
+    fn a_bare_token_key_without_a_credential_is_left_alone() {
+        let s = s();
+        for raw in [
+            r#"{"token":"Hello","logprob":-0.12}"#,
+            r#"{"tokens":1234,"token_count":1234567890}"#,
+            r#"{"stdout":"{\"token\":\"short-lived\"}\n"}"#,
+            "token: the next word the model emits",
+            "Continuation-Token: 0123456789abcdef0123456789abcdef0123456789",
+            "let aim_target_position = aim_offset + 1;",
+            "ams_ and aim_ are the key prefixes",
+        ] {
+            assert_eq!(s.scrub(raw), raw, "must be left alone: {raw}");
         }
     }
 }

@@ -46,7 +46,10 @@ async fn make_state_with_chain(
         writer: store.writer.clone(),
         reader: store.reader.clone(),
         wiki,
-        llm: None,
+        llm_providers: ai_memory_llm::LlmProviders {
+            default: None,
+            overrides: Default::default(),
+        },
         auto_improve_require_approval: false,
         auto_improve_require_approval_prefixes: Vec::new(),
         auto_improve_review_config: Default::default(),
@@ -58,7 +61,7 @@ async fn make_state_with_chain(
         data_dir: tmp.path().to_path_buf(),
         bind: "127.0.0.1:0".to_string(),
         home_dir: None,
-        bootstrap_lock: std::sync::Arc::new(tokio::sync::Mutex::new(())),
+        bootstrap_gate: ai_memory_mcp::BootstrapGate::default(),
         token_pepper: None,
         active_project: ai_memory_core::ActiveProject::new(),
         scope_invalidator: None,
@@ -240,6 +243,7 @@ async fn seed_two_projects(store: &Store, wiki: &Wiki) -> (WorkspaceId, ProjectI
                         title: format!("{label} obs {i}"),
                         body: "body".into(),
                         importance: 5,
+                        file_path: None,
                     },
                     &Sanitizer::builtin(),
                 ))
@@ -468,6 +472,7 @@ async fn purge_session_dry_run_reports_the_same_counts_the_confirmed_purge_will(
                 importance: 5,
 
                 occurred_at: None,
+                file_path: None,
             },
             &Sanitizer::builtin(),
         ))
@@ -784,6 +789,7 @@ async fn purge_session_confirm_true_and_dry_run_true_still_only_previews() {
                 importance: 5,
 
                 occurred_at: None,
+                file_path: None,
             },
             &Sanitizer::builtin(),
         ))
@@ -895,6 +901,7 @@ async fn purge_session_dry_run_and_confirmed_purge_both_report_collateral_damage
                 importance: 5,
 
                 occurred_at: None,
+                file_path: None,
             },
             &Sanitizer::builtin(),
         ))
@@ -1236,7 +1243,10 @@ async fn purge_project_rejecting_admission_leaves_source_intact() {
         writer: store.writer.clone(),
         reader: store.reader.clone(),
         wiki,
-        llm: None,
+        llm_providers: ai_memory_llm::LlmProviders {
+            default: None,
+            overrides: Default::default(),
+        },
         auto_improve_require_approval: false,
         auto_improve_require_approval_prefixes: Vec::new(),
         auto_improve_review_config: Default::default(),
@@ -1249,7 +1259,7 @@ async fn purge_project_rejecting_admission_leaves_source_intact() {
         db_path: store.db_path().to_path_buf(),
         bind: "127.0.0.1:0".to_string(),
         home_dir: None,
-        bootstrap_lock: std::sync::Arc::new(tokio::sync::Mutex::new(())),
+        bootstrap_gate: ai_memory_mcp::BootstrapGate::default(),
         token_pepper: None,
         active_project: ai_memory_core::ActiveProject::new(),
         scope_invalidator: None,
@@ -1344,7 +1354,10 @@ async fn purge_project_idempotent_second_call_is_404() {
         writer: store.writer.clone(),
         reader: store.reader.clone(),
         wiki: state_a.wiki.clone(),
-        llm: None,
+        llm_providers: ai_memory_llm::LlmProviders {
+            default: None,
+            overrides: Default::default(),
+        },
         auto_improve_require_approval: false,
         auto_improve_require_approval_prefixes: Vec::new(),
         auto_improve_review_config: Default::default(),
@@ -1357,7 +1370,7 @@ async fn purge_project_idempotent_second_call_is_404() {
         db_path: store.db_path().to_path_buf(),
         bind: "127.0.0.1:0".to_string(),
         home_dir: None,
-        bootstrap_lock: std::sync::Arc::new(tokio::sync::Mutex::new(())),
+        bootstrap_gate: ai_memory_mcp::BootstrapGate::default(),
         token_pepper: None,
         active_project: ai_memory_core::ActiveProject::new(),
         scope_invalidator: None,
@@ -1620,6 +1633,7 @@ async fn purge_project_dry_run_counts_observations_stamped_from_another_projects
                 importance: 5,
 
                 occurred_at: None,
+                file_path: None,
             },
             &Sanitizer::builtin(),
         ))
@@ -1763,6 +1777,7 @@ async fn purge_project_dry_run_and_confirmed_purge_both_report_collateral_damage
                 importance: 5,
 
                 occurred_at: None,
+                file_path: None,
             },
             &Sanitizer::builtin(),
         ))

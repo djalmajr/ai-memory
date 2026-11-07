@@ -204,30 +204,46 @@ pub fn upsert_page(conn: &mut Connection, page: &NewPage) -> StoreResult<PageId>
     Ok(result_id)
 }
 
-/// Reindex a disk page without reviving a purged session's summary.
+/// Reindex or restore a page without reviving a purged session's summary.
 /// The tombstone and any surviving manual version are checked in the upsert
 /// transaction, so a directory walk's earlier snapshot cannot authorize a
-/// write after a session purge. Explicit page writes/restores use `upsert_page`.
+/// write after a session purge. Explicit new page writes use `upsert_page`.
 pub fn upsert_page_from_disk(conn: &mut Connection, page: &NewPage) -> StoreResult<PageId> {
     let now = Timestamp::now().as_microsecond();
     let tx = conn.transaction()?;
-    let session = page
-        .path
+    check_page_restore_allowed(
+        &tx,
+        page.workspace_id,
+        page.project_id,
+        &page.path,
+        &page.frontmatter_json,
+    )?;
+    let id = upsert_page_in_tx(&tx, page, now)?;
+    tx.commit()?;
+    Ok(id)
+}
+
+/// Check the original page metadata against session-purge tombstones.
+pub(crate) fn check_page_restore_allowed(
+    conn: &Connection,
+    workspace_id: WorkspaceId,
+    project_id: ProjectId,
+    path: &PagePath,
+    frontmatter: &serde_json::Value,
+) -> StoreResult<()> {
+    let session = path
         .as_str()
         .strip_prefix("sessions/")
         .and_then(|rest| rest.strip_suffix(".md"))
         .and_then(|id| id.parse::<SessionId>().ok());
     if let Some(session) = session {
         let session_text = session.to_string();
-        let owns_file = page
-            .frontmatter_json
-            .get("session_id")
-            .and_then(|v| v.as_str())
-            == Some(session_text.as_str());
+        let owns_file =
+            frontmatter.get("session_id").and_then(|v| v.as_str()) == Some(session_text.as_str());
         // #866 keeps manual versions at this path. They may keep changing,
         // but absence of `session_id` alone is not permission to recreate a
         // deleted page: legacy summaries can lack that field too (#701).
-        let blocked: bool = tx.query_row(
+        let blocked: bool = conn.query_row(
             "SELECT EXISTS(SELECT 1 FROM purged_sessions \
                  WHERE workspace_id = ?1 AND project_id = ?2 AND session_id = ?3) \
                AND (?6 OR NOT EXISTS(SELECT 1 FROM pages \
@@ -235,10 +251,10 @@ pub fn upsert_page_from_disk(conn: &mut Connection, page: &NewPage) -> StoreResu
                    AND is_latest = 1 \
                    AND json_extract(frontmatter_json, '$.session_id') IS NOT ?5))",
             params![
-                page.workspace_id.as_bytes(),
-                page.project_id.as_bytes(),
+                workspace_id.as_bytes(),
+                project_id.as_bytes(),
                 session.as_bytes(),
-                page.path.as_str(),
+                path.as_str(),
                 session_text,
                 owns_file
             ],
@@ -248,9 +264,7 @@ pub fn upsert_page_from_disk(conn: &mut Connection, page: &NewPage) -> StoreResu
             return Err(StoreError::SessionPurged(session_text));
         }
     }
-    let id = upsert_page_in_tx(&tx, page, now)?;
-    tx.commit()?;
-    Ok(id)
+    Ok(())
 }
 
 /// What a conditional page write requires of the current latest version.
@@ -602,6 +616,20 @@ pub struct ProjectAliasWriteResolution {
     pub promoted_from: Option<String>,
 }
 
+/// Whether a project other than `except` is named `name` in the workspace.
+fn name_held_by_another_project(
+    tx: &rusqlite::Transaction<'_>,
+    workspace_id: &ai_memory_core::WorkspaceId,
+    name: &str,
+    except: ai_memory_core::ProjectId,
+) -> StoreResult<bool> {
+    Ok(tx.query_row(
+        "SELECT EXISTS(SELECT 1 FROM projects WHERE workspace_id = ?1 AND name = ?2 AND id <> ?3)",
+        params![workspace_id.as_bytes(), name, except.as_bytes()],
+        |row| row.get(0),
+    )?)
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn resolve_project_name_for_write(
     conn: &mut Connection,
@@ -630,6 +658,16 @@ pub(crate) fn resolve_project_name_for_write(
             .then(|| crate::project_coordinates::promotion_target(&matched, requested))
             .flatten()
             .map(str::to_owned);
+        // A leftover row may still hold the canonical name (#2018); the owner
+        // keeps its current name rather than failing the write.
+        let promote_to = match promote_to {
+            Some(canonical)
+                if name_held_by_another_project(&tx, workspace_id, &canonical, matched.id)? =>
+            {
+                None
+            }
+            other => other,
+        };
         let promoted_from = if let Some(canonical) = promote_to {
             rename_project_in_tx(
                 &tx,
@@ -3467,14 +3505,20 @@ pub fn admit_hook_session_event(
         Some((ws, project, agent, owner, ended_at, ended_count, cwd)) => {
             // Corrupt owners fail closed, including for Any recovery. Owner
             // and agent identify WHO the session belongs to, so a mismatch
-            // there is a genuine UUID collision and is terminal.
+            // there is a genuine UUID collision and is terminal. The owner is
+            // checked first and stays opaque: only a caller the owner check
+            // admitted learns which agent holds the session (#2023).
             if owner
                 .as_deref()
                 .is_some_and(|value| IdentityKey::from_storage_key(value).is_none())
-                || agent != session.agent_kind.as_str()
                 || !owner_filter.admits(owner.as_deref())
             {
                 return Err(StoreError::SessionCollision);
+            }
+            if agent != session.agent_kind.as_str() {
+                return Err(StoreError::SessionAgentMismatch {
+                    bound: AgentKind::from_wire(&agent),
+                });
             }
             // Scope is NOT identity. Under the default `follow-cwd` routing a
             // mid-session `cd` into another project legitimately resolves this
@@ -3722,13 +3766,17 @@ pub fn end_admitted_lifecycle_only_session(
 }
 
 /// Guarded hook end plus automatic handoff in one transaction.
+///
+/// Returns `None` when the session still has an open explicit handoff of its
+/// own ([`session_has_open_manual_handoff`]): the session ends, and no
+/// template baton is left to linger next to the one the agent wrote (#2012).
 pub fn end_admitted_session_with_handoff(
     conn: &mut Connection,
     admitted: &AdmittedSession,
     page: Option<&PageId>,
     handoff: &NewHandoff,
     occurred_at: Option<i64>,
-) -> StoreResult<HandoffId> {
+) -> StoreResult<Option<HandoffId>> {
     if handoff.from_session_id != Some(admitted.session_id)
         || handoff.workspace_id != admitted.workspace_id
         || handoff.project_id != admitted.project_id
@@ -3739,9 +3787,38 @@ pub fn end_admitted_session_with_handoff(
     let tx = conn.transaction()?;
     validate_admitted_session(&tx, admitted)?;
     end_session_row(&tx, &admitted.session_id, page, occurred_at)?;
-    let id = insert_handoff_row(&tx, handoff)?;
+    let id = if session_has_open_manual_handoff(&tx, handoff)? {
+        None
+    } else {
+        Some(insert_handoff_row(&tx, handoff, false)?)
+    };
     tx.commit()?;
     Ok(id)
+}
+
+/// Whether the automatic baton's source session already left an explicit
+/// `memory_handoff_begin` handoff that nobody has claimed yet.
+///
+/// The explicit one is what the agent wrote on purpose while wrapping up, and
+/// it wins delivery over any automatic baton, so a template baton written
+/// beside it would only be offered later as a stale pending handoff. Once the
+/// explicit one is claimed or cancelled, later automatic batons of the session
+/// carry work newer than it and are written again.
+fn session_has_open_manual_handoff(tx: &Transaction<'_>, h: &NewHandoff) -> StoreResult<bool> {
+    let Some(session_id) = h.from_session_id.as_ref() else {
+        return Ok(false);
+    };
+    Ok(tx.query_row(
+        "SELECT EXISTS (SELECT 1 FROM handoffs \
+             WHERE from_session_id = ?1 AND workspace_id = ?2 AND project_id = ?3 \
+               AND manual = 1 AND state = 'open')",
+        params![
+            session_id.as_bytes(),
+            h.workspace_id.as_bytes(),
+            h.project_id.as_bytes()
+        ],
+        |row| row.get(0),
+    )?)
 }
 
 /// An idle auto-end candidate as selected by the server-side tick
@@ -4115,11 +4192,11 @@ fn insert_observation_row(conn: &Connection, obs: &NewObservation) -> StoreResul
         }
         _ => (None, None),
     };
-    conn.execute(
+    let result = conn.execute(
         "INSERT INTO observations \
          (id, session_id, workspace_id, project_id, kind, extension, source_event, title, body, \
-          importance, created_at) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+          importance, created_at, file_path) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
         params![
             id.as_bytes(),
             obs.session_id.as_bytes(),
@@ -4132,8 +4209,42 @@ fn insert_observation_row(conn: &Connection, obs: &NewObservation) -> StoreResul
             obs.body,
             importance,
             now,
+            obs.file_path,
         ],
-    )?;
+    );
+    // Historical migration tests stop before V99 and exercise this helper
+    // against that frozen schema, as with `finish_cjk_index_write`. A real
+    // Store migrates first, so a missing column stays a fatal error in every
+    // production build.
+    #[cfg(test)]
+    let result = match result {
+        Err(error)
+            if obs.file_path.is_none()
+                && error.to_string().contains("no column named file_path") =>
+        {
+            conn.execute(
+                "INSERT INTO observations \
+                 (id, session_id, workspace_id, project_id, kind, extension, source_event, \
+                  title, body, importance, created_at) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                params![
+                    id.as_bytes(),
+                    obs.session_id.as_bytes(),
+                    obs.workspace_id.as_bytes(),
+                    obs.project_id.as_bytes(),
+                    kind,
+                    extension,
+                    source_event,
+                    obs.title,
+                    obs.body,
+                    importance,
+                    now,
+                ],
+            )
+        }
+        other => other,
+    };
+    result?;
     index_observation_cjk(conn, conn.last_insert_rowid(), &obs.title, &obs.body)?;
     Ok(id)
 }
@@ -4530,6 +4641,124 @@ pub fn record_page_feedback(
     )?;
     tx.commit()?;
     Ok(Some((page_id, next_salience)))
+}
+
+/// Record one implicit (normalized query → page) association (#1941, slice 2)
+/// and return the association's signal count after the upsert.
+///
+/// The upsert keys on `(workspace, project, query hash, page version)` and
+/// increments `signal_count` only when the writing session differs from
+/// `last_session`, so one session repeating the same read contributes at most
+/// one association. Like the access-bump reinforcement this is an implicit
+/// signal, so it writes no audit row. A `page_id` that is no longer the
+/// current version in this scope — rewritten, purged or deleted between the
+/// read and this detached write — is a no-op returning `0`, never an error:
+/// the association attaches to the version exactly as explicit feedback does.
+pub fn record_query_page_signal(
+    conn: &mut Connection,
+    workspace_id: WorkspaceId,
+    project_id: ProjectId,
+    page_id: PageId,
+    query_text: &str,
+    session: Option<&str>,
+) -> StoreResult<u32> {
+    let normalized = crate::query_signals::normalize_query(query_text);
+    if normalized.is_empty() {
+        return Ok(0);
+    }
+    let hash = crate::query_signals::query_hash(&normalized);
+    // Session keys are client-supplied strings. Store the same `SessionId`
+    // the hook ingress derives for that native id: it is bounded (a UUID),
+    // and it is what lets `purge_session` find this row and delete the query
+    // text the purged session wrote.
+    let session: Option<String> =
+        session.map(|s| ai_memory_core::SessionId::from_native(s).to_string());
+    let now = Timestamp::now().as_microsecond();
+    let tx = conn.transaction()?;
+    // The EXISTS guard is the FK lesson from `bump_access_for_pages_for_actor`:
+    // this write is detached from the read that triggered it, so the page may
+    // be gone. It must also still be the CURRENT version — an association
+    // pointing at a superseded version never boosts anything, and recording
+    // one would only orphan text.
+    let is_current: bool = tx.query_row(
+        "SELECT EXISTS(SELECT 1 FROM pages \
+          WHERE id = ?1 AND workspace_id = ?2 AND project_id = ?3 AND is_latest = 1)",
+        params![
+            page_id.as_bytes(),
+            workspace_id.as_bytes(),
+            project_id.as_bytes()
+        ],
+        |row| row.get(0),
+    )?;
+    if !is_current {
+        tx.rollback()?;
+        return Ok(0);
+    }
+    tx.execute(
+        "INSERT INTO query_page_signals \
+           (workspace_id, project_id, query_hash, page_id, query_text, signal_count, last_session, last_seen) \
+         VALUES (?1, ?2, ?3, ?4, ?5, 1, ?6, ?7) \
+         ON CONFLICT(workspace_id, project_id, query_hash, page_id) DO UPDATE SET \
+           signal_count = CASE WHEN query_page_signals.last_session IS ?6 \
+                               THEN query_page_signals.signal_count \
+                               ELSE query_page_signals.signal_count + 1 END, \
+           query_text = excluded.query_text, \
+           last_session = excluded.last_session, \
+           last_seen = excluded.last_seen",
+        params![
+            workspace_id.as_bytes(),
+            project_id.as_bytes(),
+            &hash[..],
+            page_id.as_bytes(),
+            normalized,
+            session,
+            now,
+        ],
+    )?;
+    let count: i64 = tx.query_row(
+        "SELECT signal_count FROM query_page_signals \
+          WHERE workspace_id = ?1 AND project_id = ?2 AND query_hash = ?3 AND page_id = ?4",
+        params![
+            workspace_id.as_bytes(),
+            project_id.as_bytes(),
+            &hash[..],
+            page_id.as_bytes()
+        ],
+        |row| row.get(0),
+    )?;
+    tx.commit()?;
+    Ok(u32::try_from(count.max(0)).unwrap_or(u32::MAX))
+}
+
+/// Drop one implicit (normalized query → page) association (#1941): the
+/// negative signal a `not_helpful` feedback right after the query sends.
+/// Returns whether a row was removed. Removing the row (rather than storing a
+/// negative count) keeps the boost one-sided: an association can lose its
+/// boost, but a page can never be pushed below where plain ranking put it by
+/// this signal.
+pub fn forget_query_page_signal(
+    conn: &mut Connection,
+    workspace_id: WorkspaceId,
+    project_id: ProjectId,
+    page_id: PageId,
+    query_text: &str,
+) -> StoreResult<bool> {
+    let normalized = crate::query_signals::normalize_query(query_text);
+    if normalized.is_empty() {
+        return Ok(false);
+    }
+    let hash = crate::query_signals::query_hash(&normalized);
+    let removed = conn.execute(
+        "DELETE FROM query_page_signals \
+          WHERE workspace_id = ?1 AND project_id = ?2 AND query_hash = ?3 AND page_id = ?4",
+        params![
+            workspace_id.as_bytes(),
+            project_id.as_bytes(),
+            &hash[..],
+            page_id.as_bytes()
+        ],
+    )?;
+    Ok(removed > 0)
 }
 
 /// Mark the expected latest page as evicted by the forget sweep.
@@ -5018,7 +5247,46 @@ pub fn prune_consolidated_observations(
 /// Insert a new handoff in state=open.
 pub fn insert_handoff(conn: &mut Connection, h: &NewHandoff) -> StoreResult<HandoffId> {
     let tx = conn.transaction()?;
-    let id = insert_handoff_row(&tx, h)?;
+    let id = insert_handoff_row(&tx, h, false)?;
+    tx.commit()?;
+    Ok(id)
+}
+
+/// Insert an explicit (`memory_handoff_begin`) handoff in state=open.
+///
+/// It stays manual whatever `from_session_id` it carries: project-wide for cwd
+/// matching, preferred over automatic batons, and never refreshed or swept by
+/// them. When it names its source session, that session's own open automatic
+/// batons (a turn checkpoint's, say) are retired in the same transaction: the
+/// explicit wrap-up supersedes them, and they would otherwise surface later as
+/// stale pending handoffs (#2012). The caller must have checked that the
+/// session is the caller's own, in this scope.
+pub fn insert_manual_handoff(conn: &mut Connection, h: &NewHandoff) -> StoreResult<HandoffId> {
+    let tx = conn.transaction()?;
+    let id = insert_handoff_row(&tx, h, true)?;
+    if let Some(session_id) = h.from_session_id.as_ref() {
+        let expired = tx.execute(
+            "UPDATE handoffs SET state = 'expired' \
+             WHERE from_session_id = ?1 AND workspace_id = ?2 AND project_id = ?3 \
+               AND manual = 0 AND state = 'open'",
+            params![
+                session_id.as_bytes(),
+                h.workspace_id.as_bytes(),
+                h.project_id.as_bytes()
+            ],
+        )?;
+        if expired > 0 {
+            audit(
+                &tx,
+                "expire_superseded_handoffs",
+                Some(h.workspace_id.as_bytes()),
+                Some(h.project_id.as_bytes()),
+                None,
+                None,
+                Timestamp::now().as_microsecond(),
+            )?;
+        }
+    }
     tx.commit()?;
     Ok(id)
 }
@@ -5032,7 +5300,9 @@ pub fn insert_handoff(conn: &mut Connection, h: &NewHandoff) -> StoreResult<Hand
 /// scope and owner, the same contract as [`end_session_with_handoff`]; a
 /// checkpoint that lost the race with the session's end, or with a purge,
 /// returns `None` and touches nothing, so it can neither retire the end's
-/// baton nor resurrect a claimed one.
+/// baton nor resurrect a claimed one. A session that still has an open
+/// explicit handoff of its own also gets `None`: the checkpoint keeps that
+/// wrap-up instead of writing a template baton beside it (#2012).
 pub fn checkpoint_session_handoff(
     conn: &mut Connection,
     handoff: &NewHandoff,
@@ -5062,11 +5332,14 @@ pub fn checkpoint_session_handoff(
             "checkpoint handoff scope or owner does not match its session".into(),
         ));
     }
+    if session_has_open_manual_handoff(&tx, handoff)? {
+        return Ok(None);
+    }
     let existing: Option<Vec<u8>> = tx
         .query_row(
             "SELECT id FROM handoffs \
              WHERE from_session_id = ?1 AND workspace_id = ?2 AND project_id = ?3 \
-               AND owner_user IS ?4 AND state = 'open' \
+               AND owner_user IS ?4 AND state = 'open' AND manual = 0 \
              ORDER BY created_at DESC LIMIT 1",
             params![
                 session_id.as_bytes(),
@@ -5083,7 +5356,7 @@ pub fn checkpoint_session_handoff(
             refresh_handoff_row(&tx, &id, handoff)?;
             id
         }
-        None => insert_handoff_row(&tx, handoff)?,
+        None => insert_handoff_row(&tx, handoff, false)?,
     };
     tx.commit()?;
     Ok(Some(id))
@@ -5130,7 +5403,7 @@ pub fn end_session_with_handoff(
         ));
     }
     end_session_row(&tx, session_id, summary_page_id, None)?;
-    let id = insert_handoff_row(&tx, handoff)?;
+    let id = insert_handoff_row(&tx, handoff, false)?;
     tx.commit()?;
     Ok(id)
 }
@@ -5213,7 +5486,7 @@ fn expire_same_cwd_auto_handoffs(
     let expired = conn.execute(
         "UPDATE handoffs SET state = 'expired' \
          WHERE workspace_id = ?1 AND project_id = ?2 \
-           AND state = 'open' AND from_session_id IS NOT NULL \
+           AND state = 'open' AND from_session_id IS NOT NULL AND manual = 0 \
            AND (cwd = ?3 OR (cwd IS NULL AND ?3 IS NULL)) \
            AND owner_user IS ?4 AND id IS NOT ?5 \
            AND (from_session_id IS ?6 OR NOT EXISTS ( \
@@ -5273,7 +5546,11 @@ fn refresh_handoff_row(conn: &Transaction<'_>, id: &HandoffId, h: &NewHandoff) -
     Ok(())
 }
 
-fn insert_handoff_row(conn: &Transaction<'_>, h: &NewHandoff) -> StoreResult<HandoffId> {
+fn insert_handoff_row(
+    conn: &Transaction<'_>,
+    h: &NewHandoff,
+    manual: bool,
+) -> StoreResult<HandoffId> {
     validate_identity_storage_key(h.owner_user.as_deref(), "handoff owner")?;
     let id = HandoffId::new();
     let now = Timestamp::now().as_microsecond();
@@ -5287,7 +5564,7 @@ fn insert_handoff_row(conn: &Transaction<'_>, h: &NewHandoff) -> StoreResult<Han
     let from_session: Option<&[u8]> = h.from_session_id.as_ref().map(|s| &s.as_bytes()[..]);
     let from_agent = h.from_agent.as_str();
     let to_agent = h.to_agent.map(AgentKind::as_str);
-    if from_session.is_some() {
+    if from_session.is_some() && !manual {
         expire_same_cwd_auto_handoffs(conn, h, cwd.as_deref(), None, now)?;
     }
     // Insert + audit atomically. Handoffs are keyed by agent/session, not a DB
@@ -5296,8 +5573,8 @@ fn insert_handoff_row(conn: &Transaction<'_>, h: &NewHandoff) -> StoreResult<Han
     conn.execute(
         "INSERT INTO handoffs \
          (id, workspace_id, project_id, from_session_id, from_agent, to_agent, cwd, summary, \
-          open_questions, next_steps, files_touched, state, created_at, owner_user) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, 'open', ?12, ?13)",
+          open_questions, next_steps, files_touched, state, created_at, owner_user, manual) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, 'open', ?12, ?13, ?14)",
         params![
             id.as_bytes(),
             h.workspace_id.as_bytes(),
@@ -5314,6 +5591,7 @@ fn insert_handoff_row(conn: &Transaction<'_>, h: &NewHandoff) -> StoreResult<Han
             // NULL owner = shared with the whole project: what a caller with no
             // actor writes, and what every pre-V39 row already looks like.
             h.owner_user.as_deref(),
+            manual,
         ],
     )?;
     audit(
@@ -5451,8 +5729,8 @@ pub(crate) fn accept_handoff_in_transaction(
     }
     let metadata = tx
         .query_row(
-            "SELECT from_session_id IS NOT NULL, cwd, created_at, owner_user, \
-                    EXISTS (SELECT 1 FROM sessions s \
+            "SELECT from_session_id IS NOT NULL AND manual = 0, cwd, created_at, owner_user, \
+                    manual = 0 AND EXISTS (SELECT 1 FROM sessions s \
                             WHERE s.id = handoffs.from_session_id AND s.ended_at IS NULL \
                               AND EXISTS (SELECT 1 FROM observations o \
                                           WHERE o.session_id = s.id AND o.created_at > ?4)) \
@@ -5622,7 +5900,7 @@ fn expire_superseded_auto_handoffs(
     let mut stmt = tx.prepare(
         "SELECT id, cwd, created_at FROM handoffs \
          WHERE workspace_id = ?1 AND project_id = ?2 \
-           AND state = 'open' AND from_session_id IS NOT NULL \
+           AND state = 'open' AND from_session_id IS NOT NULL AND manual = 0 \
            AND owner_user IS ?3 \
            AND NOT EXISTS (SELECT 1 FROM sessions s \
                            WHERE s.id = handoffs.from_session_id AND s.ended_at IS NULL \
@@ -6493,6 +6771,192 @@ pub fn rename_project(
     Ok(())
 }
 
+/// What [`adopt_project_identity`] changed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AdoptedProjectIdentity {
+    /// The project that now carries the repository identity, under its
+    /// final name.
+    pub project: String,
+    /// That project's name before the move.
+    pub previous: String,
+    /// The emptied project's name afterwards.
+    pub archived: String,
+    /// The repository identity that moved.
+    pub identity: String,
+}
+
+/// Move the repository identity of the empty project `from` onto `into`, the
+/// project that holds the checkout's sessions (#1993).
+///
+/// A checkout captured before it had a git remote keeps its sessions in a
+/// project named after the folder, while the remote, once added, gets its own
+/// project. Renaming alone leaves the identity on the remote project, so
+/// identity-based resolution keeps routing new work there. This moves the
+/// identity and its derived name keys, gives `into` the remote-derived name,
+/// and renames `from` to `archive_name` (default `<name>-split-<YYYYMMDD>`)
+/// when it held that name. Nothing is deleted. It is idempotent once applied.
+///
+/// # Errors
+/// - [`StoreError::NotFound`] when either project is missing from the
+///   workspace.
+/// - [`StoreError::InvalidState`] when the two are the same project, `from`
+///   carries no identity, `into` already carries a different one, `from`
+///   holds sessions or pages, or a managed run is live in `from`.
+/// - [`StoreError::ProjectNameTaken`] / [`StoreError::InvalidProjectName`]
+///   from the renames.
+pub fn adopt_project_identity(
+    conn: &mut Connection,
+    workspace_id: &WorkspaceId,
+    into: &ProjectId,
+    from: &ProjectId,
+    archive_name: Option<&str>,
+    author_id: Option<ai_memory_core::UserId>,
+) -> StoreResult<AdoptedProjectIdentity> {
+    if into == from {
+        return Err(StoreError::InvalidState(
+            "a project cannot adopt its own identity".into(),
+        ));
+    }
+    let tx = conn.transaction()?;
+    let load = |id: &ProjectId| -> StoreResult<[String; 5]> {
+        tx.query_row(
+            "SELECT name, identity, identity_source, canonical_name, legacy_name \
+             FROM projects WHERE id = ?1 AND workspace_id = ?2",
+            params![id.as_bytes(), workspace_id.as_bytes()],
+            |row| {
+                Ok([
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                ])
+            },
+        )
+        .optional()?
+        .ok_or_else(|| {
+            StoreError::NotFound(format!(
+                "project id {id} is not in workspace {workspace_id}"
+            ))
+        })
+    };
+    let [into_name, into_identity, ..] = load(into)?;
+    let [from_name, identity, source, canonical, legacy] = load(from)?;
+    let count = |sql: &str| -> StoreResult<i64> {
+        Ok(tx.query_row(sql, [from.as_bytes()], |row| row.get(0))?)
+    };
+    if count("SELECT COUNT(*) FROM sessions WHERE project_id = ?1")? > 0
+        || count("SELECT COUNT(*) FROM pages WHERE project_id = ?1")? > 0
+    {
+        return Err(StoreError::InvalidState(format!(
+            "project '{from_name}' holds its own sessions or pages; compare the two projects \
+             before merging them"
+        )));
+    }
+    if identity.is_empty() {
+        if into_identity.is_empty() {
+            return Err(StoreError::InvalidState(format!(
+                "project '{from_name}' has no repository identity to move"
+            )));
+        }
+        // Already applied: the empty project gave its identity away earlier.
+        return Ok(AdoptedProjectIdentity {
+            previous: into_name.clone(),
+            project: into_name,
+            archived: from_name,
+            identity: into_identity,
+        });
+    }
+    if !into_identity.is_empty() && into_identity != identity {
+        return Err(StoreError::InvalidState(format!(
+            "project '{into_name}' already belongs to repository {into_identity}"
+        )));
+    }
+    if count(
+        "SELECT COUNT(*) FROM managed_runs r JOIN workstreams w ON w.id = r.workstream_id \
+         WHERE w.project_id = ?1 AND r.state = 'active'",
+    )? > 0
+    {
+        return Err(StoreError::InvalidState(format!(
+            "a managed run is still active in project '{from_name}'; let it finish first"
+        )));
+    }
+    let target = if canonical.is_empty() {
+        from_name.clone()
+    } else {
+        canonical.clone()
+    };
+    // The identity index is unique per workspace: clear it on `from` before
+    // `into` takes it.
+    tx.execute(
+        "UPDATE projects SET identity = '', identity_source = '', canonical_name = '', \
+         legacy_name = '' WHERE id = ?1",
+        [from.as_bytes()],
+    )?;
+    let archived = if from_name == target {
+        let archive = archive_name.map_or_else(
+            || {
+                format!(
+                    "{from_name}-split-{}",
+                    jiff::Zoned::now().strftime("%Y%m%d")
+                )
+            },
+            |name| name.trim().to_owned(),
+        );
+        rename_project_in_tx(
+            &tx,
+            workspace_id,
+            from,
+            Some(&from_name),
+            &archive,
+            author_id,
+            "adopt_project_identity",
+        )?;
+        archive
+    } else {
+        from_name
+    };
+    if into_name != target {
+        rename_project_in_tx(
+            &tx,
+            workspace_id,
+            into,
+            Some(&into_name),
+            &target,
+            author_id,
+            "adopt_project_identity",
+        )?;
+    }
+    tx.execute(
+        "UPDATE projects SET identity = ?1, identity_source = ?2, canonical_name = ?3, \
+         legacy_name = ?4 WHERE id = ?5",
+        params![identity, source, canonical, legacy, into.as_bytes()],
+    )?;
+    let detail = serde_json::json!({
+        "identity": identity,
+        "into": target,
+        "from": archived,
+    })
+    .to_string();
+    audit_with_detail(
+        &tx,
+        "adopt_project_identity",
+        Some(workspace_id.as_bytes()),
+        Some(into.as_bytes()),
+        None,
+        author_id.as_ref().map(ai_memory_core::UserId::as_bytes),
+        Timestamp::now().as_microsecond(),
+        &detail,
+    )?;
+    tx.commit()?;
+    Ok(AdoptedProjectIdentity {
+        project: target,
+        previous: into_name,
+        archived,
+        identity,
+    })
+}
+
 /// Record a successfully-applied wiki-structure migration.
 ///
 /// Uses `INSERT OR IGNORE` so re-running the same name is a no-op
@@ -7361,6 +7825,19 @@ pub(crate) fn purge_session_with_owner(
         rusqlite::params![format!("session:{session_id}")],
     )?;
 
+    // Query-signal associations (#1941) this session wrote last carry its
+    // query text. The row goes with the session, even when earlier sessions
+    // also confirmed it: the text is the user's, and the boost is a
+    // convenience that the next confirming session rebuilds. Not scoped to
+    // this project: a row is filed under the QUERIED project, so a session
+    // that searched a sibling scope left its text there. No index covers
+    // `last_session`; this rare path scans the opt-in table rather than make
+    // every signal upsert maintain one.
+    tx.execute(
+        "DELETE FROM query_page_signals WHERE last_session = ?1",
+        rusqlite::params![session_id.to_string()],
+    )?;
+
     // Tombstone before the row goes, in the same transaction: a purge that
     // committed the deletion but not the tombstone would be undone by the
     // next spool drain (#387).
@@ -7879,6 +8356,21 @@ pub fn purge_project(
         rusqlite::params![&pid[..], workspace_id.as_bytes()],
     )?;
 
+    // Query signals this project's sessions filed under OTHER projects carry
+    // their query text; the cascade below only reaches this project's rows.
+    // Must run before the cascade removes the sessions it matches against.
+    // Same membership guard as the checkpoints above: a project id paired
+    // with another workspace deletes no project, so it must not take that
+    // live project's signals either.
+    let owned: bool = tx.query_row(
+        "SELECT EXISTS(SELECT 1 FROM projects WHERE id = ?1 AND workspace_id = ?2)",
+        rusqlite::params![&pid[..], workspace_id.as_bytes()],
+        |row| row.get(0),
+    )?;
+    if owned {
+        delete_query_signals_of_sessions(&tx, "project_id = ?1", &pid[..])?;
+    }
+
     // Cascade handles pages / sessions / observations / handoffs /
     // page_embeddings. The workspace row is intentionally left intact —
     // other projects may still live there.
@@ -7933,6 +8425,30 @@ pub fn purge_project(
         workstream_ids,
         compacted,
     })
+}
+
+/// Delete the query-signal rows (#1941) whose `last_session` is one of the
+/// sessions `sessions_where` selects, in any project.
+///
+/// A signal row is filed under the project that was queried, not the one the
+/// session belongs to, so a purge's own cascade misses the rows its sessions
+/// left in sibling scopes — and each still holds the session's query text.
+/// `last_session` is the session id's hyphenated text form (see
+/// [`record_query_page_signal`]), rebuilt here from the blob key so the delete
+/// is one statement rather than a per-session loop.
+fn delete_query_signals_of_sessions(
+    tx: &rusqlite::Transaction<'_>,
+    sessions_where: &str,
+    id: &[u8],
+) -> StoreResult<u64> {
+    let sql = format!(
+        "DELETE FROM query_page_signals WHERE last_session IN ( \
+           SELECT lower(substr(hex(id), 1, 8) || '-' || substr(hex(id), 9, 4) || '-' \
+                     || substr(hex(id), 13, 4) || '-' || substr(hex(id), 17, 4) || '-' \
+                     || substr(hex(id), 21, 12)) \
+             FROM sessions WHERE {sessions_where})"
+    );
+    Ok(tx.execute(&sql, rusqlite::params![id])? as u64)
 }
 
 /// Summary returned by [`delete_workspace`].
@@ -8119,6 +8635,9 @@ pub fn delete_workspace(
         rusqlite::params![&wid[..]],
     )?;
 
+    // Same cross-scope query-signal cleanup as `purge_project`, before the
+    // cascade removes the sessions it matches against.
+    delete_query_signals_of_sessions(&tx, "workspace_id = ?1", &wid[..])?;
     let removed = tx.execute(
         "DELETE FROM workspaces WHERE id = ?1",
         rusqlite::params![&wid[..]],
@@ -8363,6 +8882,7 @@ pub fn move_project_workspace(
         "profile_candidates",
         "profile_entry_ledger",
         "profile_harvest_marks",
+        "query_page_signals",
     ] {
         tx.execute(
             &format!(
@@ -8645,6 +9165,7 @@ pub fn merge_project(
         "session_consolidation_jobs",
         "page_feedback",
         "purged_sessions",
+        "query_page_signals",
     ] {
         tx.execute(
             &format!("UPDATE {table} SET project_id = ?1 WHERE project_id = ?2"),
@@ -9927,6 +10448,7 @@ pub(crate) mod tests {
             title: "hook".into(),
             body: "observation".into(),
             importance: 5,
+            file_path: None,
         }
     }
 
@@ -10306,6 +10828,7 @@ pub(crate) mod tests {
             importance: 5,
 
             occurred_at: None,
+            file_path: None,
         };
         insert_observation(&mut conn, &stray).unwrap();
 
@@ -10413,6 +10936,7 @@ pub(crate) mod tests {
             importance: 5,
 
             occurred_at: None,
+            file_path: None,
         };
         insert_observation(&mut conn, &stray_observation).unwrap();
 
@@ -10888,6 +11412,7 @@ pub(crate) mod tests {
             importance: 5,
 
             occurred_at: None,
+            file_path: None,
         };
         insert_observation(&mut conn, &collateral_obs).unwrap();
 
@@ -11868,6 +12393,251 @@ pub(crate) mod tests {
         assert_eq!(summary, "/turn/2 baton");
     }
 
+    fn session_baton(
+        ws: WorkspaceId,
+        proj: ProjectId,
+        from: Option<SessionId>,
+        cwd: &str,
+        summary: &str,
+    ) -> NewHandoff {
+        NewHandoff {
+            workspace_id: ws,
+            project_id: proj,
+            from_session_id: from,
+            from_agent: AgentKind::Codex,
+            to_agent: None,
+            cwd: Some(cwd.into()),
+            summary: summary.into(),
+            open_questions: Vec::new(),
+            next_steps: Vec::new(),
+            files_touched: Vec::new(),
+            owner_user: Some("user:alice".into()),
+        }
+    }
+
+    fn handoff_state(conn: &Connection, id: &HandoffId) -> String {
+        conn.query_row(
+            "SELECT state FROM handoffs WHERE id = ?1",
+            params![id.as_bytes()],
+            |r| r.get(0),
+        )
+        .unwrap()
+    }
+
+    fn open_handoff_summaries(conn: &Connection) -> Vec<String> {
+        let mut stmt = conn
+            .prepare("SELECT summary FROM handoffs WHERE state = 'open' ORDER BY summary")
+            .unwrap();
+        stmt.query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap()
+    }
+
+    // #2012: a session that wrapped up with `memory_handoff_begin` ends
+    // without a template baton beside it, and its turn checkpoints write none
+    // while that explicit handoff is open. A session with no explicit handoff
+    // still gets its baton, and once the explicit one is claimed the session's
+    // later checkpoints publish again.
+    #[test]
+    fn an_open_explicit_handoff_replaces_the_sessions_template_baton() {
+        let (_tmp, mut conn, ws, proj) = fresh_db();
+        let owner = OwnerFilter::User("user:alice".into());
+        let admit = |conn: &mut Connection, session: &NewSession| {
+            admitted_session(
+                admit_hook_session_event(
+                    conn,
+                    session,
+                    &hook_observation(session),
+                    &owner,
+                    None,
+                    None,
+                )
+                .unwrap(),
+            )
+        };
+        let wrapped = hook_session(SessionId::new(), ws, proj, Some("user:alice"));
+        let wrapped_guard = admit(&mut conn, &wrapped);
+        let plain = hook_session(SessionId::new(), ws, proj, Some("user:alice"));
+        let plain_guard = admit(&mut conn, &plain);
+
+        let explicit = insert_manual_handoff(
+            &mut conn,
+            &session_baton(ws, proj, Some(wrapped.id), "/repo", "explicit"),
+        )
+        .unwrap();
+        assert_eq!(
+            checkpoint_session_handoff(
+                &mut conn,
+                &session_baton(ws, proj, Some(wrapped.id), "/repo", "checkpoint"),
+            )
+            .unwrap(),
+            None,
+            "a turn checkpoint keeps the open explicit handoff instead",
+        );
+        assert_eq!(
+            end_admitted_session_with_handoff(
+                &mut conn,
+                &wrapped_guard,
+                None,
+                &session_baton(ws, proj, Some(wrapped.id), "/repo", "template"),
+                None,
+            )
+            .unwrap(),
+            None,
+            "the session ends without a template baton",
+        );
+        let ended: bool = conn
+            .query_row(
+                "SELECT ended_at IS NOT NULL FROM sessions WHERE id = ?1",
+                params![wrapped.id.as_bytes()],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(ended, "the end itself still lands");
+        assert_eq!(handoff_state(&conn, &explicit), "open");
+
+        let plain_baton = end_admitted_session_with_handoff(
+            &mut conn,
+            &plain_guard,
+            None,
+            &session_baton(ws, proj, Some(plain.id), "/other", "plain template"),
+            None,
+        )
+        .unwrap();
+        assert!(
+            plain_baton.is_some(),
+            "another session's explicit handoff does not suppress this one's baton",
+        );
+        assert_eq!(
+            open_handoff_summaries(&conn),
+            vec!["explicit".to_owned(), "plain template".to_owned()],
+        );
+
+        let live = hook_session(SessionId::new(), ws, proj, Some("user:alice"));
+        begin_session(&mut conn, &live).unwrap();
+        let live_explicit = insert_manual_handoff(
+            &mut conn,
+            &session_baton(ws, proj, Some(live.id), "/live", "live explicit"),
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE handoffs SET state = 'accepted' WHERE id = ?1",
+            params![live_explicit.as_bytes()],
+        )
+        .unwrap();
+        assert!(
+            checkpoint_session_handoff(
+                &mut conn,
+                &session_baton(ws, proj, Some(live.id), "/live", "later turn"),
+            )
+            .unwrap()
+            .is_some(),
+            "work after a claimed explicit handoff gets a baton again",
+        );
+    }
+
+    // #2012: writing an explicit handoff retires its own session's open
+    // automatic batons, and nothing else: another open session's baton, the
+    // session's baton in another project and a claimed one all stay as they were.
+    #[test]
+    fn an_explicit_handoff_retires_only_its_own_sessions_automatic_batons() {
+        let (_tmp, mut conn, ws, proj) = fresh_db();
+        let other_proj = get_or_create_project(&mut conn, &ws, "other", None).unwrap();
+        let session = hook_session(SessionId::new(), ws, proj, Some("user:alice"));
+        begin_session(&mut conn, &session).unwrap();
+        let sibling = hook_session(SessionId::new(), ws, proj, Some("user:alice"));
+        begin_session(&mut conn, &sibling).unwrap();
+
+        let own = checkpoint_session_handoff(
+            &mut conn,
+            &session_baton(ws, proj, Some(session.id), "/repo", "own checkpoint"),
+        )
+        .unwrap()
+        .unwrap();
+        let siblings = checkpoint_session_handoff(
+            &mut conn,
+            &session_baton(ws, proj, Some(sibling.id), "/repo", "sibling checkpoint"),
+        )
+        .unwrap()
+        .unwrap();
+        let elsewhere = insert_handoff(
+            &mut conn,
+            &session_baton(ws, other_proj, Some(session.id), "/repo", "elsewhere"),
+        )
+        .unwrap();
+
+        insert_manual_handoff(
+            &mut conn,
+            &session_baton(ws, proj, Some(session.id), "/repo", "explicit"),
+        )
+        .unwrap();
+
+        assert_eq!(handoff_state(&conn, &own), "expired");
+        assert_eq!(handoff_state(&conn, &siblings), "open");
+        assert_eq!(handoff_state(&conn, &elsewhere), "open");
+
+        // Without a source session an explicit handoff retires nothing.
+        insert_manual_handoff(&mut conn, &session_baton(ws, proj, None, "/repo", "bare")).unwrap();
+        assert_eq!(handoff_state(&conn, &siblings), "open");
+    }
+
+    // #2014: an explicit handoff that records its session stays manual. A
+    // later automatic baton from the same cwd and the sweep after claiming one
+    // both leave it open, which they would do to an automatic baton.
+    #[test]
+    fn an_explicit_handoff_with_a_session_is_never_swept_as_automatic() {
+        let (_tmp, mut conn, ws, proj) = fresh_db();
+        let source = hook_session(SessionId::new(), ws, proj, Some("user:alice"));
+        begin_session(&mut conn, &source).unwrap();
+        end_session(&mut conn, &source.id, None).unwrap();
+        let explicit = insert_manual_handoff(
+            &mut conn,
+            &session_baton(ws, proj, Some(source.id), "/repo", "explicit"),
+        )
+        .unwrap();
+        let control = insert_handoff(
+            &mut conn,
+            &session_baton(ws, proj, Some(source.id), "/repo", "automatic"),
+        )
+        .unwrap();
+
+        let later = hook_session(SessionId::new(), ws, proj, Some("user:alice"));
+        begin_session(&mut conn, &later).unwrap();
+        end_session(&mut conn, &later.id, None).unwrap();
+        let newest = insert_handoff(
+            &mut conn,
+            &session_baton(ws, proj, Some(later.id), "/repo", "newest"),
+        )
+        .unwrap();
+        assert_eq!(
+            handoff_state(&conn, &control),
+            "expired",
+            "control: the same-cwd sweep retires an automatic baton",
+        );
+        assert_eq!(handoff_state(&conn, &explicit), "open");
+
+        let receiver = hook_session(SessionId::new(), ws, proj, Some("user:alice"));
+        begin_session(&mut conn, &receiver).unwrap();
+        assert!(
+            accept_handoff(
+                &mut conn,
+                &HandoffAcceptance {
+                    handoff_id: newest,
+                    workspace_id: ws,
+                    project_id: proj,
+                    accepting_agent: AgentKind::Codex,
+                    accepting_session: Some(receiver.id),
+                    accepting_user: Some("user:alice".into()),
+                    owner_filter: OwnerFilter::User("user:alice".into()),
+                    receiving_cwd: Some("/repo".into()),
+                },
+            )
+            .unwrap()
+        );
+        assert_eq!(handoff_state(&conn, &explicit), "open");
+    }
+
     fn embed_failure_rows(conn: &Connection) -> i64 {
         conn.query_row("SELECT COUNT(*) FROM page_embed_failures", [], |r| r.get(0))
             .unwrap()
@@ -12528,6 +13298,7 @@ pub(crate) mod tests {
             importance: 5,
 
             occurred_at: None,
+            file_path: None,
         };
         insert_observation(&mut conn, &stray_observation).unwrap();
 
@@ -14776,6 +15547,7 @@ pub(crate) mod tests {
                 title: "Read".into(),
                 body: "README.md".into(),
                 importance: 5,
+                file_path: None,
             },
         )
         .unwrap();
@@ -14837,6 +15609,7 @@ pub(crate) mod tests {
                 title: "stop".into(),
                 body: String::new(),
                 importance: 5,
+                file_path: None,
             },
         )
         .unwrap();
@@ -14884,6 +15657,7 @@ pub(crate) mod tests {
                 title: "hello".into(),
                 body: "do the thing".into(),
                 importance: 5,
+                file_path: None,
             },
         )
         .unwrap();
@@ -14945,6 +15719,7 @@ pub(crate) mod tests {
                     title: "t".into(),
                     body: "b".into(),
                     importance: 5,
+                    file_path: None,
                 },
             )
             .unwrap();
@@ -15402,6 +16177,7 @@ pub(crate) mod tests {
                 title: "hook".into(),
                 body: "observation".into(),
                 importance: 5,
+                file_path: None,
             },
         )
         .unwrap();
@@ -15447,6 +16223,7 @@ pub(crate) mod tests {
                 title: "hook".into(),
                 body: "observation".into(),
                 importance: 5,
+                file_path: None,
             },
         )
         .unwrap();
@@ -16229,6 +17006,7 @@ pub(crate) mod tests {
                 title: "t".into(),
                 body: "b".into(),
                 importance: 5,
+                file_path: None,
             },
         )
         .unwrap();
@@ -16797,6 +17575,7 @@ pub(crate) mod tests {
                     title: format!("movable-obs-{n}"),
                     body: "zebra token body".into(),
                     importance: 5,
+                    file_path: None,
                 },
             )
             .unwrap();
@@ -17446,6 +18225,7 @@ pub(crate) mod tests {
                     title: format!("stray-obs-{i}"),
                     body: "zebra token body".into(),
                     importance: 5,
+                    file_path: None,
                 },
             )
             .unwrap();
@@ -18154,6 +18934,7 @@ pub(crate) mod tests {
                     title: format!("call {i}"),
                     body: "body".into(),
                     importance: 5,
+                    file_path: None,
                 },
             )
             .unwrap();
@@ -18516,6 +19297,7 @@ pub(crate) mod tests {
                     title: format!("call {i}"),
                     body: "body".into(),
                     importance: 5,
+                    file_path: None,
                 },
             )
             .unwrap();
@@ -18608,6 +19390,7 @@ pub(crate) mod tests {
                     title: "before v20".into(),
                     body: "existing observation survives table rebuild".into(),
                     importance: 5,
+                    file_path: None,
                 },
             )
             .unwrap();
@@ -19138,6 +19921,7 @@ pub(crate) mod tests {
             title: "t".into(),
             body: "b".into(),
             importance: 5,
+            file_path: None,
         };
         assert!(
             insert_observation(&mut conn, &mismatched_obs).is_err(),
@@ -19191,6 +19975,155 @@ pub(crate) mod tests {
     /// `404 Not Found`. Pins both the writer-side semantic and a
     /// concrete recipe for the failure shape so a future refactor
     /// can't quietly downgrade the error back to a silent Ok.
+    /// A folder-named project holding the sessions (`api`) and the empty
+    /// remote-named project that owns the repository identity (`acme-api`):
+    /// the state #1993 left behind.
+    fn split_projects(conn: &mut Connection, ws: &WorkspaceId) -> (ProjectId, ProjectId) {
+        let folder = get_or_create_project(conn, ws, "api", None).unwrap();
+        begin_session(conn, &hook_session(SessionId::new(), *ws, folder, None)).unwrap();
+        let (remote, _) = resolve_project_by_identity(
+            conn,
+            ws,
+            &acme_api_identity(),
+            ai_memory_core::repository_identity::IdentityStyle::Path,
+            false,
+            "acme-api",
+            None,
+            None,
+            None,
+            crate::AccessMode::Open,
+        )
+        .unwrap();
+        assert_ne!(folder, remote, "the fixture must reproduce the split");
+        (folder, remote)
+    }
+
+    fn acme_api_identity() -> ai_memory_core::repository_identity::RepositoryIdentity {
+        ai_memory_core::repository_identity::RepositoryIdentity {
+            identity: "github.com/acme/api".into(),
+            source: ai_memory_core::repository_identity::IdentitySource::GitRemote,
+        }
+    }
+
+    fn name_and_identity(conn: &Connection, id: &ProjectId) -> (String, String) {
+        conn.query_row(
+            "SELECT name, identity FROM projects WHERE id = ?1",
+            [id.as_bytes()],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap()
+    }
+
+    /// Identity-based resolution reaches the session-holding project after the
+    /// move, for a fresh split and for one already renamed by hand (the
+    /// half-repaired state 3.4.1's two renames left), and a second call
+    /// changes nothing.
+    #[test]
+    fn adopt_project_identity_routes_the_remote_to_the_session_project() {
+        for renamed_by_hand in [false, true] {
+            let (_tmp, mut conn, ws, _) = fresh_db();
+            let (folder, remote) = split_projects(&mut conn, &ws);
+            if renamed_by_hand {
+                rename_project(&mut conn, &ws, &remote, "acme-api-split-20261105", None).unwrap();
+                rename_project(&mut conn, &ws, &folder, "acme-api", None).unwrap();
+            }
+            let adopted = adopt_project_identity(
+                &mut conn,
+                &ws,
+                &folder,
+                &remote,
+                Some("acme-api-split-20261105"),
+                None,
+            )
+            .unwrap();
+            assert_eq!(
+                adopted,
+                AdoptedProjectIdentity {
+                    project: "acme-api".into(),
+                    previous: String::from(if renamed_by_hand { "acme-api" } else { "api" }),
+                    archived: "acme-api-split-20261105".into(),
+                    identity: "github.com/acme/api".into(),
+                },
+                "renamed_by_hand={renamed_by_hand}"
+            );
+            assert_eq!(
+                name_and_identity(&conn, &folder),
+                ("acme-api".into(), "github.com/acme/api".into())
+            );
+            assert_eq!(
+                name_and_identity(&conn, &remote),
+                ("acme-api-split-20261105".into(), String::new())
+            );
+            let (resolved, _) = resolve_project_by_identity(
+                &mut conn,
+                &ws,
+                &acme_api_identity(),
+                ai_memory_core::repository_identity::IdentityStyle::Path,
+                false,
+                "acme-api",
+                None,
+                None,
+                None,
+                crate::AccessMode::Open,
+            )
+            .unwrap();
+            assert_eq!(resolved, folder, "renamed_by_hand={renamed_by_hand}");
+            let again =
+                adopt_project_identity(&mut conn, &ws, &folder, &remote, None, None).unwrap();
+            assert_eq!(
+                again,
+                AdoptedProjectIdentity {
+                    previous: "acme-api".into(),
+                    ..adopted
+                },
+                "applying it twice changes nothing"
+            );
+        }
+    }
+
+    /// Each refusal leaves both projects exactly as they were.
+    #[test]
+    fn adopt_project_identity_refuses_anything_that_could_hide_data() {
+        let (_tmp, mut conn, ws, _) = fresh_db();
+        let (folder, remote) = split_projects(&mut conn, &ws);
+        let before = (
+            name_and_identity(&conn, &folder),
+            name_and_identity(&conn, &remote),
+        );
+        let refused = |conn: &mut Connection, into: &ProjectId, from: &ProjectId| {
+            let error = adopt_project_identity(conn, &ws, into, from, None, None).unwrap_err();
+            assert!(matches!(error, StoreError::InvalidState(_)), "{error:?}");
+        };
+        // The session project cannot give away the identity it lacks, and a
+        // project cannot adopt itself.
+        refused(&mut conn, &remote, &folder);
+        refused(&mut conn, &folder, &folder);
+        // The remote project holds a session of its own.
+        let session = SessionId::new();
+        begin_session(&mut conn, &hook_session(session, ws, remote, None)).unwrap();
+        refused(&mut conn, &folder, &remote);
+        assert_eq!(
+            (
+                name_and_identity(&conn, &folder),
+                name_and_identity(&conn, &remote)
+            ),
+            before
+        );
+        // The session project already belongs to another repository.
+        let (_tmp, mut conn, ws, _) = fresh_db();
+        let (folder, remote) = split_projects(&mut conn, &ws);
+        conn.execute(
+            "UPDATE projects SET identity = 'github.com/acme/other', identity_source = 'git_remote' \
+             WHERE id = ?1",
+            [folder.as_bytes()],
+        )
+        .unwrap();
+        let error =
+            adopt_project_identity(&mut conn, &ws, &folder, &remote, None, None).unwrap_err();
+        assert!(matches!(error, StoreError::InvalidState(_)), "{error:?}");
+        assert_eq!(name_and_identity(&conn, &remote).1, "github.com/acme/api");
+    }
+
     #[test]
     fn rename_project_after_purge_returns_not_found() {
         let (_tmp, mut conn, ws, proj) = fresh_db();
@@ -20147,7 +21080,9 @@ pub(crate) mod tests {
                 None,
                 None,
             ),
-            Err(StoreError::SessionCollision)
+            Err(StoreError::SessionAgentMismatch {
+                bound: AgentKind::Codex
+            })
         ));
 
         let observations: u64 = conn
@@ -20366,7 +21301,9 @@ pub(crate) mod tests {
         let end = session_end_observation(&drifted);
         assert!(matches!(
             admit_hook_session_event(&mut conn, &drifted, &end, &alice, None, None),
-            Err(StoreError::SessionCollision)
+            Err(StoreError::SessionAgentMismatch {
+                bound: AgentKind::OpenCode
+            })
         ));
     }
 
@@ -20455,7 +21392,9 @@ pub(crate) mod tests {
                 Some("agent-key"),
                 None,
             ),
-            Err(StoreError::SessionCollision)
+            Err(StoreError::SessionAgentMismatch {
+                bound: AgentKind::Codex
+            })
         ));
         let counts: (u64, u64) = conn
             .query_row(

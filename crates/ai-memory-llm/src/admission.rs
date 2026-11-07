@@ -109,13 +109,15 @@ impl ChatTokenCounter {
 ///
 /// Construct once around the *entire* primary/fallback chain, then clone the
 /// resulting `Arc<dyn LlmProvider>` into every job. This keeps fallback
-/// attempts under the same permit as the original call.
+/// attempts under the same permit as the original call. A chain configured
+/// for one workload joins through [`AdmittedLlmProvider::sharing`], so the
+/// process still has one request in flight however its jobs are routed.
 pub struct AdmittedLlmProvider {
     inner: Arc<dyn LlmProvider>,
-    in_flight: Semaphore,
-    waiting: AtomicUsize,
+    in_flight: Arc<Semaphore>,
+    waiting: Arc<AtomicUsize>,
     max_waiters: usize,
-    tokenizer: Option<Tokenizer>,
+    tokenizer: Option<Arc<Tokenizer>>,
     max_input_tokens: Option<usize>,
     ambiguous_cooldown: Duration,
     jitter_max_secs: u8,
@@ -140,33 +142,52 @@ impl AdmittedLlmProvider {
         max_input_tokens: Option<usize>,
         tokenizer_path: Option<&Path>,
     ) -> LlmResult<Self> {
-        let tokenizer =
-            match (max_input_tokens, tokenizer_path) {
-                (Some(0), _) => {
-                    return Err(LlmError::NotConfigured(
-                        "llm_max_input_tokens must be greater than zero".into(),
-                    ));
-                }
-                (Some(_), Some(path)) => Some(Tokenizer::from_file(path).map_err(|_| {
+        let tokenizer = match (max_input_tokens, tokenizer_path) {
+            (Some(0), _) => {
+                return Err(LlmError::NotConfigured(
+                    "llm_max_input_tokens must be greater than zero".into(),
+                ));
+            }
+            (Some(_), Some(path)) => {
+                Some(Arc::new(Tokenizer::from_file(path).map_err(|_| {
                     LlmError::NotConfigured("cannot load llm_tokenizer_path".into())
-                })?),
-                (Some(_), None) => {
-                    return Err(LlmError::NotConfigured(
-                        "llm_tokenizer_path is required with llm_max_input_tokens".into(),
-                    ));
-                }
-                (None, _) => None,
-            };
+                })?))
+            }
+            (Some(_), None) => {
+                return Err(LlmError::NotConfigured(
+                    "llm_tokenizer_path is required with llm_max_input_tokens".into(),
+                ));
+            }
+            (None, _) => None,
+        };
         Ok(Self {
             inner,
-            in_flight: Semaphore::new(1),
-            waiting: AtomicUsize::new(0),
+            in_flight: Arc::new(Semaphore::new(1)),
+            waiting: Arc::new(AtomicUsize::new(0)),
             max_waiters: MAX_WAITERS,
             tokenizer,
             max_input_tokens,
             ambiguous_cooldown: AMBIGUOUS_COOLDOWN,
             jitter_max_secs: 16,
         })
+    }
+
+    /// Admit `inner` through this guard's in-flight permit, waiting queue
+    /// and input cap. A separate guard per workload chain would let two
+    /// chains reach the provider at once, which the process-local
+    /// serialization exists to prevent.
+    #[must_use]
+    pub fn sharing(&self, inner: Arc<dyn LlmProvider>) -> Self {
+        Self {
+            inner,
+            in_flight: self.in_flight.clone(),
+            waiting: self.waiting.clone(),
+            max_waiters: self.max_waiters,
+            tokenizer: self.tokenizer.clone(),
+            max_input_tokens: self.max_input_tokens,
+            ambiguous_cooldown: self.ambiguous_cooldown,
+            jitter_max_secs: self.jitter_max_secs,
+        }
     }
 
     fn count_input_tokens(
@@ -480,6 +501,38 @@ mod tests {
         assert_eq!(inner.max_active.load(Ordering::Acquire), 1);
     }
 
+    // Mutation captured: a workload chain built with its own guard instead
+    // of `sharing` lets a second job type reach the provider while the
+    // first is still in flight.
+    #[tokio::test]
+    async fn a_sharing_chain_waits_for_the_permit_the_first_holds() {
+        let inner = Arc::new(BlockingProvider {
+            active: AtomicUsize::new(0),
+            max_active: AtomicUsize::new(0),
+            started: Notify::new(),
+            release: Semaphore::new(0),
+        });
+        let default = Arc::new(AdmittedLlmProvider::new(inner.clone(), None, None).unwrap());
+        let workload = Arc::new(default.sharing(inner.clone()));
+        let first = {
+            let default = default.clone();
+            tokio::spawn(async move { default.complete(ChatRequest::user_prompt("first")).await })
+        };
+        inner.started.notified().await;
+        let second = {
+            let workload = workload.clone();
+            tokio::spawn(async move { workload.complete(ChatRequest::user_prompt("second")).await })
+        };
+        while workload.waiting.load(Ordering::Acquire) == 0 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(inner.active.load(Ordering::Acquire), 1);
+        inner.release.add_permits(2);
+        first.await.unwrap().unwrap();
+        second.await.unwrap().unwrap();
+        assert_eq!(inner.max_active.load(Ordering::Acquire), 1);
+    }
+
     // Mutation captured: accepting an unbounded waiter permits an arbitrary
     // number of jobs to pile up behind one slow GPU request.
     #[tokio::test]
@@ -529,7 +582,7 @@ mod tests {
             .unwrap();
         let mut tokenizer = Tokenizer::new(model);
         tokenizer.with_pre_tokenizer(Some(Whitespace));
-        guard.tokenizer = Some(tokenizer);
+        guard.tokenizer = Some(Arc::new(tokenizer));
         guard.max_input_tokens = Some(1_090);
         let request = ChatRequest {
             system: None,

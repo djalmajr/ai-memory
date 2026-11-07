@@ -55,3 +55,4 @@ evals/models/
 # PowerShell module analysis cache, written when a test runs PowerShell
 # with LOCALAPPDATA inside the repository
 Microsoft/Windows/PowerShell/
+evals/.cache/
