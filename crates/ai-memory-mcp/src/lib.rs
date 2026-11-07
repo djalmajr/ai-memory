@@ -15,6 +15,7 @@ pub mod auth;
 mod compact_job;
 pub mod human_auth;
 pub mod identity;
+pub mod launch_scope;
 pub mod metrics;
 mod page_patch;
 pub mod self_service_keys;
@@ -23,8 +24,8 @@ pub mod session_management;
 
 pub use actor::actor_from_headers;
 pub use admin::{
-    AdminState, ScopeInvalidation, ScopeInvalidator, admin_router, admin_router_with_decay_breadth,
-    admin_router_with_sweep_tuning,
+    AdminState, BootstrapGate, ScopeInvalidation, ScopeInvalidator, admin_router,
+    admin_router_with_decay_breadth, admin_router_with_sweep_tuning,
 };
 pub use human_auth::{
     HumanAuthRuntime, expire_legacy_cookie_mw, internal_auth_router, public_auth_router,

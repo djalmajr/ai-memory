@@ -117,6 +117,20 @@ Windows 11 runs under emulation. Errors are thrown rather than exiting, so a
 failure under `iex` leaves your PowerShell window open. Details are in
 [`docs/windows.md`](windows.md).
 
+With [Scoop](https://scoop.sh), add the maintainer's bucket and install from it
+instead (ai-memory 3.4.0 or later):
+
+```powershell
+scoop bucket add akitaonrails https://github.com/akitaonrails/scoop-bucket
+scoop install ai-memory
+ai-memory setup
+```
+
+Scoop verifies the zip against the SHA-256 published with the release and puts
+an `ai-memory` shim on `PATH`. Update with `scoop update ai-memory`;
+`ai-memory upgrade` refuses a Scoop install, because the bucket owns the
+version.
+
 `ai-memory setup [--yes] [--agent <name>]... [--no-service] [--plan [--json]] [--web [--no-open]]`
 runs, in order, the commands a native install otherwise needs one by one:
 
@@ -132,11 +146,13 @@ runs, in order, the commands a native install otherwise needs one by one:
    `~/Library/LaunchAgents/com.github.akitaonrails.ai-memory.plist` on macOS,
    rendered from the packaged LaunchAgent. The unit runs the binary `setup` ran
    from. When that binary sits in a versioned package location (Homebrew's
-   `Cellar/ai-memory/<version>` or a `/nix/store` path, both gone after an
-   upgrade and `brew cleanup` or garbage collection), the unit names a stable
-   link that resolves to the same file instead: the path as invoked, an
-   `ai-memory` on `PATH` such as `~/.nix-profile/bin/ai-memory`, or Homebrew's
-   `opt/ai-memory/bin/ai-memory` or `bin/ai-memory`. With no such link it names
+   `Cellar/ai-memory/<version>`, a `/nix/store` path, or Scoop's
+   `apps\ai-memory\<version>`, all gone after an upgrade and `brew cleanup`,
+   garbage collection or `scoop cleanup`), the unit names a stable link that
+   resolves to the same file instead: the path as invoked, an `ai-memory` on
+   `PATH` such as `~/.nix-profile/bin/ai-memory`, Homebrew's
+   `opt/ai-memory/bin/ai-memory` or `bin/ai-memory`, or Scoop's
+   `apps\ai-memory\current\ai-memory.exe`. With no such link it names
    the versioned path, and you re-run `setup` after upgrading.
    On Windows there is no per-user service manager, so `setup` writes an
    `ai-memory` value under `HKCU\Software\Microsoft\Windows\CurrentVersion\Run`
@@ -576,6 +592,28 @@ take precedence; see
 [the marker-file reference](marker-file.md#install-wide-default-no-marker).
 
 ---
+
+## Homebrew (macOS and Linux)
+
+The `akitaonrails/tap` formula installs the release binary and its hook
+sources for macOS (Apple Silicon and Intel) and Linux (x86_64 and aarch64).
+On Linux it works with Homebrew on Linux, which is how atomic distributions
+such as Bazzite and Fedora Silverblue usually add command-line tools.
+
+```bash
+brew install akitaonrails/tap/ai-memory
+ai-memory setup
+```
+
+`ai-memory setup` creates the data directory and its bearer token, installs
+and starts its own user service (a LaunchAgent on macOS, a systemd user unit
+on Linux), wires the agents it finds and checks the result. The formula also
+defines a `brew services` entry. Use one or the other, not both: with
+`brew services start ai-memory`, run `ai-memory init` first and wire the
+agents with `ai-memory setup --no-service`. `brew upgrade ai-memory` replaces
+the binary under a versioned Cellar path, so a service started by
+`ai-memory setup` should point at the stable `$(brew --prefix)/bin/ai-memory`
+(see the note on versioned package locations above).
 
 ## Fedora (RPM)
 
@@ -2264,6 +2302,22 @@ and launch share the same captured environment plus `--env` / `--env-file`
 overrides. Malformed output, a timeout, or an unsupported future major fails with
 an actionable error instead of guessing.
 
+OpenCode 1 and 2 load plugins from the same `~/.config/opencode/plugins/`
+directory, and OpenCode 2 refuses the V1 plugin with "Plugin must export a
+default definition with an id and an effect or setup function". After upgrading
+OpenCode itself to 2.x, run `ai-memory install-hooks --agent opencode --apply`
+again (or `ai-memory upgrade`, which probes the installed major the same way):
+it writes `ai-memory-opencode2.ts` and removes the V1 `ai-memory.ts` it owns.
+
+A Claude Code compatibility layer inside OpenCode (such as oh-my-opencode's
+`claude_code.hooks`) may also run the hooks from `~/.claude/settings.json`. On
+native Windows those entries use Claude Code's exec form: `command` is the bare
+path to `ai-memory.exe` and the arguments sit in `args`, which Claude Code
+spawns without a shell, so a path with spaces is correct there. A layer that
+runs `command` through a shell and drops `args` splits that path at the first
+space and fails with `unrecognized subcommand`. Turn its Claude hooks off; the
+OpenCode plugin already captures those events.
+
 ### OpenCode V2 compatibility
 
 The generated plugin targets the OpenCode 2.0.10+ event API (checked against
@@ -3951,7 +4005,7 @@ are checked against the release workflow's exact layout but are not extracted
 during self-upgrade. Archives are capped at 4,096 entries and 512 MiB expanded,
 in addition to the 128 MiB response-body cap. Windows uses rename-aside
 (`.exe` → `.old`, then promote `.new`) because
-a running image cannot be overwritten in place. It refuses Homebrew/AUR/`/usr`
+a running image cannot be overwritten in place. It refuses Homebrew/AUR/Scoop/`/usr`
 installs (use the package manager), unwritable prefixes (for example Program
 Files; download the zip manually), and in-container binaries (upgrade the
 host wrapper/image instead). Windows aarch64 has no release asset yet. For

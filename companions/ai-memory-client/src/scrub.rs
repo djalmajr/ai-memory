@@ -199,10 +199,19 @@ fn secret_patterns() -> &'static [RedactionRule] {
             },
             RedactionRule {
                 regex: Regex::new(
-                    r"\b(?:github_pat_[A-Za-z0-9_]{20,}|gh[pousr]_[A-Za-z0-9]{20,}|sk-[A-Za-z0-9_-]{16,}|AKIA[0-9A-Z]{16})\b",
+                    r"\b(?:github_pat_[A-Za-z0-9_]{20,}|gh[pousr]_[A-Za-z0-9]{20,}|AKIA[0-9A-Z]{16})\b",
                 )
                 .unwrap(),
                 replacement: "[REDACTED CREDENTIAL]",
+            },
+            // Vendor `sk-` keys, anchored like the server's `api_key` rule: a
+            // letter right before the prefix means it ends a word (`task-…`),
+            // so only that may not start a match. A `\b` would also skip a key
+            // glued to `_`, a digit, a CJK character or a percent escape.
+            RedactionRule {
+                regex: Regex::new(r"(?P<pre>^|[^A-Za-z]|%[0-9A-Fa-f]{2})sk-[A-Za-z0-9_-]{16,}")
+                    .unwrap(),
+                replacement: "${pre}[REDACTED CREDENTIAL]",
             },
             RedactionRule {
                 regex: Regex::new(r"(?i)\b(bearer\s+)[A-Za-z0-9._~+/=-]{8,}").unwrap(),
@@ -225,7 +234,7 @@ fn secret_patterns() -> &'static [RedactionRule] {
             },
             RedactionRule {
                 regex: Regex::new(
-                    r#"(?i)\b(api[_-]?key|access[_-]?token|auth[_-]?token|token|secret|password)\b(\s*[:=]\s*)(\"[^\"\r\n]{6,}\"|'[^'\r\n]{6,}'|(?:\[REDACTED(?: CREDENTIAL| PRIVATE KEY)?\]|[^\s,;])+)"#,
+                    r#"(?i)\b(api[_-]?key|access[_-]?token|auth[_-]?token|token|secret|password)\b((?:\\*")?\s*[:=]\s*)(\\*"[^"\\\r\n]{6,}\\*"|'[^'\r\n]{6,}'|(?:\[REDACTED(?: CREDENTIAL| PRIVATE KEY)?\]|[^\s,;])+)"#,
                 )
                 .unwrap(),
                 replacement: "$1$2[REDACTED]",
