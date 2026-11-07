@@ -94,7 +94,7 @@ version in [`docs/changelog/`](docs/changelog/):
   should be run with the binary that is live before upgrading. Fresh
   installs (no database file, a zero-byte file, a store with no migration
   history) and stores already on the target schema do not warn, and a schema
-  that cannot be read only logs at debug and never blocks boot.
+  that cannot be read only logs at debug and never blocks boot. (#31)
 
 ### Fixed
 - Fixed `ai-memory restore` refusing the boot-time pre-migration backup
@@ -108,7 +108,7 @@ version in [`docs/changelog/`](docs/changelog/):
   `auth-tokens` as a file and an `auth-tokensx` path are still refused, and
   the receipt or `logs/` or `auth-tokens/` in any other shape (a directory or
   link named `pre-migration-backup.json`, a path outside the root, a
-  traversal or link entry under `logs/` or `auth-tokens/`) is still refused.
+  traversal or link entry under `logs/` or `auth-tokens/`) is still refused. (#31)
 - A skipped `relations:` entry on a stored page now names the page in its log
   warning, so an operator can find the page to fix. Together with the idle
   reconcile pass's skip of unchanged files (#1975), a page with an invalid target
