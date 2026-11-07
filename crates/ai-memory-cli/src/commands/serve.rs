@@ -1235,6 +1235,20 @@ fn keepalive_listener(
     })
 }
 
+/// Whether boot should warn that it is about to migrate the database schema
+/// without a pre-migration package. `snapshot_taken` is whether this boot's
+/// pre-open snapshot produced one (it only does on the 1.x→2.0 path, so
+/// every other schema upgrade runs without any backup); `status` is the
+/// schema position read before `Store::open`, `None` for a fresh install or
+/// an unreadable database — neither of which warns.
+#[must_use]
+fn warn_on_migration_without_backup(
+    snapshot_taken: bool,
+    status: Option<ai_memory_store::SchemaStatus>,
+) -> bool {
+    !snapshot_taken && status.is_some_and(|status| status.has_pending_migrations())
+}
+
 /// Run the `serve` subcommand.
 ///
 /// # Errors
@@ -1288,8 +1302,45 @@ pub async fn run(config: &Config, args: ServeArgs) -> Result<()> {
     let backup_dest_override = std::env::var("AI_MEMORY_BACKUP_DIR")
         .ok()
         .map(std::path::PathBuf::from);
-    migrations::snapshot_before_db_migration(&config.data_dir, backup_dest_override.as_deref())
-        .with_context(|| "taking the pre-migration safety backup")?;
+    let pre_migration_backup =
+        migrations::snapshot_before_db_migration(&config.data_dir, backup_dest_override.as_deref())
+            .with_context(|| "taking the pre-migration safety backup")?;
+
+    // The pre-open snapshot only takes a package on the 1.x→2.0 path, so
+    // every other schema migration (a 2.x→3.x upgrade of an already
+    // conformant store, for instance) would otherwise run with no backup at
+    // all. Warn when this boot is about to advance the schema without having
+    // created a package this boot. `None` also covers a package an earlier
+    // boot created and the receipt still points at: it may protect an older
+    // version than the one this migration starts from, so the warning says
+    // only that this boot made none. The version read is best-effort: a fresh
+    // install (no database, or no applied history yet) never warns, and an
+    // unreadable database must not block boot — `Store::open` below surfaces
+    // the real error.
+    if pre_migration_backup.is_none() {
+        let schema_status = match ai_memory_store::schema_status(&config.data_dir) {
+            Ok(status) => status,
+            Err(error) => {
+                tracing::debug!(
+                    %error,
+                    "could not read the database schema version; \
+                     the pre-migration backup warning is skipped"
+                );
+                None
+            }
+        };
+        if let Some(status) = schema_status
+            && warn_on_migration_without_backup(false, Some(status))
+        {
+            tracing::warn!(
+                current_schema_version = status.current,
+                target_schema_version = status.target,
+                "about to migrate the database schema without a new backup: this boot \
+                 did not create a pre-migration package. Run `ai-memory backup` with the \
+                 previous binary before upgrading to keep a restorable snapshot"
+            );
+        }
+    }
 
     let mut store = Store::open(&config.data_dir)
         .with_context(|| format!("opening store at {}", config.data_dir.display()))?;
@@ -3765,6 +3816,33 @@ mod tests {
             hint.contains("anthropic") && hint.contains("claude-haiku-4-5"),
             "the hint must still name what failed: {hint}"
         );
+    }
+
+    /// The boot warning fires only when this boot's pre-open snapshot took
+    /// no package AND the schema still needs a migration: a fresh install
+    /// never warns, an up-to-date store never warns, and a package taken
+    /// this boot (the 1.x→2.0 path) covers the migration.
+    #[test]
+    fn the_pre_migration_backup_warning_fires_only_on_a_pending_schema_without_a_package() {
+        use ai_memory_store::SchemaStatus;
+        let target = 99_u32;
+        let pending = SchemaStatus {
+            current: 50,
+            target,
+        };
+        let current = SchemaStatus {
+            current: target,
+            target,
+        };
+        assert!(
+            warn_on_migration_without_backup(false, Some(pending)),
+            "a pending schema with no package this boot must warn"
+        );
+        assert!(!warn_on_migration_without_backup(false, Some(current)));
+        assert!(!warn_on_migration_without_backup(false, None));
+        assert!(!warn_on_migration_without_backup(true, Some(pending)));
+        assert!(!warn_on_migration_without_backup(true, Some(current)));
+        assert!(!warn_on_migration_without_backup(true, None));
     }
 
     #[cfg(feature = "management-ui")]

@@ -84,8 +84,31 @@ version in [`docs/changelog/`](docs/changelog/):
   queue's retry, because the prompt never reached the model, and the fork's
   consolidator still sends a 429'd prompt once before the queue re-queues the
   job. (#18)
+- The server now logs a warning at boot when it is about to run pending
+  SQLite schema migrations without a pre-migration backup. The boot-time
+  snapshot exists only on the 1.x→2.0 OKF path, so the boot checks the
+  schema read-only (`ai_memory_store::schema_status`: highest applied
+  refinery version against the embedded migrations) whenever this boot created
+  no snapshot, and warns — with the current and target schema versions — that a
+  migration is about to run without a package and that `ai-memory backup`
+  should be run with the binary that is live before upgrading. Fresh
+  installs (no database file, a zero-byte file, a store with no migration
+  history) and stores already on the target schema do not warn, and a schema
+  that cannot be read only logs at debug and never blocks boot.
 
 ### Fixed
+- Fixed `ai-memory restore` refusing the boot-time pre-migration backup
+  package: the package tars the whole data dir, so its archive also carries
+  the `pre-migration-backup.json` receipt at the root, the server's `logs/`
+  directory, and the `auth-tokens/` directory when auth is on, beside
+  `wiki/`, `db/` and `config.toml`. Those non-data entries are now validated
+  as safe and skipped without being extracted, so none of them is written to
+  the data dir (a stale root bearer in the new data dir would be wrong). A
+  `logs/` or `auth-tokens/` inside the wiki still extracts as page content, an
+  `auth-tokens` as a file and an `auth-tokensx` path are still refused, and
+  the receipt or `logs/` or `auth-tokens/` in any other shape (a directory or
+  link named `pre-migration-backup.json`, a path outside the root, a
+  traversal or link entry under `logs/` or `auth-tokens/`) is still refused.
 - A skipped `relations:` entry on a stored page now names the page in its log
   warning, so an operator can find the page to fix. Together with the idle
   reconcile pass's skip of unchanged files (#1975), a page with an invalid target
