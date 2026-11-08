@@ -154,13 +154,6 @@ version in [`docs/changelog/`](docs/changelog/):
   `ai-memory-client` redacts the same keys in the external text it scrubs.
   Text stored before this release is not rewritten, so a key already captured
   stays in the store until it is purged. (#23)
-- Fixed an own-prefix key (`aim_`, `amk_`, `ams_`) whose body holds a vendor
-  fragment (`sk-…`, `ghp_…`, `sk_live_…`) being only partly redacted. 3.4.4 runs
-  its unanchored own-prefix rule after the vendor rules, and `ai-memory-client`
-  ran both own-prefix rules after its GitHub, AWS and `sk-` rules, so a vendor
-  rule redacted the fragment and the head of the key was stored. Both
-  own-prefix rules now run before every vendor rule, on the server and in the
-  client.
 - Stopped `config.toml` errors from echoing values, which could hold
   `[auth].bearer_token`, on every subcommand. A syntax error keeps the file, line
   and column, and a type error keeps the key and the expected type. (#23)
