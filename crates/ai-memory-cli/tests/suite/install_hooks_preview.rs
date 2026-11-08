@@ -2,7 +2,9 @@
 //! scrollback, a CI log or an agent's transcript keeps. No such run may print
 //! the token, for any agent and from any source: `--auth-token`, the
 //! environment, the config file, `[auth].bearer_token_file` or an installed MCP
-//! entry. These drive the shipped binary because the renderers print directly.
+//! entry: the preview embeds the `mask_secret` form (`<4-char prefix>...[REDACTED]`),
+//! never the full credential. These drive the shipped binary because the
+//! renderers print directly.
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
@@ -14,8 +16,12 @@ const TOKEN: &str = "aim_FAKEfakeFAKEfakeFAKEfakeFAKEfakeFAKEfake000";
 const TOKEN_BODY: &str = "FAKEfake";
 
 const TS_NULL_TOKEN: &str = "const TOKEN: string | null = null;";
-const TS_NOTE: &str = "the token is omitted from this preview";
-const PLACEHOLDER: &str = "<redacted>";
+/// The `mask_secret` form of [`TOKEN`]: a 4-character prefix plus the marker.
+const MASKED_TOKEN: &str = "aim_...[REDACTED]";
+/// What a generated TypeScript preview prints in place of [`TOKEN`].
+const TS_MASKED_TOKEN: &str = "const TOKEN: string | null = \"aim_...[REDACTED]\";";
+/// Cline's preview redacts the token with its own marker (upstream behavior).
+const CLINE_REDACTED: &str = "<redacted>";
 
 /// Generated TypeScript integrations.
 const TS_AGENTS: &[&str] = &["open-code", "opencode2", "pi", "omp", "openclaw"];
@@ -158,17 +164,11 @@ fn clean_preview(what: &str, mut cmd: Command) -> String {
 }
 
 fn assert_ts_preview(what: &str, stdout: &str) {
-    assert!(stdout.contains(TS_NULL_TOKEN), "{what}:\n{stdout}");
-    assert!(stdout.contains(TS_NOTE), "{what}:\n{stdout}");
+    assert!(stdout.contains(TS_MASKED_TOKEN), "{what}:\n{stdout}");
 }
 
-fn assert_placeholder_preview(what: &str, stdout: &str) {
-    assert!(stdout.contains(PLACEHOLDER), "{what}:\n{stdout}");
-    assert!(stdout.contains(TS_NOTE), "{what}:\n{stdout}");
-    assert!(
-        !stdout.contains("sensitive (chmod 600)"),
-        "{what} must not call a redacted preview sensitive:\n{stdout}"
-    );
+fn assert_masked_preview(what: &str, stdout: &str) {
+    assert!(stdout.contains(MASKED_TOKEN), "{what}:\n{stdout}");
 }
 
 /// Every agent in `agents` from `--auth-token`, then the first one from the
@@ -200,18 +200,18 @@ fn typescript_previews_render_a_null_token() {
 }
 
 #[test]
-fn json_hook_config_previews_show_the_placeholder() {
-    check_family(JSON_AGENTS, assert_placeholder_preview);
+fn json_hook_config_previews_show_the_masked_token() {
+    check_family(JSON_AGENTS, assert_masked_preview);
 }
 
 #[test]
-fn yaml_hook_config_previews_show_the_placeholder() {
-    check_family(YAML_AGENTS, assert_placeholder_preview);
+fn yaml_hook_config_previews_show_the_masked_token() {
+    check_family(YAML_AGENTS, assert_masked_preview);
 }
 
 #[test]
-fn toml_hook_config_preview_shows_the_placeholder() {
-    check_family(TOML_AGENTS, assert_placeholder_preview);
+fn toml_hook_config_preview_shows_the_masked_token() {
+    check_family(TOML_AGENTS, assert_masked_preview);
 }
 
 #[test]
@@ -225,9 +225,9 @@ fn manual_script_lists_only_name_the_variable() {
 }
 
 #[test]
-fn cline_preview_keeps_its_placeholder() {
+fn cline_preview_keeps_its_redaction() {
     check_family(&["cline"], |what, stdout| {
-        assert!(stdout.contains(PLACEHOLDER), "{what}:\n{stdout}");
+        assert!(stdout.contains(CLINE_REDACTED), "{what}:\n{stdout}");
     });
 }
 
@@ -238,7 +238,7 @@ fn claude_code_project_scope_preview_holds_no_placeholder_either() {
     cmd.args(["--auth-token", TOKEN, "--scope", "project"]);
     let stdout = clean_preview("claude-code --scope project", cmd);
     assert!(stdout.contains("NOT embedded below"), "{stdout}");
-    assert!(!stdout.contains(PLACEHOLDER), "{stdout}");
+    assert!(!stdout.contains("[REDACTED]"), "{stdout}");
 }
 
 /// A token read from an installed MCP entry, planted by hand in the sandbox:
@@ -271,7 +271,7 @@ Authorization = \"Bearer {TOKEN}\"
         let what = format!("{agent} with an inferred MCP token");
         let stdout = clean_preview(&what, sandbox.install_hooks(agent));
         assert!(
-            stdout.contains(PLACEHOLDER) || stdout.contains("omitted from this"),
+            stdout.contains(MASKED_TOKEN) || stdout.contains("omitted from this"),
             "{what}: the fixture must make the preview see a token:
 {stdout}"
         );
@@ -290,7 +290,10 @@ fn bearer_token_file_stays_out_of_previews() {
     for agent in ["opencode2", "claude-code", "hermes", "kimi-code", "codex"] {
         let what = format!("{agent} with [auth].bearer_token_file");
         let stdout = clean_preview(&what, sandbox.install_hooks(agent));
-        assert!(!stdout.contains(PLACEHOLDER), "{what}:\n{stdout}");
+        // A file bearer never renders into a printed snippet, so neither the
+        // live token nor a masked form may appear; the `--apply` control
+        // below proves the file's value is still consumed.
+        assert!(!stdout.contains("[REDACTED]"), "{what}:\n{stdout}");
     }
 }
 
@@ -308,8 +311,7 @@ fn preview_without_a_token_announces_none() {
     );
     for agent in ["opencode2", "claude-code", "hermes", "kimi-code"] {
         let stdout = clean_preview(agent, sandbox.install_hooks(agent));
-        assert!(!stdout.contains(PLACEHOLDER), "{agent}:\n{stdout}");
-        assert!(!stdout.contains(TS_NOTE), "{agent}:\n{stdout}");
+        assert!(!stdout.contains("[REDACTED]"), "{agent}:\n{stdout}");
     }
 }
 
@@ -470,8 +472,8 @@ fn config_syntax_error_exits_one_without_echoing_the_line() {
         "a non-numeric env bearer is a valid value:\n{stdout}\n{stderr}"
     );
     assert!(
-        stdout.contains(TS_NOTE),
-        "the preview must omit the token: {stdout}"
+        stdout.contains("FAKE...[REDACTED]"),
+        "the preview must show the env bearer masked: {stdout}"
     );
     assert!(
         !stdout.contains("FAKEfakeEnvBearer12345") && !stderr.contains("FAKEfakeEnvBearer12345"),
@@ -482,7 +484,7 @@ fn config_syntax_error_exits_one_without_echoing_the_line() {
     let sandbox = Sandbox::new();
     sandbox.write_config(&format!("[auth]\nbearer_token = \"{TOKEN}\"\n"));
     let stdout = clean_preview("valid config control", sandbox.install_hooks("opencode2"));
-    assert!(stdout.contains(TS_NOTE), "{stdout}");
+    assert!(stdout.contains(TS_MASKED_TOKEN), "{stdout}");
 }
 
 /// Control for the token-file preview check above: with the token only in
@@ -503,7 +505,7 @@ fn bearer_token_file_apply_stores_the_file_value_without_printing_it() {
     let mut cmd = sandbox.install_hooks("opencode2");
     cmd.args(["--apply", "--config-file"]).arg(&plugin);
     let stdout = clean_preview("opencode2 --apply with [auth].bearer_token_file", cmd);
-    assert!(!stdout.contains(TS_NOTE), "{stdout}");
+    assert!(!stdout.contains("[REDACTED]"), "{stdout}");
 
     let stored = std::fs::read_to_string(sandbox.data_dir.join("auth-token")).unwrap();
     assert_eq!(stored.trim(), TOKEN);
@@ -521,7 +523,7 @@ fn apply_still_stores_the_token_under_the_data_dir() {
     cmd.args(["--auth-token", TOKEN, "--apply", "--config-file"])
         .arg(&plugin);
     let stdout = clean_preview("opencode2 --apply", cmd);
-    assert!(!stdout.contains(TS_NOTE), "{stdout}");
+    assert!(!stdout.contains("[REDACTED]"), "{stdout}");
 
     let stored = std::fs::read_to_string(sandbox.data_dir.join("auth-token")).unwrap();
     assert_eq!(stored.trim(), TOKEN);

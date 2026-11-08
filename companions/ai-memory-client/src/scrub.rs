@@ -197,12 +197,25 @@ fn secret_patterns() -> &'static [RedactionRule] {
                 .unwrap(),
                 replacement: "[REDACTED PRIVATE KEY]${end}",
             },
+            // GitHub tokens: left-unanchored like the server's rule, so a
+            // token glued onto a word by a stripped control character (a
+            // removed BEL, `…\x07ghp_…`) is still matched.
             RedactionRule {
                 regex: Regex::new(
-                    r"\b(?:github_pat_[A-Za-z0-9_]{20,}|gh[pousr]_[A-Za-z0-9]{20,}|AKIA[0-9A-Z]{16})\b",
+                    r"(?:github_pat_[A-Za-z0-9_]{20,}|gh[pousr]_[A-Za-z0-9]{20,})",
                 )
                 .unwrap(),
                 replacement: "[REDACTED CREDENTIAL]",
+            },
+            // AWS access-key IDs, anchored like the server's `aws_key` rule:
+            // a boundary or a percent-encoded byte before the exact 20-char
+            // shape. A letter removed from directly before `AKIA` stays
+            // unmatched on purpose — redacting `AKIA` mid-word would destroy
+            // ordinary uppercase text irreversibly.
+            RedactionRule {
+                regex: Regex::new(r"(?P<pre>\b|%[0-9A-Fa-f]{2})(?:AKIA|ASIA)[0-9A-Z]{16}\b")
+                    .unwrap(),
+                replacement: "${pre}[REDACTED CREDENTIAL]",
             },
             // Vendor `sk-` keys, anchored like the server's `api_key` rule: a
             // letter right before the prefix means it ends a word (`task-…`),
@@ -217,20 +230,35 @@ fn secret_patterns() -> &'static [RedactionRule] {
                 regex: Regex::new(r"(?i)\b(bearer\s+)[A-Za-z0-9._~+/=-]{8,}").unwrap(),
                 replacement: "$1[REDACTED]",
             },
-            // Same rule and label as the server's: `aim_`, `amk_` and `ams_`
-            // credentials in the captured text, including right after a
-            // serialized control character — the one-letter escapes the
-            // serializers use (\b \t \n \f \r), the numeric spellings
-            // (\uXXXX, \xNN), the ANSI CSI escape that follows a serialized
-            // ESC and the percent-encoded forms. The escape is captured so
-            // the replacement keeps it, and the ASCII word boundary rejects
-            // `claim_…` without treating `é` as one.
+            // ai-memory's own keys, mirroring the server's own-prefix pair:
+            // `aim_`, `amk_` and `ams_` credentials in the captured text,
+            // including right after a serialized control character — the
+            // one-letter escapes the serializers use (\b \t \n \f \r), the
+            // numeric spellings (\uXXXX, \xNN), the ANSI CSI escape that
+            // follows a serialized ESC and the percent-encoded forms. The
+            // escape is captured so the replacement keeps it, and the ASCII
+            // word boundary rejects `claim_…` without treating `é` as one.
+            // Like the server's own-prefix rule it runs before the vendor
+            // rules; unlike it the client replaces with its unlabeled
+            // `[REDACTED CREDENTIAL]` marker.
             RedactionRule {
                 regex: Regex::new(
                     r"((?:\\(?:[nrtbf]|u[0-9A-Fa-f]{4}|x[0-9A-Fa-f]{2})(?:\[[0-9;?]*[ -/]*[@-~])?|%[0-9A-Fa-f]{2})|(?-u:\b))(?:aim|amk|ams)_[A-Za-z0-9_\-]{22,}",
                 )
                 .unwrap(),
-                replacement: "$1[REDACTED:ai_memory_token]",
+                replacement: "$1[REDACTED CREDENTIAL]",
+            },
+            // ai-memory's own keys: native `aim_`, web-session `ams_`, and
+            // external mcp-auth `amk_`. Left-unanchored, like the server's
+            // unanchored own-prefix rule: a 256-bit base64url tail after the
+            // prefix makes a false positive negligible, so matching the prefix
+            // even when a stripped control character or the visible tail of an
+            // ANSI sequence glues a word onto it is safe and necessary. The
+            // 22-character rule above runs first, so a key it covers is
+            // redacted there.
+            RedactionRule {
+                regex: Regex::new(r"(?:aim|ams|amk)_[A-Za-z0-9_-]{40,}").unwrap(),
+                replacement: "[REDACTED CREDENTIAL]",
             },
             RedactionRule {
                 regex: Regex::new(

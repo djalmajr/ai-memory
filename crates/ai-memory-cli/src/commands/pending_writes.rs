@@ -65,7 +65,8 @@ async fn list(config: &Config, ep: &ServerEndpoint, args: PendingWritesListArgs)
     } else if proposals.is_empty() {
         println!(
             "{}",
-            i18n.format(
+            crate::localization::format(
+                i18n,
                 "cli-pending-writes-no-pending-writes-in-workspace-project",
                 &[("value0", workspace.clone()), ("value1", project.clone())]
             )

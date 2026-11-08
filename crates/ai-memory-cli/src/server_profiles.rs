@@ -273,8 +273,10 @@ fn parse_profile(table: &dyn toml_edit::TableLike) -> Result<Profile> {
 /// slashes — rejected here rather than on every hook request.
 fn validate_url(raw: &str) -> Result<String> {
     let trimmed = raw.trim().trim_end_matches('/');
+
     // The value stays out of both errors: a URL can hold credentials.
     let parsed = reqwest::Url::parse(trimmed).context("`url` is not a valid URL")?;
+
     if !matches!(parsed.scheme(), "http" | "https") || parsed.host_str().is_none_or(str::is_empty) {
         bail!("`url` is not an http:// or https:// URL with a host");
     }

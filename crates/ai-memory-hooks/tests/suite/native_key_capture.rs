@@ -65,7 +65,7 @@ fn scrubbed_body(stdout: &str) -> String {
 fn structured_stdout_key_after_a_line_break_is_redacted_whole() {
     let out = scrubbed_body(&format!("title\n{KEY}"));
     assert!(
-        out.contains("[REDACTED:ai_memory_token]"),
+        out.contains("[REDACTED:ai_memory_key]"),
         "the escaped-break excerpt must be redacted: {out:?}"
     );
     assert!(!out.contains(KEY), "the full key must not survive: {out:?}");
@@ -89,7 +89,7 @@ fn structured_stdout_key_after_a_line_break_is_redacted_whole() {
 fn structured_stdout_key_after_a_space_is_redacted_whole() {
     let out = scrubbed_body(&format!("title {KEY}"));
     assert!(
-        out.contains("[REDACTED:ai_memory_token]"),
+        out.contains("[REDACTED:ai_memory_key]"),
         "the space-delimited excerpt must be redacted: {out:?}"
     );
     assert!(!out.contains(KEY), "the full key must not survive: {out:?}");
@@ -298,7 +298,7 @@ async fn a_native_key_after_a_serialized_control_reaches_sqlite_redacted() {
         // This case's row is the newest one.
         let body = &rows.last().unwrap().body;
         assert!(
-            body.contains("[REDACTED:ai_memory_token]"),
+            body.contains("[REDACTED:ai_memory_key]"),
             "{what}: the persisted line carries no marker: {body:?}"
         );
         assert!(

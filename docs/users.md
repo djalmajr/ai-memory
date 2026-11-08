@@ -523,9 +523,9 @@ stay in `mcp-auth`; they are not listed here.
 
 #### Where the token is stored
 
-`install-hooks` without `--apply` only prints a preview, and that preview never
-holds the token: generated TypeScript plugins show `TOKEN` as `null` and hook
-configs show `<redacted>`. Errors from `config.toml` never echo a value, which
+`install-hooks` without `--apply` only prints a preview, and the bearer it
+prints is the masked form — the first four characters, then `...[REDACTED]` —
+never the live token. Errors from `config.toml` never echo a value, which
 may hold `[auth].bearer_token`: a syntax error keeps the file, line and column
 (not the offending line), and a type error keeps the key and the expected type
 (the class of the value found, never the value). `install-hooks --apply --auth-token …` writes the

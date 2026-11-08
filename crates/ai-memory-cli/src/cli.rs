@@ -2109,7 +2109,8 @@ pub struct SetupAgentArgs {
     #[arg(long, default_value_t = crate::config::DEFAULT_SERVER_URL.to_string())]
     pub server_url: String,
     /// Bearer token for the printed hook config. The printed output shows
-    /// <redacted> in its place.
+    /// the masked form (first four characters, then `[REDACTED]`) in its
+    /// place.
     #[arg(long, hide_env_values = true)]
     pub auth_token: Option<String>,
     /// Source directory for the embedded hook bundle. Defaults to
@@ -3591,7 +3592,8 @@ pub struct InstallMcpArgs {
     #[arg(long, default_value = "ai-memory")]
     pub name: String,
     /// Bearer token for the client config. With --apply it is written there.
-    /// Without --apply the printed snippet shows <redacted> in its place.
+    /// Without --apply the printed snippet shows the masked form (first four
+    /// characters, then `[REDACTED]`) in its place.
     #[arg(long, hide_env_values = true)]
     pub auth_token: Option<String>,
     /// **Mutate** the client's config file in place instead of just
