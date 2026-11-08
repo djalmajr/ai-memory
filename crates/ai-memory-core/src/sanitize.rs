@@ -483,6 +483,20 @@ const BUILTIN_PATTERNS: &[(&str, &str)] = &[
         r"(?:(?:\\(?:[nrtbf]|u[0-9A-Fa-f]{4}|x[0-9A-Fa-f]{2})(?:\[[0-9;?]*[ -/]*[@-~])?|%[0-9A-Fa-f]{2})|(?-u:\b))(?P<secret>(?:aim|amk|ams)_[A-Za-z0-9_\-]{22,})",
         "ai_memory_key",
     ),
+    // ai-memory's own keys: native DB-user (`aim_`), web-session (`ams_`), and
+    // external mcp-auth (`amk_`). Each is the prefix plus a 256-bit base64url
+    // secret (43 characters); the 40-character floor keeps snake_case
+    // identifiers that start with one of the prefixes intact. Deliberately
+    // left-unanchored: `strip_control` runs before matching and can glue a
+    // word, or the visible tail of a removed ANSI sequence (`…[32m`), straight
+    // onto the prefix, where a `\b` or non-letter anchor would then miss the
+    // key. The distinctive prefix plus a 40-character base64url tail makes a
+    // false positive on real text negligible — unlike the AWS rule below,
+    // whose `AKIA`/`ASIA` prefix is ordinary uppercase text. It runs before
+    // every vendor rule for the same reason as the anchored rule above: a key
+    // body can hold `sk-…`, `ghp_…` or `sk_live_…`, and a vendor rule that
+    // ran first would redact that fragment and leave the head of the key.
+    (r"(?:aim|ams|amk)_[A-Za-z0-9_-]{40,}", "ai_memory_key"),
     // Vendor-prefixed API keys. A letter right before the prefix means it
     // ends a word (`task-…`, `disk-…`), so that is the one place a match may
     // not start; only the `secret` group is redacted. A plain `\b` would also
@@ -505,17 +519,6 @@ const BUILTIN_PATTERNS: &[(&str, &str)] = &[
     // `ghs_` (server-to-server / Actions), `ghr_` (refresh).
     (r"gh[pousr]_[A-Za-z0-9]{20,}", "github_token"),
     (r"github_pat_[A-Za-z0-9_]{20,}", "github_token"),
-    // ai-memory's own keys: native DB-user (`aim_`), web-session (`ams_`), and
-    // external mcp-auth (`amk_`). Each is the prefix plus a 256-bit base64url
-    // secret (43 characters); the 40-character floor keeps snake_case
-    // identifiers that start with one of the prefixes intact. Deliberately
-    // left-unanchored: `strip_control` runs before matching and can glue a
-    // word, or the visible tail of a removed ANSI sequence (`…[32m`), straight
-    // onto the prefix, where a `\b` or non-letter anchor would then miss the
-    // key. The distinctive prefix plus a 40-character base64url tail makes a
-    // false positive on real text negligible — unlike the AWS rule below,
-    // whose `AKIA`/`ASIA` prefix is ordinary uppercase text.
-    (r"(?:aim|ams|amk)_[A-Za-z0-9_-]{40,}", "ai_memory_key"),
     // AWS access-key IDs: long-lived (AKIA) and STS temporary (ASIA).
     //
     // Anchored to the exact published format — a 4-character prefix plus
@@ -2857,5 +2860,39 @@ mod tests {
                 "AWS key must be redacted: {aws:?} -> {out:?}"
             );
         }
+    }
+    /// An own-prefix key whose base64url body holds a vendor fragment (`sk-…`,
+    /// `ghp_…`, `sk_live_…`) used to lose only that fragment when the key sat
+    /// where the anchored rule could not see it: the unanchored rule ran after
+    /// the vendor rules, which redacted the fragment and left the head of the
+    /// key in the stored text. Both own-prefix rules now run before every
+    /// vendor rule. Control: a vendor key on its own keeps its own label.
+    #[test]
+    fn an_own_prefix_key_holding_a_vendor_fragment_is_redacted_whole() {
+        let s = s();
+        for prefix in ["aim_", "amk_", "ams_"] {
+            for fragment in [
+                format!("_sk-{}", "A".repeat(20)),
+                format!("_ghp_{}", "B".repeat(20)),
+                format!("_sk_live_{}", "C".repeat(16)),
+            ] {
+                let head = "Z".repeat(19);
+                let key = format!("{prefix}{head}{fragment}");
+                for input in [
+                    format!("word{key}"),
+                    format!("word {key}"),
+                    format!("word\u{1b}[31m{key}"),
+                    format!("word{}\u{0}{}", &key[..1], &key[1..]),
+                ] {
+                    let out = s.scrub(&input);
+                    assert!(
+                        out.contains("[REDACTED:ai_memory_key]") && !out.contains(&head),
+                        "own-prefix key must be redacted whole: {input:?} -> {out:?}"
+                    );
+                }
+            }
+        }
+        let vendor = format!("use sk-{} here", "D".repeat(24));
+        assert!(s.scrub(&vendor).contains("[REDACTED:api_key]"));
     }
 }

@@ -488,3 +488,34 @@ fn a_key_glued_onto_a_word_by_a_stripped_character_is_still_redacted() {
         );
     }
 }
+
+#[test]
+fn an_own_prefix_key_holding_a_vendor_fragment_is_redacted_whole() {
+    // The client ran its GitHub, AWS and `sk-` rules before both own-prefix
+    // rules, so a native key whose body held one of those fragments lost only
+    // the fragment and kept its head, even with a plain space before it.
+    for prefix in ["aim_", "amk_", "ams_"] {
+        for fragment in [
+            format!("_sk-{}", "A".repeat(20)),
+            format!("_ghp_{}", "B".repeat(20)),
+            format!("_sk_live_{}", "C".repeat(16)),
+        ] {
+            let head = "Z".repeat(19);
+            let key = format!("{prefix}{head}{fragment}");
+            for input in [
+                format!("word{key}"),
+                format!("word {key}"),
+                format!("word\u{1b}[31m{key}"),
+                format!("word{}\u{0}{}", &key[..1], &key[1..]),
+            ] {
+                let out = sanitize_external_text(&input);
+                assert!(
+                    out.contains("[REDACTED CREDENTIAL]") && !out.contains(&head),
+                    "own-prefix key must be redacted whole: {input:?} -> {out:?}"
+                );
+            }
+        }
+    }
+    let vendor = format!("use sk-{} here", "D".repeat(24));
+    assert!(sanitize_external_text(&vendor).contains("[REDACTED CREDENTIAL]"));
+}
