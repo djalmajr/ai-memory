@@ -412,10 +412,16 @@ fn shared_sanitizer_vectors_hold() {
     // The structured tool-response cases the shared loop's `key … end`
     // wrap cannot express: exact input, exact output, and idempotency.
     // The core runs the same block first, so the two copies cannot drift on
-    // the serialized-control spellings either.
+    // the serialized-control spellings either. The server labels the marker
+    // `[REDACTED:ai_memory_key]`; the client replaces with its own unlabeled
+    // marker, so its expected output is the same vector with the label
+    // swapped.
     for case in vectors["native_key_cases"].as_array().unwrap() {
         let input = case["input"].as_str().unwrap();
-        let expected = case["output"].as_str().unwrap();
+        let expected = case["output"]
+            .as_str()
+            .unwrap()
+            .replace("[REDACTED:ai_memory_key]", "[REDACTED CREDENTIAL]");
         let out = sanitize_external_text(input);
         assert_eq!(out, expected, "{input:?}");
         assert_eq!(
@@ -439,4 +445,46 @@ fn characters_that_hide_text_or_split_a_credential_are_removed() {
     // A control character inside a credential no longer keeps it whole.
     let out = sanitize_external_text("sk-leak-012345\u{0}6789abcdef0123");
     assert_eq!(out, "[REDACTED CREDENTIAL]");
+}
+
+/// Control characters are stripped before matching, so a word glued onto a key
+/// by a removed character used to keep the key whole: the `aim_`/`ams_` and
+/// `AKIA` rules required a left word boundary the removal had destroyed, and
+/// `amk_` had no rule (GHSA-6pmr-q79m-87vp, item 5, the client mirror). The
+/// own-prefix and GitHub rules are now left-unanchored; AWS accepts a
+/// percent-encoded byte.
+#[test]
+fn a_key_glued_onto_a_word_by_a_stripped_character_is_still_redacted() {
+    let tail = "FAKEfake0123-_xy".repeat(3); // 48 base64url chars, > the 40 floor
+    for prefix in ["aim_", "ams_", "amk_"] {
+        let key = format!("{prefix}{tail}");
+        for glued in [
+            format!("title\u{7}{key}"),      // a removed BEL
+            format!("title\u{1b}[32m{key}"), // a removed ANSI escape
+            format!("word{key}"),            // a letter directly before it
+        ] {
+            let out = sanitize_external_text(&glued);
+            // A stripped character leaves a word boundary, so the anchored
+            // 22-character own-prefix rule redacts the first two cases with
+            // its labeled marker; a bare glued letter falls through to the
+            // left-unanchored 40-character rule. Either way the tail must be
+            // gone.
+            assert!(
+                out.contains("[REDACTED") && !out.contains(&tail),
+                "glued key must be redacted: {glued:?} -> {out:?}"
+            );
+        }
+    }
+    // A GitHub token glued onto a word by a removed BEL, and an AWS key behind
+    // a percent-encoded byte.
+    for (input, leaked) in [
+        ("word\u{7}ghp_FAKE0123456789ABCDEFGHIJ0123", "ghp_FAKE"),
+        ("url?k=%20AKIAFAKEFAKEFAKEFAKE", "FAKEFAKE"),
+    ] {
+        let out = sanitize_external_text(input);
+        assert!(
+            out.contains("[REDACTED CREDENTIAL]") && !out.contains(leaked),
+            "credential must be redacted: {input:?} -> {out:?}"
+        );
+    }
 }

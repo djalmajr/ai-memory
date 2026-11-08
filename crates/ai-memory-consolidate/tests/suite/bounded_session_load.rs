@@ -103,6 +103,87 @@ impl LlmProvider for CapturingLlm {
     }
 }
 
+/// Stage-aware capturing LLM for the chunked scope test: map/reduce stages
+/// (schema carries `extractions`) answer with zero extractions and list every
+/// observation id the stage showed as `no_durable_fact_ids` (satisfying the
+/// coverage validation); the final stage answers with a valid single-page or
+/// batch-anchor payload. Every request is recorded.
+struct ChunkStageLlm {
+    requests: Arc<Mutex<Vec<ChatRequest>>>,
+}
+
+#[async_trait::async_trait]
+impl LlmProvider for ChunkStageLlm {
+    fn name(&self) -> &'static str {
+        "chunk-stage"
+    }
+
+    fn model(&self) -> &str {
+        "chunk-stage"
+    }
+
+    async fn complete(&self, _request: ChatRequest) -> LlmResult<ai_memory_llm::ChatResponse> {
+        unreachable!("the chunked path uses structured completion")
+    }
+
+    async fn complete_structured_raw(
+        &self,
+        request: ChatRequest,
+        schema: Value,
+    ) -> LlmResult<Value> {
+        let user = request.messages[0].content.clone();
+        self.requests.lock().unwrap().push(request);
+        let properties = schema.get("properties");
+        if properties.and_then(|p| p.get("extractions")).is_some() {
+            let re = regex::Regex::new(r"--- observation ([0-9a-fA-F-]{36})").unwrap();
+            let mut ids: Vec<String> = re.captures_iter(&user).map(|c| c[1].to_string()).collect();
+            let re2 = regex::Regex::new(r"observation_ids: ([0-9a-fA-F, -]+)").unwrap();
+            for cap in re2.captures_iter(&user) {
+                for piece in cap[1].split(',') {
+                    let t = piece.trim();
+                    if t.len() == 36 {
+                        ids.push(t.to_string());
+                    }
+                }
+            }
+            ids.dedup();
+            return Ok(json!({
+                "extractions": [],
+                "rationale": "stage ok",
+                "no_durable_fact_ids": ids
+            }));
+        }
+        if properties.and_then(|p| p.get("updates")).is_some() {
+            let sid = regex::Regex::new(r"Session id: ([0-9a-fA-F-]{36})")
+                .unwrap()
+                .captures(&user)
+                .map(|c| c[1].to_string());
+            let anchor = sid
+                .map(|s| format!("sessions/{s}.md"))
+                .unwrap_or_else(|| "sessions/unknown.md".to_string());
+            return Ok(json!({
+                "updates": [{
+                    "path": anchor,
+                    "title": "Session page",
+                    "body_markdown": "# Session page\n\nchunked scope test body",
+                    "tier": "episodic",
+                    "kind": "fact",
+                    "tags": [],
+                    "entities": []
+                }],
+                "rationale": "chunked scope test"
+            }));
+        }
+        Ok(json!({
+            "title": "Session page",
+            "body_markdown": "# Session page\n\nchunked scope test body",
+            "tags": [],
+            "summary": "s",
+            "relations": {"causes": [], "fixes": [], "contradicts": []}
+        }))
+    }
+}
+
 /// Deterministic fixture row for index `idx` of `total`: a mix of kinds,
 /// importances, high-signal and routing text, code fences and one
 /// near-16-KiB body per ~97 rows. `bulk` pads every body to ~4 KiB so the
@@ -789,6 +870,226 @@ async fn gated_reader_refuses_foreign_scopes() {
     );
 }
 
+/// The opt-in map-reduce pipeline loads the session's observations through
+/// the scope-bound reader (GHSA-xfgc-hc4c-wj7h): a session that crossed
+/// repositories mid-flight holds rows in two scopes, and a run bound to one
+/// scope must build EVERY stage's prompt from that scope's rows only. The
+/// legitimate control is the run bound to the other scope, which sees the
+/// other's rows and none of the first's.
+#[tokio::test]
+async fn chunked_consolidation_reads_only_the_bound_scope() {
+    let tmp = TempDir::new().unwrap();
+    let store = Store::open(tmp.path()).unwrap();
+    let ws = store
+        .writer
+        .get_or_create_workspace("default")
+        .await
+        .unwrap();
+    let proj_a = store
+        .writer
+        .get_or_create_project(ws, "alpha", None)
+        .await
+        .unwrap();
+    let proj_b = store
+        .writer
+        .get_or_create_project(ws, "bravo", None)
+        .await
+        .unwrap();
+    let sid = SessionId::new();
+
+    const BASE: i64 = 1_700_000_000_000_000; // µs
+    {
+        let conn = rusqlite::Connection::open(db_file(tmp.path()).as_path()).unwrap();
+        let tx = conn.unchecked_transaction().unwrap();
+        tx.execute(
+            "INSERT INTO sessions (id, workspace_id, project_id, agent_kind, cwd, started_at) \
+             VALUES (?1, ?2, ?3, 'claude-code', ?4, ?5)",
+            rusqlite::params![sid.as_bytes(), ws.as_bytes(), proj_a.as_bytes(), "/w", BASE],
+        )
+        .unwrap();
+        let mut ins = tx
+            .prepare_cached(
+                "INSERT INTO observations \
+                 (id, session_id, workspace_id, project_id, kind, title, body, importance, created_at) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            )
+            .unwrap();
+        for (scope, marker) in [(proj_a.as_bytes(), "ALPHA"), (proj_b.as_bytes(), "BRAVO")] {
+            for i in 1..=3usize {
+                let mut id = [0u8; 16];
+                id[..8].copy_from_slice(&(i as u64).to_be_bytes());
+                id[8..16].copy_from_slice(&scope[8..16]);
+                ins.execute(rusqlite::params![
+                    &id[..],
+                    sid.as_bytes(),
+                    ws.as_bytes(),
+                    scope,
+                    "user-prompt",
+                    format!("{marker} {i}"),
+                    format!("{marker}_SCOPE_MARKER_{i} chunked load payload"),
+                    2,
+                    BASE + (i * 10) as i64 * 60_000_000,
+                ])
+                .unwrap();
+            }
+        }
+        drop(ins);
+        tx.commit().unwrap();
+    }
+
+    let wiki = Wiki::new(tmp.path(), store.writer.clone())
+        .unwrap()
+        .with_store_reader(store.reader.clone());
+
+    // Word-level tokenizer so the planner sizes blocks with a real counter.
+    let tok_path = {
+        use tokenizers::models::wordlevel::WordLevel;
+        use tokenizers::pre_tokenizers::whitespace::Whitespace;
+
+        let model = WordLevel::builder()
+            .vocab(
+                [("w1".to_string(), 0), ("[UNK]".to_string(), 1)]
+                    .into_iter()
+                    .collect(),
+            )
+            .unk_token("[UNK]".to_string())
+            .build()
+            .unwrap();
+        let mut tokenizer = tokenizers::Tokenizer::new(model);
+        tokenizer.with_pre_tokenizer(Some(Whitespace));
+        let path = tmp.path().join("tokenizer.json");
+        std::fs::write(&path, tokenizer.to_string(true).unwrap()).unwrap();
+        path
+    };
+
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let llm: Arc<dyn LlmProvider> = Arc::new(ChunkStageLlm {
+        requests: requests.clone(),
+    });
+    let consolidator = Consolidator::new(
+        store.reader.clone(),
+        store.writer.clone(),
+        wiki.clone(),
+        llm.clone(),
+        ws,
+        proj_a,
+    )
+    .with_chunking(8, Some(8192), Some(&tok_path))
+    .unwrap();
+
+    let capture_prompts = || {
+        requests
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|r| r.messages[0].content.clone())
+            .collect::<Vec<_>>()
+    };
+
+    // Single-page chunked run bound to scope A: every stage's prompt is
+    // built from A's rows only.
+    consolidator
+        .consolidate_session_in_scope(
+            ws,
+            proj_a,
+            sid,
+            false,
+            ActorContext::anonymous(),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    let prompts = capture_prompts();
+    assert!(!prompts.is_empty(), "the chunked run must call the LLM");
+    let joined = prompts.join("\n");
+    for i in 1..=3 {
+        assert!(
+            joined.contains(&format!("ALPHA_SCOPE_MARKER_{i}")),
+            "A's rows must reach the chunked run's prompts"
+        );
+    }
+    for p in &prompts {
+        assert!(
+            !p.contains("BRAVO_SCOPE_MARKER"),
+            "B's rows leaked into A's run: {p}"
+        );
+    }
+    requests.lock().unwrap().clear();
+
+    // Multi-page chunked entry: the same scope-bound load.
+    consolidator
+        .consolidate_session_multi_in_scope(
+            ws,
+            proj_a,
+            sid,
+            false,
+            ActorContext::anonymous(),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    let prompts = capture_prompts();
+    assert!(
+        !prompts.is_empty(),
+        "the multi-page chunked run must call the LLM"
+    );
+    let joined = prompts.join("\n");
+    for i in 1..=3 {
+        assert!(
+            joined.contains(&format!("ALPHA_SCOPE_MARKER_{i}")),
+            "A's rows must reach the multi run's prompts"
+        );
+    }
+    for p in &prompts {
+        assert!(
+            !p.contains("BRAVO_SCOPE_MARKER"),
+            "B's rows leaked into A's multi run: {p}"
+        );
+    }
+    requests.lock().unwrap().clear();
+
+    // Legitimate control: a run bound to scope B sees B's rows only.
+    let consolidator_b = Consolidator::new(
+        store.reader.clone(),
+        store.writer.clone(),
+        wiki,
+        llm.clone(),
+        ws,
+        proj_b,
+    )
+    .with_chunking(8, Some(8192), Some(&tok_path))
+    .unwrap();
+    consolidator_b
+        .consolidate_session_in_scope(
+            ws,
+            proj_b,
+            sid,
+            false,
+            ActorContext::anonymous(),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    let prompts = capture_prompts();
+    assert!(!prompts.is_empty(), "the B-bound run must call the LLM");
+    let joined = prompts.join("\n");
+    for i in 1..=3 {
+        assert!(
+            joined.contains(&format!("BRAVO_SCOPE_MARKER_{i}")),
+            "B's rows must reach B-bound run's prompts"
+        );
+    }
+    for p in &prompts {
+        assert!(
+            !p.contains("ALPHA_SCOPE_MARKER"),
+            "A's rows leaked into B's run: {p}"
+        );
+    }
+}
+
 /// The auto-improve review still refuses a foreign-scope session through its
 /// pre-existing `session_project_ids` gate, with no rows loaded and no LLM
 /// call; a missing session is refused as `SessionNotFound`.
@@ -1368,12 +1669,14 @@ async fn stale_sessions_row_does_not_divert_the_write() {
     assert_eq!(requests.lock().unwrap().len(), 1);
 }
 
-/// A hybrid session whose observations landed in two projects keeps exactly
-/// today's prompt: the bounded path reads every row regardless of the row's
-/// scope (the prompt is per-session, not per-project) and the page lands in
-/// the observations' majority project.
+/// A hybrid session whose observations landed in two projects is consolidated
+/// strictly within the project it is bound to: the bounded path reads only
+/// that project's rows, so project B's observations never reach a project-A
+/// consolidation's prompt (GHSA-xfgc-hc4c-wj7h). The oracle is built from
+/// project A's rows alone, and the dump's row count and project-B content
+/// prove the other scope is absent.
 #[tokio::test]
-async fn hybrid_two_project_session_prompt_is_unchanged() {
+async fn hybrid_two_project_session_prompt_is_scoped_to_its_project() {
     let tmp = TempDir::new().unwrap();
     let store = Store::open(tmp.path()).unwrap();
     let ws = store
@@ -1437,13 +1740,15 @@ async fn hybrid_two_project_session_prompt_is_unchanged() {
     let (current_body, instructions, titles) =
         builder_inputs(&wiki, &store.reader, ws, proj_a, sid).await;
 
-    // Old path: the full load covers every row of the session id, both
-    // projects, exactly as today.
-    let observations = store.reader.observations_for_session(sid).await.unwrap();
-    assert_eq!(observations.len(), COUNT_A + COUNT_B);
+    // The oracle is project A's rows alone: a consolidation bound to project
+    // A must read only those, never the session's project-B rows.
+    let all = store.reader.observations_for_session(sid).await.unwrap();
+    assert_eq!(all.len(), COUNT_A + COUNT_B);
+    let project_a_only: Vec<_> = all.into_iter().filter(|o| o.project_id == proj_a).collect();
+    assert_eq!(project_a_only.len(), COUNT_A);
     let oracle = oracle_single_request(
         sid,
-        &observations,
+        &project_a_only,
         &current_body,
         instructions.as_deref(),
         PromptBudgets::default(),
@@ -1451,8 +1756,7 @@ async fn hybrid_two_project_session_prompt_is_unchanged() {
         false,
     );
 
-    // New path: the bounded gate passes on the majority project and the
-    // projection reads every row.
+    // The bounded path gates on, and reads, only project A's rows.
     let requests = Arc::new(Mutex::new(Vec::new()));
     let llm: Arc<dyn LlmProvider> = Arc::new(CapturingLlm {
         requests: requests.clone(),
@@ -1487,11 +1791,17 @@ async fn hybrid_two_project_session_prompt_is_unchanged() {
         )
     );
 
-    // Every row from both projects made it into the dump.
+    // Byte-equality with the project-A-only oracle already proves the prompt
+    // holds exactly project A's projection; the dump's row count confirms the
+    // hybrid session's project-B rows did not inflate it.
+    let dump = &captured[0].messages[0].content;
     assert!(
-        captured[0].messages[0]
-            .content
-            .contains(&format!("--- observation {}/300 ---", COUNT_A + COUNT_B))
+        dump.contains(&format!("--- observation {COUNT_A}/{COUNT_A} ---")),
+        "the dump is scoped to project A's row count"
+    );
+    assert!(
+        !dump.contains(&format!("/{} ---", COUNT_A + COUNT_B)),
+        "the hybrid session's project-B rows must not inflate the count"
     );
 }
 

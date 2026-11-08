@@ -33,13 +33,13 @@ use crate::commands::render_shared::{
     ANTIGRAVITY_LIFECYCLE_EVENTS, ANTIGRAVITY_TOOL_EVENTS, CODEX_PROFILE, COMMAND_CODE_PROFILE,
     COPILOT_CLI_PROFILE, CURSOR_PROFILE, DSH_EVENTS, GEMINI_PROFILE, HermesHookSet,
     KIMI_CODE_EVENTS, KIRO_CLI_V2_EVENTS, KIRO_CLI_V3_EVENTS, POOL_EVENTS,
-    PREVIEW_TOKEN_PLACEHOLDER, TS_PREVIEW_TOKEN_NOTE, build_antigravity_payload_with_data_dir,
-    build_claude_code_payload_with_data_dir, build_devin_payload_with_data_dir,
-    build_dsh_hooks_payload, build_grok_payload_with_data_dir, build_kiro_cli_v2_hooks_value,
-    build_kiro_cli_v3_hooks_value, build_pool_settings_yaml_with_data_dir,
-    build_profile_payload_for_agent, hook_embedded_exe_path, hook_script_for_claude_code,
-    hook_script_for_current_platform, kimi_code_hook_commands, local_hook_policy_v1_supported,
-    shell_quote, ts_auth_headers_fn, ts_capture_policy_v1, ts_string_literal, ts_timeout_signal,
+    build_antigravity_payload_with_data_dir, build_claude_code_payload_with_data_dir,
+    build_devin_payload_with_data_dir, build_dsh_hooks_payload, build_grok_payload_with_data_dir,
+    build_kiro_cli_v2_hooks_value, build_kiro_cli_v3_hooks_value,
+    build_pool_settings_yaml_with_data_dir, build_profile_payload_for_agent,
+    hook_embedded_exe_path, hook_script_for_claude_code, hook_script_for_current_platform,
+    kimi_code_hook_commands, local_hook_policy_v1_supported, mask_secret, shell_quote,
+    ts_auth_headers_fn, ts_capture_policy_v1, ts_string_literal, ts_timeout_signal,
     yaml_single_quote,
 };
 use crate::commands::uninstall::hook_command_is_ours;
@@ -649,16 +649,6 @@ fn kiro_cli_home_join(
 ///
 /// # Errors
 /// Returns an error if the hook script directory cannot be located.
-/// The comment a preview prints when its hook entries show
-/// [`PREVIEW_TOKEN_PLACEHOLDER`], behind the format's own comment marker.
-fn preview_token_note(comment: &str) -> String {
-    format!(
-        "{comment} Auth: the token is omitted from this preview ({PREVIEW_TOKEN_PLACEHOLDER} below).\n\
-         {comment}       `--apply` stores it under the data dir (0600); a hand-placed copy\n\
-         {comment}       needs the real value in place of the placeholder.\n"
-    )
-}
-
 pub fn run(config: &Config, args: InstallHooksArgs) -> Result<()> {
     let i18n = &config.i18n;
     if args.scope == HookInstallScope::Project && args.agent != AgentChoice::ClaudeCode {
@@ -794,6 +784,14 @@ pub(crate) fn run_with_opencode_dialect_and_mcp_path(
     } else {
         renderable_token.as_deref()
     };
+    // The inline bearer masked for any path that PRINTS the rendered block to
+    // the terminal instead of writing it to a config file: every agent's
+    // preview (no `--apply`), and Hermes/Pool on `--apply` too — they have no
+    // file to write and print the ready-to-paste block, so a token embedded as
+    // the #552 store-failure fallback would otherwise land in the scrollback, a
+    // CI log or an agent transcript (GHSA-6pmr-q79m-87vp items 1 and 2).
+    let printed_auth_owned = auth.map(mask_secret);
+    let printed_auth = printed_auth_owned.as_deref();
     // P1.8 multi-user attribution: `--as-user` is metadata only — the
     // token stamped into the hook env block is whatever the operator
     // passed via `--auth-token` (typically a native key from
@@ -1020,7 +1018,7 @@ pub(crate) fn run_with_opencode_dialect_and_mcp_path(
             // block a preview does.
             AgentChoice::Hermes => render_hermes(
                 &server_url,
-                auth,
+                printed_auth,
                 &config.data_dir,
                 args.project_strategy.and_then(ProjectStrategyArg::baked),
                 hermes_plugin_dir(&config.runtime_env).as_deref(),
@@ -1083,7 +1081,7 @@ pub(crate) fn run_with_opencode_dialect_and_mcp_path(
                     &config.i18n,
                     &hooks_dir,
                     &server_url,
-                    auth,
+                    printed_auth,
                     &config.data_dir,
                     &args,
                 )
@@ -1163,31 +1161,29 @@ pub(crate) fn run_with_opencode_dialect_and_mcp_path(
             }
         };
     }
-    // A preview goes to stdout, where a terminal's scrollback, a CI log or an
-    // agent's transcript keeps it. From here on no renderer holds the token,
-    // whichever source it came from: flag, environment, config or inferred MCP.
-    let auth = auth.map(|_| PREVIEW_TOKEN_PLACEHOLDER);
     let strategy = args.project_strategy.and_then(ProjectStrategyArg::baked);
     // Preview must bake the same `CAPTURE_MODE` the next `--apply` would
     // persist (#661) — resolved read-only so a bare preview never writes.
     let preview_capture_mode = resolve_capture_mode(&config.data_dir, args.capture_mode);
+    // Every arm below renders to stdout, so the inline bearer is masked for the
+    // whole preview (GHSA-6pmr-q79m-87vp item 1); `--apply` returned above and
+    // renders the real token into the agent's config file.
+    let auth = printed_auth;
     match args.agent {
         AgentChoice::OpenCode => {
-            render_opencode_plugin(&server_url, auth.is_some(), strategy, &preview_capture_mode)
+            render_opencode_plugin(&server_url, auth, strategy, &preview_capture_mode)
         }
         AgentChoice::OpenCode2 => render_opencode2_plugin(
             &server_url,
-            auth.is_some(),
+            auth,
             strategy,
             &preview_capture_mode,
             args.capture_assistant,
         ),
-        AgentChoice::Pi => {
-            render_pi_extension(&server_url, auth.is_some(), strategy, &preview_capture_mode)
-        }
+        AgentChoice::Pi => render_pi_extension(&server_url, auth, strategy, &preview_capture_mode),
         AgentChoice::Omp => render_omp_extension(
             &server_url,
-            auth.is_some(),
+            auth,
             strategy,
             args.profile.as_deref(),
             &preview_capture_mode,
@@ -1292,7 +1288,7 @@ pub(crate) fn run_with_opencode_dialect_and_mcp_path(
             render_devin(&hooks_dir, &server_url, auth, &config.data_dir, strategy)
         }
         AgentChoice::Openclaw => {
-            openclaw_plugin::render(&server_url, auth.is_some(), strategy, &preview_capture_mode);
+            openclaw_plugin::render(&server_url, auth, strategy, &preview_capture_mode);
             Ok(())
         }
         AgentChoice::KimiCode => {
@@ -3270,6 +3266,24 @@ fn path_needs_shell_quoting(path: &Path) -> bool {
         .any(|segment| shell_quote(segment) != segment)
 }
 
+/// Escape every `/` as `\/` in a serialized JSON document.
+///
+/// Cursor strips `//` to end-of-line and `/* … */` comments *before* parsing
+/// `~/.cursor/hooks.json`, with a regex that ignores string boundaries
+/// (`parseJSONC(e){let t=e.replace(/\/\/.*$/gm,"");return
+/// t=t.replace(/\/\*[\s\S]*?\*\//g,""),JSON.parse(t)}`). A `--server-url
+/// https://…` baked into a command therefore truncates the line, `JSON.parse`
+/// fails, and Cursor drops the whole file silently — no Cursor session is ever
+/// captured (#2069). `\/` is valid JSON that decodes to `/`, and it leaves no
+/// `//` for the line-comment pass and no intact `*/` for the block pass, so the
+/// document survives both and parses to the same value. `/` only ever appears
+/// inside JSON string literals (never in structural tokens), so escaping the
+/// whole serialized text is safe and also repairs any `//` in a user's own
+/// preserved entries.
+fn escape_slashes_for_cursor_jsonc(json: &str) -> String {
+    json.replace('/', "\\/")
+}
+
 fn merge_cursor_hooks(
     staged: &Path,
     server_url: &str,
@@ -3294,7 +3308,7 @@ fn merge_cursor_hooks(
         .context("internal: payload builder didn't return a hooks object")?
         .clone();
     apply_atomic(config_path, |existing| {
-        mutate_json(existing, |root| {
+        let json = mutate_json(existing, |root| {
             // Cursor requires "version": 1 at the top level.
             // Overwrite unconditionally — the schema is versioned
             // so future Cursor releases can bump this; we'll bump
@@ -3309,7 +3323,10 @@ fn merge_cursor_hooks(
                 overlay_event_hooks(hooks, event, value);
             }
             Ok(())
-        })
+        })?;
+        // Cursor's comment stripper would otherwise drop the whole file over
+        // the `//` in a `https://` server URL (#2069).
+        Ok(escape_slashes_for_cursor_jsonc(&json))
     })
 }
 
@@ -4186,20 +4203,17 @@ fn warn_opencode_plugin_restore_conflict(quarantine: &Path, sibling: &Path) {
 
 fn render_opencode_plugin(
     server_url: &str,
-    has_token: bool,
+    auth_token: Option<&str>,
     project_strategy: Option<&str>,
     capture_mode: &str,
 ) -> Result<()> {
     println!("// OpenCode plugin — write to ~/.config/opencode/plugins/ai-memory.ts");
     println!("// Or re-run with `--apply` to install it automatically.");
     println!("// Restart OpenCode after changing plugins; config is loaded at startup.");
-    if has_token {
-        println!("{TS_PREVIEW_TOKEN_NOTE}");
-    }
     println!();
     println!(
         "{}",
-        build_opencode_plugin(server_url, None, project_strategy, capture_mode)
+        build_opencode_plugin(server_url, auth_token, project_strategy, capture_mode)
     );
     Ok(())
 }
@@ -4276,7 +4290,7 @@ fn apply_to_opencode2_plugin(
 
 fn render_opencode2_plugin(
     server_url: &str,
-    has_token: bool,
+    auth_token: Option<&str>,
     project_strategy: Option<&str>,
     capture_mode: &str,
     capture_assistant: bool,
@@ -4284,15 +4298,12 @@ fn render_opencode2_plugin(
     println!("// OpenCode V2 plugin — write to ~/.config/opencode/plugins/ai-memory-opencode2.ts");
     println!("// Or re-run with `--apply` to install it automatically.");
     println!("// Restart OpenCode V2 after changing plugins; config is loaded at startup.");
-    if has_token {
-        println!("{TS_PREVIEW_TOKEN_NOTE}");
-    }
     println!();
     println!(
         "{}",
         build_opencode2_plugin(
             server_url,
-            None,
+            auth_token,
             project_strategy,
             capture_mode,
             capture_assistant
@@ -5991,7 +6002,7 @@ fn pi_extension_hint_in(env_override: Option<std::ffi::OsString>) -> String {
 
 fn render_omp_extension(
     server_url: &str,
-    has_token: bool,
+    auth_token: Option<&str>,
     project_strategy: Option<&str>,
     profile: Option<&str>,
     capture_mode: &str,
@@ -6002,13 +6013,10 @@ fn render_omp_extension(
     );
     println!("// Or re-run with `--apply` to install it automatically.");
     println!("// Restart OMP after changing extensions; config is loaded at startup.");
-    if has_token {
-        println!("{TS_PREVIEW_TOKEN_NOTE}");
-    }
     println!();
     println!(
         "{}",
-        build_omp_extension(server_url, None, project_strategy, capture_mode)
+        build_omp_extension(server_url, auth_token, project_strategy, capture_mode)
     );
     Ok(())
 }
@@ -6064,7 +6072,7 @@ fn apply_to_pi_extension(
 
 fn render_pi_extension(
     server_url: &str,
-    has_token: bool,
+    auth_token: Option<&str>,
     project_strategy: Option<&str>,
     capture_mode: &str,
 ) -> Result<()> {
@@ -6074,13 +6082,10 @@ fn render_pi_extension(
     );
     println!("// Or re-run with `--apply` to install it automatically.");
     println!("// Restart Pi after changing extensions; MCP tools are bridged by this file.");
-    if has_token {
-        println!("{TS_PREVIEW_TOKEN_NOTE}");
-    }
     println!();
     println!(
         "{}",
-        build_pi_extension(server_url, None, project_strategy, capture_mode)
+        build_pi_extension(server_url, auth_token, project_strategy, capture_mode)
     );
     Ok(())
 }
@@ -7102,8 +7107,9 @@ fn render_claude_code(
         assistant: capture_assistant,
         prompts: capture_prompts,
     } = capture;
-    // Project scope tells the operator to paste this snippet into a checkout,
-    // so even the placeholder stays out; `--apply` persists the bearer instead.
+    // A preview never persists the bearer (#552), so it would land inline in
+    // the snippet — and project scope tells the operator to paste that snippet
+    // into a checkout. Withhold it there; `--apply` persists it instead.
     let token_withheld = scope == HookInstallScope::Project && auth_token.is_some();
     let auth_token = if token_withheld { None } else { auth_token };
     // Soft check: warn (don't bail) if a script is missing. The user
@@ -7153,7 +7159,11 @@ fn render_claude_code(
             data_dir.display()
         );
     } else if auth_token.is_some() {
-        print!("{}", preview_token_note("#"));
+        println!("# Auth: AI_MEMORY_AUTH_TOKEN embedded in each hook command below.");
+        println!(
+            "#       Treat {} as sensitive (chmod 600).",
+            settings_path.display()
+        );
     }
     println!();
     println!("{serialized}");
@@ -7199,7 +7209,11 @@ fn render_grok(
     println!("# Hook scripts: {}", hooks_dir.display());
     println!("# AI-memory server URL: {server_url}");
     if auth_token.is_some() {
-        print!("{}", preview_token_note("#"));
+        println!("# Auth: AI_MEMORY_AUTH_TOKEN embedded in each hook command below.");
+        println!(
+            "#       Treat {} as sensitive (chmod 600).",
+            config_path.display()
+        );
     }
     println!("# NOTE: Grok ignores hook stdout on SessionStart — capture works,");
     println!("#       but that event does not inject the handoff. The first");
@@ -7331,7 +7345,8 @@ fn render_zero(
     println!("# re-run with --apply to merge it in place, preserving other hooks.");
     println!("# AI-memory server URL: {server_url}");
     if auth_token.is_some() {
-        print!("{}", preview_token_note("#"));
+        println!("# Auth: token embedded in each hook's args below.");
+        println!("#       Treat hooks.json as sensitive (chmod 600).");
     }
     print!("{}", zero_install_notes(data_dir.display()));
     println!();
@@ -7597,7 +7612,12 @@ fn render_zcode(
     println!("# merge it in place, preserving the rest of the config.");
     println!("# AI-memory server URL: {server_url}");
     if auth_token.is_some() {
-        print!("{}", preview_token_note("#"));
+        println!("# Auth: this printed snippet embeds the token in each hook's args");
+        println!("#       so a hand-placed config works as-is — treat it as");
+        println!("#       sensitive (chmod 600). NOTE: `--apply` does NOT embed the");
+        println!("#       token; it persists it to <data-dir>/auth-token (0600) and");
+        println!("#       writes token-less args, so the applied config differs from");
+        println!("#       this snippet by design (#552, #600).");
     }
     println!("# NOTE: ZCode injects SessionStart stdout as model context, so the");
     println!("#       prior session's handoff is delivered automatically.");
@@ -7688,9 +7708,7 @@ fn render_hermes_output(
     out.push_str("# write that file: it is YAML you also edit, and it would have to\n");
     out.push_str("# be spliced. Restart Hermes (and its gateway) to load it.\n");
     out.push_str(&format!("# AI-memory server URL: {server_url}\n"));
-    if auth_token == Some(PREVIEW_TOKEN_PLACEHOLDER) {
-        out.push_str(&preview_token_note("#"));
-    } else if auth_token.is_some() {
+    if auth_token.is_some() {
         out.push_str("# Auth: this snippet embeds the token in each hook command —\n");
         out.push_str("#       treat ~/.hermes/config.yaml as sensitive (chmod 600).\n");
     }
@@ -7861,7 +7879,9 @@ fn render_droid(
     println!("# while hooks.json does not exist.");
     println!("# AI-memory server URL: {server_url}");
     if auth_token.is_some() {
-        print!("{}", preview_token_note("#"));
+        println!("# Auth: this printed snippet embeds the token in each hook command —");
+        println!("#       treat the file as sensitive (chmod 600). `--apply` stores it");
+        println!("#       under the data dir instead.");
     }
     print!("{DROID_INSTALL_NOTES}");
     println!();
@@ -7944,7 +7964,9 @@ fn render_codebuddy(
     println!("# place.");
     println!("# AI-memory server URL: {server_url}");
     if auth_token.is_some() {
-        print!("{}", preview_token_note("#"));
+        println!("# Auth: this printed snippet embeds the token in each hook command —");
+        println!("#       treat settings.json as sensitive (chmod 600). `--apply` stores it");
+        println!("#       under the data dir instead.");
     }
     print!("{CODEBUDDY_INSTALL_NOTES}");
     println!();
@@ -8106,7 +8128,9 @@ fn render_ibm_bob(
     println!("# ~/.bob/settings/settings.json, or re-run with --apply to merge it in place.");
     println!("# AI-memory server URL: {server_url}");
     if auth_token.is_some() {
-        print!("{}", preview_token_note("#"));
+        println!("# Auth: this printed snippet embeds the token in each hook command —");
+        println!("#       treat settings.json as sensitive (chmod 600). `--apply` stores it");
+        println!("#       under the data dir instead.");
     }
     print!("{IBM_BOB_INSTALL_NOTES}");
     println!();
@@ -8189,7 +8213,9 @@ fn render_qwen_code(
     println!("# place. MCP servers share this file under `mcpServers`.");
     println!("# AI-memory server URL: {server_url}");
     if auth_token.is_some() {
-        print!("{}", preview_token_note("#"));
+        println!("# Auth: this printed snippet embeds the token in each hook command —");
+        println!("#       treat settings.json as sensitive (chmod 600). `--apply` stores it");
+        println!("#       under the data dir instead.");
     }
     print!("{QWEN_CODE_INSTALL_NOTES}");
     println!();
@@ -8283,7 +8309,9 @@ fn render_muse(
     println!("# muse command fails at startup.");
     println!("# AI-memory server URL: {server_url}");
     if auth_token.is_some() {
-        print!("{}", preview_token_note("#"));
+        println!("# Auth: this printed snippet embeds the token in each hook command —");
+        println!("#       treat the file as sensitive (chmod 600). `--apply` stores it");
+        println!("#       under the data dir instead.");
     }
     print!("{MUSE_INSTALL_NOTES}");
     println!();
@@ -8328,7 +8356,10 @@ fn render_devin(
     println!("# Hook scripts: {}", hooks_dir.display());
     println!("# AI-memory server URL: {server_url}");
     if auth_token.is_some() {
-        print!("{}", preview_token_note("#"));
+        println!("# Auth: AI_MEMORY_AUTH_TOKEN embedded in each hook command below.");
+        println!(
+            "#       Treat ~/.devin/hooks.v1.json or ~/.devin/config.json as sensitive (chmod 600)."
+        );
     }
     println!(
         "# NOTE: Devin consumes the handoff via hookSpecificOutput.additionalContext on SessionStart."
@@ -8380,7 +8411,8 @@ fn render_kimi_code(
     println!("# Hook scripts: {}", hooks_dir.display());
     println!("# AI-memory server URL: {server_url}");
     if auth_token.is_some() {
-        print!("{}", preview_token_note("#"));
+        println!("# Auth: AI_MEMORY_AUTH_TOKEN embedded in each hook command below.");
+        println!("#       Treat config.toml as sensitive (chmod 600).");
     }
     println!();
     print!("{doc}");
@@ -8426,7 +8458,8 @@ fn render_kiro_cli(
     println!("// Hook scripts: {}", hooks_dir.display());
     println!("// AI-memory server URL: {server_url}");
     if auth_token.is_some() {
-        print!("{}", preview_token_note("//"));
+        println!("// Auth: AI_MEMORY_AUTH_TOKEN embedded in each hook command below.");
+        println!("//       Treat agent configs as sensitive (chmod 600).");
     }
     println!();
     println!(
@@ -8468,7 +8501,8 @@ fn render_kiro_cli_v3(
     println!("// Hook scripts: {}", hooks_dir.display());
     println!("// AI-memory server URL: {server_url}");
     if auth_token.is_some() {
-        print!("{}", preview_token_note("//"));
+        println!("// Auth: AI_MEMORY_AUTH_TOKEN embedded in each hook command below.");
+        println!("//       Treat the hook file as sensitive (chmod 600).");
     }
     println!();
     println!(
@@ -8540,9 +8574,7 @@ fn render_pool_output(
     out.push_str("# (re-run with --apply first to stage the scripts to a stable path).\n");
     out.push_str(&format!("# Hook scripts: {}\n", hooks_dir.display()));
     out.push_str(&format!("# AI-memory server URL: {server_url}\n"));
-    if auth_token == Some(PREVIEW_TOKEN_PLACEHOLDER) {
-        out.push_str(&preview_token_note("#"));
-    } else if auth_token.is_some() {
+    if auth_token.is_some() {
         out.push_str("# Auth: AI_MEMORY_AUTH_TOKEN embedded in each hook command below.\n");
         out.push_str("#       Treat .poolside/settings.yaml as sensitive (chmod 600).\n");
     }
@@ -8698,7 +8730,7 @@ fn render_cline_hooks(
         );
     }
     for (name, event) in CLINE_HOOK_EVENTS {
-        let preview_token = auth_token.map(|_| PREVIEW_TOKEN_PLACEHOLDER);
+        let preview_token = auth_token.map(|_| "<redacted>");
         let argv = cline_hook_argv(
             event,
             server_url,
@@ -8859,7 +8891,8 @@ fn render_dsh_output(
     out.push_str(&format!("# Hook scripts: {}\n", hooks_dir.display()));
     out.push_str(&format!("# AI-memory server URL: {server_url}\n"));
     if auth_token.is_some() {
-        out.push_str(&preview_token_note("#"));
+        out.push_str("# Auth: AI_MEMORY_AUTH_TOKEN embedded in each hook command below.\n");
+        out.push_str("#       Treat the hook config as sensitive (chmod 600).\n");
     }
     out.push_str("# NOTE: the bridge delivers exactly these seven events - no\n");
     out.push_str("#       PreCompact or SessionEnd, and SessionStart runs detached,\n");
@@ -8952,6 +8985,15 @@ fn write_private_dsh_config(path: &Path, content: &[u8]) -> Result<()> {
 /// and `setup-agent`.
 pub(crate) fn dsh_bridge_patch_fragment(command_dir: &Path) -> String {
     let config_path = command_dir.join("hooks.json");
+    // The bridge is a Node plugin that reads this path with
+    // `fs.readFileSync`, which cannot resolve a Windows `\\?\` verbatim
+    // prefix and fails ENOENT (it treats the path as relative, #2032).
+    // `command_dir` descends from the canonical data dir, which carries that
+    // prefix on Windows, so strip it the way `service_host` does for command
+    // lines. A plain `C:\...` drive path reads fine in Node.
+    let config_path =
+        super::path_util::strip_windows_verbatim_prefix(&config_path.to_string_lossy())
+            .into_owned();
     let mut out = String::new();
     out.push_str("# DeepSeek Harness (DSH) - merge the entry below into the DSH\n");
     out.push_str("# profile patch at $DSH_HOME/profiles/<profile>/cordis.patch.yml,\n");
@@ -8965,7 +9007,7 @@ pub(crate) fn dsh_bridge_patch_fragment(command_dir: &Path) -> String {
     out.push_str("      config:\n");
     out.push_str(&format!(
         "        configPath: {}\n",
-        yaml_single_quote(&config_path.to_string_lossy())
+        yaml_single_quote(&config_path)
     ));
     out
 }
@@ -10979,79 +11021,64 @@ command = "AI_MEMORY_HOOK_URL=http://h AI_MEMORY_PROJECT_STRATEGY=repo-root /x/a
         assert!(snippet.contains("tok-test"), "auth token must be embedded");
     }
 
-    /// `--apply` for Hermes and Pool prints through the same functions as the
-    /// preview. When the token could not be stored it is still embedded, as it
-    /// was, and the comment has to say so rather than promise a placeholder.
+    /// A preview prints the rendered block to a terminal a scrollback, a CI
+    /// log or an agent's transcript keeps, so the caller hands the renderer
+    /// the `mask_secret` form: the full credential never appears, the masked
+    /// prefix does. (Fork preview test, adapted to the upstream mask.)
     #[test]
-    fn apply_output_with_an_unstored_token_still_embeds_it_and_says_so() {
-        let token = "aim_FAKEfakeFAKEfakeFAKEfake";
+    fn preview_output_with_a_masked_token_never_shows_the_full_token() {
+        let token = "aim_FAKEfakeFAKEfakeFAKEfakeFAKEfakeFAKEfake111";
+        let masked = mask_secret(token);
+
         let hermes = render_hermes_output(
             "http://127.0.0.1:49374",
-            Some(token),
+            Some(&masked),
             Path::new("/data"),
             None,
             None,
         );
-        assert!(hermes.contains(token));
-        assert!(hermes.contains("embeds the token"));
-        assert!(!hermes.contains("omitted from this preview"));
+        assert!(!hermes.contains(token), "{hermes}");
+        assert!(hermes.contains("[REDACTED]"), "{hermes}");
 
         let pool = render_pool_output(
             Path::new("/staging/pool"),
             "http://127.0.0.1:49374",
-            Some(token),
+            Some(&masked),
             Path::new("/data"),
             None,
         );
-        assert!(pool.contains(token));
-        assert!(pool.contains("embedded in each hook command"));
-        assert!(!pool.contains("omitted from this preview"));
+        assert!(!pool.contains(token), "{pool}");
+        assert!(pool.contains("[REDACTED]"), "{pool}");
     }
 
+    /// The other half of the preview fix: on `--apply` Hermes and Pool have no
+    /// file to write, so a token that could not be stored still rides in the
+    /// printed block — masked, not live.
+    /// (Fork `--apply` fallback test, adapted to the upstream mask.)
     #[test]
-    fn output_with_the_placeholder_says_the_token_was_omitted() {
+    fn apply_output_with_an_unstored_token_embeds_it_masked() {
+        let token = "aim_FAKEfakeFAKEfakeFAKEfake";
+        let masked = mask_secret(token);
+
         let hermes = render_hermes_output(
             "http://127.0.0.1:49374",
-            Some(PREVIEW_TOKEN_PLACEHOLDER),
+            Some(&masked),
             Path::new("/data"),
             None,
             None,
         );
-        assert!(hermes.contains("omitted from this preview"));
-        assert!(!hermes.contains("embeds the token"));
+        assert!(!hermes.contains(token), "{hermes}");
+        assert!(hermes.contains(&masked), "{hermes}");
 
         let pool = render_pool_output(
             Path::new("/staging/pool"),
             "http://127.0.0.1:49374",
-            Some(PREVIEW_TOKEN_PLACEHOLDER),
+            Some(&masked),
             Path::new("/data"),
             None,
         );
-        assert!(pool.contains("omitted from this preview"));
-        assert!(!pool.contains("embedded in each hook command"));
-    }
-
-    /// The other half of the preview fix: a generated plugin written by
-    /// `--apply` with a token it could not store still carries that token.
-    #[test]
-    fn apply_with_an_unstored_token_still_writes_it_into_the_plugin() {
-        let temp = TempDir::new().unwrap();
-        let plugin = temp.path().join("ai-memory.ts");
-        let mut args = default_hook_args();
-        args.config_file = Some(plugin.clone());
-        let token = "aim_FAKEfakeFAKEfakeFAKEfake";
-
-        apply_to_opencode_plugin(
-            &ai_memory_core::i18n::Localizer::default(),
-            "http://127.0.0.1:49374",
-            Some(token),
-            &args,
-            "denylist",
-        )
-        .unwrap();
-
-        let written = fs::read_to_string(&plugin).unwrap();
-        assert!(written.contains(&format!("const TOKEN: string | null = \"{token}\";")));
+        assert!(!pool.contains(token), "{pool}");
+        assert!(pool.contains(&masked), "{pool}");
     }
 
     #[test]
@@ -11118,6 +11145,26 @@ command = "AI_MEMORY_HOOK_URL=http://h AI_MEMORY_PROJECT_STRATEGY=repo-root /x/a
         assert!(
             out.contains(&format!("configPath: '{expected}'")),
             "expected quoted configPath in: {out}"
+        );
+    }
+
+    #[test]
+    fn dsh_bridge_patch_fragment_strips_windows_verbatim_prefix() {
+        // `command_dir` descends from the canonical data dir, which carries a
+        // `\\?\` verbatim prefix on Windows. The Node bridge reads configPath
+        // with `fs.readFileSync`, which fails ENOENT on that prefix (#2032),
+        // so the emitted path must be a plain drive path. The strip is
+        // lexical, so this bites on any host.
+        let out = dsh_bridge_patch_fragment(Path::new(
+            r"\\?\C:\Users\me\AppData\Local\ai-memory\hooks\dsh",
+        ));
+        assert!(
+            !out.contains(r"\\?\"),
+            "verbatim prefix must not reach configPath: {out}"
+        );
+        assert!(
+            out.contains(r"configPath: 'C:\Users\me\AppData\Local\ai-memory\hooks\dsh"),
+            "expected a plain drive path in: {out}"
         );
     }
 
@@ -16459,6 +16506,72 @@ process.exit(0);
         )
         .unwrap();
         assert_eq!(second, ApplyOutcome::NoOp, "second apply must be a no-op");
+    }
+
+    // Cursor strips comments before parsing hooks.json, with a regex that
+    // ignores string boundaries, so a `//` anywhere — including inside a
+    // `https://` server URL baked into a command — truncates the line,
+    // `JSON.parse` throws, and Cursor drops the whole file and captures
+    // nothing (#2069). Model Cursor's exact `parseJSONC` from the shipped
+    // cursor-agent bundle (2026.11.05 `6139.index.js`):
+    //   e.replace(/\/\/.*$/gm,"").replace(/\/\*[\s\S]*?\*\//g,"")
+    // and prove the rendered file carries no bare `//`, still parses after the
+    // strip, and keeps the full `https://` URL in an ai-memory command.
+    #[test]
+    fn cursor_hooks_survive_cursors_comment_stripper() {
+        let hooks_tmp = TempDir::new().unwrap();
+        stub_scripts(
+            hooks_tmp.path(),
+            &[
+                "session-start.sh",
+                "session-end.sh",
+                "user-prompt-submit.sh",
+                "pre-tool-use.sh",
+                "post-tool-use.sh",
+                "pre-compact.sh",
+                "stop.sh",
+            ],
+        );
+        let config_tmp = TempDir::new().unwrap();
+        let config_path = config_tmp.path().join("hooks.json");
+        let url = "https://memory.example.com:8443/mcp";
+        merge_cursor_hooks(
+            hooks_tmp.path(),
+            url,
+            None,
+            Some(config_tmp.path()),
+            None,
+            &config_path,
+        )
+        .unwrap();
+
+        let raw = fs::read_to_string(&config_path).unwrap();
+        assert!(
+            !raw.contains("//"),
+            "rendered hooks.json still carries a bare `//` Cursor would strip: {raw}"
+        );
+
+        // Cursor's parseJSONC, modeled from the shipped bundle.
+        let line = regex::Regex::new(r"(?m)//.*$").unwrap();
+        let block = regex::Regex::new(r"(?s)/\*.*?\*/").unwrap();
+        let stripped = block
+            .replace_all(&line.replace_all(&raw, ""), "")
+            .into_owned();
+        let parsed: serde_json::Value = serde_json::from_str(&stripped)
+            .expect("Cursor would drop a hooks.json it cannot parse after stripping comments");
+        assert!(
+            parsed
+                .get("hooks")
+                .and_then(serde_json::Value::as_object)
+                .is_some_and(|hooks| !hooks.is_empty()),
+            "our hooks did not survive Cursor's comment strip: {stripped}"
+        );
+
+        let commands = cursor_ai_memory_commands(&config_path);
+        assert!(
+            commands.iter().any(|(_, command)| command.contains(url)),
+            "no ai-memory command kept the https:// server URL intact: {commands:?}"
+        );
     }
 
     // ----------------------------------------------------------------

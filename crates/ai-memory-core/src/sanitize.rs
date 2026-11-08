@@ -481,7 +481,7 @@ const BUILTIN_PATTERNS: &[(&str, &str)] = &[
     // would otherwise be left behind.
     (
         r"(?:(?:\\(?:[nrtbf]|u[0-9A-Fa-f]{4}|x[0-9A-Fa-f]{2})(?:\[[0-9;?]*[ -/]*[@-~])?|%[0-9A-Fa-f]{2})|(?-u:\b))(?P<secret>(?:aim|amk|ams)_[A-Za-z0-9_\-]{22,})",
-        "ai_memory_token",
+        "ai_memory_key",
     ),
     // Vendor-prefixed API keys. A letter right before the prefix means it
     // ends a word (`task-…`, `disk-…`), so that is the one place a match may
@@ -505,6 +505,17 @@ const BUILTIN_PATTERNS: &[(&str, &str)] = &[
     // `ghs_` (server-to-server / Actions), `ghr_` (refresh).
     (r"gh[pousr]_[A-Za-z0-9]{20,}", "github_token"),
     (r"github_pat_[A-Za-z0-9_]{20,}", "github_token"),
+    // ai-memory's own keys: native DB-user (`aim_`), web-session (`ams_`), and
+    // external mcp-auth (`amk_`). Each is the prefix plus a 256-bit base64url
+    // secret (43 characters); the 40-character floor keeps snake_case
+    // identifiers that start with one of the prefixes intact. Deliberately
+    // left-unanchored: `strip_control` runs before matching and can glue a
+    // word, or the visible tail of a removed ANSI sequence (`…[32m`), straight
+    // onto the prefix, where a `\b` or non-letter anchor would then miss the
+    // key. The distinctive prefix plus a 40-character base64url tail makes a
+    // false positive on real text negligible — unlike the AWS rule below,
+    // whose `AKIA`/`ASIA` prefix is ordinary uppercase text.
+    (r"(?:aim|ams|amk)_[A-Za-z0-9_-]{40,}", "ai_memory_key"),
     // AWS access-key IDs: long-lived (AKIA) and STS temporary (ASIA).
     //
     // Anchored to the exact published format — a 4-character prefix plus
@@ -515,7 +526,18 @@ const BUILTIN_PATTERNS: &[(&str, &str)] = &[
     // BEFORE storage and is irreversible: the observation loses the text with
     // no error and no way to recover it. The word boundaries keep a real key
     // from being missed when it sits inside punctuation.
-    (r"\b(?:AKIA|ASIA)[0-9A-Z]{16}\b", "aws_key"),
+    //
+    // The left anchor also accepts a percent-encoded byte (`?key=%20AKIA…`),
+    // like the `sk-`/Stripe rules, so a key glued to an escape survives the
+    // strip. A letter removed from directly before the prefix (a stripped
+    // control character between two words) is still not matched: redacting
+    // `AKIA` mid-word is the irreversible uppercase-text destruction the floor
+    // above guards against, so that one case is left to the own-prefix rule's
+    // distinctive tail, which `AKIA` lacks.
+    (
+        r"(?:\b|%[0-9A-Fa-f]{2})(?P<secret>(?:AKIA|ASIA)[0-9A-Z]{16})\b",
+        "aws_key",
+    ),
     // Naked Google / Gemini API keys (legacy standard-key shape).
     (r"AIza[A-Za-z0-9_\-]{30,}", "google_api_key"),
     // Gemini authorization ("auth") keys. AI Studio has issued these instead
@@ -1192,7 +1214,7 @@ mod tests {
             ] {
                 let out = s().scrub(&text);
                 assert!(
-                    out.contains("[REDACTED:ai_memory_token]"),
+                    out.contains("[REDACTED:ai_memory_key]"),
                     "{prefix} {shape}: {out}"
                 );
                 assert!(!out.contains("FAKEfake"), "{prefix} {shape}: {out}");
@@ -1206,7 +1228,7 @@ mod tests {
         let key = native_key("aim_");
         assert_eq!(
             s().scrub(&format!("const TOKEN: string | null = \"{key}\";")),
-            "const TOKEN: string | null = \"[REDACTED:ai_memory_token]\";"
+            "const TOKEN: string | null = \"[REDACTED:ai_memory_key]\";"
         );
     }
 
@@ -1216,7 +1238,7 @@ mod tests {
             let key = format!("{}{tail}", native_key("aim_"));
             assert_eq!(
                 s().scrub(&format!("key {key} end")),
-                "key [REDACTED:ai_memory_token] end"
+                "key [REDACTED:ai_memory_key] end"
             );
         }
     }
@@ -1226,7 +1248,7 @@ mod tests {
         let key = native_key("aim_");
         let (head, tail) = key.split_at(10);
         let out = s().scrub(&format!("key {head}\u{200b}{tail}"));
-        assert_eq!(out, "key [REDACTED:ai_memory_token]");
+        assert_eq!(out, "key [REDACTED:ai_memory_key]");
     }
 
     #[test]
@@ -1241,7 +1263,7 @@ mod tests {
     #[test]
     fn native_key_floor_is_twenty_two_tail_characters() {
         let at_floor = format!("aim_{}", "x".repeat(22));
-        assert_eq!(s().scrub(&at_floor), "[REDACTED:ai_memory_token]");
+        assert_eq!(s().scrub(&at_floor), "[REDACTED:ai_memory_key]");
         let below_floor = format!("aim_{}", "x".repeat(21));
         assert_eq!(s().scrub(&below_floor), below_floor);
     }
@@ -1268,7 +1290,7 @@ mod tests {
     /// must be matched through the escape, which the redaction keeps.
     #[test]
     fn native_key_after_a_json_escaped_break_keeps_the_escape_and_redacts_the_key() {
-        let marker = "[REDACTED:ai_memory_token]";
+        let marker = "[REDACTED:ai_memory_key]";
         for (input, expected) in [
             (
                 format!("title\\n{}", native_key("aim_")),
@@ -1305,7 +1327,7 @@ mod tests {
     #[test]
     fn a_double_escaped_backslash_before_the_key_keeps_the_escape() {
         let out = s().scrub(&format!("\\\\n{}", native_key("aim_")));
-        assert_eq!(out, "\\\\n[REDACTED:ai_memory_token]");
+        assert_eq!(out, "\\\\n[REDACTED:ai_memory_key]");
         assert_eq!(s().scrub(&out), out);
     }
 
@@ -1314,7 +1336,7 @@ mod tests {
     /// mistaken for an identifier.
     #[test]
     fn native_key_glued_to_a_unicode_word_is_redacted_like_a_bare_one() {
-        let marker = "[REDACTED:ai_memory_token]";
+        let marker = "[REDACTED:ai_memory_key]";
         for input in [
             format!("\u{e9}{}", native_key("aim_")),
             format!("\u{65e5}\u{672c}{}", native_key("amk_")),
@@ -1333,7 +1355,7 @@ mod tests {
         let key = native_key("aim_");
         let (head, tail) = key.split_at(10);
         let out = s().scrub(&format!("title\\n{head}\u{200b}{tail}"));
-        assert_eq!(out, "title\\n[REDACTED:ai_memory_token]");
+        assert_eq!(out, "title\\n[REDACTED:ai_memory_key]");
     }
 
     /// A native key whose base64url body contains `sk-` must be matched whole
@@ -1342,7 +1364,7 @@ mod tests {
     /// fragment of the key stays in clear.
     #[test]
     fn a_native_key_with_an_sk_suffix_in_its_body_leaves_no_fragment() {
-        let marker = "[REDACTED:ai_memory_token]";
+        let marker = "[REDACTED:ai_memory_key]";
         // `sk-` after 5, 21 and 22 body characters; the tail after it stays
         // long enough for the `sk-` rule to want it.
         let bodies = [
@@ -1378,7 +1400,7 @@ mod tests {
         let key = native_key("aim_");
         for prefix in ["\u{1b}[32m", "\u{1b}[0m", "\u{1b}"] {
             let out = s().scrub(&format!("{prefix}{key}"));
-            assert_eq!(out, "[REDACTED:ai_memory_token]", "{prefix:?} -> {out:?}");
+            assert_eq!(out, "[REDACTED:ai_memory_key]", "{prefix:?} -> {out:?}");
             assert_eq!(s().scrub(&out), out, "second pass: {prefix:?}");
         }
     }
@@ -2794,6 +2816,46 @@ mod tests {
             "ams_ and aim_ are the key prefixes",
         ] {
             assert_eq!(s.scrub(raw), raw, "must be left alone: {raw}");
+        }
+    }
+
+    /// `strip_control` runs before matching, so a word glued onto a key by a
+    /// stripped character used to leave the key whole: the `aim_`/`ams_` rule
+    /// and the AWS rule both required a left word boundary that the removal
+    /// had just destroyed, and `amk_` had no rule at all (GHSA-6pmr-q79m-87vp,
+    /// item 5). The own-prefix rule is now left-unanchored; the AWS rule
+    /// additionally accepts a percent-encoded byte.
+    #[test]
+    fn a_key_glued_onto_a_word_by_a_stripped_character_is_still_redacted() {
+        let s = s();
+        let tail = "FAKEfake0123-_xy".repeat(3); // 48 base64url chars, > the 40 floor
+        for prefix in ["aim_", "ams_", "amk_"] {
+            let key = format!("{prefix}{tail}");
+            for glued in [
+                format!("title\u{7}{key}"),      // a removed BEL
+                format!("title\u{1b}[32m{key}"), // a removed ANSI colour code
+                format!("word%20{key}"),         // a percent-encoded byte
+                format!("prefixword{key}"),      // a letter directly before it
+            ] {
+                let out = s.scrub(&glued);
+                assert!(
+                    out.contains("[REDACTED:ai_memory_key]") && !out.contains(&tail),
+                    "glued key must be redacted: {glued:?} -> {out:?}"
+                );
+            }
+        }
+        // AWS: the percent-encoded byte is newly covered; a boundary case still
+        // works. (A letter removed from directly before `AKIA` stays unmatched
+        // on purpose — redacting it mid-word would destroy uppercase text.)
+        for aws in [
+            "url?k=%20AKIAFAKEFAKEFAKEFAKE",
+            "set AKIAFAKEFAKEFAKEFAKE here",
+        ] {
+            let out = s.scrub(aws);
+            assert!(
+                out.contains("[REDACTED:aws_key]") && !out.contains("FAKEFAKE"),
+                "AWS key must be redacted: {aws:?} -> {out:?}"
+            );
         }
     }
 }

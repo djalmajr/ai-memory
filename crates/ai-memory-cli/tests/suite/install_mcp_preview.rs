@@ -13,13 +13,8 @@ const SERVER_URL: &str = "http://127.0.0.1:49374";
 const TOKEN: &str = "aim_FAKEfakeFAKEfakeFAKEfakeFAKEfakeFAKEfake111";
 /// Part of [`TOKEN`] that survives any quoting or escaping a format applies.
 const TOKEN_BODY: &str = "FAKEfake";
-const PLACEHOLDER: &str = "<redacted>";
-/// The stderr note `install-mcp` must print when its snippet holds the
-/// placeholder.
-const MCP_NOTE: &str = "[ai-memory] token omitted from this output: replace <redacted> with it, or rerun with --apply.";
-/// The stderr note `setup-agent` must print when it saw a token.
-const SETUP_NOTE: &str =
-    "[ai-memory] token omitted from this output: replace any <redacted> with it.";
+/// The `mask_secret` form of [`TOKEN`]: a 4-character prefix plus the marker.
+const MASKED_TOKEN: &str = "aim_...[REDACTED]";
 
 /// Every `--client` value `install-mcp` accepts, by CLI name.
 const MCP_CLIENTS: &[&str] = &[
@@ -59,17 +54,17 @@ const MCP_CLIENTS: &[&str] = &[
 /// Entries that never carry the token literal: they name
 /// `AI_MEMORY_AUTH_TOKEN` or run the bridge that reads the install's
 /// credential. For those, a given token shows neither the token nor the
-/// placeholder in the snippet.
+/// masked marker in the snippet.
 const NO_TOKEN_CLIENTS: &[&str] = &["pi", "droid", "hermes", "prime-agent"];
 
 /// `setup-agent` agents that print a config or stage scripts. `open-code`
 /// needs `--opencode-dialect`, because the container cannot probe the host
 /// `opencode` binary.
 const SETUP_AGENTS: &[&str] = &["zero", "zcode", "droid", "claude-code", "open-code", "pi"];
-/// The agents whose printed config embeds the token, and so the
-/// placeholder, when a token is given. Pi's guidance prints the literal
-/// `<token>` it tells the operator to fill in, so it holds neither.
-const SETUP_AGENTS_WITH_PLACEHOLDER: &[&str] =
+/// The agents whose printed config embeds the masked token when a
+/// token is given. Pi's guidance prints the literal `<token>` it tells
+/// the operator to fill in, so it holds neither.
+const SETUP_AGENTS_WITH_MASKED_TOKEN: &[&str] =
     &["zero", "zcode", "droid", "claude-code", "open-code"];
 
 struct Sandbox {
@@ -235,27 +230,21 @@ fn mcp_preview_keeps_the_token_out_of_every_client() {
     }
 }
 
-/// The clients whose entry embeds the token show the placeholder and the
-/// exact stderr note in its place; the entries that never carry the token
-/// show neither, so the note is not printed for them.
+/// The clients whose entry embeds the token show the masked marker in its
+/// place; the entries that never carry the token show neither.
 #[test]
-fn mcp_previews_show_the_placeholder_where_the_token_would_be() {
+fn mcp_previews_show_the_masked_token_where_the_token_would_be() {
     let sandbox = Sandbox::new();
     for client in MCP_CLIENTS {
         let what = format!("install-mcp --client {client} with --auth-token");
         let mut cmd = sandbox.install_mcp(client);
         cmd.args(["--auth-token", TOKEN]);
-        let (stdout, stderr) = clean(&what, cmd);
+        let (stdout, _stderr) = clean(&what, cmd);
         let holds_token = !NO_TOKEN_CLIENTS.contains(client);
         assert_eq!(
-            stdout.contains(PLACEHOLDER),
+            stdout.contains(MASKED_TOKEN),
             holds_token,
-            "{client}: the placeholder must appear exactly when the entry embeds the token:\n{stdout}"
-        );
-        assert_eq!(
-            stderr.contains(MCP_NOTE),
-            holds_token,
-            "{client}: the omission note must appear exactly when the entry embeds the token:\n{stderr}"
+            "{client}: the masked token must appear exactly when the entry embeds the token:\n{stdout}"
         );
     }
 }
@@ -271,20 +260,18 @@ fn mcp_previews_redact_the_token_from_every_source() {
 
         let mut cmd = sandbox.install_mcp(client);
         cmd.env("AI_MEMORY_AUTH_TOKEN", TOKEN);
-        let (stdout, stderr) = clean(&format!("{client} with AI_MEMORY_AUTH_TOKEN"), cmd);
-        assert!(stdout.contains(PLACEHOLDER), "{client}:\n{stdout}");
-        assert!(stderr.contains(MCP_NOTE), "{client}:\n{stderr}");
+        let (stdout, _stderr) = clean(&format!("{client} with AI_MEMORY_AUTH_TOKEN"), cmd);
+        assert!(stdout.contains(MASKED_TOKEN), "{client}:\n{stdout}");
 
         sandbox.write_config(&format!("[auth]\nbearer_token = \"{TOKEN}\"\n"));
-        let (stdout, stderr) = clean(
+        let (stdout, _stderr) = clean(
             &format!("{client} with [auth].bearer_token"),
             sandbox.install_mcp(client),
         );
-        assert!(stdout.contains(PLACEHOLDER), "{client}:\n{stdout}");
-        assert!(stderr.contains(MCP_NOTE), "{client}:\n{stderr}");
+        assert!(stdout.contains(MASKED_TOKEN), "{client}:\n{stdout}");
 
         // The token file routes the entry to the bridge instead of
-        // inlining a literal, so no placeholder either: the token must
+        // inlining a literal, so no masked token either: the token must
         // simply stay out.
         let token_file = sandbox.home.join("root-token");
         std::fs::write(&token_file, TOKEN).unwrap();
@@ -292,12 +279,11 @@ fn mcp_previews_redact_the_token_from_every_source() {
             "[auth]\nbearer_token_file = {:?}\n",
             token_file.display().to_string()
         ));
-        let (stdout, stderr) = clean(
+        let (stdout, _stderr) = clean(
             &format!("{client} with [auth].bearer_token_file"),
             sandbox.install_mcp(client),
         );
-        assert!(!stdout.contains(PLACEHOLDER), "{client}:\n{stdout}");
-        assert!(!stderr.contains(MCP_NOTE), "{client}:\n{stderr}");
+        assert!(!stdout.contains(MASKED_TOKEN), "{client}:\n{stdout}");
     }
 }
 
@@ -321,12 +307,11 @@ fn planted_mcp_entry_stays_out_of_the_preview() {
         std::fs::write(&path, &json_entry).unwrap();
 
         let what = format!("{client} with a planted MCP entry");
-        let (stdout, stderr) = clean(&what, sandbox.install_mcp(client));
+        let (stdout, _stderr) = clean(&what, sandbox.install_mcp(client));
         assert!(
-            !stdout.contains(PLACEHOLDER),
-            "{client}: the preview saw no token, so it must not show the placeholder:\n{stdout}"
+            !stdout.contains(MASKED_TOKEN),
+            "{client}: the preview saw no token, so it must not show the masked token:\n{stdout}"
         );
-        assert!(!stderr.contains(MCP_NOTE), "{client}:\n{stderr}");
     }
 
     let sandbox = Sandbox::new();
@@ -345,12 +330,11 @@ fn planted_mcp_entry_stays_out_of_the_preview() {
     .unwrap();
     let mut cmd = sandbox.command();
     cmd.args(["install-mcp", "--client", "open-code"]);
-    let (stdout, stderr) = clean("open-code with an inferred MCP token", cmd);
+    let (stdout, _stderr) = clean("open-code with an inferred MCP token", cmd);
     assert!(
-        stdout.contains(PLACEHOLDER),
-        "the inferred token must come out as the placeholder:\n{stdout}"
+        stdout.contains(MASKED_TOKEN),
+        "the inferred token must come out masked:\n{stdout}"
     );
-    assert!(stderr.contains(MCP_NOTE), "{stderr}");
 }
 
 /// `setup-agent` prints the config and, for the script agents, stages
@@ -364,15 +348,11 @@ fn setup_agent_keeps_the_token_out_of_output_and_staged_files() {
         let what = format!("setup-agent --agent {agent} with --auth-token");
         let mut cmd = sandbox.setup_agent(agent, &staged);
         cmd.args(["--auth-token", TOKEN]);
-        let (stdout, stderr) = clean(&what, cmd);
-        assert!(
-            stderr.contains(SETUP_NOTE),
-            "{agent}: the omission note must say where the token went:\n{stderr}"
-        );
+        let (stdout, _stderr) = clean(&what, cmd);
         assert_eq!(
-            stdout.contains(PLACEHOLDER),
-            SETUP_AGENTS_WITH_PLACEHOLDER.contains(agent),
-            "{agent}: the placeholder must appear exactly when the printed config embeds the token:\n{stdout}"
+            stdout.contains(MASKED_TOKEN),
+            SETUP_AGENTS_WITH_MASKED_TOKEN.contains(agent),
+            "{agent}: the masked token must appear exactly when the printed config embeds the token:\n{stdout}"
         );
     }
     assert_no_token_under("setup-agent staged files", &staged);
@@ -392,20 +372,19 @@ fn setup_agent_redacts_the_token_from_the_other_sources() {
 
         let mut cmd = sandbox.setup_agent(client, &staged);
         cmd.env("AI_MEMORY_AUTH_TOKEN", TOKEN);
-        let (_stdout, stderr) = clean(
+        let (stdout, _stderr) = clean(
             &format!("setup-agent --agent {client} with the env token"),
             cmd,
         );
-        assert!(stderr.contains(SETUP_NOTE), "{client}:\n{stderr}");
+        assert!(stdout.contains(MASKED_TOKEN), "{client}:\n{stdout}");
 
         sandbox.write_config(&format!("[auth]\nbearer_token = \"{TOKEN}\"\n"));
-        let (stdout, stderr) = clean(
+        let (stdout, _stderr) = clean(
             &format!("setup-agent --agent {client} with [auth].bearer_token"),
             sandbox.setup_agent(client, &staged),
         );
-        assert!(stderr.contains(SETUP_NOTE), "{client}:\n{stderr}");
         if client == "zero" {
-            assert!(stdout.contains(PLACEHOLDER), "{client}:\n{stdout}");
+            assert!(stdout.contains(MASKED_TOKEN), "{client}:\n{stdout}");
         }
     }
 }
@@ -416,9 +395,8 @@ fn setup_agent_redacts_the_token_from_the_other_sources() {
 fn preview_without_a_token_announces_none() {
     let sandbox = Sandbox::new();
     for client in ["claude-code", "cursor", "kimi-code", "codex", "opencode2"] {
-        let (stdout, stderr) = clean(client, sandbox.install_mcp(client));
-        assert!(!stdout.contains(PLACEHOLDER), "{client}:\n{stdout}");
-        assert!(!stderr.contains(MCP_NOTE), "{client}:\n{stderr}");
+        let (stdout, _stderr) = clean(client, sandbox.install_mcp(client));
+        assert!(!stdout.contains(MASKED_TOKEN), "{client}:\n{stdout}");
     }
     let claude = clean("claude-code", sandbox.install_mcp("claude-code")).0;
     assert!(
@@ -431,9 +409,8 @@ fn preview_without_a_token_announces_none() {
 
     let staged = sandbox.home.join("staged");
     for agent in ["zero", "claude-code"] {
-        let (stdout, stderr) = clean(agent, sandbox.setup_agent(agent, &staged));
-        assert!(!stdout.contains(PLACEHOLDER), "{agent}:\n{stdout}");
-        assert!(!stderr.contains(SETUP_NOTE), "{agent}:\n{stderr}");
+        let (stdout, _stderr) = clean(agent, sandbox.setup_agent(agent, &staged));
+        assert!(!stdout.contains(MASKED_TOKEN), "{agent}:\n{stdout}");
     }
 }
 
@@ -450,13 +427,12 @@ fn codex_token_env_var_shows_no_placeholder() {
         "[auth]\nbearer_token_file = {:?}\n",
         token_file.display().to_string()
     ));
-    let (stdout, stderr) = clean(
+    let (stdout, _stderr) = clean(
         "codex with a bearer token file",
         sandbox.install_mcp("codex"),
     );
     assert!(stdout.contains("bearer_token_env_var"), "{stdout}");
-    assert!(!stdout.contains(PLACEHOLDER), "{stdout}");
-    assert!(!stderr.contains(MCP_NOTE), "{stderr}");
+    assert!(!stdout.contains(MASKED_TOKEN), "{stdout}");
 }
 
 /// Control: `--apply` still writes the real token to the file the
