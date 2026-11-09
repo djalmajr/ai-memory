@@ -169,8 +169,12 @@ version in [`docs/changelog/`](docs/changelog/):
   `ghp_…` or `sk_live_…`), the whole key is now redacted under
   `ai_memory_key`, and when a vendor key's body (`sk-`, `sk-proj-`,
   `github_pat_` or `sk_live_`) holds an own-prefix fragment, the whole vendor
-  key is redacted under its own label. The server and `ai-memory-client`
-  scrubber agree, and every other sanitizer output is unchanged.
+  key is redacted under its own label. The `ai-memory-client` scrubber now
+  redacts its own-prefix groups with its own marker even inside a `Bearer …`
+  value, so a header holding a native key comes out as
+  `Bearer [REDACTED CREDENTIAL]` instead of `Bearer [REDACTED]`; the server
+  output is unchanged, where the bearer rule still redacts the whole header
+  value under `bearer_token`.
 
 ## [3.4.4] - 2026-11-08
 

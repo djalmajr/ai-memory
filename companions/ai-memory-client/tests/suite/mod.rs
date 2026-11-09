@@ -591,10 +591,13 @@ fn a_vendor_key_holding_an_own_prefix_fragment_is_redacted_whole() {
 
 /// The union must not reach beyond the credential set: two own-prefix keys
 /// side by side stay two separate redactions, a vendor key plus a separate
-/// own-prefix key keeps both, and a native key in a `Bearer` header stays on
-/// the bearer marker the client uses for it.
+/// own-prefix key keeps both, and a native key in a `Bearer` header is
+/// redacted by the union with its own marker — the accepted change of the
+/// deferral removal, where the bearer marker used to stand for the key —
+/// while a bearer value no member span covers still takes the bearer
+/// marker.
 #[test]
-fn the_union_keeps_disjoint_credentials_and_the_bearer_marker() {
+fn the_union_keeps_disjoint_credentials_and_marks_the_bearer_header_key() {
     let a = format!("aim_{}", "J".repeat(43));
     let b = format!("amk_{}", "K".repeat(43));
     assert_eq!(
@@ -606,22 +609,33 @@ fn the_union_keeps_disjoint_credentials_and_the_bearer_marker() {
         sanitize_external_text(&format!("{vendor} and {a}")),
         "[REDACTED CREDENTIAL] and [REDACTED CREDENTIAL]"
     );
+    // A native key in a header: the union redacts the key, and the bearer
+    // rule then sees only the marker, which holds no bearer characters.
     assert_eq!(
         sanitize_external_text(&format!("Authorization: Bearer {a}")),
+        "Authorization: Bearer [REDACTED CREDENTIAL]"
+    );
+    // The canonical R1 key, head and all, in a header.
+    assert_eq!(
+        sanitize_external_text(
+            "Authorization: Bearer aim_Q_ghp_AAAAAAAAAAAAAAAAAAAA_ZZZZZZZZZZZZZZZA"
+        ),
+        "Authorization: Bearer [REDACTED CREDENTIAL]"
+    );
+    // A bearer value no member span covers still takes the bearer marker.
+    assert_eq!(
+        sanitize_external_text("Authorization: Bearer ABCDEFGH"),
         "Authorization: Bearer [REDACTED]"
     );
 }
 
 /// The R1 probe: an own-prefix key inside a `Bearer …` match whose body also
-/// holds a `ghp_` fragment. The per-segment deferral left the own-prefix span
-/// to the bearer rule while the union redacted the fragment — breaking the
-/// bearer match (the marker is no bearer value) and leaving the key head and
-/// tail in clear. The deferral now runs per overlapping group: a group defers
-/// to the bearer only when every member of it is own-prefix and a single
-/// bearer match over the same pre-union text holds the merged group, so a
-/// group holding a vendor fragment is redacted whole by the union instead.
-/// Nothing of the head or the tail may survive, in plain text, in JSON and
-/// with U+200B inside the prefix.
+/// holds a `ghp_` fragment. Run sequentially, the rule that finds the
+/// fragment first redacts it and splits the other's match, leaving the key
+/// head and tail in clear; the union collects every member's spans over the
+/// same pre-rewrite text and redacts the overlapping group once, with its
+/// own marker, in plain text, in JSON and with U+200B inside the prefix.
+/// Nothing of the head or the tail may survive.
 #[test]
 fn an_own_prefix_key_holding_a_vendor_fragment_in_a_bearer_header_is_redacted_whole() {
     let fragment = format!("ghp_{}", "A".repeat(20));
@@ -681,36 +695,29 @@ fn an_own_prefix_key_holding_a_vendor_fragment_in_a_bearer_header_is_redacted_wh
             }
         }
     }
-    // Control: a lone own key in a header keeps the bearer marker, so the
-    // group deferral still leaves plain keys to the bearer rule.
+    // Control: a lone own key in a header is redacted by the union with its
+    // own marker; the bearer rule then sees only the marker.
     let lone = format!("ams_{}", "M".repeat(43));
     assert_eq!(
         sanitize_external_text(&format!("Authorization: Bearer {lone}")),
-        "Authorization: Bearer [REDACTED]"
+        "Authorization: Bearer [REDACTED CREDENTIAL]"
     );
 }
 
-/// The deferral's failure mode: the union defers a group to the bearer rule
-/// on the pre-union text, assuming the bearer match holding the group will
-/// still exist when the rule runs. Two shapes break that assumption, and
-/// without the post-bearer net the deferred key — the one credential the
-/// union left untouched and the own-prefix rules never run (they ride on the
-/// union) — would leave the scrubber whole:
-///
-/// 1. A vendor group redacted inside the same bearer value: the marker is no
-///    bearer value, so the match is dead and the own key after it survives.
-/// 2. A zero-width space splitting one value into two bearer matches: the
-///    shadow pass's first match joins the split value and consumes the
-///    second `Bearer`, so the plain pass no longer sees the key's match.
-///
-/// The union records each deferred group's exact text and the net redacts
-/// whatever of it still remains after the bearer rule's two passes, with the
-/// union's own marker.
+/// A `Bearer …` value that holds a vendor group next to an own key used to
+/// come out with a live key once the deferral's bet on the bearer match
+/// broke: a vendor group redacted inside the same value, or a shadow-pass
+/// match that consumes the second `Bearer` of a split value, killed the match
+/// the own group had been left to. There is no deferral: the union redacts
+/// the own group with its own marker regardless of what the bearer rule
+/// later sees, and the bearer rule then runs on the rewritten text. Every
+/// part of the key must be gone, in the shapes below, and the output must
+/// be a no-op a second time.
 #[test]
-fn a_deferred_group_is_redacted_even_when_the_bearer_match_is_gone() {
+fn a_bearer_value_holding_a_vendor_group_and_an_own_key_is_redacted_whole() {
     let tail = format!("{}A", "Z".repeat(42)); // 43 base64url characters
-    // Case 1: the vendor group and the own key sit in one bearer value,
-    // every own prefix and every value-class separator between them.
+    // A vendor group and the own key in one bearer value, every own prefix
+    // and every value-class separator between them.
     let fragment = format!("ghp_{}", "A".repeat(20));
     for prefix in ["aim_", "amk_", "ams_"] {
         for separator in [".", "/", "+", "=", "~"] {
@@ -733,8 +740,11 @@ fn a_deferred_group_is_redacted_even_when_the_bearer_match_is_gone() {
             );
         }
     }
-    // Case 2: a zero-width space splits one value into two bearer matches;
-    // the shadow pass's first match consumes the second `Bearer`.
+    // A zero-width space splits one value into two bearer matches; the
+    // shadow pass's first match joins the split value and consumes the
+    // second `Bearer`, so the plain pass alone would never see the key's
+    // match. The union redacts the key either way, and the bearer rule then
+    // redacts what it still holds whole.
     for prefix in ["aim_", "amk_", "ams_"] {
         let input = format!("Bearer ABCDEFGH\u{200b}Bearer {prefix}{tail}");
         let out = sanitize_external_text(&input);
@@ -757,8 +767,7 @@ fn a_deferred_group_is_redacted_even_when_the_bearer_match_is_gone() {
         // its serialized escape: the client does not decode JSON escapes, so
         // the plain pass alone must see the matches. The escape's trailing
         // `b` glues onto the second `Bearer` and kills its word boundary, so
-        // the union redacts the key itself and the net has nothing left —
-        // either way no part of the key may survive.
+        // only the plain pass finds the value it holds.
         let input = format!(
             "{{\"out\": \"Bearer ABCDEFGH\\u200bBearer {prefix}{tail}\", \"neighbor\": \"KEEP_NEIGHBOR\"}}"
         );
@@ -774,17 +783,186 @@ fn a_deferred_group_is_redacted_even_when_the_bearer_match_is_gone() {
             "{prefix}: not idempotent: {out:?}"
         );
     }
-    // Controls: the simple header still defers to the bearer rule and keeps
-    // its marker, so the net removes only what the bearer rule itself could
-    // not redact, and a plain vendor key keeps the union's marker.
+    // Controls: a lone own key in a header is redacted by the union with its
+    // own marker, and a plain vendor key keeps the union's marker.
     for prefix in ["aim_", "amk_", "ams_"] {
         assert_eq!(
             sanitize_external_text(&format!("Authorization: Bearer {prefix}{tail}")),
-            "Authorization: Bearer [REDACTED]"
+            "Authorization: Bearer [REDACTED CREDENTIAL]"
         );
     }
     assert_eq!(
         sanitize_external_text(&format!("use {fragment} here")),
         "use [REDACTED CREDENTIAL] here"
     );
+}
+
+/// The R3 input: an own key whose body ends with `-B`, then an invisible
+/// character, then `earer ` plus a filler run. The bearer value class
+/// accepts `-`, and the `\s+` between `Bearer` and its value can be the
+/// invisible itself, so a bearer match starts inside the key and its
+/// shadow-pass rewrite would remove the invisible, re-encoding the key with
+/// bytes no exact-text look-up would find. There is no deferral to break:
+/// the union redacts the key's group — the invisible and the glued `Bearer`
+/// letters included, because the shadow view runs them into the key body —
+/// and the bearer rule then sees only the marker. The filler run is not a
+/// credential and stays; no run of the key's synthetic letters, its prefix
+/// or its tail may survive, in plain text and inside JSON, and the output
+/// must be a no-op a second time.
+#[test]
+fn a_bearer_match_that_starts_inside_an_invisible_split_key_leaves_no_fragment() {
+    let tail = format!("{}A", "Z".repeat(42)); // 43 base64url characters
+    let fragment = format!("ghp_{}", "A".repeat(20));
+    let filler = "X".repeat(14);
+    let z8 = "Z".repeat(8);
+    for prefix in ["aim_", "amk_", "ams_"] {
+        for invis in ['\u{200b}', '\u{200d}', '\u{00ad}'] {
+            let plain = format!("Bearer {fragment}.{prefix}{tail}-B{invis}earer {filler}");
+            let expected = format!("Bearer [REDACTED CREDENTIAL].[REDACTED CREDENTIAL] {filler}");
+            let out = sanitize_external_text(&plain);
+            assert_eq!(out, expected, "{prefix} {invis:?}: {plain:?} -> {out:?}");
+            for leaked in [prefix, tail.as_str(), z8.as_str()] {
+                assert!(
+                    !out.contains(leaked),
+                    "{prefix} {invis:?}: fragment in {out:?}"
+                );
+            }
+            assert_eq!(
+                sanitize_external_text(&out),
+                out,
+                "{prefix} {invis:?}: not idempotent: {out:?}"
+            );
+            // The same split inside a JSON string, the invisible as the
+            // character itself: the client scrubs the serialized text and
+            // the neighbor must survive.
+            let json = format!(
+                "{{\"out\": \"Bearer {fragment}.{prefix}{tail}-B{invis}earer {filler}\", \"neighbor\": \"KEEP_NEIGHBOR\"}}"
+            );
+            let expected_json = format!(
+                "{{\"out\": \"Bearer [REDACTED CREDENTIAL].[REDACTED CREDENTIAL] {filler}\", \"neighbor\": \"KEEP_NEIGHBOR\"}}"
+            );
+            let out = sanitize_external_text(&json);
+            assert_eq!(
+                out, expected_json,
+                "{prefix} {invis:?}: {json:?} -> {out:?}"
+            );
+            for leaked in [prefix, tail.as_str(), z8.as_str()] {
+                assert!(
+                    !out.contains(leaked),
+                    "{prefix} {invis:?}: JSON fragment in {out:?}"
+                );
+            }
+            let parsed: Value = serde_json::from_str(&out).unwrap();
+            assert_eq!(parsed["neighbor"], "KEEP_NEIGHBOR");
+            assert_eq!(
+                sanitize_external_text(&out),
+                out,
+                "{prefix} {invis:?}: JSON not idempotent: {out:?}"
+            );
+        }
+    }
+    // Control without the invisible: the union redacts the group whole and
+    // the filler run, not a credential, stays.
+    for prefix in ["aim_", "amk_", "ams_"] {
+        let plain = format!("Bearer {fragment}.{prefix}{tail}-Bearer {filler}");
+        let expected = format!("Bearer [REDACTED CREDENTIAL].[REDACTED CREDENTIAL] {filler}");
+        let out = sanitize_external_text(&plain);
+        assert_eq!(out, expected, "{prefix}: {plain:?} -> {out:?}");
+        for leaked in [prefix, tail.as_str(), z8.as_str()] {
+            assert!(
+                !out.contains(leaked),
+                "{prefix}: control fragment in {out:?}"
+            );
+        }
+        assert_eq!(
+            sanitize_external_text(&out),
+            out,
+            "{prefix}: control not idempotent: {out:?}"
+        );
+    }
+}
+
+/// The R3 inputs, both orders: a short own key whose exact text is a
+/// substring of a larger own key, and a short own key that is a prefix of a
+/// larger one, each after a vendor group inside a bearer value. The old
+/// safety net replaced the short group's exact text globally over the
+/// already-mutated text, so it cut the larger key before reaching the whole
+/// of it, and the head and tail of the larger key left the scrubber in
+/// clear. The union decides every group on the same pre-rewrite text, so
+/// neither order leaves a fragment of either key, and the output must be a
+/// no-op a second time.
+#[test]
+fn a_group_substring_of_a_larger_group_leaves_no_fragment() {
+    let small_tail = "M".repeat(22);
+    let fragment = format!("ghp_{}", "A".repeat(20));
+    let big_tail = format!("Q_amk_{small_tail}_{}A", "Z".repeat(13)); // 43 chars
+    let z8 = "Z".repeat(8);
+    let y8 = "Y".repeat(8);
+    for prefix in ["aim_", "amk_", "ams_"] {
+        let big = format!("{prefix}{big_tail}");
+        let small = format!("amk_{small_tail}");
+        let forbidden = [
+            prefix,
+            small.as_str(),
+            big.as_str(),
+            small_tail.as_str(),
+            z8.as_str(),
+        ];
+        // NET_SUBSTRING: the small key first, the larger one after a vendor
+        // group in the second bearer value.
+        let input = format!("Bearer {small}\nBearer {fragment}.{big}");
+        let expected =
+            "Bearer [REDACTED CREDENTIAL]\nBearer [REDACTED CREDENTIAL].[REDACTED CREDENTIAL]";
+        let out = sanitize_external_text(&input);
+        assert_eq!(out, expected, "{prefix}: {input:?} -> {out:?}");
+        for leaked in &forbidden {
+            assert!(
+                !out.contains(leaked),
+                "{prefix}: NET_SUBSTRING fragment in {out:?}"
+            );
+        }
+        assert_eq!(
+            sanitize_external_text(&out),
+            out,
+            "{prefix}: NET_SUBSTRING not idempotent: {out:?}"
+        );
+        // NET_SUBSTRING_REVERSED: the two lines swapped.
+        let input = format!("Bearer {fragment}.{big}\nBearer {small}");
+        let expected =
+            "Bearer [REDACTED CREDENTIAL].[REDACTED CREDENTIAL]\nBearer [REDACTED CREDENTIAL]";
+        let out = sanitize_external_text(&input);
+        assert_eq!(out, expected, "{prefix}: {input:?} -> {out:?}");
+        for leaked in &forbidden {
+            assert!(
+                !out.contains(leaked),
+                "{prefix}: NET_SUBSTRING_REVERSED fragment in {out:?}"
+            );
+        }
+        assert_eq!(
+            sanitize_external_text(&out),
+            out,
+            "{prefix}: NET_SUBSTRING_REVERSED not idempotent: {out:?}"
+        );
+        // NET_PREFIX: the short key a prefix of the larger one, no inner
+        // prefix, both after a vendor group.
+        let prefix22 = "Z".repeat(22);
+        let input = format!(
+            "Bearer {fragment}.{prefix}{prefix22}\nBearer {fragment}.{prefix}{prefix22}{}",
+            "Y".repeat(21)
+        );
+        let expected = "Bearer [REDACTED CREDENTIAL].[REDACTED CREDENTIAL]\nBearer [REDACTED CREDENTIAL].[REDACTED CREDENTIAL]";
+        let out = sanitize_external_text(&input);
+        assert_eq!(out, expected, "{prefix}: {input:?} -> {out:?}");
+        for leaked in [prefix, prefix22.as_str(), y8.as_str()] {
+            assert!(
+                !out.contains(leaked),
+                "{prefix}: NET_PREFIX fragment in {out:?}"
+            );
+        }
+        assert_eq!(
+            sanitize_external_text(&out),
+            out,
+            "{prefix}: NET_PREFIX not idempotent: {out:?}"
+        );
+    }
 }
