@@ -976,6 +976,7 @@ mod tests {
     use super::*;
     use crate::config::RuntimeEnv;
     use rmcp::model::JsonObject;
+    use rmcp::service::ClientInitializeError;
     use std::sync::{Arc, Mutex};
 
     use axum::Router;
@@ -1119,6 +1120,305 @@ mod tests {
         assert!(upstream.peer_info().is_some());
         upstream.cancel().await.unwrap();
         http_server.abort();
+    }
+
+    /// Read one HTTP/1.1 request from a single loopback connection, then
+    /// answer with a `transfer-encoding: chunked` `application/json`
+    /// response of exactly `body.len()` bytes and no `content-length`.
+    /// Without a length hint the client cannot size the body up front and
+    /// must count bytes while streaming — the exact unbounded-buffering
+    /// vector behind RUSTSEC-2026-0462 (a malicious MCP server streams an
+    /// `application/json` body that never ends).
+    async fn serve_one_chunked_response(
+        listener: tokio::net::TcpListener,
+        status_line: &'static str,
+        body: Vec<u8>,
+        chunk: usize,
+    ) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let Ok((mut socket, _)) = listener.accept().await else {
+            return;
+        };
+        // Read until we hold the full request: headers plus the declared
+        // body. A single loopback read may already carry both, so count the
+        // body bytes already consumed instead of re-reading them.
+        let mut req = Vec::new();
+        let mut buf = [0_u8; 65536];
+        let mut header_end: Option<usize> = None;
+        let mut content_length: usize = 0;
+        loop {
+            let Ok(n) = socket.read(&mut buf).await else {
+                return;
+            };
+            if n == 0 {
+                return;
+            }
+            req.extend_from_slice(&buf[..n]);
+            if header_end.is_none()
+                && let Some(p) = req.windows(4).position(|w| w == b"\r\n\r\n")
+            {
+                header_end = Some(p);
+                let header = String::from_utf8_lossy(&req[..p]);
+                content_length = header
+                    .lines()
+                    .find_map(|line| {
+                        let (name, value) = line.split_once(':')?;
+                        if !name.trim().eq_ignore_ascii_case("content-length") {
+                            return None;
+                        }
+                        value.trim().parse::<usize>().ok()
+                    })
+                    .unwrap_or(0);
+            }
+            // Body fully in hand (or nothing declared) — stop.
+            if let Some(p) = header_end
+                && req.len() >= p + 4 + content_length
+            {
+                break;
+            }
+        }
+        let mut out = Vec::with_capacity(body.len() * 2 + 256);
+        out.extend_from_slice(status_line.as_bytes());
+        out.extend_from_slice(
+            b"\r\ncontent-type: application/json\r\ntransfer-encoding: chunked\r\n\r\n",
+        );
+        for piece in body.chunks(chunk) {
+            out.extend_from_slice(format!("{:x}\r\n", piece.len()).as_bytes());
+            out.extend_from_slice(piece);
+            out.extend_from_slice(b"\r\n");
+        }
+        out.extend_from_slice(b"0\r\n\r\n");
+        let Ok(()) = socket.write_all(&out).await else {
+            return;
+        };
+        // Finish gracefully: close the write side, then let the client read
+        // everything before the connection tears down.
+        let _ = socket.shutdown().await;
+    }
+
+    /// RUSTSEC-2026-0462 regression, success path: an upstream server that
+    /// answers `initialize` with a chunked `application/json` body above
+    /// rmcp's 16 MiB limit must be rejected with
+    /// `StreamableHttpError::ResponseBodyTooLarge` at the limit — not
+    /// buffered to the end of the body (3.8.0 buffered it in full and only
+    /// failed while parsing it, after allocating the whole body). The
+    /// transport under test is the production `upstream_transport`, i.e.
+    /// rmcp's built-in bounded reqwest client over a real loopback socket.
+    /// The legitimate control is `a_server_that_starts_within_the_bound_is_reached`
+    /// (same transport, small valid response, full handshake).
+    #[tokio::test]
+    async fn an_oversized_upstream_response_is_rejected_at_the_bounded_limit() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let oversized = vec![b'a'; 17 * 1024 * 1024]; // 1 MiB past the 16 MiB limit
+        let server = tokio::spawn(async move {
+            serve_one_chunked_response(listener, "HTTP/1.1 200 OK", oversized, 64 * 1024).await;
+        });
+        let url = format!("http://{address}/mcp");
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(30),
+            ().serve(upstream_transport(&url, None, None, None).unwrap()),
+        )
+        .await
+        .expect("the bounded client must decide long before the timeout");
+        let err = outcome.expect_err("the oversized body must fail the handshake");
+        let ClientInitializeError::TransportError { error: dynamic, .. } = &err else {
+            panic!("expected a bounded-body transport rejection, got: {err:?}");
+        };
+        use rmcp::transport::streamable_http_client::StreamableHttpError;
+        let inner = dynamic
+            .error
+            .downcast_ref::<StreamableHttpError<reqwest_mcp::Error>>();
+        assert!(
+            matches!(
+                inner,
+                Some(StreamableHttpError::ResponseBodyTooLarge { max_size })
+                    if *max_size == 16 * 1024 * 1024
+            ),
+            "expected ResponseBodyTooLarge at 16 MiB, got: {inner:?}"
+        );
+        server.abort();
+    }
+
+    /// Read one HTTP/1.1 request from a single loopback connection, answer
+    /// it with a `transfer-encoding: chunked` HTTP 500 whose body is a
+    /// complete, correlated JSON-RPC error envelope (jsonrpc 2.0, the id of
+    /// the request just read, code -32000, a synthetic marker in the
+    /// message) padded to exactly `body_len` bytes, and no `content-length`.
+    /// Reading the id from the real request keeps the envelope correlated:
+    /// an uncorrelated id would make the service reject the error before it
+    /// proves anything about body handling.
+    async fn serve_one_chunked_jsonrpc_error(
+        listener: tokio::net::TcpListener,
+        marker: &'static str,
+        body_len: usize,
+        chunk: usize,
+    ) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let Ok((mut socket, _)) = listener.accept().await else {
+            return;
+        };
+        // Read until we hold the full request: headers plus the declared
+        // body (same accounting as `serve_one_chunked_response`).
+        let mut req = Vec::new();
+        let mut buf = [0_u8; 65536];
+        let mut header_end: Option<usize> = None;
+        let mut content_length: usize = 0;
+        loop {
+            let Ok(n) = socket.read(&mut buf).await else {
+                return;
+            };
+            if n == 0 {
+                return;
+            }
+            req.extend_from_slice(&buf[..n]);
+            if header_end.is_none()
+                && let Some(p) = req.windows(4).position(|w| w == b"\r\n\r\n")
+            {
+                header_end = Some(p);
+                let header = String::from_utf8_lossy(&req[..p]);
+                content_length = header
+                    .lines()
+                    .find_map(|line| {
+                        let (name, value) = line.split_once(':')?;
+                        if !name.trim().eq_ignore_ascii_case("content-length") {
+                            return None;
+                        }
+                        value.trim().parse::<usize>().ok()
+                    })
+                    .unwrap_or(0);
+            }
+            // Body fully in hand (or nothing declared) — stop.
+            if let Some(p) = header_end
+                && req.len() >= p + 4 + content_length
+            {
+                break;
+            }
+        }
+        let Some(p) = header_end else {
+            return;
+        };
+        let request_json = &req[p + 4..p + 4 + content_length];
+        let Ok(request) = serde_json::from_slice::<serde_json::Value>(request_json) else {
+            return;
+        };
+        // The id of the real request, echoed verbatim into the envelope.
+        let id = request
+            .get("id")
+            .cloned()
+            .unwrap_or_else(|| serde_json::json!(-1));
+        let prefix = format!(
+            "{{\"jsonrpc\":\"2.0\",\"id\":{id},\"error\":{{\"code\":-32000,\"message\":\"{marker}"
+        );
+        let suffix = "\"}}";
+        let padding = body_len.saturating_sub(prefix.len() + suffix.len());
+        let mut body = prefix.into_bytes();
+        body.extend(std::iter::repeat_n(b'x', padding));
+        body.extend_from_slice(suffix.as_bytes());
+        assert_eq!(
+            body.len(),
+            body_len,
+            "the envelope must reach the exact size"
+        );
+        let mut out = Vec::with_capacity(body.len() * 2 + 256);
+        out.extend_from_slice(b"HTTP/1.1 500 Internal Server Error");
+        out.extend_from_slice(
+            b"\r\ncontent-type: application/json\r\ntransfer-encoding: chunked\r\n\r\n",
+        );
+        for piece in body.chunks(chunk) {
+            out.extend_from_slice(format!("{:x}\r\n", piece.len()).as_bytes());
+            out.extend_from_slice(piece);
+            out.extend_from_slice(b"\r\n");
+        }
+        out.extend_from_slice(b"0\r\n\r\n");
+        let Ok(()) = socket.write_all(&out).await else {
+            return;
+        };
+        // Finish gracefully: close the write side, then let the client read
+        // everything before the connection tears down.
+        let _ = socket.shutdown().await;
+    }
+
+    /// RUSTSEC-2026-0462 regression, error-path control: a non-2xx JSON body
+    /// under the 64 KiB error limit is a complete, correlated JSON-RPC error
+    /// (jsonrpc 2.0, the id of the real initialize request, code -32000,
+    /// synthetic marker) and must arrive as a valid JSON-RPC error — proving
+    /// the error body actually reaches the parser on this path. The
+    /// oversized twin test's absent marker is therefore the bound at work,
+    /// not a body the parser never sees.
+    #[tokio::test]
+    async fn a_small_error_body_reaches_the_parser_as_a_valid_jsonrpc_error() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            serve_one_chunked_jsonrpc_error(listener, "crafted-error-marker", 512, 16 * 1024).await;
+        });
+        let url = format!("http://{address}/mcp");
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(30),
+            ().serve(upstream_transport(&url, None, None, None).unwrap()),
+        )
+        .await
+        .expect("the bounded client must decide long before the timeout");
+        let err = outcome.expect_err("a 500 error response must fail the handshake");
+        let ClientInitializeError::JsonRpcError(data) = &err else {
+            panic!("expected the JSON-RPC error to reach the caller, got: {err:?}");
+        };
+        assert_eq!(data.code.0, -32000, "got: {data:?}");
+        assert!(
+            data.message.contains("crafted-error-marker"),
+            "the small error body must be parsed into the failure: {data:?}"
+        );
+        server.abort();
+    }
+
+    /// RUSTSEC-2026-0462 regression, error path: a non-2xx JSON body above
+    /// the 64 KiB error limit is refused before it is fully buffered, even
+    /// as a complete, correlated JSON-RPC error envelope (jsonrpc 2.0, the
+    /// id of the real initialize request, code -32000). rmcp falls back to
+    /// the HTTP status metadata on this path — it does not report
+    /// `ResponseBodyTooLarge` for a 5xx — so the assertion pins the real
+    /// variant and status, and that the crafted marker is not forwarded. 3.8.0
+    /// read the whole body and would have surfaced the crafted `message`
+    /// text. The small control proves the path parses valid envelopes, so
+    /// the absent marker here is the bound, not a parsing gap.
+    #[tokio::test]
+    async fn an_oversized_error_body_is_dropped_and_reported_by_status() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let body_len = 64 * 1024 + 100; // just over the 64 KiB error limit
+        let server = tokio::spawn(async move {
+            serve_one_chunked_jsonrpc_error(listener, "crafted-error-marker", body_len, 16 * 1024)
+                .await;
+        });
+        let url = format!("http://{address}/mcp");
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(30),
+            ().serve(upstream_transport(&url, None, None, None).unwrap()),
+        )
+        .await
+        .expect("the bounded client must decide long before the timeout");
+        let err = outcome.expect_err("the oversized error body must fail the handshake");
+        let ClientInitializeError::TransportError { error: dynamic, .. } = &err else {
+            panic!("expected the status fallback, not a parsed envelope, got: {err:?}");
+        };
+        use rmcp::transport::streamable_http_client::StreamableHttpError;
+        let inner = dynamic
+            .error
+            .downcast_ref::<StreamableHttpError<reqwest_mcp::Error>>();
+        let Some(StreamableHttpError::HttpStatus(status_error)) = inner else {
+            panic!("expected HttpStatus(500) after the bound, got: {inner:?}");
+        };
+        assert_eq!(
+            status_error.status, 500,
+            "the status fallback must carry the 500, got: {status_error:?}"
+        );
+        let rendered = format!("{dynamic:?}");
+        assert!(
+            !rendered.contains("crafted-error-marker"),
+            "the oversized error body must not be parsed into the failure: {rendered}"
+        );
+        server.abort();
     }
 
     /// The wait covers only a refusing port: a name that does not resolve is

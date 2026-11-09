@@ -27,6 +27,22 @@ const FORK_CHUNK_PROGRESS_V84: u32 = 84;
 /// Fork-only table created outside the refinery numbering, after the runner.
 const FORK_CHUNK_PROGRESS_DDL: &str = include_str!("consolidation_chunk_progress.sql");
 
+/// refinery 0.10 reports `Migration::version()` as signed
+/// (`SchemaVersion` = `i32`) where 0.8 returned `u32`; the values are the
+/// same. A version either comes from refinery parsing a `V{digits}__{name}`
+/// name or from the store's own history rows, so a negative value is
+/// corruption, not a version: reject it with the number in the error
+/// instead of saturating it into the "no version" baseline (0). Use this
+/// only at the boundaries that must keep `u32`; prefer exact i32
+/// comparisons for the internals.
+fn version_u32(version: i32) -> StoreResult<u32> {
+    u32::try_from(version).map_err(|_| {
+        StoreError::InvalidState(format!(
+            "migration version {version} is negative; expected a non-negative V{{digits}} version"
+        ))
+    })
+}
+
 /// Run all pending migrations against an open connection.
 ///
 /// # Errors
@@ -69,11 +85,11 @@ fn repair_known_migration_checksums(conn: &mut rusqlite::Connection) -> StoreRes
     let runner = migrations::runner();
     let mut known = Vec::new();
     for migration in runner.get_migrations() {
-        let Some(crlf_checksum) = crlf_checksum(migration) else {
+        let Some(crlf_checksum) = crlf_checksum(migration)? else {
             continue;
         };
         known.push((
-            migration.version(),
+            version_u32(migration.version())?,
             migration.name().to_owned(),
             crlf_checksum,
             migration.checksum(),
@@ -82,7 +98,7 @@ fn repair_known_migration_checksums(conn: &mut rusqlite::Connection) -> StoreRes
     let Some(v62) = runner
         .get_migrations()
         .iter()
-        .find(|migration| migration.version() == V62_VERSION)
+        .find(|migration| migration.version() == V62_VERSION as i32)
     else {
         return Ok(());
     };
@@ -119,13 +135,15 @@ fn repair_known_migration_checksums(conn: &mut rusqlite::Connection) -> StoreRes
     Ok(())
 }
 
-fn crlf_checksum(migration: &refinery::Migration) -> Option<u64> {
-    let sql = migration.sql()?;
-    Some(checksum_for_sql(
-        migration.version(),
+fn crlf_checksum(migration: &refinery::Migration) -> StoreResult<Option<u64>> {
+    let Some(sql) = migration.sql() else {
+        return Ok(None);
+    };
+    Ok(Some(checksum_for_sql(
+        version_u32(migration.version())?,
         migration.name(),
         &sql.replace('\n', "\r\n"),
-    ))
+    )))
 }
 
 fn checksum_for_sql(version: u32, name: &str, sql: &str) -> u64 {
@@ -158,7 +176,7 @@ fn repair_fork_chunk_progress_rows(conn: &rusqlite::Connection) -> StoreResult<(
         let Some(migration) = runner
             .get_migrations()
             .iter()
-            .find(|migration| migration.version() == version)
+            .find(|migration| migration.version() == version as i32)
         else {
             continue;
         };
@@ -211,13 +229,19 @@ fn forget_fork_v84_history_row(conn: &rusqlite::Connection) -> StoreResult<()> {
 }
 
 /// Highest schema version baked into this binary (the max embedded migration).
-fn max_supported_version() -> u32 {
-    migrations::runner()
+fn max_supported_version() -> StoreResult<u32> {
+    // The ceiling is computed in i32 and converted once, at the u32
+    // boundary; embedded versions are non-negative, so the conversion
+    // errors only if corruption ever reached the embedded set. The
+    // `unwrap_or(0)` is the empty-set default (no embedded migrations),
+    // not a refused conversion.
+    let max_version = migrations::runner()
         .get_migrations()
         .iter()
-        .map(refinery::Migration::version)
+        .map(|migration| migration.version())
         .max()
-        .unwrap_or(0)
+        .unwrap_or(0);
+    version_u32(max_version)
 }
 
 /// Where a store's schema sits relative to this binary's embedded
@@ -285,7 +309,7 @@ pub fn schema_status(data_dir: &Path) -> StoreResult<Option<SchemaStatus>> {
     }
     Ok(Some(SchemaStatus {
         current,
-        target: max_supported_version(),
+        target: max_supported_version()?,
     }))
 }
 
@@ -299,8 +323,16 @@ fn classify_run_error(err: refinery::Error) -> StoreError {
         if migration.applied_on().is_none() {
             return StoreError::MigrationHistoryGap { missing: identity };
         }
-        let supported = max_supported_version();
-        if migration.version() > supported {
+        let supported = match max_supported_version() {
+            Ok(supported) => supported,
+            Err(error) => return error,
+        };
+        // Exact i32 comparison: `supported` is the embedded ceiling (small,
+        // non-negative, so `as i32` is lossless); `migration.version()`
+        // comes from the store history and may be negative or corrupt — a
+        // negative stays a rejection, never a version read as ahead of the
+        // ceiling.
+        if migration.version() > supported as i32 {
             return StoreError::DataSchemaAhead {
                 applied: identity,
                 supported,
@@ -311,9 +343,18 @@ fn classify_run_error(err: refinery::Error) -> StoreError {
 }
 
 #[cfg(test)]
-pub(crate) fn run_to(conn: &mut rusqlite::Connection, target: u32) -> Result<(), refinery::Error> {
+pub(crate) fn run_to(conn: &mut rusqlite::Connection, target: u32) -> StoreResult<()> {
+    // refinery 0.10 takes a signed `SchemaVersion`. A target that does not
+    // fit in `i32` is refused before the runner is invoked (`refinery::Error`
+    // has no public constructor): saturating it to `i32::MAX` would silently
+    // mean "run every embedded migration".
+    let version = i32::try_from(target).map_err(|_| {
+        StoreError::InvalidState(format!(
+            "migration target {target} does not fit in refinery's signed version"
+        ))
+    })?;
     migrations::runner()
-        .set_target(refinery::Target::Version(target))
+        .set_target(refinery::Target::Version(version))
         .run(conn)?;
     Ok(())
 }
@@ -556,7 +597,7 @@ mod tests {
         // whose version sits above the embedded ceiling. refinery stores
         // `applied_on` as RFC3339 and `checksum` as a u64 string, and parses
         // both eagerly, so the row must be well-formed.
-        let future = max_supported_version() + 100;
+        let future = max_supported_version().unwrap() + 100;
         conn.execute(
             "INSERT INTO refinery_schema_history (version, name, applied_on, checksum) \
              VALUES (?1, ?2, ?3, ?4)",
@@ -569,10 +610,51 @@ mod tests {
             StoreError::DataSchemaAhead { applied, supported } => {
                 assert!(applied.contains(&format!("V{future}")), "applied={applied}");
                 assert!(applied.contains("future_feature"), "applied={applied}");
-                assert_eq!(supported, max_supported_version());
+                assert_eq!(supported, max_supported_version().unwrap());
             }
             other => panic!("expected DataSchemaAhead, got: {other:?}"),
         }
+    }
+
+    /// Version-boundary contract (refinery 0.10 signed versions): a `u32`
+    /// target that does not fit the signed `SchemaVersion` and a negative
+    /// stored version are refused explicitly, with the number in the error
+    /// — never saturated into `i32::MAX` ("run everything") or into the
+    /// "no version" baseline (0). A valid target still migrates.
+    #[test]
+    fn version_boundaries_are_refused_without_saturating_or_migrating() {
+        let mut conn = Connection::open_in_memory().unwrap();
+
+        // The smallest u32 outside i32 (i32::MAX + 1) and u32::MAX are both
+        // refused before the refinery runner is invoked: no migration runs,
+        // no history table is created, and the number is in the error.
+        for target in [i32::MAX as u32 + 1, u32::MAX] {
+            let err = run_to(&mut conn, target).unwrap_err();
+            let StoreError::InvalidState(message) = &err else {
+                panic!("expected InvalidState for target {target}, got: {err:?}");
+            };
+            assert!(
+                message.contains(&target.to_string()),
+                "target={target} message={message}"
+            );
+            assert_eq!(
+                schema_object_count(&conn, "table", "refinery_schema_history"),
+                0,
+                "a refused target must not create migration history"
+            );
+        }
+
+        // A negative version is corruption: an explicit error carrying the
+        // number, not the baseline 0.
+        let err = version_u32(-1).unwrap_err();
+        let StoreError::InvalidState(message) = &err else {
+            panic!("expected InvalidState for version -1, got: {err:?}");
+        };
+        assert!(message.contains("-1"), "message={message}");
+
+        // Control: a valid target still migrates to exactly that version.
+        run_to(&mut conn, 64).unwrap();
+        assert_eq!(applied_versions(&conn).last(), Some(&64));
     }
 
     #[test]
@@ -621,7 +703,10 @@ mod tests {
         run(&mut conn).unwrap();
         let applied = applied_versions(&conn);
         assert!(applied.contains(&65) && applied.contains(&66));
-        assert_eq!(applied.last(), Some(&i64::from(max_supported_version())));
+        assert_eq!(
+            applied.last(),
+            Some(&i64::from(max_supported_version().unwrap()))
+        );
     }
 
     /// The rendered message must drop refinery's misleading phrasing and carry
@@ -710,7 +795,7 @@ mod tests {
         let applied = applied_versions(&conn);
         assert_eq!(
             applied.last(),
-            Some(&i64::from(max_supported_version())),
+            Some(&i64::from(max_supported_version().unwrap())),
             "re-run must reach the embedded ceiling: {applied:?}"
         );
         assert!(applied.contains(&31) && applied.contains(&32));
@@ -2386,7 +2471,7 @@ mod tests {
         let embedded = migrations::runner()
             .get_migrations()
             .iter()
-            .find(|migration| migration.version() == V62_VERSION)
+            .find(|migration| migration.version() == V62_VERSION as i32)
             .expect("V62 must remain embedded")
             .checksum();
         assert_ne!(
@@ -2410,7 +2495,11 @@ mod tests {
                 .iter()
                 .find(|migration| migration.version() == version)
                 .unwrap();
-            assert_eq!(crlf_checksum(migration), Some(reported), "V{version}");
+            assert_eq!(
+                crlf_checksum(migration).unwrap(),
+                Some(reported),
+                "V{version}"
+            );
         }
     }
 
@@ -2424,7 +2513,7 @@ mod tests {
         let v62 = runner
             .get_migrations()
             .iter()
-            .find(|migration| migration.version() == V62_VERSION)
+            .find(|migration| migration.version() == V62_VERSION as i32)
             .unwrap();
         let current_checksum = v62.checksum();
         assert_ne!(current_checksum, ORIGINAL_V62_CHECKSUM);
@@ -2438,7 +2527,10 @@ mod tests {
             let rewritten = conn
                 .execute(
                     "UPDATE refinery_schema_history SET checksum = ?1 WHERE version = ?2",
-                    params![crlf_checksum(migration).unwrap().to_string(), version],
+                    params![
+                        crlf_checksum(migration).unwrap().unwrap().to_string(),
+                        version
+                    ],
                 )
                 .unwrap();
             assert_eq!(rewritten, 1, "V{version} history row must exist");
@@ -2558,7 +2650,8 @@ mod tests {
             .get_migrations()
             .iter()
             .find(|migration| migration.name() == "project_coordinate_keys")
-            .map(refinery::Migration::version)
+            .map(|migration| version_u32(migration.version()))
+            .unwrap()
             .unwrap();
         let mut conn = Connection::open_in_memory().unwrap();
         run_to(&mut conn, coordinate_version - 1).unwrap();
@@ -2603,8 +2696,9 @@ mod tests {
             .get_migrations()
             .iter()
             .find(|m| m.name() == "project_identity")
-            .map(refinery::Migration::version)
-            .expect("the project_identity migration is embedded");
+            .map(|migration| version_u32(migration.version()))
+            .expect("the project_identity migration is embedded")
+            .unwrap();
 
         let mut conn = Connection::open_in_memory().unwrap();
         run_to(&mut conn, identity_version - 1).unwrap();
@@ -2669,7 +2763,7 @@ mod tests {
         assert_eq!(chunk_checkpoint_count(&conn), 1, "the row must survive");
         assert_eq!(
             applied_versions(&conn).last(),
-            Some(&i64::from(max_supported_version()))
+            Some(&i64::from(max_supported_version().unwrap()))
         );
     }
 
@@ -2691,7 +2785,7 @@ mod tests {
             .get_migrations()
             .iter()
             .filter(|m| m.name() == FORK_CHUNK_PROGRESS_NAME)
-            .map(refinery::Migration::version)
+            .map(|migration| version_u32(migration.version()).unwrap())
             .collect();
         assert!(numbered.is_empty(), "numbered as {numbered:?}");
     }
@@ -2718,7 +2812,7 @@ mod tests {
         );
         assert_eq!(
             applied_versions(&conn),
-            (1..=i64::from(max_supported_version())).collect::<Vec<i64>>()
+            (1..=i64::from(max_supported_version().unwrap())).collect::<Vec<i64>>()
         );
         assert_eq!(
             schema_object_count(&conn, "table", "api_credential_pepper_state"),
@@ -2815,7 +2909,7 @@ mod tests {
         run(&mut conn).expect("a store carrying the fork's V72 row must still open");
 
         let versions = applied_versions(&conn);
-        for version in 72..=i64::from(max_supported_version()) {
+        for version in 72..=i64::from(max_supported_version().unwrap()) {
             assert!(
                 versions.contains(&version),
                 "V{version} must be recorded: {versions:?}"
@@ -2860,7 +2954,7 @@ mod tests {
         run(&mut conn).expect("a store carrying the fork's V81 row must still open");
 
         let versions = applied_versions(&conn);
-        for version in 81..=i64::from(max_supported_version()) {
+        for version in 81..=i64::from(max_supported_version().unwrap()) {
             assert!(
                 versions.contains(&version),
                 "V{version} must be recorded: {versions:?}"
@@ -2905,7 +2999,7 @@ mod tests {
         let migration = runner
             .get_migrations()
             .iter()
-            .find(|migration| migration.version() == version)
+            .find(|migration| migration.version() == version as i32)
             .expect("migration must be embedded");
         (
             migration.name().to_string(),
@@ -2962,7 +3056,7 @@ mod tests {
 
         assert_eq!(
             applied_versions(&conn),
-            (1..=i64::from(max_supported_version())).collect::<Vec<i64>>()
+            (1..=i64::from(max_supported_version().unwrap())).collect::<Vec<i64>>()
         );
         assert_fork_table_and_index(&conn);
         for version in [72, 81] {
@@ -3010,7 +3104,7 @@ mod tests {
 
         assert_eq!(
             applied_versions(&conn),
-            (1..=i64::from(max_supported_version())).collect::<Vec<i64>>()
+            (1..=i64::from(max_supported_version().unwrap())).collect::<Vec<i64>>()
         );
         assert_eq!(
             schema_object_count(&conn, "table", "api_credential_pepper_state"),
@@ -3331,7 +3425,7 @@ mod tests {
         run(&mut conn).unwrap();
         assert_eq!(
             applied_versions(&conn).last(),
-            Some(&i64::from(max_supported_version()))
+            Some(&i64::from(max_supported_version().unwrap()))
         );
         for table in V100_TABLES {
             assert_eq!(
@@ -3447,8 +3541,8 @@ mod tests {
             run(&mut conn).unwrap();
         }
         let status = schema_status(current_dir.path()).unwrap().unwrap();
-        assert_eq!(status.current, max_supported_version());
-        assert_eq!(status.target, max_supported_version());
+        assert_eq!(status.current, max_supported_version().unwrap());
+        assert_eq!(status.target, max_supported_version().unwrap());
         assert!(!status.has_pending_migrations());
 
         // An older store: only part of the embedded migrations applied.
@@ -3463,5 +3557,107 @@ mod tests {
         assert_eq!(status.current, 50);
         assert!(status.has_pending_migrations());
         assert!(status.current < status.target);
+    }
+
+    /// A store written by the PREVIOUS driver — bundled SQLite 3.46.0
+    /// (libsqlite3-sys 0.30.1), refinery 0.8.16, rusqlite 0.32.1, i.e. the
+    /// 3.4.4 stack — must open under the upgraded driver (bundled SQLite
+    /// 3.54.1, refinery 0.10, rusqlite 0.41) and pass the strict migration
+    /// validation (abort_divergent + abort_missing) over every one of the
+    /// 101 history rows the old refinery wrote. A fresh-store round-trip
+    /// would not prove cross-driver file compatibility, so the input is a
+    /// pinned artifact, generated by the scratch `legacy-db-producer`
+    /// against the pinned old stack with fully synthetic data (one
+    /// workspace, project, session and one FTS-indexed page; no real
+    /// store is ever read).
+    #[tokio::test]
+    async fn a_store_written_by_the_previous_driver_opens_migrates_reopens_and_backs_up() {
+        use sha2::{Digest, Sha256};
+
+        const EXPECTED_SHA256: [u8; 32] = [
+            0x15, 0x5a, 0x9f, 0x90, 0x27, 0x1a, 0x7b, 0x31, 0x0e, 0x0e, 0x5a, 0x14, 0x3a, 0x44,
+            0x04, 0x27, 0xce, 0x49, 0x4d, 0x60, 0x1d, 0x0d, 0x2a, 0xe1, 0xd9, 0x7e, 0xdf, 0xb7,
+            0xa5, 0x62, 0xed, 0x92,
+        ];
+        let fixture: &[u8] = include_bytes!("testdata/legacy-store-v101-sqlite346.db");
+        let mut hasher = Sha256::new();
+        hasher.update(fixture);
+        assert_eq!(
+            hasher.finalize().as_slice(),
+            &EXPECTED_SHA256[..],
+            "the legacy fixture must not change silently"
+        );
+
+        let data_dir = tempfile::TempDir::new().unwrap();
+        let db_path = data_dir.path().join("db").join(crate::DB_FILENAME);
+        std::fs::create_dir_all(db_path.parent().unwrap()).unwrap();
+        std::fs::write(&db_path, fixture).unwrap();
+
+        // 1. The upgraded driver opens the legacy store; the strict runner
+        //    re-validates every legacy history row, and the boot backfills
+        //    are no-ops on an already-complete store.
+        let store = crate::Store::open(data_dir.path()).unwrap();
+
+        // 2. The schema sits at the embedded maximum with nothing pending.
+        let status = schema_status(data_dir.path()).unwrap().unwrap();
+        assert_eq!(status.current, max_supported_version().unwrap());
+        assert!(!status.has_pending_migrations());
+
+        // 3. The synthetic page is readable and still FTS5-indexed by the
+        //    new driver.
+        {
+            let conn = Connection::open(store.db_path()).unwrap();
+            let body: String = conn
+                .query_row(
+                    "SELECT body FROM pages WHERE path = 'notes/legacy-fixture.md'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert!(
+                body.contains("upgraded-driver compatibility test"),
+                "{body}"
+            );
+            let fts: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM pages_fts WHERE pages_fts MATCH 'legacy'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(fts, 1, "the legacy page must stay FTS5-retrievable");
+            drop(conn);
+        }
+
+        // 4. The online backup API (what `ai-memory backup` takes) works on
+        //    the legacy file, and the snapshot restores through
+        //    `open_snapshot` (the `ai-memory restore` entry point), which
+        //    re-runs the strict migration validation on the restored file.
+        let backup_path = data_dir.path().join("db").join("legacy-backup.sqlite");
+        store.reader.snapshot_to(backup_path.clone()).await.unwrap();
+        let snapshot_dir = tempfile::TempDir::new().unwrap();
+        let snapshot_db = snapshot_dir.path().join("db").join(crate::DB_FILENAME);
+        std::fs::create_dir_all(snapshot_db.parent().unwrap()).unwrap();
+        std::fs::copy(&backup_path, &snapshot_db).unwrap();
+        let restored = crate::Store::open_snapshot(snapshot_dir.path()).unwrap();
+        let body: String = {
+            let conn = Connection::open(restored.db_path()).unwrap();
+            conn.query_row(
+                "SELECT body FROM pages WHERE path = 'notes/legacy-fixture.md'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+        assert!(
+            body.contains("upgraded-driver compatibility test"),
+            "{body}"
+        );
+
+        // 5. Re-opening the original store is a no-op the second time.
+        drop(restored);
+        let _ = crate::Store::open(data_dir.path()).unwrap();
+        let status = schema_status(data_dir.path()).unwrap().unwrap();
+        assert!(!status.has_pending_migrations());
     }
 }

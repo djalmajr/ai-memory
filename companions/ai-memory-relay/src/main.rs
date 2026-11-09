@@ -104,9 +104,9 @@ fn finish(outcome: anyhow::Result<Report>) -> i32 {
             report.exit_code()
         }
         Err(error) => {
-            // `{error:#}` prints the context chain, which is built from paths,
-            // counts and classes only.
-            eprintln!("error: {error:#}");
+            // The chain is built from paths, counts and classes only;
+            // `format_error` renders it with the SQLite cause exactly once.
+            eprintln!("error: {}", ai_memory_relay::format_error(&error));
             2
         }
     }
