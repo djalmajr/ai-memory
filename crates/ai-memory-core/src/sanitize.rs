@@ -3185,4 +3185,42 @@ mod tests {
             "Authorization: [REDACTED:bearer_token]"
         );
     }
+
+    /// The two inputs the client's deferral could not protect: another
+    /// credential group redacted inside the same bearer value, and a
+    /// zero-width space that splits one value into two overlapping bearer
+    /// matches. On the server the bearer rule runs before the credential
+    /// set, so there is no deferral and it redacts the header value whole in
+    /// both shapes; the second scrub is a no-op. The `ABCDEFGH` head is an
+    /// eight-character opaque string the server deliberately leaves alone.
+    #[test]
+    fn the_bearer_rule_covers_another_group_and_a_zwsp_split_inside_a_header() {
+        let own = format!("aim_{}A", "Z".repeat(42));
+        for (input, expected) in [
+            (
+                format!("Authorization: Bearer ghp_{}.{own}", "A".repeat(20)),
+                "Authorization: [REDACTED:bearer_token]",
+            ),
+            (
+                format!("Bearer ABCDEFGH\u{200b}Bearer {own}"),
+                "Bearer ABCDEFGH\u{200b}[REDACTED:bearer_token]",
+            ),
+        ] {
+            let out = s().scrub(&input);
+            assert_eq!(out, expected, "{input:?} -> {out:?}");
+            assert!(
+                !out.contains("aim_") && !out.contains(&own),
+                "{input:?}: a credential part survives in {out:?}"
+            );
+            // The router scrubs and then `Sanitized::new` scrubs again:
+            // the second pass must be a no-op, not a fresh fragment.
+            assert_eq!(s().scrub(&out), out, "second pass: {out:?}");
+        }
+        // Control: a lone own key in a header keeps the bearer label.
+        let lone = format!("ams_{}", "O".repeat(43));
+        assert_eq!(
+            s().scrub(&format!("Authorization: Bearer {lone}")),
+            "Authorization: [REDACTED:bearer_token]"
+        );
+    }
 }

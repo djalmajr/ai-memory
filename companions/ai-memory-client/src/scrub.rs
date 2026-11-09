@@ -103,6 +103,7 @@ pub fn sanitize_external_text(input: &str) -> String {
     }
     let rules = secret_patterns();
     let mut union_applied = false;
+    let mut deferred_groups: Vec<String> = Vec::new();
     let mut text = controls_removed;
     for rule in rules {
         if matches!(
@@ -114,7 +115,9 @@ pub fn sanitize_external_text(input: &str) -> String {
                 continue;
             }
             union_applied = true;
-            text = union_credential_spans(&text, rules);
+            let (unioned, deferred) = union_credential_spans(&text, rules);
+            deferred_groups = deferred;
+            text = unioned;
             continue;
         }
         // Through invisible characters first, so a split credential is
@@ -129,8 +132,51 @@ pub fn sanitize_external_text(input: &str) -> String {
                 replacement(rule, captures)
             })
             .into_owned();
+        if matches!(rule.union_role, UnionRole::Bearer) {
+            // The groups the union left to this rule, netted once its two
+            // passes have run: the deferral was decided on the pre-union
+            // text and the rule's own rewrites may have broken the match it
+            // deferred to, so whatever of a deferred group still remains is
+            // redacted before any later rule sees it.
+            text = redact_deferred_groups(&text, &deferred_groups);
+        }
     }
     text
+}
+
+/// The safety net for the groups the union deferred to the bearer rule:
+/// right after that rule's two passes, every occurrence of a deferred
+/// group's exact text that still remains is redacted with the union's own
+/// marker. The deferral assumes the bearer match holding the group will
+/// still exist when the rule runs; another group redacted inside the same
+/// value (a marker is no bearer value) or a shadow-pass match that consumes
+/// the second `Bearer` of a split value breaks that assumption, and without
+/// this net the deferred key — the one credential the union left untouched
+/// and the later own-prefix rules never run, because they ride on the
+/// union — would leave the scrubber whole. Positions are useless by then
+/// (the rewrites moved them), so the net matches the exact text: a same
+/// sequence elsewhere is the same credential and is redacted too. One pass
+/// over the post-bearer text suffices: a bearer match that overlaps a
+/// deferred group holds it whole (the group starts with a prefix no bearer
+/// value can contain and no match can start inside it), so the group is
+/// either redacted by the rule or intact, never split; and neither the
+/// passes nor the marker can forge a new occurrence, so a deferred group
+/// never leaves `sanitize_external_text` unredacted. The scan runs once per
+/// distinct deferred text (a repeated key defers the same text over and
+/// over), so the cost stays linear in the text for the repeated-key corpus.
+fn redact_deferred_groups(text: &str, deferred: &[String]) -> String {
+    let mut out = text.to_string();
+    for (index, group) in deferred.iter().enumerate() {
+        // Same sequence is the same credential: one scan settles every
+        // group that repeats it.
+        if deferred[..index].contains(group) {
+            continue;
+        }
+        if out.contains(group.as_str()) {
+            out = out.replace(group.as_str(), "[REDACTED CREDENTIAL]");
+        }
+    }
+    out
 }
 
 fn replacement(rule: &RedactionRule, captures: &regex::Captures<'_>) -> String {
@@ -270,7 +316,11 @@ fn union_member_spans(
 /// The bearer matches are indexed once ([`BearerHoldings`]), so the deferral
 /// check is a binary search per group: a per-span scan of the whole list cost
 /// N(N+1)/2 comparisons for N spans against N matches.
-fn union_credential_spans(text: &str, rules: &[RedactionRule]) -> String {
+///
+/// Returns the unioned text plus the exact text of every group deferred to
+/// the bearer rule, so the safety net ([`redact_deferred_groups`]) can redact
+/// whatever of a deferred group survives the bearer rule's own rewrites.
+fn union_credential_spans(text: &str, rules: &[RedactionRule]) -> (String, Vec<String>) {
     let shadow = if text.contains(is_default_ignorable) {
         Some(build_shadow(text))
     } else {
@@ -296,10 +346,11 @@ fn union_credential_spans(text: &str, rules: &[RedactionRule]) -> String {
         }
     }
     if spans.is_empty() {
-        return text.to_string();
+        return (text.to_string(), Vec::new());
     }
     spans.sort_unstable();
     let mut out = String::with_capacity(text.len());
+    let mut deferred: Vec<String> = Vec::new();
     let mut copied = 0;
     let mut index = 0;
     while index < spans.len() {
@@ -312,7 +363,10 @@ fn union_credential_spans(text: &str, rules: &[RedactionRule]) -> String {
         }
         // The merged group defers to the bearer rule only as a whole: every
         // member own-prefix, one bearer match of this same text holding it.
+        // Its exact text goes to the safety net: the deferral is a bet on
+        // that match surviving, and the net pays it if the bet loses.
         if own && bearer.holds(start, end) {
+            deferred.push(text[start..end].to_string());
             continue;
         }
         out.push_str(&text[copied..start]);
@@ -320,7 +374,7 @@ fn union_credential_spans(text: &str, rules: &[RedactionRule]) -> String {
         copied = end;
     }
     out.push_str(&text[copied..]);
-    out
+    (out, deferred)
 }
 
 /// The `Bearer …` matches the union may defer a group to, indexed so the
@@ -407,8 +461,10 @@ fn emoji_tag_run_len(rest: &str) -> usize {
 /// (`union_credential_spans`): the set members redact their overlapping
 /// spans as one, per merged group; an own-prefix group defers to the bearer
 /// rule only when every member is own-prefix and a single bearer match holds
-/// the merged group, which is how that key is redacted today; and the bearer
-/// rule's spans are collected so the union can make that deferral.
+/// the merged group, which is how that key is redacted today, and its exact
+/// text is netted after the bearer rule runs so the deferral cannot lose it;
+/// and the bearer rule's spans are collected so the union can make that
+/// deferral.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum UnionRole {
     None,
