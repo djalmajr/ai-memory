@@ -162,6 +162,15 @@ version in [`docs/changelog/`](docs/changelog/):
   `install-hooks --apply` and `auth enable`. The error keeps the line and column.
   `servers.toml` errors no longer echo a `url`, which could hold credentials,
   after a syntax error or an invalid URL. (#24)
+- Fixed the sanitizer to redact overlapping prefixed credentials whole, in both
+  directions, instead of letting the rule that finds a fragment first redact
+  only it and leave the rest of the credential in clear text. When an
+  own-prefix `aim_`/`amk_`/`ams_` key's body holds a vendor fragment (`sk-…`,
+  `ghp_…` or `sk_live_…`), the whole key is now redacted under
+  `ai_memory_key`, and when a vendor key's body (`sk-`, `sk-proj-`,
+  `github_pat_` or `sk_live_`) holds an own-prefix fragment, the whole vendor
+  key is redacted under its own label. The server and `ai-memory-client`
+  scrubber agree, and every other sanitizer output is unchanged.
 
 ## [3.4.4] - 2026-11-08
 

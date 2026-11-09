@@ -488,3 +488,126 @@ fn a_key_glued_onto_a_word_by_a_stripped_character_is_still_redacted() {
         );
     }
 }
+
+/// An own-prefix key whose body holds a vendor fragment used to lose only
+/// the fragment to the vendor rule, leaving the head of the key in clear
+/// text whenever the anchored own-prefix rule could not see the key (a word
+/// glued onto it, a split). The credential-set union collects every member's
+/// spans over the same pre-rewrite text and redacts the overlap once, so the
+/// whole key goes.
+#[test]
+fn an_own_prefix_key_holding_a_vendor_fragment_is_redacted_whole() {
+    let head = "Z".repeat(19);
+    for prefix in ["aim_", "amk_", "ams_"] {
+        for fragment in [
+            format!("_sk-{}", "A".repeat(20)),
+            format!("_ghp_{}", "B".repeat(20)),
+            // The client has no Stripe rule: this fragment matches no client
+            // vendor rule, and the union must still take the whole key.
+            format!("_sk_live_{}", "C".repeat(16)),
+        ] {
+            let key = format!("{prefix}{head}{fragment}");
+            for (shape, input, expected_prefix) in [
+                // Glued onto a word: the anchored rule loses its boundary.
+                ("glued", format!("word{key}"), "word"),
+                // A plain space: both own-prefix rules see the key.
+                ("space", format!("word {key}"), "word "),
+                // A removed BEL glues the word onto the key.
+                ("bel", format!("word\u{7}{key}"), "word"),
+                // A removed ANSI escape glues the word onto the key (the
+                // visible tail of the sequence stays).
+                ("ansi", format!("word\u{1b}[32m{key}"), "word"),
+                // A NUL inside the prefix is removed and glues the word on.
+                (
+                    "nul",
+                    format!(
+                        "word{first}\u{0}{rest}",
+                        first = &key[..1],
+                        rest = &key[1..]
+                    ),
+                    "word",
+                ),
+            ] {
+                let out = sanitize_external_text(&input);
+                assert!(
+                    out == format!("{expected_prefix}[REDACTED CREDENTIAL]")
+                        || out.ends_with("[REDACTED CREDENTIAL]"),
+                    "{shape} {prefix}: {input:?} -> {out:?}"
+                );
+                assert!(
+                    !out.contains(prefix) && !out.contains(&head) && !out.contains(&fragment),
+                    "{shape} {prefix}: a credential part survives in {out:?}"
+                );
+                // The scrubber runs before and after the value boundary: a
+                // second pass must be a no-op, not a fresh fragment.
+                assert_eq!(
+                    sanitize_external_text(&out),
+                    out,
+                    "{shape} {prefix}: not idempotent: {out:?}"
+                );
+            }
+        }
+    }
+    // Controls: a lone vendor key and an ordinary word keep their shape.
+    let vendor = format!("use sk-{} here", "D".repeat(24));
+    assert_eq!(
+        sanitize_external_text(&vendor),
+        "use [REDACTED CREDENTIAL] here"
+    );
+    let word = "the aimless stop at the gate";
+    assert_eq!(sanitize_external_text(word), word);
+}
+
+/// The other direction: a vendor key whose body holds an own-prefix fragment
+/// used to come out as `sk-QQQQ[REDACTED CREDENTIAL]`, the vendor head in
+/// clear. The union redacts the vendor key whole. The client's `sk-` rule
+/// covers the `sk-`/`sk-proj-` family and its `github_pat_` alternative
+/// covers the GitHub PAT family; a token the client's own rules do not
+/// recognize (a `ghp_` body with underscores) was never a match here and is
+/// out of scope for the union.
+#[test]
+fn a_vendor_key_holding_an_own_prefix_fragment_is_redacted_whole() {
+    let families = ["sk-", "sk-proj-", "github_pat_"];
+    for prefix in ["aim_", "amk_", "ams_"] {
+        for family in families {
+            for head in ["Q".repeat(8), "Q".repeat(24)] {
+                for tail in ["Z".repeat(40), "Z".repeat(43)] {
+                    let input = format!("use {family}{head}{prefix}{tail} here");
+                    let out = sanitize_external_text(&input);
+                    assert_eq!(
+                        out, "use [REDACTED CREDENTIAL] here",
+                        "family {family} {prefix}: {input:?} -> {out:?}"
+                    );
+                    assert!(
+                        !out.contains(prefix) && !out.contains(&head) && !out.contains(&tail),
+                        "family {family} {prefix}: a credential part survives in {out:?}"
+                    );
+                    assert_eq!(sanitize_external_text(&out), out, "not idempotent: {out:?}");
+                }
+            }
+        }
+    }
+}
+
+/// The union must not reach beyond the credential set: two own-prefix keys
+/// side by side stay two separate redactions, a vendor key plus a separate
+/// own-prefix key keeps both, and a native key in a `Bearer` header stays on
+/// the bearer marker the client uses for it.
+#[test]
+fn the_union_keeps_disjoint_credentials_and_the_bearer_marker() {
+    let a = format!("aim_{}", "J".repeat(43));
+    let b = format!("amk_{}", "K".repeat(43));
+    assert_eq!(
+        sanitize_external_text(&format!("{a} {b}")),
+        "[REDACTED CREDENTIAL] [REDACTED CREDENTIAL]"
+    );
+    let vendor = format!("sk-{}", "L".repeat(24));
+    assert_eq!(
+        sanitize_external_text(&format!("{vendor} and {a}")),
+        "[REDACTED CREDENTIAL] and [REDACTED CREDENTIAL]"
+    );
+    assert_eq!(
+        sanitize_external_text(&format!("Authorization: Bearer {a}")),
+        "Authorization: Bearer [REDACTED]"
+    );
+}

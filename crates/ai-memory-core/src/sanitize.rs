@@ -426,6 +426,46 @@ fn redact_spans(text: &str, spans: Vec<(usize, usize)>, label: &str) -> String {
     out
 }
 
+/// The credential set's spans, merged into one redaction per overlapping
+/// group and labeled with the credential that starts first. Each span is
+/// widened with [`whole_escapes`] first, mirroring [`redact_spans`], so a
+/// group never starts or ends between a backslash and the character it
+/// escapes. Allowlisted spans are already out: the set members were
+/// collected through [`Sanitizer::pattern_spans`], which filters them per
+/// rule, exactly as the sequential loop did.
+fn redact_credential_union(text: &str, labeled: Vec<(usize, usize, &'static str)>) -> String {
+    let mut labeled: Vec<_> = labeled
+        .into_iter()
+        .map(|(start, end, label)| {
+            let (start, end) = whole_escapes(text, (start, end));
+            (start, end, label)
+        })
+        .collect();
+    // Stable: two spans tying on start and end keep pattern order, so the
+    // earliest member's label wins. In practice a tie only happens between
+    // the two own-prefix rules, which share a label.
+    labeled.sort_by_key(|a| (a.0, a.1));
+    let mut out = String::with_capacity(text.len());
+    let mut copied = 0;
+    let mut index = 0;
+    while index < labeled.len() {
+        let (start, mut end, label) = labeled[index];
+        index += 1;
+        while index < labeled.len() && labeled[index].0 < end {
+            end = end.max(labeled[index].1);
+            index += 1;
+        }
+        debug!(label, "sanitize: redacted credential union");
+        out.push_str(&text[copied..start]);
+        out.push_str("[REDACTED:");
+        out.push_str(label);
+        out.push(']');
+        copied = end;
+    }
+    out.push_str(&text[copied..]);
+    out
+}
+
 /// Compile-time list of redaction patterns. Order is intentional:
 /// more-specific patterns first. False positives are acceptable —
 /// better to redact a stray hash than to leak a credential.
@@ -460,10 +500,11 @@ const BUILTIN_PATTERNS: &[(&str, &str)] = &[
     // names that happen to start with a prefix (`ams_session_token_hash`),
     // and the leading word boundary rejects `claim_…` — ASCII, so a
     // non-ASCII word character glued to the key (`éaim_…`) is not mistaken
-    // for one. This rule runs before the vendor-prefixed rules below,
-    // because a key body may contain a fragment one of their patterns
-    // matches (`sk-…`): running it last would redact the fragment and leave
-    // the prefix behind.
+    // for one. It is the first member of the credential-union set below,
+    // whose spans are collected over the same text and merged before any of
+    // them rewrites it, so a key body holding a `sk-…` fragment is redacted
+    // whole instead of the fragment being redacted first and the head left
+    // behind.
     //
     // The pipeline compact-serializes a structured tool response before this
     // pass runs: a real control character survives as the literal escape text
@@ -514,7 +555,14 @@ const BUILTIN_PATTERNS: &[(&str, &str)] = &[
     // onto the prefix, where a `\b` or non-letter anchor would then miss the
     // key. The distinctive prefix plus a 40-character base64url tail makes a
     // false positive on real text negligible — unlike the AWS rule below,
-    // whose `AKIA`/`ASIA` prefix is ordinary uppercase text.
+    // whose `AKIA`/`ASIA` prefix is ordinary uppercase text. The unanchored
+    // rule is what catches the key a word is glued onto, where the anchored
+    // rule above cannot see it; the credential-union set (both this rule and
+    // the anchored one, plus `api_key`, `stripe_key`, the two `github_token`
+    // rules and `aws_key`) collects its spans over the same text before any
+    // member rewrites it, so a key body holding a `sk-…`, `ghp_…` or
+    // `sk_live_…` fragment is redacted whole under the label of the
+    // credential that starts first.
     (r"(?:aim|ams|amk)_[A-Za-z0-9_-]{40,}", "ai_memory_key"),
     // AWS access-key IDs: long-lived (AKIA) and STS temporary (ASIA).
     //
@@ -714,6 +762,14 @@ struct Pattern {
     /// A built-in rule whose match must include context that is not itself
     /// secret (a line end) redacts only its `secret` capture group.
     secret_group: bool,
+    /// The vendor-prefixed credential rules that run as one union: their
+    /// spans are collected over the same text, before any of them rewrites
+    /// it, and the overlapping ones are redacted once, under the label of
+    /// the credential that starts first. The set is the two `ai_memory_key`
+    /// rules, `api_key`, `stripe_key`, the two `github_token` rules and
+    /// `aws_key`; operator extras (label `custom`) are never in it, so their
+    /// sequential behaviour is unchanged.
+    credential_union: bool,
 }
 
 /// The one label the allowlist never exempts: no project codename belongs
@@ -760,6 +816,10 @@ impl Sanitizer {
                 re,
                 label,
                 secret_group,
+                credential_union: matches!(
+                    *label,
+                    "ai_memory_key" | "api_key" | "stripe_key" | "github_token" | "aws_key"
+                ),
             });
         }
         for p in &cfg.extra_patterns {
@@ -767,6 +827,7 @@ impl Sanitizer {
                 re: Regex::new(p)?,
                 label: "custom",
                 secret_group: false,
+                credential_union: false,
             });
         }
         Ok(Self {
@@ -813,32 +874,42 @@ impl Sanitizer {
         // grow as far as `json_value_end` allows: never past its JSON string
         // or onto the next `.env` line.
         let mut shadow = Shadow::of(&out);
+        let mut union_applied = false;
         for pattern in &self.inner.patterns {
-            let mut spans = self.spans(&out, shadow.as_ref(), pattern);
-            if shadow.is_some() {
-                let plain = self.spans(&out, None, pattern);
-                if !plain.is_empty() {
-                    let view = SortedSpans::new(&spans);
-                    let mut json_lines = JsonLines::new(&out);
-                    let kept: Vec<_> = plain
-                        .into_iter()
-                        .flat_map(|span| {
-                            let covered = view.overlapping(span);
-                            if covered.is_empty() || !json_lines.contains(span.0) {
-                                return vec![span];
-                            }
-                            // Only each view value's own tail grows; the
-                            // view spans already cover the rest.
-                            covered
-                                .iter()
-                                .map(|&(_, end)| (end, json_value_end(&out, end).min(span.1)))
-                                .filter(|&(start, end)| end > start)
-                                .collect()
-                        })
-                        .collect();
-                    spans.extend(kept);
+            if pattern.credential_union {
+                if union_applied {
+                    // The set was already unioned when its first member ran.
+                    continue;
                 }
+                union_applied = true;
+                // The first member of the credential set: collect every
+                // member's spans over this same text, before any of them
+                // rewrites it. A credential's body can hold a fragment
+                // another member matches (`aim_…sk-…`, `sk-…aim_…`), and run
+                // sequentially the member that finds the fragment first
+                // redacts it and splits the other's match, so part of the
+                // credential is stored in clear. Overlapping spans are
+                // unioned and redacted once, under the label of the
+                // credential that starts first.
+                let mut labeled: Vec<(usize, usize, &'static str)> = Vec::new();
+                for rule in &self.inner.patterns {
+                    if !rule.credential_union {
+                        continue;
+                    }
+                    for span in self.pattern_spans(&out, shadow.as_ref(), rule) {
+                        labeled.push((span.0, span.1, rule.label));
+                    }
+                }
+                if labeled.is_empty() {
+                    continue;
+                }
+                out = redact_credential_union(&out, labeled);
+                // Dropped first, so two views of a large result never coexist.
+                drop(shadow.take());
+                shadow = Shadow::of(&out);
+                continue;
             }
+            let spans = self.pattern_spans(&out, shadow.as_ref(), pattern);
             if spans.is_empty() {
                 continue;
             }
@@ -848,6 +919,47 @@ impl Sanitizer {
             shadow = Shadow::of(&out);
         }
         out
+    }
+
+    /// The spans of `text` one pattern would redact, both views merged as the
+    /// scrub loop always did: over `shadow` when there is one, each match
+    /// mapped back to the span of `text` it covers, and over the text as
+    /// written, which finds a match that needs an invisible character as its
+    /// word boundary. Outside a JSON line the two sets merge to the widest
+    /// span; inside one, an overlapping plain match only extends each view
+    /// value's own tail, as far as `json_value_end` allows.
+    fn pattern_spans(
+        &self,
+        text: &str,
+        shadow: Option<&Shadow>,
+        pattern: &Pattern,
+    ) -> Vec<(usize, usize)> {
+        let mut spans = self.spans(text, shadow, pattern);
+        if shadow.is_some() {
+            let plain = self.spans(text, None, pattern);
+            if !plain.is_empty() {
+                let view = SortedSpans::new(&spans);
+                let mut json_lines = JsonLines::new(text);
+                let kept: Vec<_> = plain
+                    .into_iter()
+                    .flat_map(|span| {
+                        let covered = view.overlapping(span);
+                        if covered.is_empty() || !json_lines.contains(span.0) {
+                            return vec![span];
+                        }
+                        // Only each view value's own tail grows; the
+                        // view spans already cover the rest.
+                        covered
+                            .iter()
+                            .map(|&(_, end)| (end, json_value_end(text, end).min(span.1)))
+                            .filter(|&(start, end)| end > start)
+                            .collect()
+                    })
+                    .collect();
+                spans.extend(kept);
+            }
+        }
+        spans
     }
 
     /// Whether `path` may be stored as a file index key: a valid key
@@ -2857,5 +2969,178 @@ mod tests {
                 "AWS key must be redacted: {aws:?} -> {out:?}"
             );
         }
+    }
+
+    /// An own-prefix key whose body holds a vendor fragment used to lose only
+    /// the fragment when the key sat where the anchored rule could not see it
+    /// (glued onto a word, or split by a removed character): the vendor rule
+    /// redacted the fragment and the unanchored own-prefix rule, running
+    /// after it, saw a tail below its floor and let the head of the key
+    /// through. The credential-union set now collects every member's spans
+    /// over the same text and redacts the overlap once, under the label of
+    /// the credential that starts first — here always the own-prefix key.
+    #[test]
+    fn an_own_prefix_key_holding_a_vendor_fragment_is_redacted_whole() {
+        let s = s();
+        for prefix in ["aim_", "amk_", "ams_"] {
+            for fragment in [
+                format!("_sk-{}", "A".repeat(20)),
+                format!("_ghp_{}", "B".repeat(20)),
+                format!("_sk_live_{}", "C".repeat(16)),
+            ] {
+                let head = "Z".repeat(19);
+                let key = format!("{prefix}{head}{fragment}");
+                for (shape, input) in [
+                    // Glued onto a word: the anchored rule loses its boundary.
+                    ("glued", format!("word{key}")),
+                    // A plain space: the anchored rule sees the key, the
+                    // unanchored one sees the same span.
+                    ("space", format!("word {key}")),
+                    // A colour code removed by `strip_control` glues the word
+                    // onto the key, with the helper space kept in between.
+                    ("ansi", format!("word\u{1b}[31m{key}")),
+                    // A NUL inside the prefix is removed and glues the key
+                    // onto the word.
+                    (
+                        "nul",
+                        format!(
+                            "word{first}\u{0}{rest}",
+                            first = &key[..1],
+                            rest = &key[1..]
+                        ),
+                    ),
+                ] {
+                    let out = s.scrub(&input);
+                    let expected = match shape {
+                        "space" | "ansi" => "word [REDACTED:ai_memory_key]",
+                        _ => "word[REDACTED:ai_memory_key]",
+                    };
+                    assert_eq!(
+                        out, expected,
+                        "{shape} {prefix} {fragment:?}: {input:?} -> {out:?}"
+                    );
+                    for leaked in [prefix, &head, &fragment] {
+                        assert!(
+                            !out.contains(leaked),
+                            "{shape} {prefix}: {leaked:?} in {out:?}"
+                        );
+                    }
+                    // The router scrubs and then `Sanitized::new` scrubs again:
+                    // the second pass must be a no-op, not a fresh fragment.
+                    assert_eq!(s.scrub(&out), out, "{shape} {prefix}: {out:?}");
+                }
+            }
+        }
+        // Control: a vendor key on its own keeps its own label.
+        let vendor = format!("use sk-{} here", "D".repeat(24));
+        assert_eq!(s.scrub(&vendor), "use [REDACTED:api_key] here");
+    }
+
+    /// The other direction: a vendor key whose body holds an own-prefix
+    /// fragment. Swapping the rule order fixes the case above only by
+    /// leaking this one (`sk-QQQQQQQQ[REDACTED:ai_memory_key]`), so the union
+    /// must redact the vendor key whole, under its own label, which starts
+    /// first. Head `Q`×8 and ×24, tail `Z`×40 and ×43, every vendor family
+    /// and internal prefix.
+    #[test]
+    fn a_vendor_key_holding_an_own_prefix_fragment_is_redacted_whole() {
+        let s = s();
+        let families = [
+            ("sk-", "api_key"),
+            ("sk-proj-", "api_key"),
+            ("github_pat_", "github_token"),
+            ("sk_live_", "stripe_key"),
+        ];
+        for (family, label) in families {
+            for prefix in ["aim_", "amk_", "ams_"] {
+                for head in ["Q".repeat(8), "Q".repeat(24)] {
+                    for tail in ["Z".repeat(40), "Z".repeat(43)] {
+                        let input = format!("use {family}{head}{prefix}{tail} here");
+                        let out = s.scrub(&input);
+                        assert_eq!(
+                            out,
+                            format!("use [REDACTED:{label}] here"),
+                            "family {family}: {input:?} -> {out:?}"
+                        );
+                        for leaked in [prefix, &head, &tail] {
+                            assert!(
+                                !out.contains(leaked),
+                                "family {family} {prefix}: {leaked:?} in {out:?}"
+                            );
+                        }
+                        assert_eq!(s.scrub(&out), out, "second pass: {out:?}");
+                    }
+                }
+            }
+        }
+    }
+
+    /// The union must not reach beyond the credential set: a lone credential
+    /// of every family in the set keeps its own label, and ordinary text
+    /// stays byte-identical. (`leaves_ordinary_text_untouched` holds the full
+    /// ordinary-text controls; this pins the labels the union must not
+    /// alter.)
+    #[test]
+    fn the_union_keeps_lone_credentials_on_their_own_labels() {
+        let s = s();
+        let own = format!("aim_{}", "E".repeat(43));
+        for (input, expected) in [
+            (own.as_str(), "[REDACTED:ai_memory_key]"),
+            (&format!("sk-{}", "F".repeat(24)), "[REDACTED:api_key]"),
+            (
+                &format!("sk_live_{}", "G".repeat(20)),
+                "[REDACTED:stripe_key]",
+            ),
+            (
+                &format!("ghp_{}", "H".repeat(24)),
+                "[REDACTED:github_token]",
+            ),
+            (
+                &format!("github_pat_{}", "I".repeat(24)),
+                "[REDACTED:github_token]",
+            ),
+            ("AKIAFAKEFAKEFAKEFAKE", "[REDACTED:aws_key]"),
+        ] {
+            assert_eq!(s.scrub(input), expected, "{input:?}");
+        }
+        for keep in [
+            "claim_session_consolidation_jobs",
+            "ams_session_token_hash",
+            "the AKIA meeting notes",
+            "pit-stop-strategy-analysis for the race",
+        ] {
+            assert_eq!(s.scrub(keep), keep, "{keep}");
+        }
+    }
+
+    /// Two own-prefix keys side by side are two separate redactions, and a
+    /// vendor key plus a separate own-prefix key in one line keeps both
+    /// labels: the union merges only what overlaps.
+    #[test]
+    fn the_union_leaves_disjoint_credentials_on_their_own_spans() {
+        let s = s();
+        let a = format!("aim_{}", "J".repeat(43));
+        let b = format!("amk_{}", "K".repeat(43));
+        assert_eq!(
+            s.scrub(&format!("{a} {b}")),
+            "[REDACTED:ai_memory_key] [REDACTED:ai_memory_key]"
+        );
+        let vendor = format!("sk-{}", "L".repeat(24));
+        assert_eq!(
+            s.scrub(&format!("{vendor} and {a}")),
+            "[REDACTED:api_key] and [REDACTED:ai_memory_key]"
+        );
+    }
+
+    /// The `Bearer` rule runs before the credential set, so a native key in
+    /// a header stays under its label: the union runs at the set's first
+    /// member and never re-labels what the bearer rule already redacted.
+    #[test]
+    fn the_bearer_rule_still_wins_before_the_union_runs() {
+        let key = format!("aim_{}", "M".repeat(43));
+        assert_eq!(
+            s().scrub(&format!("Authorization: Bearer {key}")),
+            "Authorization: [REDACTED:bearer_token]"
+        );
     }
 }
