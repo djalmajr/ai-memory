@@ -156,7 +156,7 @@ version in [`docs/changelog/`](docs/changelog/):
   the failure falls back to the response's HTTP status, so the crafted error
   payload is never forwarded. Loopback regression tests exercise the
   production transport against an oversized chunked body on both paths, with
-  a small valid error envelope as the control on the error path.
+  a small valid error envelope as the control on the error path. (#34)
 - Fixed RUSTSEC-2026-0459 (CVE-2026-119375) by upgrading the bundled SQLite
   stack: `rusqlite` 0.32.1 to 0.41.1 (bundling SQLite 3.54.1 through
   `libsqlite3-sys` 0.39.1), `refinery` 0.8.16 to 0.10.0 (core 0.10.1) in the
@@ -169,7 +169,7 @@ version in [`docs/changelog/`](docs/changelog/):
   refinery history format are unchanged, and a regression test opens a V101
   store written by the previous driver (SQLite 3.46, refinery 0.8) with the
   new driver, re-runs the strict migration validation, re-opens and backs the
-  store up.
+  store up. (#34)
 - Added a sanitizer rule for ai-memory's own `aim_`, `amk_` and `ams_` keys
   with a 22- to 39-character body: 3.4.4's unanchored rule redacts a key of
   40 or more characters wherever it sits, but a key glued right after a
