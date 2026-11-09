@@ -185,7 +185,7 @@ version in [`docs/changelog/`](docs/changelog/):
   `Bearer [REDACTED]`. The decoded view decodes exactly one layer and leaves
   ordinary text outside a span untouched. On the server, the bearer rule
   retains priority over the credential union and redacts the whole header
-  value under `bearer_token`.
+  value under `bearer_token`. (#33)
 
 ## [3.4.4] - 2026-11-08
 
