@@ -3143,4 +3143,46 @@ mod tests {
             "Authorization: [REDACTED:bearer_token]"
         );
     }
+
+    /// The R1 probe on the server: the same overlapping credential the
+    /// client's per-segment bearer deferral used to split — an own key whose
+    /// body holds a `ghp_` fragment, inside a `Bearer …` match. The
+    /// `bearer_token` rule runs before the credential set, so it redacts the
+    /// header value whole and the union never sees the fragment. This pins
+    /// that ordering: it fails if the bearer rule is removed or moved after
+    /// the union (the union would then relabel the key `ai_memory_key`), not
+    /// with the union removed.
+    #[test]
+    fn the_bearer_rule_covers_a_vendor_fragment_inside_a_native_key_in_a_header() {
+        let fragment = format!("ghp_{}", "A".repeat(20));
+        let tail = format!("_{}A", "Z".repeat(15));
+        // The R1 input's head (`Q_`) plus heads of 1, 2, 3 and 8 characters
+        // before the fragment.
+        for prefix in ["aim_", "amk_", "ams_"] {
+            for head in ["Q_", "Q", "QQ", "QQQ", "QQQQQQQQ"] {
+                let input = format!("Authorization: Bearer {prefix}{head}{fragment}{tail}");
+                let out = s().scrub(&input);
+                assert_eq!(
+                    out, "Authorization: [REDACTED:bearer_token]",
+                    "{prefix} head {head:?}: {input:?} -> {out:?}"
+                );
+                let zwsp_run = "Z".repeat(15);
+                for leaked in [prefix, head, fragment.as_str(), zwsp_run.as_str()] {
+                    assert!(
+                        !out.contains(leaked),
+                        "{prefix} head {head:?}: {leaked:?} in {out:?}"
+                    );
+                }
+                // The router scrubs and then `Sanitized::new` scrubs again:
+                // the second pass must be a no-op, not a fresh fragment.
+                assert_eq!(s().scrub(&out), out, "second pass: {out:?}");
+            }
+        }
+        // Control: a lone own key in a header keeps the bearer label.
+        let lone = format!("ams_{}", "N".repeat(43));
+        assert_eq!(
+            s().scrub(&format!("Authorization: Bearer {lone}")),
+            "Authorization: [REDACTED:bearer_token]"
+        );
+    }
 }

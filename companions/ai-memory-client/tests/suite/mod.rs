@@ -611,3 +611,81 @@ fn the_union_keeps_disjoint_credentials_and_the_bearer_marker() {
         "Authorization: Bearer [REDACTED]"
     );
 }
+
+/// The R1 probe: an own-prefix key inside a `Bearer …` match whose body also
+/// holds a `ghp_` fragment. The per-segment deferral left the own-prefix span
+/// to the bearer rule while the union redacted the fragment — breaking the
+/// bearer match (the marker is no bearer value) and leaving the key head and
+/// tail in clear. The deferral now runs per overlapping group: a group defers
+/// to the bearer only when every member of it is own-prefix and a single
+/// bearer match over the same pre-union text holds the merged group, so a
+/// group holding a vendor fragment is redacted whole by the union instead.
+/// Nothing of the head or the tail may survive, in plain text, in JSON and
+/// with U+200B inside the prefix.
+#[test]
+fn an_own_prefix_key_holding_a_vendor_fragment_in_a_bearer_header_is_redacted_whole() {
+    let fragment = format!("ghp_{}", "A".repeat(20));
+    let tail = format!("_{}A", "Z".repeat(15));
+    // The R1 input's head (`Q_`) plus heads of 1, 2, 3 and 8 characters
+    // before the fragment.
+    let heads = ["Q_", "Q", "QQ", "QQQ", "QQQQQQQQ"];
+    for prefix in ["aim_", "amk_", "ams_"] {
+        for head in &heads {
+            let value = format!("{prefix}{head}{fragment}{tail}");
+            // U+200B inside the prefix: the plain pass cannot see the key,
+            // only the view through the invisible character can.
+            let split_prefix = format!("{}\u{200b}{}", &prefix[..1], &prefix[1..]);
+            let zwsp_value = format!("{split_prefix}{head}{fragment}{tail}");
+            for (context, input, expected) in [
+                (
+                    "plain",
+                    format!("Authorization: Bearer {value}"),
+                    "Authorization: Bearer [REDACTED CREDENTIAL]",
+                ),
+                (
+                    "json",
+                    format!(
+                        "{{\"out\": \"Authorization: Bearer {value}\", \"neighbor\": \"KEEP_NEIGHBOR\"}}"
+                    ),
+                    "{\"out\": \"Authorization: Bearer [REDACTED CREDENTIAL]\", \"neighbor\": \"KEEP_NEIGHBOR\"}",
+                ),
+                (
+                    "zwsp",
+                    format!("Authorization: Bearer {zwsp_value}"),
+                    "Authorization: Bearer [REDACTED CREDENTIAL]",
+                ),
+            ] {
+                let out = sanitize_external_text(&input);
+                assert_eq!(
+                    out, expected,
+                    "{context} {prefix} head {head:?}: {input:?} -> {out:?}"
+                );
+                let zwsp_run = "Z".repeat(15);
+                for leaked in [
+                    prefix,
+                    *head,
+                    fragment.as_str(),
+                    zwsp_run.as_str(),
+                    split_prefix.as_str(),
+                ] {
+                    assert!(
+                        !out.contains(leaked),
+                        "{context} {prefix} head {head:?}: a credential part survives in {out:?}"
+                    );
+                }
+                assert_eq!(
+                    sanitize_external_text(&out),
+                    out,
+                    "{context} {prefix} head {head:?}: not idempotent: {out:?}"
+                );
+            }
+        }
+    }
+    // Control: a lone own key in a header keeps the bearer marker, so the
+    // group deferral still leaves plain keys to the bearer rule.
+    let lone = format!("ams_{}", "M".repeat(43));
+    assert_eq!(
+        sanitize_external_text(&format!("Authorization: Bearer {lone}")),
+        "Authorization: Bearer [REDACTED]"
+    );
+}
