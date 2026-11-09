@@ -1738,7 +1738,20 @@ fn journal_reclassification_busy_preserves_committed_migration_and_retries_same_
     assert!(start.elapsed() < std::time::Duration::from_secs(1));
     assert!(busy > 1, "one short budget must contain retries");
     assert!(queue_under_test::is_lock_contention(&error));
-    let display = format!("{error:#}");
+    // The typed cause survives the retry wrapper: the innermost link is still
+    // a `rusqlite::Error` carrying the busy/locked code (downcast intact), so
+    // classification works on the real type, not on text.
+    let sqlite = error
+        .downcast_ref::<rusqlite::Error>()
+        .expect("the SQLite failure must stay in the error chain");
+    let rusqlite::Error::SqliteFailure(ffi, _) = sqlite else {
+        panic!("expected a SqliteFailure, got: {sqlite:?}");
+    };
+    assert!(matches!(
+        ffi.code,
+        rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked
+    ));
+    let display = ai_memory_relay::format_error(&error);
     assert!(display.contains("queue busy"), "{display}");
     assert!(
         display.contains("retry opening the same queue"),
@@ -1752,8 +1765,13 @@ fn journal_reclassification_busy_preserves_committed_migration_and_retries_same_
     ] {
         assert!(!display.contains(misleading), "{display}");
     }
-    let cause = error.downcast_ref::<rusqlite::Error>().unwrap().to_string();
-    assert_eq!(display.matches(&cause).count(), 1, "{display}");
+    // The SQLite cause (the "database is locked" message for
+    // SQLITE_BUSY/LOCKED) is surfaced to the operator exactly once.
+    assert_eq!(
+        display.matches("database is locked").count(),
+        1,
+        "{display}"
+    );
     assert!(std::fs::read(&path).unwrap() == committed);
     assert_eq!(snapshot(&holder), before);
     holder.execute_batch("ROLLBACK;").unwrap();
@@ -1790,15 +1808,94 @@ fn classification_read_failures_display_the_sqlite_cause_once_and_preserve_forei
         let before = std::fs::read(&path).unwrap();
         let error = Queue::open(&dir).unwrap_err();
         assert!(!queue_under_test::is_lock_contention(&error));
-        let display = format!("{error:#}");
+        // The typed cause is preserved: the innermost link is still a
+        // `rusqlite::Error` (downcast intact), not a text-rebuilt wrapper.
+        let sqlite = error
+            .downcast_ref::<rusqlite::Error>()
+            .expect("the SQLite failure must stay in the error chain");
+        assert!(
+            matches!(sqlite, rusqlite::Error::SqliteFailure(_, _)),
+            "expected a SqliteFailure, got: {sqlite:?}"
+        );
+        let display = ai_memory_relay::format_error(&error);
         assert!(display.contains("not a usable relay queue"), "{display}");
-        let cause = error.downcast_ref::<rusqlite::Error>().unwrap().to_string();
-        assert_eq!(display.matches(&cause).count(), 1, "{display}");
+        // The specific SQLite cause (code plus message) is surfaced to the
+        // operator exactly once: SQLITE_NOTAFILE for the non-database file,
+        // the missing-table message for the dropped `meta` table.
+        let cause = if malformed_file {
+            "file is not a database"
+        } else {
+            "no such table: meta"
+        };
+        assert_eq!(display.matches(cause).count(), 1, "{display}");
         assert!(std::fs::read(&path).unwrap() == before);
         for name in fsguard::SIDECARS {
             assert!(!dir.join(name).exists());
         }
     }
+}
+
+#[test]
+fn the_binary_renders_the_sqlite_cause_once_and_non_sqlite_errors_verbatim() {
+    // Synthetic malformed queue: the real binary must print the SQLite cause
+    // exactly once through `finish` (the renderer is live), with the
+    // surrounding context intact.
+    let sandbox = fixture("binary-error-rendering");
+    let dir = fsguard::prepare_queue_dir(&queue_dir(&sandbox)).unwrap();
+    let path = dir.join("relay.sqlite");
+    fsguard::create_private_file(&path).unwrap();
+    std::fs::OpenOptions::new()
+        .append(true)
+        .open(&path)
+        .unwrap()
+        .write_all(b"not a SQLite database")
+        .unwrap();
+
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_ai-memory-relay"))
+        .args(["status", "--queue-dir"])
+        .arg(&dir)
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+    assert!(!output.status.success(), "{stderr}");
+    assert!(stderr.starts_with("error: "), "{stderr}");
+    assert!(stderr.contains("not a usable relay queue"), "{stderr}");
+    assert_eq!(
+        stderr.matches("file is not a database").count(),
+        1,
+        "the SQLite cause must appear exactly once: {stderr}"
+    );
+
+    // Non-SQLite control: a plain validation error renders verbatim — no
+    // chain collapse and no type erasure at the operator boundary.
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_ai-memory-relay"))
+        .args([
+            "init",
+            "--queue-dir",
+            sandbox
+                .path
+                .join("control-queue")
+                .to_string_lossy()
+                .as_ref(),
+            "--server-url",
+            "file:///x",
+            "--producer",
+            "example.runtime",
+            "--actor",
+            "operator-a",
+            "--workspace",
+            "team",
+            "--project",
+            "app",
+        ])
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+    assert!(!output.status.success(), "{stderr}");
+    assert!(
+        stderr.contains("--server-url must be http or https, got \"file\""),
+        "{stderr}"
+    );
 }
 
 #[test]
