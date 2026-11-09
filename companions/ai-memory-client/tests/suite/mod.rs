@@ -710,21 +710,23 @@ fn an_own_prefix_key_holding_a_vendor_fragment_in_a_bearer_header_is_redacted_wh
 /// match that consumes the second `Bearer` of a split value, killed the match
 /// the own group had been left to. There is no deferral: the union redacts
 /// the own group with its own marker regardless of what the bearer rule
-/// later sees, and the bearer rule then runs on the rewritten text. Every
-/// part of the key must be gone, in the shapes below, and the output must
-/// be a no-op a second time.
+/// later sees, and the bearer value's own span is a union member, so the
+/// value's groups — vendor group, separator, own key — merge into one and
+/// the whole value is redacted under `[REDACTED CREDENTIAL]`. Every part of
+/// the key must be gone, in the shapes below, and the output must be a
+/// no-op a second time.
 #[test]
 fn a_bearer_value_holding_a_vendor_group_and_an_own_key_is_redacted_whole() {
     let tail = format!("{}A", "Z".repeat(42)); // 43 base64url characters
     // A vendor group and the own key in one bearer value, every own prefix
-    // and every value-class separator between them.
+    // and every value-class separator between them. The bearer value's span
+    // covers the whole value, so the merged group is one marker, separator
+    // included.
     let fragment = format!("ghp_{}", "A".repeat(20));
     for prefix in ["aim_", "amk_", "ams_"] {
         for separator in [".", "/", "+", "=", "~"] {
             let input = format!("Authorization: Bearer {fragment}{separator}{prefix}{tail}");
-            let expected = format!(
-                "Authorization: Bearer [REDACTED CREDENTIAL]{separator}[REDACTED CREDENTIAL]"
-            );
+            let expected = "Authorization: Bearer [REDACTED CREDENTIAL]";
             let out = sanitize_external_text(&input);
             assert_eq!(out, expected, "{prefix} {separator}: {input:?} -> {out:?}");
             for leaked in [prefix, fragment.as_str(), tail.as_str()] {
@@ -764,17 +766,19 @@ fn a_bearer_value_holding_a_vendor_group_and_an_own_key_is_redacted_whole() {
             "{prefix}: not idempotent: {out:?}"
         );
         // The same split written as a JSON string, the zero-width space in
-        // its serialized escape: the client does not decode JSON escapes, so
-        // the plain pass alone must see the matches. The escape's trailing
-        // `b` glues onto the second `Bearer` and kills its word boundary, so
-        // only the plain pass finds the value it holds.
+        // its serialized escape: the decoded view decodes one layer of JSON
+        // escapes and drops the same invisibles, so it sees the glued value
+        // exactly like the shadow does for the real character — same
+        // semantics as the server's view. The escape and the second
+        // `Bearer` label fall inside the first bearer value's span and come
+        // out with it; the key's group keeps its own marker.
         let input = format!(
             "{{\"out\": \"Bearer ABCDEFGH\\u200bBearer {prefix}{tail}\", \"neighbor\": \"KEEP_NEIGHBOR\"}}"
         );
         let out = sanitize_external_text(&input);
         assert_eq!(
             out,
-            "{\"out\": \"Bearer [REDACTED]\\u200bBearer [REDACTED CREDENTIAL]\", \"neighbor\": \"KEEP_NEIGHBOR\"}",
+            "{\"out\": \"Bearer [REDACTED] [REDACTED CREDENTIAL]\", \"neighbor\": \"KEEP_NEIGHBOR\"}",
             "{prefix}: {input:?} -> {out:?}"
         );
         assert_eq!(
@@ -797,18 +801,116 @@ fn a_bearer_value_holding_a_vendor_group_and_an_own_key_is_redacted_whole() {
     );
 }
 
+/// The R4 probe (BEARER_SUFFIX): a `Bearer …` value whose own key is
+/// followed, inside the same value, by a separator and a tail the key's span
+/// does not reach. The union used to collect only the credential members'
+/// spans, so it redacted the key's group and left the rest of the bearer
+/// value — the separator and the tail — in clear, where the bearer rule then
+/// saw the marker and no longer matched the value. The bearer value's span
+/// is a union member now, collected in the same three views over the same
+/// pre-rewrite text as the credential members: the group merges the key,
+/// the separator and the tail, comes out `[REDACTED CREDENTIAL]` because it
+/// holds a credential member, and nothing of the value survives. Matrix:
+/// three own prefixes, heads of no, four and nine characters before the
+/// separator, the four separators both bearers accept, tails of seven and
+/// twenty-one characters, in plain text, in JSON and with a real U+200B
+/// inside the prefix (216 inputs). No Z, Y or Q of the synthetic key may
+/// survive, and the output must be a no-op a second time.
+#[test]
+fn a_bearer_value_tail_after_the_credential_group_leaves_no_fragment() {
+    let body = format!("{}A", "Z".repeat(42)); // 43 base64url characters
+    for prefix in ["aim_", "amk_", "ams_"] {
+        for head in ["", "QQQ.", "QQQQQQQQ."] {
+            for separator in [".", "/", "+", "="] {
+                for tail_len in [7, 21] {
+                    let tail = "Y".repeat(tail_len);
+                    let value = format!("{prefix}{body}{head}{separator}{tail}");
+                    // A real U+200B inside the prefix: the plain pass cannot
+                    // see the key, only the view through the invisible
+                    // character can.
+                    let split_prefix = format!("{}\u{200b}{}", &prefix[..1], &prefix[1..]);
+                    let zwsp_value = format!("{split_prefix}{body}{head}{separator}{tail}");
+                    for (context, input, expected) in [
+                        (
+                            "plain",
+                            format!("Authorization: Bearer {value}"),
+                            "Authorization: Bearer [REDACTED CREDENTIAL]",
+                        ),
+                        (
+                            "json",
+                            format!(
+                                "{{\"out\": \"Authorization: Bearer {value}\", \"neighbor\": \"KEEP_NEIGHBOR\"}}"
+                            ),
+                            "{\"out\": \"Authorization: Bearer [REDACTED CREDENTIAL]\", \"neighbor\": \"KEEP_NEIGHBOR\"}",
+                        ),
+                        (
+                            "zwsp",
+                            format!("Authorization: Bearer {zwsp_value}"),
+                            "Authorization: Bearer [REDACTED CREDENTIAL]",
+                        ),
+                    ] {
+                        let out = sanitize_external_text(&input);
+                        assert_eq!(
+                            out, expected,
+                            "{context} {prefix} head {head:?} {separator} tail {tail_len}: {input:?} -> {out:?}"
+                        );
+                        // No fragment of the synthetic key: not a single Z,
+                        // Y or Q, and no invisible left behind.
+                        for leaked in ['Z', 'Y', 'Q', '\u{200b}'] {
+                            assert!(
+                                !out.contains(leaked),
+                                "{context} {prefix} head {head:?} {separator} tail {tail_len}: {leaked:?} survives in {out:?}"
+                            );
+                        }
+                        assert_eq!(
+                            sanitize_external_text(&out),
+                            out,
+                            "{context} {prefix} head {head:?} {separator} tail {tail_len}: not idempotent: {out:?}"
+                        );
+                        if context == "json" {
+                            let parsed: Value = serde_json::from_str(&out).unwrap();
+                            assert_eq!(parsed["neighbor"], "KEEP_NEIGHBOR");
+                        }
+                    }
+                }
+            }
+        }
+    }
+    // Controls: a bearer value with no credential member keeps the bearer
+    // marker, a value holding only an own key takes the credential marker,
+    // whole value gone in both shapes.
+    assert_eq!(
+        sanitize_external_text("Authorization: Bearer ABCDEFGH"),
+        "Authorization: Bearer [REDACTED]"
+    );
+    for prefix in ["aim_", "amk_", "ams_"] {
+        assert_eq!(
+            sanitize_external_text(&format!("Authorization: Bearer {prefix}{body}")),
+            "Authorization: Bearer [REDACTED CREDENTIAL]"
+        );
+        let out = sanitize_external_text(&format!("Authorization: Bearer {prefix}{body}"));
+        assert_eq!(
+            sanitize_external_text(&out),
+            out,
+            "{prefix}: control not idempotent"
+        );
+    }
+}
+
 /// The R3 input: an own key whose body ends with `-B`, then an invisible
 /// character, then `earer ` plus a filler run. The bearer value class
 /// accepts `-`, and the `\s+` between `Bearer` and its value can be the
 /// invisible itself, so a bearer match starts inside the key and its
 /// shadow-pass rewrite would remove the invisible, re-encoding the key with
-/// bytes no exact-text look-up would find. There is no deferral to break:
-/// the union redacts the key's group — the invisible and the glued `Bearer`
-/// letters included, because the shadow view runs them into the key body —
-/// and the bearer rule then sees only the marker. The filler run is not a
-/// credential and stays; no run of the key's synthetic letters, its prefix
-/// or its tail may survive, in plain text and inside JSON, and the output
-/// must be a no-op a second time.
+/// bytes no exact-text look-up would find. The union collects every span on
+/// the same pre-rewrite text: the shadow view runs the invisible and the
+/// glued `Bearer` letters into the key body, and the bearer value's own span
+/// (shadow view) covers from the vendor fragment to the last glued letter,
+/// so the merged group redacts fragment, separator, key, invisible and the
+/// glued letters in one marker. The filler run is not a credential and
+/// stays; no run of the key's synthetic letters, its prefix or its tail may
+/// survive, in plain text and inside JSON, and the output must be a no-op a
+/// second time.
 #[test]
 fn a_bearer_match_that_starts_inside_an_invisible_split_key_leaves_no_fragment() {
     let tail = format!("{}A", "Z".repeat(42)); // 43 base64url characters
@@ -818,7 +920,7 @@ fn a_bearer_match_that_starts_inside_an_invisible_split_key_leaves_no_fragment()
     for prefix in ["aim_", "amk_", "ams_"] {
         for invis in ['\u{200b}', '\u{200d}', '\u{00ad}'] {
             let plain = format!("Bearer {fragment}.{prefix}{tail}-B{invis}earer {filler}");
-            let expected = format!("Bearer [REDACTED CREDENTIAL].[REDACTED CREDENTIAL] {filler}");
+            let expected = format!("Bearer [REDACTED CREDENTIAL] {filler}");
             let out = sanitize_external_text(&plain);
             assert_eq!(out, expected, "{prefix} {invis:?}: {plain:?} -> {out:?}");
             for leaked in [prefix, tail.as_str(), z8.as_str()] {
@@ -839,7 +941,7 @@ fn a_bearer_match_that_starts_inside_an_invisible_split_key_leaves_no_fragment()
                 "{{\"out\": \"Bearer {fragment}.{prefix}{tail}-B{invis}earer {filler}\", \"neighbor\": \"KEEP_NEIGHBOR\"}}"
             );
             let expected_json = format!(
-                "{{\"out\": \"Bearer [REDACTED CREDENTIAL].[REDACTED CREDENTIAL] {filler}\", \"neighbor\": \"KEEP_NEIGHBOR\"}}"
+                "{{\"out\": \"Bearer [REDACTED CREDENTIAL] {filler}\", \"neighbor\": \"KEEP_NEIGHBOR\"}}"
             );
             let out = sanitize_external_text(&json);
             assert_eq!(
@@ -865,7 +967,7 @@ fn a_bearer_match_that_starts_inside_an_invisible_split_key_leaves_no_fragment()
     // the filler run, not a credential, stays.
     for prefix in ["aim_", "amk_", "ams_"] {
         let plain = format!("Bearer {fragment}.{prefix}{tail}-Bearer {filler}");
-        let expected = format!("Bearer [REDACTED CREDENTIAL].[REDACTED CREDENTIAL] {filler}");
+        let expected = format!("Bearer [REDACTED CREDENTIAL] {filler}");
         let out = sanitize_external_text(&plain);
         assert_eq!(out, expected, "{prefix}: {plain:?} -> {out:?}");
         for leaked in [prefix, tail.as_str(), z8.as_str()] {
@@ -889,8 +991,10 @@ fn a_bearer_match_that_starts_inside_an_invisible_split_key_leaves_no_fragment()
 /// already-mutated text, so it cut the larger key before reaching the whole
 /// of it, and the head and tail of the larger key left the scrubber in
 /// clear. The union decides every group on the same pre-rewrite text, so
-/// neither order leaves a fragment of either key, and the output must be a
-/// no-op a second time.
+/// neither order leaves a fragment of either key; the bearer value's span
+/// covers the whole value, so the vendor group and the key's groups merge
+/// into one marker, separator included. The output must be a no-op a second
+/// time.
 #[test]
 fn a_group_substring_of_a_larger_group_leaves_no_fragment() {
     let small_tail = "M".repeat(22);
@@ -911,8 +1015,7 @@ fn a_group_substring_of_a_larger_group_leaves_no_fragment() {
         // NET_SUBSTRING: the small key first, the larger one after a vendor
         // group in the second bearer value.
         let input = format!("Bearer {small}\nBearer {fragment}.{big}");
-        let expected =
-            "Bearer [REDACTED CREDENTIAL]\nBearer [REDACTED CREDENTIAL].[REDACTED CREDENTIAL]";
+        let expected = "Bearer [REDACTED CREDENTIAL]\nBearer [REDACTED CREDENTIAL]";
         let out = sanitize_external_text(&input);
         assert_eq!(out, expected, "{prefix}: {input:?} -> {out:?}");
         for leaked in &forbidden {
@@ -928,8 +1031,7 @@ fn a_group_substring_of_a_larger_group_leaves_no_fragment() {
         );
         // NET_SUBSTRING_REVERSED: the two lines swapped.
         let input = format!("Bearer {fragment}.{big}\nBearer {small}");
-        let expected =
-            "Bearer [REDACTED CREDENTIAL].[REDACTED CREDENTIAL]\nBearer [REDACTED CREDENTIAL]";
+        let expected = "Bearer [REDACTED CREDENTIAL]\nBearer [REDACTED CREDENTIAL]";
         let out = sanitize_external_text(&input);
         assert_eq!(out, expected, "{prefix}: {input:?} -> {out:?}");
         for leaked in &forbidden {
@@ -950,7 +1052,7 @@ fn a_group_substring_of_a_larger_group_leaves_no_fragment() {
             "Bearer {fragment}.{prefix}{prefix22}\nBearer {fragment}.{prefix}{prefix22}{}",
             "Y".repeat(21)
         );
-        let expected = "Bearer [REDACTED CREDENTIAL].[REDACTED CREDENTIAL]\nBearer [REDACTED CREDENTIAL].[REDACTED CREDENTIAL]";
+        let expected = "Bearer [REDACTED CREDENTIAL]\nBearer [REDACTED CREDENTIAL]";
         let out = sanitize_external_text(&input);
         assert_eq!(out, expected, "{prefix}: {input:?} -> {out:?}");
         for leaked in [prefix, prefix22.as_str(), y8.as_str()] {
@@ -963,6 +1065,217 @@ fn a_group_substring_of_a_larger_group_leaves_no_fragment() {
             sanitize_external_text(&out),
             out,
             "{prefix}: NET_PREFIX not idempotent: {out:?}"
+        );
+    }
+}
+
+/// The F1 input (review5): a vendor fragment, a separator, then an own key
+/// whose prefix is written as a one-layer JSON escape (`a\u0069m_…` or
+/// `a\u200bim_…`), inside one `Bearer` value. Neither the plain text nor the
+/// shadow can see the key through the escape, so the union used to redact
+/// only up to the escape's first byte and hand the key's body to the server
+/// already missing the prefix letter the merged group had consumed. The
+/// union's decoded view — one layer of JSON escapes, the same invisibles
+/// dropped, built once per union and projected onto the original bytes —
+/// sees the whole key and the merged group covers vendor, separator, the
+/// escape's bytes and the body in one marker. Matrix: three own prefixes,
+/// the five value-class separators, the two escape contexts (an escaped
+/// prefix letter and an escaped invisible inside the prefix), in JSON with
+/// the neighbor preserved. No part of the synthetic key may survive.
+#[test]
+fn an_escaped_own_key_inside_a_bearer_value_is_redacted_whole() {
+    let body = format!("{}A", "Z".repeat(42)); // 43 base64url characters
+    let fragment = format!("ghp_{}", "A".repeat(20));
+    let esc_char = |c: char| format!("\\u{:04X}", c as u32);
+    for prefix in ["aim_", "amk_", "ams_"] {
+        let own = format!("{prefix}{body}");
+        for separator in [".", "/", "+", "=", "~"] {
+            let second = prefix.chars().nth(1).unwrap();
+            // The prefix letter after the `a` written as a JSON escape:
+            // `a\u0069m_…`, `a\u006Dk_…`, `a\u0073s_…`.
+            let esc_prefix =
+                own.replacen(prefix, &format!("a{}{}", esc_char(second), &prefix[2..]), 1);
+            // The invisible inside the prefix written as a JSON escape:
+            // `a\u200bim_…` and the like.
+            let esc_invisible = own.replacen(prefix, &format!("a\\u200b{}", &prefix[1..]), 1);
+            for (context, value) in [
+                ("esc-prefix", esc_prefix.as_str()),
+                ("esc-invisible", esc_invisible.as_str()),
+            ] {
+                let input = format!(
+                    "{{\"out\": \"Authorization: Bearer {fragment}{separator}{value}\", \"neighbor\": \"KEEP_NEIGHBOR\"}}"
+                );
+                let out = sanitize_external_text(&input);
+                assert_eq!(
+                    out,
+                    "{\"out\": \"Authorization: Bearer [REDACTED CREDENTIAL]\", \"neighbor\": \"KEEP_NEIGHBOR\"}",
+                    "{context} {prefix} {separator}: {input:?} -> {out:?}"
+                );
+                // The whole synthetic key body and every prefix letter gone:
+                // not a single Z, not a prefix, not the escape text.
+                for leaked in [
+                    "Z".repeat(8).as_str(),
+                    prefix,
+                    "\\u0069",
+                    "\\u006D",
+                    "\\u0073",
+                    "\\u200b",
+                ] {
+                    assert!(
+                        !out.contains(leaked),
+                        "{context} {prefix} {separator}: {leaked:?} survives in {out:?}"
+                    );
+                }
+                assert_eq!(
+                    sanitize_external_text(&out),
+                    out,
+                    "{context} {prefix} {separator}: not idempotent: {out:?}"
+                );
+                let parsed: serde_json::Value = serde_json::from_str(&out).unwrap();
+                assert_eq!(parsed["neighbor"], "KEEP_NEIGHBOR");
+            }
+        }
+    }
+    // Controls: the credential-less and own-key-only bearer markers hold,
+    // and an escaped separator between a vendor fragment and an own key is
+    // merged the same way.
+    assert_eq!(
+        sanitize_external_text("Authorization: Bearer ABCDEFGH"),
+        "Authorization: Bearer [REDACTED]"
+    );
+    for prefix in ["aim_", "amk_", "ams_"] {
+        assert_eq!(
+            sanitize_external_text(&format!("Authorization: Bearer {prefix}{body}")),
+            "Authorization: Bearer [REDACTED CREDENTIAL]"
+        );
+    }
+    assert_eq!(
+        sanitize_external_text(&format!("Authorization: Bearer {fragment}\\u002E{body}")),
+        "Authorization: Bearer [REDACTED CREDENTIAL]"
+    );
+}
+
+/// The decoded view's boundary behavior: invalid, truncated and lone
+/// surrogate escapes stay literal text (one layer, no recursion, nothing
+/// re-serialized), a valid surrogate pair projects onto all twelve of its
+/// source bytes when the match ends on it, an escape that ends the match is
+/// covered whole, multibyte UTF-8 outside the spans is preserved byte for
+/// byte, and an escaped backslash keeps its two source bytes. Every shape
+/// is a no-op a second time.
+#[test]
+fn the_escape_view_handles_invalid_and_boundary_escapes_without_breaking_text() {
+    let z21 = "Z".repeat(21);
+    // A truncated escape after a plain key: the key redacts, the escape's
+    // literal bytes stay — the decoder does not guess at missing hex.
+    let input = format!("Authorization: Bearer aim_{z21}A\\u00");
+    let out = sanitize_external_text(&input);
+    assert_eq!(
+        out, "Authorization: Bearer [REDACTED CREDENTIAL]\\u00",
+        "{input:?}"
+    );
+    // A lone high surrogate: not a pair, so the whole spelling stays
+    // literal; the key before it still redacts.
+    let input = format!("Authorization: Bearer aim_{z21}A\\uD800tail");
+    let out = sanitize_external_text(&input);
+    assert_eq!(
+        out, "Authorization: Bearer [REDACTED CREDENTIAL]\\uD800tail",
+        "{input:?}"
+    );
+    // A valid surrogate pair after the key: outside every span it survives
+    // byte for byte, never decoded and re-serialized.
+    let input = format!("Authorization: Bearer aim_{z21}A\\uD83D\\uDE00x");
+    let out = sanitize_external_text(&input);
+    assert_eq!(
+        out, "Authorization: Bearer [REDACTED CREDENTIAL]\\uD83D\\uDE00x",
+        "{input:?}"
+    );
+    // A valid surrogate pair inside the key body: the own-key body class is
+    // URL-safe ASCII in both copies, so a non-ASCII body character breaks
+    // the body run here and on the server alike — parity, not a gap. The
+    // decoder still sees the pair as one twelve-byte unit, nothing is cut
+    // mid-sequence and the text stays byte for byte.
+    let input = format!(
+        "Authorization: Bearer aim_ZZ\\uD83D\\uDE00{}A",
+        "Z".repeat(19)
+    );
+    let out = sanitize_external_text(&input);
+    assert_eq!(
+        out, input,
+        "{input:?}: a non-ASCII body character breaks the ASCII body run in both copies"
+    );
+    assert_eq!(
+        sanitize_external_text(&out),
+        out,
+        "{input:?}: not idempotent: {out:?}"
+    );
+    // An escape that is the key body's last character: the span's end
+    // projects past the escape's full extent, nothing of it survives.
+    let input = format!("Authorization: Bearer aim_{z21}\\u0041");
+    let out = sanitize_external_text(&input);
+    assert_eq!(
+        out, "Authorization: Bearer [REDACTED CREDENTIAL]",
+        "{input:?}"
+    );
+    assert!(
+        !out.contains('Z') && !out.contains("aim_"),
+        "{input:?}: {out:?}"
+    );
+    // Multibyte UTF-8 outside the span: the span's end must not split the
+    // two-byte character that follows it.
+    let input = format!("Authorization: Bearer aim_{z21}Aé");
+    let out = sanitize_external_text(&input);
+    assert_eq!(
+        out, "Authorization: Bearer [REDACTED CREDENTIAL]é",
+        "{input:?}"
+    );
+    // A non-ASCII character inside the body run breaks the ASCII body class
+    // (both copies): the client's eight-character bearer floor still takes
+    // the prefix run, the trailing character stays.
+    let input = format!("Authorization: Bearer aim_{}éA", "Z".repeat(20));
+    let out = sanitize_external_text(&input);
+    assert_eq!(out, "Authorization: Bearer [REDACTED]éA", "{input:?}");
+    assert!(!out.contains("Z".repeat(8).as_str()), "{input:?}: {out:?}");
+    // An escaped backslash after the key: the two source bytes stay as
+    // written — the output is never a re-serialization of the document.
+    let input = format!("Authorization: Bearer aim_{z21}A\\\\tail");
+    let out = sanitize_external_text(&input);
+    assert_eq!(
+        out, "Authorization: Bearer [REDACTED CREDENTIAL]\\\\tail",
+        "{input:?}"
+    );
+    // One layer only: `\\u0061` is an escaped backslash followed by the
+    // literal text `u0061` — one layer decodes the backslash and leaves a
+    // literal `\u0061`, which must not decode again into the `a` of a key
+    // on a second layer. No view sees a contiguous `aim_`, so the text
+    // stays byte for byte.
+    let input = format!("Authorization: Bearer \\\\u0061im_{z21}A");
+    let out = sanitize_external_text(&input);
+    assert_eq!(out, input, "{input:?}: a second decode layer must not run");
+    assert!(!out.contains("[REDACTED]"), "{input:?} -> {out:?}");
+    // Ordinary text with escapes and no credential: byte for byte.
+    let input = "C:\\temp\\build\\log.txt and `\\u0061im_` in prose";
+    let out = sanitize_external_text(input);
+    assert_eq!(out, input, "{out:?}");
+    // Idempotency across every shape above.
+    for input in [
+        format!("Authorization: Bearer aim_{z21}A\\u00"),
+        format!("Authorization: Bearer aim_{z21}A\\uD800tail"),
+        format!("Authorization: Bearer aim_{z21}A\\uD83D\\uDE00x"),
+        format!(
+            "Authorization: Bearer aim_ZZ\\uD83D\\uDE00{}A",
+            "Z".repeat(19)
+        ),
+        format!("Authorization: Bearer aim_{z21}\\u0041"),
+        format!("Authorization: Bearer aim_{z21}Aé"),
+        format!("Authorization: Bearer aim_{}éA", "Z".repeat(20)),
+        format!("Authorization: Bearer aim_{z21}A\\\\tail"),
+        format!("Authorization: Bearer \\\\u0061im_{z21}A"),
+    ] {
+        let out = sanitize_external_text(&input);
+        assert_eq!(
+            sanitize_external_text(&out),
+            out,
+            "{input:?}: not idempotent: {out:?}"
         );
     }
 }

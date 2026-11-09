@@ -6,8 +6,16 @@
 //! rules for private keys and invisible characters: key blocks are matched
 //! first, including PGP armor and a block cut off before its end line, and
 //! invisible formatting characters do not hide a credential from the
-//! patterns. Unlike the server it does not decode JSON string escapes, so a key
-//! with part of itself written as `\uXXXX` passes here and is caught there.
+//! patterns. Like the server's sanitizer the credential-set union collects
+//! its spans through views of the same pre-rewrite text: the plain text, a
+//! shadow copy without `Default_Ignorable_Code_Point` characters, and a
+//! decoded view that decodes one layer of JSON string escapes (the
+//! two-letter escapes, `\uXXXX` and a valid surrogate pair) and drops the
+//! same invisibles, so a key written as `a\u0069m_…` is seen and redacted
+//! whole — the escape's bytes included — here, not only on the server. The
+//! decoding is one layer deep, the same semantics as the server's view: an
+//! invalid or truncated escape, a lone surrogate and a `\\u…` spelling stay
+//! literal text.
 
 use regex::Regex;
 use std::sync::OnceLock;
@@ -107,7 +115,7 @@ pub fn sanitize_external_text(input: &str) -> String {
     for rule in rules {
         if matches!(
             rule.union_role,
-            UnionRole::Credential | UnionRole::OwnPrefix
+            UnionRole::Credential | UnionRole::OwnPrefix | UnionRole::Bearer
         ) {
             if union_applied {
                 // The set was already unioned when its first member ran.
@@ -189,15 +197,21 @@ fn redact_through_invisibles(text: &str, rule: &RedactionRule) -> String {
     output
 }
 
-/// The spans `rule` would replace in `text`, from both views the rule always
-/// runs: through the invisible characters first (each view match mapped back
-/// to the span of `text` it covers, the kept group outside it), then the
-/// plain pass, which still finds a match that needs an invisible character as
-/// its word boundary. The kept groups (`pre`, the serialized escape) stay
-/// out of every span, exactly where the rule's replacement leaves them.
+/// The spans `rule` would replace in `text`, from the three views the union
+/// always runs: through the invisible characters first (each view match
+/// mapped back to the span of `text` it covers, the kept group outside it),
+/// through the one-layer JSON-escape decoded view (a match's span projected
+/// onto the original bytes, the final escape's full extent included), and
+/// the plain pass, which still finds a match that needs an invisible
+/// character as its word boundary. The kept groups (`pre`, the serialized
+/// escape, the `bearer\s+` label) stay out of every span, exactly where the
+/// rule's replacement leaves them: for the bearer rule the span is the value
+/// after the label, which is what the union redacts and the label is what
+/// stays.
 fn union_member_spans(
     text: &str,
     shadow: Option<&Shadow>,
+    decoded: Option<&Shadow>,
     rule: &RedactionRule,
 ) -> Vec<(usize, usize)> {
     let mut spans = Vec::new();
@@ -235,38 +249,83 @@ fn union_member_spans(
             spans.push((start, found.end()));
         }
     }
+    if let Some(decoded) = decoded {
+        for captures in rule.regex.captures_iter(&decoded.text) {
+            let Some(found) = captures.get(0) else {
+                continue;
+            };
+            // Each view byte maps to the source character that produced it
+            // (one per source byte), so the span's start projects to the
+            // first source byte of the match's first character and the end
+            // past the last source byte the match's final character covers —
+            // a decoded escape's full extent, a valid surrogate pair's
+            // twelve bytes included.
+            let start = kept_group(&captures).map_or(found.start(), |group| group.end());
+            if start < found.end() {
+                let from = decoded.origin[start];
+                let last = decoded.origin[found.end() - 1];
+                spans.push((from, last + source_len_at(text, last)));
+            }
+        }
+    }
     spans
 }
 
-/// The vendor-prefixed credential rules, applied to the same text at once,
+/// The credential set — the vendor-prefixed credential rules, the own-prefix
+/// rules and the bearer value rule — applied to the same text at once,
 /// before any member rewrites it: a credential's body can hold a fragment
 /// another member matches (`aim_…sk-…`, `sk-…aim_…`) and, run sequentially,
 /// the member that finds the fragment first redacts it and splits the other's
-/// match, so part of the credential is stored in clear. Overlapping spans
-/// are unioned and replaced once with `[REDACTED CREDENTIAL]`.
+/// match, so part of the credential is stored in clear. A bearer value the
+/// same way can hold a credential plus a tail the credential span does not
+/// reach (`Bearer aim_…ZZZ.A.YYYY`), and the member that finds the credential
+/// first redacts only it, leaving the tail of the same bearer value in clear.
+/// Overlapping spans are unioned and replaced once: a group holding a
+/// credential member (a vendor-prefixed or own-prefix span) comes out
+/// `[REDACTED CREDENTIAL]`, a group made of bearer value spans alone comes
+/// out `[REDACTED]`, so `Authorization: Bearer xyz…` stays
+/// `Authorization: Bearer [REDACTED]` and `Authorization: Bearer aim_…`
+/// stays `Authorization: Bearer [REDACTED CREDENTIAL]`.
 ///
-/// The union redacts every group it forms, own-prefix groups included: there
-/// is no deferral to the bearer rule, so a `Bearer …` value holding a
-/// native key comes out as `Bearer [REDACTED CREDENTIAL]` instead of
-/// `Bearer [REDACTED]`. The bearer rule then runs where it always has, over
-/// this rewritten text: the union's marker holds no bearer characters, so a
-/// value it redacted is left, and a value no member span covered is still
-/// redacted whole under the bearer rule's own marker.
+/// The bearer rule therefore never runs on its own after the union: its
+/// matches are exactly the value spans the union collects from the same
+/// three views (plain, shadow and the one-layer JSON-escape decoded view)
+/// over the same pre-rewrite text, merged with the credential spans they
+/// overlap. The decoded view is what a key whose prefix or separator is
+/// written as `a\u0069m_…` needs: neither the plain text nor the shadow can
+/// see through the escape, so without it the union would redact the vendor
+/// fragment and the bearer value up to the escape's first byte and leave the
+/// key's body in clear where only the server — which redacts the whole
+/// header value — used to catch it. A bearer value the union does not cover
+/// cannot exist — every value match the rule would find is a collected span
+/// — and a value the union did redact holds no bearer characters, so the
+/// marker is left alone on a second pass.
 fn union_credential_spans(text: &str, rules: &[RedactionRule]) -> String {
     let shadow = if text.contains(is_default_ignorable) {
         Some(build_shadow(text))
     } else {
         None
     };
-    let mut spans: Vec<(usize, usize)> = Vec::new();
+    // Built once per union and reused by every member rule: the escape
+    // decoding is the union's costliest view, so it must not run per rule.
+    let decoded = if text.contains('\\') {
+        Some(decoded_shadow(text))
+    } else {
+        None
+    };
+    // Each span carries whether its member is a credential (a vendor-
+    // prefixed or own-prefix rule) or a bearer value: the merged group's
+    // marker depends on the mix.
+    let mut spans: Vec<(usize, usize, bool)> = Vec::new();
     for rule in rules.iter().filter(|rule| {
         matches!(
             rule.union_role,
-            UnionRole::Credential | UnionRole::OwnPrefix
+            UnionRole::Credential | UnionRole::OwnPrefix | UnionRole::Bearer
         )
     }) {
-        for span in union_member_spans(text, shadow.as_ref(), rule) {
-            spans.push(span);
+        let credential = !matches!(rule.union_role, UnionRole::Bearer);
+        for (start, end) in union_member_spans(text, shadow.as_ref(), decoded.as_ref(), rule) {
+            spans.push((start, end, credential));
         }
     }
     if spans.is_empty() {
@@ -277,14 +336,19 @@ fn union_credential_spans(text: &str, rules: &[RedactionRule]) -> String {
     let mut copied = 0;
     let mut index = 0;
     while index < spans.len() {
-        let (start, mut end) = spans[index];
+        let (start, mut end, mut credential) = spans[index];
         index += 1;
         while index < spans.len() && spans[index].0 < end {
             end = end.max(spans[index].1);
+            credential = credential || spans[index].2;
             index += 1;
         }
         out.push_str(&text[copied..start]);
-        out.push_str("[REDACTED CREDENTIAL]");
+        out.push_str(if credential {
+            "[REDACTED CREDENTIAL]"
+        } else {
+            "[REDACTED]"
+        });
         copied = end;
     }
     out.push_str(&text[copied..]);
@@ -324,18 +388,103 @@ fn emoji_tag_run_len(rest: &str) -> usize {
     0
 }
 
+/// Build the one-layer JSON-escape decoded view of `text`, dropping the same
+/// [`is_default_ignorable`] characters the shadow drops. `origin` maps each
+/// view byte to the source *character* that produced it (repeated for the
+/// view byte's own length), so a match's last view byte projects back to the
+/// full source extent of the character that decoded into it — the escape's
+/// six bytes, a surrogate pair's twelve, or the character's UTF-8 length for
+/// a plain one. An escape the decoder does not accept (invalid, truncated,
+/// a lone surrogate) contributes its literal bytes like any other character:
+/// one layer, no recursion, nothing re-serialized.
+fn decoded_shadow(text: &str) -> Shadow {
+    let mut shadow = String::with_capacity(text.len());
+    let mut origin = Vec::with_capacity(text.len());
+    let mut index = 0;
+    while let Some(c) = text[index..].chars().next() {
+        let (c, len) = json_escape_at(text.as_bytes(), index).unwrap_or((c, c.len_utf8()));
+        if !is_default_ignorable(c) {
+            shadow.push(c);
+            origin.extend(std::iter::repeat_n(index, c.len_utf8()));
+        }
+        index += len;
+    }
+    Shadow {
+        text: shadow,
+        origin,
+    }
+}
+
+/// How many source bytes the character at `index` occupies: the escape's
+/// length when a JSON escape starts there (the character decoded from it),
+/// otherwise the character's own UTF-8 length.
+fn source_len_at(text: &str, index: usize) -> usize {
+    json_escape_at(text.as_bytes(), index).map_or_else(
+        || text[index..].chars().next().map_or(0, char::len_utf8),
+        |(_, len)| len,
+    )
+}
+
+/// The character the JSON string escape at `bytes[index..]` stands for and
+/// the escape's byte length. Anything else, a lone surrogate included, is
+/// text. Same semantics as the server's `json_escape_at` in
+/// `crates/ai-memory-core/src/sanitize.rs`: the two-letter escapes, `\uXXXX`
+/// and a `\uXXXX\uXXXX` surrogate pair; no `\xNN`, no recursion.
+fn json_escape_at(bytes: &[u8], index: usize) -> Option<(char, usize)> {
+    if bytes.get(index) != Some(&b'\\') {
+        return None;
+    }
+    let decoded = match bytes.get(index + 1)? {
+        b'"' => ('"', 2),
+        b'\\' => ('\\', 2),
+        b'/' => ('/', 2),
+        b'b' => ('\u{8}', 2),
+        b'f' => ('\u{c}', 2),
+        b'n' => ('\n', 2),
+        b'r' => ('\r', 2),
+        b't' => ('\t', 2),
+        b'u' => json_unicode_escape_at(bytes, index)?,
+        _ => return None,
+    };
+    Some(decoded)
+}
+
+/// `\uXXXX`, or a `\uXXXX\uXXXX` surrogate pair, at `bytes[index..]`.
+fn json_unicode_escape_at(bytes: &[u8], index: usize) -> Option<(char, usize)> {
+    let unit = json_hex_unit(bytes, index + 2)?;
+    if !(0xD800..=0xDBFF).contains(&unit) {
+        return Some((char::from_u32(unit)?, 6));
+    }
+    if bytes.get(index + 6..index + 8)? != b"\\u" {
+        return None;
+    }
+    let low = json_hex_unit(bytes, index + 8).filter(|low| (0xDC00..=0xDFFF).contains(low))?;
+    let code = 0x1_0000 + ((unit - 0xD800) << 10) + (low - 0xDC00);
+    Some((char::from_u32(code)?, 12))
+}
+
+/// The four hex digits at `bytes[at..]` as a UTF-16 code unit.
+fn json_hex_unit(bytes: &[u8], at: usize) -> Option<u32> {
+    bytes.get(at..at + 4)?.iter().try_fold(0, |unit, b| {
+        Some((unit << 4) | char::from(*b).to_digit(16)?)
+    })
+}
+
 /// Which role, if any, a rule plays in the credential-set union
 /// (`union_credential_spans`): the set members redact their overlapping
-/// spans as one, per merged group, with the union's own marker. The union
-/// redacts every group it forms — own-prefix groups inside a `Bearer …`
-/// value included — and the bearer rule, which runs where it always has, on
-/// the union's rewritten text, keeps redacting the values no member span
-/// covered.
+/// spans as one, per merged group. A group holding a `Credential` or
+/// `OwnPrefix` span comes out `[REDACTED CREDENTIAL]`; a group of `Bearer`
+/// spans alone comes out `[REDACTED]`. The bearer rule contributes only the
+/// value after the `bearer\s+` label and never runs on its own after the
+/// union: every value match is collected into the union from the same three
+/// views the rule would run on (plain, shadow and decoded).
+
 #[derive(Clone, Copy)]
 enum UnionRole {
     None,
     Credential,
     OwnPrefix,
+    Bearer,
 }
 
 struct RedactionRule {
@@ -400,12 +549,13 @@ fn secret_patterns() -> &'static [RedactionRule] {
             },
             RedactionRule {
                 regex: Regex::new(r"(?i)\b(bearer\s+)[A-Za-z0-9._~+/=-]{8,}").unwrap(),
+                // Unused: the rule's matches are collected into the union as
+                // value spans (the `bearer\s+` label kept out by
+                // `kept_group`) and never run on their own. A bearer-only
+                // group redacts under `[REDACTED]`, a group that also holds
+                // a credential member under `[REDACTED CREDENTIAL]`.
                 replacement: "$1[REDACTED]",
-                // Runs where it always has, after the union rewrote the text:
-                // the union's marker holds no bearer characters, so a value
-                // it redacted is left, and a value no member span covered is
-                // still redacted whole under its own marker.
-                union_role: UnionRole::None,
+                union_role: UnionRole::Bearer,
             },
             // ai-memory's own keys, mirroring the server's own-prefix pair:
             // `aim_`, `amk_` and `ams_` credentials in the captured text,
@@ -425,7 +575,11 @@ fn secret_patterns() -> &'static [RedactionRule] {
             // `Bearer [REDACTED CREDENTIAL]`; the bearer rule then runs on
             // the rewritten text and leaves the marker alone.
             // Unlike the server the client replaces with its unlabeled
-            // `[REDACTED CREDENTIAL]` marker.
+            // `[REDACTED CREDENTIAL]` marker, and the union collects this
+            // rule's spans together with the bearer value's: a `Bearer …`
+            // value holding an own key comes out
+            // `Bearer [REDACTED CREDENTIAL]` with the whole value gone,
+            // not only the key's group.
             RedactionRule {
                 regex: Regex::new(
                     r"((?:\\(?:[nrtbf]|u[0-9A-Fa-f]{4}|x[0-9A-Fa-f]{2})(?:\[[0-9;?]*[ -/]*[@-~])?|%[0-9A-Fa-f]{2})|(?-u:\b))(?:aim|amk|ams)_[A-Za-z0-9_\-]{22,}",
@@ -444,7 +598,8 @@ fn secret_patterns() -> &'static [RedactionRule] {
             // redacted there. In the union it is the member that catches a
             // key a word is glued onto, where the anchored rule cannot see
             // it, and the union redacts the group with its own marker even
-            // inside a `Bearer …` value.
+            // inside a `Bearer …` value, where it merges with the bearer
+            // value's span so the whole value is redacted.
             RedactionRule {
                 regex: Regex::new(r"(?:aim|ams|amk)_[A-Za-z0-9_-]{40,}").unwrap(),
                 replacement: "[REDACTED CREDENTIAL]",

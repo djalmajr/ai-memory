@@ -3223,4 +3223,66 @@ mod tests {
             "Authorization: [REDACTED:bearer_token]"
         );
     }
+
+    /// The R4 matrix on the server (BEARER_SUFFIX): a bearer value whose own
+    /// key is followed, inside the same value, by a separator and a tail the
+    /// credential span does not reach. The `bearer_token` rule runs before
+    /// the credential set, so it redacts the whole value under its own label
+    /// and the union never sees the tail: no Z, Q or Y of the synthetic key
+    /// survives, and the second scrub is a no-op. The matrix mirrors the
+    /// client-side one — three own prefixes, heads of no, `QQQ.` and
+    /// `QQQQQQQQ.` characters before the separator, the four separators both
+    /// bearers accept, tails of seven and twenty-one Y characters, in plain
+    /// text, inside JSON and with a real U+200B inside the prefix.
+    #[test]
+    fn the_bearer_rule_covers_a_tail_after_the_credential_group_in_a_header() {
+        let body = format!("{}A", "Z".repeat(42));
+        for prefix in ["aim_", "amk_", "ams_"] {
+            for head in ["", "QQQ.", "QQQQQQQQ."] {
+                for sep in [".", "/", "+", "="] {
+                    for tail_len in [7, 21] {
+                        let tail = "Y".repeat(tail_len);
+                        let value = format!("{prefix}{body}{head}{sep}{tail}");
+                        let split_prefix = format!("{}\u{200b}{}", &prefix[..1], &prefix[1..]);
+                        for (context, input, expected) in [
+                            (
+                                "plain",
+                                format!("Authorization: Bearer {value}"),
+                                "Authorization: [REDACTED:bearer_token]",
+                            ),
+                            (
+                                "json",
+                                format!(
+                                    "{{\"out\": \"Authorization: Bearer {value}\", \"neighbor\": \"KEEP_NEIGHBOR\"}}"
+                                ),
+                                "{\"out\": \"Authorization: [REDACTED:bearer_token]\", \"neighbor\": \"KEEP_NEIGHBOR\"}",
+                            ),
+                            (
+                                "zwsp",
+                                format!(
+                                    "Authorization: Bearer {split_prefix}{body}{head}{sep}{tail}"
+                                ),
+                                "Authorization: [REDACTED:bearer_token]",
+                            ),
+                        ] {
+                            let out = s().scrub(&input);
+                            assert_eq!(
+                                out, expected,
+                                "{context} {prefix} head {head:?} {sep} tail {tail_len}: {input:?} -> {out:?}"
+                            );
+                            for leaked in ['Z', 'Q', 'Y'] {
+                                assert!(
+                                    !out.contains(leaked),
+                                    "{context} {prefix} head {head:?} {sep} tail {tail_len}: {leaked} survives in {out:?}"
+                                );
+                            }
+                            // The router scrubs and then `Sanitized::new`
+                            // scrubs again: the second pass must be a no-op.
+                            assert_eq!(s().scrub(&out), out, "second pass: {out:?}");
+                        }
+                    }
+                }
+            }
+        }
+    }
 }

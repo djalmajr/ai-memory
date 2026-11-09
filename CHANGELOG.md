@@ -170,10 +170,21 @@ version in [`docs/changelog/`](docs/changelog/):
   `ai_memory_key`, and when a vendor key's body (`sk-`, `sk-proj-`,
   `github_pat_` or `sk_live_`) holds an own-prefix fragment, the whole vendor
   key is redacted under its own label. The `ai-memory-client` scrubber now
-  redacts its own-prefix groups with its own marker even inside a `Bearer …`
-  value, so a header holding a native key comes out as
-  `Bearer [REDACTED CREDENTIAL]` instead of `Bearer [REDACTED]`; the server
-  output is unchanged, where the bearer rule still redacts the whole header
+  redacts the bearer value and the credential groups it holds as one: its
+  union collects the own-prefix, vendor-prefixed and bearer value spans over
+  the same text in three views — the plain text, the invisible-stripped
+  shadow, and a decoded view that decodes one layer of JSON string escapes
+  (`\"`, `\\`, `\/`, `\b`, `\f`, `\n`, `\r`, `\t` and `\uXXXX`, a valid
+  surrogate pair as one unit) and maps each span back to the original bytes —
+  and each merged group is redacted under
+  `[REDACTED CREDENTIAL]` when it holds a credential member, `[REDACTED]`
+  when it is a bearer value alone — so a header holding a native key comes
+  out as `Bearer [REDACTED CREDENTIAL]` with the whole value redacted,
+  separator, any tail after the key, and an escaped prefix or separator
+  (`a\u0069m_…`, `a\u200bim_…`) included, while a credential-less value keeps
+  `Bearer [REDACTED]`. The decoded view decodes exactly one layer and leaves
+  ordinary text outside a span untouched. On the server, the bearer rule
+  retains priority over the credential union and redacts the whole header
   value under `bearer_token`.
 
 ## [3.4.4] - 2026-11-08
