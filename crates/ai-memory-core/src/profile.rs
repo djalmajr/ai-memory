@@ -248,6 +248,22 @@ pub const DEFAULT_APPLY_MAX_LINES: usize = 40;
 /// Default output-token allowance for one profile LLM call.
 pub const DEFAULT_MAX_OUTPUT_TOKENS: u32 = 2_000;
 
+/// Which sessions' prompts the harvester reads into the profile.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HarvestPrompts {
+    /// Harvest every project's `user-prompt` observations, regardless of how
+    /// the session was launched. The historical behaviour and the default.
+    #[default]
+    All,
+    /// Skip prompts from sessions a launcher stamped
+    /// [`crate::SessionOrigin::Automation`] (via
+    /// `AI_MEMORY_SESSION_ORIGIN=automation`), so a generated orchestrator
+    /// brief is not harvested as the operator's own preference (#2180).
+    /// Curated pages and stack signals of those projects still contribute.
+    Interactive,
+}
+
 /// `[profile]` server settings.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
@@ -274,6 +290,10 @@ pub struct ProfileSettings {
     pub max_output_tokens: u32,
     /// Use the configured LLM provider, when there is one.
     pub llm: bool,
+    /// Which sessions' prompts the harvester reads. `all` (default) keeps the
+    /// historical behaviour; `interactive` skips prompts from sessions a
+    /// launcher stamped as automation (#2180).
+    pub harvest_prompts: HarvestPrompts,
 }
 
 impl Default for ProfileSettings {
@@ -288,6 +308,7 @@ impl Default for ProfileSettings {
             apply_max_lines: DEFAULT_APPLY_MAX_LINES,
             max_output_tokens: DEFAULT_MAX_OUTPUT_TOKENS,
             llm: true,
+            harvest_prompts: HarvestPrompts::All,
         }
     }
 }
@@ -849,10 +870,12 @@ pub fn render_profile_block(lines: &[String], omitted: usize) -> String {
 
 /// Byte range of the managed block in `text`: both delimiters plus the line
 /// break after the closing one. Only delimiters alone on their line count, so
-/// a quoted mention in prose is never mistaken for one.
+/// a quoted mention in prose is never mistaken for one, and a start line
+/// whose end was deleted by hand is skipped, so the user's text after it is
+/// never taken for part of the block.
 fn profile_block_range(text: &str) -> Option<(usize, usize)> {
-    let start = crate::find_marker_line(text, PROFILE_BLOCK_START, 0)?;
-    let end = crate::find_marker_line(text, PROFILE_BLOCK_END, start)?;
+    let (start, end) =
+        crate::routing_snippet::find_delimited_block(text, PROFILE_BLOCK_START, PROFILE_BLOCK_END)?;
     let mut after = end + PROFILE_BLOCK_END.len();
     if text[after..].starts_with("\r\n") {
         after += 2;
@@ -1378,6 +1401,42 @@ mod tests {
         assert_eq!(
             remove_profile_block(&merged).as_deref(),
             Some(prose.as_str())
+        );
+    }
+
+    #[test]
+    fn merge_keeps_text_after_a_start_marker_without_its_end() {
+        let block = render_profile_block(&["- use pnpm (`profile/tools/pnpm.md`)".into()], 0);
+        let existing = format!("# A\n{PROFILE_BLOCK_START}\nmy notes\n");
+        let first = merge_profile_block(&existing, &block);
+        assert_eq!(first, format!("{existing}\n{block}"));
+        assert_eq!(
+            merge_profile_block(&first, &block),
+            first,
+            "a re-run is a no-op and keeps my notes"
+        );
+        let newer = render_profile_block(&["- use bun (`profile/tools/bun.md`)".into()], 0);
+        assert_eq!(
+            merge_profile_block(&first, &newer),
+            format!("{existing}\n{newer}"),
+            "only the appended block is replaced"
+        );
+    }
+
+    #[test]
+    fn remove_keeps_text_after_a_start_marker_without_its_end() {
+        let block = render_profile_block(&["- use pnpm (`profile/tools/pnpm.md`)".into()], 0);
+        let existing = format!("# A\n{PROFILE_BLOCK_START}\nmy notes\n");
+        let applied = merge_profile_block(&existing, &block);
+        assert_eq!(
+            remove_profile_block(&applied).as_deref(),
+            Some(existing.as_str()),
+            "--remove takes out the appended block and restores the file"
+        );
+        assert_eq!(
+            remove_profile_block(&existing),
+            None,
+            "a start line alone is no block"
         );
     }
 }

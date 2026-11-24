@@ -326,7 +326,7 @@ impl LlmProvider for AdmittedLlmProvider {
     ) -> LlmResult<ChatResponse> {
         self.execute(&request, None, || {
             self.inner
-                .complete_with_operation_id(request.clone(), operation_id)
+                .complete_with_operation_id(request.clone(), operation_id.clone())
         })
         .await
     }
@@ -350,7 +350,7 @@ impl LlmProvider for AdmittedLlmProvider {
             self.inner.complete_structured_raw_with_operation_id(
                 request.clone(),
                 schema.clone(),
-                operation_id,
+                operation_id.clone(),
             )
         })
         .await
@@ -827,7 +827,7 @@ mod tests {
                     "properties": { "ok": { "type": "boolean" } },
                     "required": ["ok"],
                 }),
-                operation_id,
+                operation_id.clone(),
             )
             .await
             .expect("the delayed replay succeeds");

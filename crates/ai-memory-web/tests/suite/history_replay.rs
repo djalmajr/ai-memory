@@ -88,6 +88,7 @@ impl Fixture {
                 expires_at,
                 entities: Vec::new(),
                 evidence: Vec::new(),
+                trust_class: None,
             })
             .await
             .unwrap()
@@ -127,6 +128,7 @@ impl Fixture {
                 agent_kind: AgentKind::ClaudeCode,
                 cwd: None,
                 actor_user: owner.map(|name| IdentityKey::User(name.into()).storage_key()),
+                origin: None,
             })
             .await
             .unwrap();
@@ -146,6 +148,7 @@ impl Fixture {
                         body: (*body).to_owned(),
                         importance: 5,
                         file_path: None,
+                        trust_class: None,
                     },
                     &Sanitizer::builtin(),
                 ))
@@ -316,6 +319,7 @@ async fn history_lists_k_plus_one_versions_newest_first_and_diffs_the_latest() {
             author_id: None,
             actor: ActorContext::anonymous(),
             evidence: Vec::new(),
+            trust_class: None,
         })
         .await
         .unwrap();
@@ -323,7 +327,7 @@ async fn history_lists_k_plus_one_versions_newest_first_and_diffs_the_latest() {
     assert_eq!(status, StatusCode::OK, "{page}");
     assert!(
         page.contains(
-            "href=\"w/default/app/h/notes/on-disk.md\" class=\"text-blue-600 dark:text-blue-400 underline\">History</a>"
+            "href=\"w/default/app/h/notes/on-disk.md\" class=\"text-green underline\">History</a>"
         ),
         "{page}"
     );

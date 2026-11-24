@@ -10,14 +10,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `pages.patch` accepts `global: true` (sent as `scope: "global"`) to patch a
+  page in the reserved global scope, matching `pages.read`. (#2362)
+- `messages.list` accepts `afterId` (sent as `after_id`) to page the pending
+  queue with the last id from the previous page. (#2295)
 - `observations` documents the server's new `session_id: "current"`: the
   server resolves it only for a request carrying the caller's hook session
   id, which this client does not send, so SDK callers pass the id. (#1983)
 - `pages.write`, `pages.writeBatch` and `pages.update` accept `sourceFiles`
   (sent as `source_files`), the repository files a page describes with the
   commit it was checked against; `pages.update` carries it over. (#1957)
+- `messages.send` and `handoffs.begin` return `truncated` and
+  `truncatedFields` when the server cut any of the sent text to its size caps:
+  `originalChars` / `storedChars` per field, plus `originalItems` /
+  `storedItems` for handoff lists. Both stay `undefined` when nothing was cut.
+  (#2411)
 
 ### Fixed
+
+- Waited for the active MCP handshake during a capability refresh so a
+  superseded response cannot send a call without a stateful session ID. (#2047)
+
+- `pages.update` preserves profile stack filters and enforcement metadata on
+  a body edit. `pages.write` and `pages.update` accept `appliesTo` and
+  `enforcedBy` for profile entries. (#2207)
 
 - Pinned TypeDoc's transitive `minimatch` to 11.0.3, which fixes
   GHSA-g3hv-75wg-m249 while preserving the generated API documentation on
@@ -30,6 +46,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Initialized the MCP session before the first `callTool`, so raw tool calls
   work with `--http-stateful` without a preceding wrapped call. Raw calls
   still skip `tools/list` and schema checks. (#1816)
+
+- Restored `pages.read` and `pages.update` compatibility with servers that
+  predate the section metadata added in 3.3.0.
+
+- `api.page` accepts literal `%2e` and `%2e%2e` segments in stored page paths. (#2217)
 
 ### Added
 

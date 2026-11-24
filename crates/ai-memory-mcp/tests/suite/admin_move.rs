@@ -174,6 +174,7 @@ async fn seed_page_with_metadata(
         author_id: None,
         actor: ai_memory_core::ActorContext::anonymous(),
         evidence: Vec::new(),
+        trust_class: None,
     })
     .await
     .unwrap();
@@ -479,6 +480,7 @@ async fn a_copy_purge_merge_requires_its_own_acknowledgement() {
             agent_kind: AgentKind::Codex,
             cwd: Some("/src/proj".into()),
             actor_user: None,
+            origin: None,
         })
         .await
         .unwrap();
@@ -835,6 +837,7 @@ async fn move_project_true_move_preserves_sessions_and_observations() {
             agent_kind: AgentKind::ClaudeCode,
             cwd: None,
             actor_user: None,
+            origin: None,
         })
         .await
         .unwrap();
@@ -853,6 +856,7 @@ async fn move_project_true_move_preserves_sessions_and_observations() {
                 body: "do the thing".into(),
                 importance: 5,
                 file_path: None,
+                trust_class: None,
             },
             &Sanitizer::builtin(),
         ))
@@ -925,6 +929,7 @@ async fn true_move_stale_source_write_fails_before_creating_file() {
             author_id: None,
             actor: ai_memory_core::ActorContext::anonymous(),
             evidence: Vec::new(),
+            trust_class: None,
         })
         .await
         .unwrap_err();
@@ -973,6 +978,8 @@ async fn true_move_notifies_admission_with_destination_names() {
         failure_policy: FailurePolicy::Reject,
         events: vec![AdmissionOp::MoveProject],
         blocking: true,
+        projects: Vec::new(),
+        headers: Vec::new(),
     }])
     .unwrap();
     let wiki = Wiki::new(tmp.path(), store.writer.clone())
@@ -1779,6 +1786,8 @@ async fn true_move_aborts_when_admission_rejects() {
         failure_policy: FailurePolicy::Reject,
         events: vec![AdmissionOp::MoveProject],
         blocking: true,
+        projects: Vec::new(),
+        headers: Vec::new(),
     }])
     .unwrap();
     let wiki = Wiki::new(tmp.path(), store.writer.clone())
@@ -1884,6 +1893,8 @@ async fn copy_purge_purge_admission_runs_before_db_destruction() {
         failure_policy: FailurePolicy::Reject,
         events: vec![AdmissionOp::MoveProject, AdmissionOp::PurgeProject],
         blocking: true,
+        projects: Vec::new(),
+        headers: Vec::new(),
     }])
     .unwrap();
     let wiki = Wiki::new(tmp.path(), store.writer.clone())
@@ -1997,6 +2008,8 @@ async fn move_copy_skips_contributors_webhook_but_runs_others() {
             failure_policy: FailurePolicy::Reject,
             events: vec![AdmissionOp::WritePage],
             blocking: true,
+            projects: Vec::new(),
+            headers: Vec::new(),
         },
         WebhookConfig {
             name: "mirror".into(),
@@ -2005,6 +2018,8 @@ async fn move_copy_skips_contributors_webhook_but_runs_others() {
             failure_policy: FailurePolicy::Reject,
             events: vec![AdmissionOp::WritePage],
             blocking: true,
+            projects: Vec::new(),
+            headers: Vec::new(),
         },
     ])
     .unwrap();
@@ -2300,6 +2315,7 @@ async fn delete_workspace_dry_run_reports_the_same_counts_the_confirmed_delete_w
             author_id: None,
             actor: ai_memory_core::ActorContext::anonymous(),
             evidence: Vec::new(),
+            trust_class: None,
         })
         .await
         .unwrap();
@@ -2316,6 +2332,7 @@ async fn delete_workspace_dry_run_reports_the_same_counts_the_confirmed_delete_w
             actor_user: None,
 
             occurred_at: None,
+            origin: None,
         })
         .await
         .unwrap();
@@ -2335,6 +2352,7 @@ async fn delete_workspace_dry_run_reports_the_same_counts_the_confirmed_delete_w
 
                 occurred_at: None,
                 file_path: None,
+                trust_class: None,
             },
             &Sanitizer::builtin(),
         ))
@@ -2614,6 +2632,8 @@ async fn delete_workspace_dry_run_does_not_dispatch_admission_webhook() {
         failure_policy: FailurePolicy::Ignore,
         events: vec![AdmissionOp::PurgeWorkspace],
         blocking: false,
+        projects: Vec::new(),
+        headers: Vec::new(),
     }])
     .unwrap();
     let (state, store) = make_state_with_chain(&tmp, chain).await;
@@ -2677,6 +2697,7 @@ async fn delete_workspace_dry_run_and_confirmed_delete_both_report_collateral_da
             actor_user: None,
 
             occurred_at: None,
+            origin: None,
         })
         .await
         .unwrap();
@@ -2698,6 +2719,7 @@ async fn delete_workspace_dry_run_and_confirmed_delete_both_report_collateral_da
 
                 occurred_at: None,
                 file_path: None,
+                trust_class: None,
             },
             &Sanitizer::builtin(),
         ))
@@ -2807,6 +2829,7 @@ async fn delete_workspace_dry_run_never_counts_a_different_workspaces_rows() {
             actor_user: None,
 
             occurred_at: None,
+            origin: None,
         })
         .await
         .unwrap();
@@ -2826,6 +2849,7 @@ async fn delete_workspace_dry_run_never_counts_a_different_workspaces_rows() {
 
                 occurred_at: None,
                 file_path: None,
+                trust_class: None,
             },
             &Sanitizer::builtin(),
         ))
@@ -2896,6 +2920,7 @@ async fn delete_workspace_dry_run_never_counts_a_different_workspaces_rows() {
             actor_user: None,
 
             occurred_at: None,
+            origin: None,
         })
         .await
         .unwrap();
@@ -2915,6 +2940,7 @@ async fn delete_workspace_dry_run_never_counts_a_different_workspaces_rows() {
 
                 occurred_at: None,
                 file_path: None,
+                trust_class: None,
             },
             &Sanitizer::builtin(),
         ))
@@ -2956,6 +2982,7 @@ async fn delete_workspace_dry_run_never_counts_a_different_workspaces_rows() {
 
                 occurred_at: None,
                 file_path: None,
+                trust_class: None,
             },
             &Sanitizer::builtin(),
         ))
@@ -3187,6 +3214,8 @@ async fn delete_workspace_reject_policy_aborts_before_db_or_disk_destruction() {
         failure_policy: FailurePolicy::Reject,
         events: vec![AdmissionOp::PurgeWorkspace],
         blocking: true,
+        projects: Vec::new(),
+        headers: Vec::new(),
     }])
     .unwrap();
     let (state, store) = make_state_with_chain(&tmp, chain).await;
@@ -3234,6 +3263,8 @@ async fn delete_workspace_refuses_invalid_namespace_before_db_or_notification() 
         failure_policy: FailurePolicy::Ignore,
         events: vec![AdmissionOp::PurgeWorkspace],
         blocking: false,
+        projects: Vec::new(),
+        headers: Vec::new(),
     }])
     .unwrap();
     let (state, store) = make_state_with_chain(&tmp, chain).await;
@@ -3580,6 +3611,7 @@ async fn merge_project_dry_run_then_preserves_history_and_sessions() {
             agent_kind: AgentKind::Codex,
             cwd: None,
             actor_user: None,
+            origin: None,
         })
         .await
         .unwrap();
@@ -3596,6 +3628,10 @@ async fn merge_project_dry_run_then_preserves_history_and_sessions() {
     assert_eq!(preview["dry_run"], true);
     assert_eq!(preview["page_versions"], 2);
     assert_eq!(preview["sessions"], 1);
+    // Both resolved ids are reported, so a client that named the projects can
+    // re-point a checkout bound to the source.
+    assert_eq!(preview["from_project_id"], source.to_string());
+    assert_eq!(preview["into_project_id"], target.to_string());
     assert!(
         store
             .reader
@@ -3722,6 +3758,7 @@ async fn merge_project_refuses_open_sessions_and_foreign_ids() {
             agent_kind: AgentKind::Codex,
             cwd: None,
             actor_user: None,
+            origin: None,
         })
         .await
         .unwrap();

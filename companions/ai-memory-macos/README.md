@@ -18,7 +18,9 @@ The app does not replace `ai-memory status`, `/web`, or hand-editing `config.tom
 
 ## Build
 
-From the repository root (needs a Rust toolchain and Xcode / Swift 6):
+From the repository root. Needs rustup (it applies the Rust version pinned in
+`rust-toolchain.toml`; a Homebrew or distro `rust` does not) and Xcode 16.2 or
+later (Swift 6; the Command Line Tools alone lack SwiftUI's macros):
 
 ```bash
 chmod +x companions/ai-memory-macos/build.sh
@@ -49,7 +51,10 @@ Drag the `.app` to `/Applications` for a stable LaunchAgent path. Notarization, 
 
 Updates: replace `/Applications/AI Memory.app`. The data dir is untouched. If
 the helper path inside the bundle changed, **Restart Server** re-renders the
-plist. App and home-directory paths preserve spaces and XML characters such as
+plist. It also reloads the LaunchAgent when a data-directory override is added,
+changed, or cleared in Settings; restarting then uses the selected directory
+without moving existing files. App and home-directory paths preserve spaces
+and XML characters such as
 `&` in the generated LaunchAgent.
 
 ## Tests

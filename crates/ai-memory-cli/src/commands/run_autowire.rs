@@ -48,6 +48,7 @@ pub(crate) fn agent_choice_for_harness(harness: ManagedHarness) -> Option<AgentC
         ManagedHarness::Grok => AgentChoice::Grok,
         ManagedHarness::Antigravity => AgentChoice::AntigravityCli,
         ManagedHarness::Copilot => AgentChoice::CopilotCli,
+        ManagedHarness::Gemini => AgentChoice::GeminiCli,
         // No AgentChoice / installer support.
         ManagedHarness::Crush => return None,
     })
@@ -318,6 +319,7 @@ fn wire_installs(config: &Config, targets: WireTargets, overrides: &WireOverride
     // routes it through the bridge or an env-var reference (#552).
     let auth_token = config.auth.renderable_bearer_token().map(str::to_owned);
     let hook_install = |config_file: Option<PathBuf>| InstallHooksArgs {
+        absolute_paths: false,
         agent,
         hooks_dir: overrides.hooks_dir.clone(),
         server_url: server_url.clone(),
@@ -713,6 +715,7 @@ mod tests {
             ManagedHarness::Grok,
             ManagedHarness::Antigravity,
             ManagedHarness::Copilot,
+            ManagedHarness::Gemini,
         ] {
             assert!(
                 agent_choice_for_harness(harness).is_some(),
@@ -1074,6 +1077,12 @@ mod tests {
                 "hooks/ai-memory.json",
                 Some("mcp-config.json"),
             ),
+            (
+                ManagedHarness::Gemini,
+                "GEMINI_CLI_HOME",
+                ".gemini/settings.json",
+                Some(".gemini/settings.json"),
+            ),
         ] {
             let installs = planned_installs(&config, harness, &env_pair(var, &root));
             assert_eq!(installs.hooks.len(), 1, "{harness:?}");
@@ -1217,6 +1226,7 @@ mod tests {
             (ManagedHarness::KiroV3, &["KIRO_HOME"][..]),
             (ManagedHarness::Grok, &["GROK_HOME"][..]),
             (ManagedHarness::Copilot, &["COPILOT_HOME"][..]),
+            (ManagedHarness::Gemini, &["GEMINI_CLI_HOME"][..]),
         ] {
             let run_env: Vec<_> = vars
                 .iter()
@@ -1613,6 +1623,10 @@ mod tests {
                 AgentChoice::CopilotCli,
                 install_hooks::copilot_cli_hooks_path(),
             ),
+            (
+                AgentChoice::GeminiCli,
+                install_hooks::gemini_settings_path(),
+            ),
         ] {
             assert_eq!(
                 install_hooks::hook_config_target_with(agent, &process_env).ok(),
@@ -1634,6 +1648,7 @@ mod tests {
             ManagedHarness::Grok,
             ManagedHarness::Antigravity,
             ManagedHarness::Copilot,
+            ManagedHarness::Gemini,
         ] {
             let agent = agent_choice_for_harness(harness).unwrap();
             assert!(

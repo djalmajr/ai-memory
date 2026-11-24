@@ -153,6 +153,7 @@ async fn seed_session(
             agent_kind: AgentKind::ClaudeCode,
             cwd: Some(cwd.into()),
             actor_user: None,
+            origin: None,
         })
         .await
         .unwrap();
@@ -172,6 +173,7 @@ async fn seed_session(
                     body: "do the thing".into(),
                     importance: 5,
                     file_path: None,
+                    trust_class: None,
                 },
                 &Sanitizer::builtin(),
             ))
@@ -228,6 +230,7 @@ async fn seed_session(
         author_id: None,
         actor: ai_memory_core::ActorContext::anonymous(),
         evidence: Vec::new(),
+        trust_class: None,
     })
     .await
     .unwrap();
@@ -516,6 +519,7 @@ async fn move_session_page_collision_returns_409_and_leaves_source_intact() {
             expires_at: None,
             entities: vec![],
             evidence: Vec::new(),
+            trust_class: None,
         })
         .await
         .unwrap();
@@ -588,6 +592,7 @@ async fn move_session_pending_job_or_open_session_needs_force() {
                 body: "one more".into(),
                 importance: 5,
                 file_path: None,
+                trust_class: None,
             },
             &Sanitizer::builtin(),
         ))
@@ -600,6 +605,7 @@ async fn move_session_pending_job_or_open_session_needs_force() {
             .await
             .unwrap()
     );
+    let commits = state.wiki.git().commit_count();
 
     let resp = post(
         &state,
@@ -608,6 +614,11 @@ async fn move_session_pending_job_or_open_session_needs_force() {
     )
     .await;
     assert_eq!(resp.status(), StatusCode::CONFLICT);
+    assert_eq!(
+        state.wiki.git().commit_count(),
+        commits,
+        "a refused move must not write its pre-move checkpoint"
+    );
     let body = body_json(resp).await;
     assert!(
         body["error"]
@@ -644,6 +655,7 @@ async fn move_session_pending_job_or_open_session_needs_force() {
             agent_kind: AgentKind::Codex,
             cwd: None,
             actor_user: None,
+            origin: None,
         })
         .await
         .unwrap();
@@ -761,6 +773,7 @@ async fn move_session_batch_stops_at_first_error_and_reports_progress() {
             agent_kind: AgentKind::Codex,
             cwd: None,
             actor_user: None,
+            origin: None,
         })
         .await
         .unwrap();
@@ -1002,6 +1015,7 @@ async fn scatter_observations(
                     body: "landed in the wrong bucket".into(),
                     importance: 5,
                     file_path: None,
+                    trust_class: None,
                 },
                 &Sanitizer::builtin(),
             ))
@@ -1110,6 +1124,7 @@ async fn move_session_rehome_of_open_session_needs_no_force() {
             agent_kind: AgentKind::ClaudeCode,
             cwd: Some("/repo/dst".into()),
             actor_user: None,
+            origin: None,
         })
         .await
         .unwrap();
@@ -1141,4 +1156,174 @@ async fn move_session_rehome_of_open_session_needs_no_force() {
     )
     .await;
     assert_eq!(resp.status(), StatusCode::CONFLICT);
+}
+
+/// #2137: a session already rooted in the destination whose summary page was
+/// written into another project. The store sweeps that stray row, so the file
+/// has to follow it.
+async fn rooted_in_dst_with_stray_page(
+    state: &AdminState,
+    store: &Store,
+    scopes: &Scopes,
+) -> SessionId {
+    let sid = SessionId::new();
+    store
+        .writer
+        .begin_session(NewSession {
+            occurred_at: None,
+            id: sid,
+            workspace_id: scopes.ws,
+            project_id: scopes.dst,
+            agent_kind: AgentKind::ClaudeCode,
+            cwd: Some("/repo/dst".into()),
+            actor_user: None,
+            origin: None,
+        })
+        .await
+        .unwrap();
+    store.writer.end_session(sid, None).await.unwrap();
+    state
+        .wiki
+        .write_page(WritePageRequest {
+            workspace_id: scopes.ws,
+            project_id: scopes.src,
+            path: page_path(sid),
+            frontmatter: json!({ "title": "Stray summary" }),
+            body: format!("misplaced body of {sid}"),
+            tier: Tier::Episodic,
+            pinned: false,
+            title: Some("Stray summary".into()),
+            admission_ctx: None,
+            author_id: None,
+            actor: ai_memory_core::ActorContext::anonymous(),
+            evidence: Vec::new(),
+            trust_class: None,
+        })
+        .await
+        .unwrap();
+    sid
+}
+
+#[tokio::test]
+async fn move_session_rehome_move_relocates_the_stray_page_file() {
+    let tmp = TempDir::new().unwrap();
+    let (state, store) = make_state(&tmp).await;
+    let scopes = seed_scopes(&store).await;
+    let sid = rooted_in_dst_with_stray_page(&state, &store, &scopes).await;
+    let path = page_path(sid);
+
+    let resp = post(
+        &state,
+        "/admin/move-session",
+        json!({ "session_id": sid.to_string(), "project": "dst",
+                "pages": "move", "confirm": true }),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = body_json(resp).await;
+    assert_eq!(body["session_moved"], false, "{body}");
+    assert_eq!(body["page"], "moved", "{body}");
+
+    assert!(
+        !state.wiki.abs_path(scopes.ws, scopes.src, &path).exists(),
+        "the stray file must leave the source project"
+    );
+    assert!(state.wiki.abs_path(scopes.ws, scopes.dst, &path).exists());
+    assert_eq!(
+        read_page(&state, "default", "src", sid).await,
+        StatusCode::NOT_FOUND
+    );
+    let landed = store
+        .reader
+        .page_body_by_ids(scopes.ws, scopes.dst, path.as_str())
+        .await
+        .unwrap()
+        .expect("destination serves the page row");
+    assert!(landed.body.contains("misplaced body"));
+}
+
+#[tokio::test]
+async fn move_session_rehome_regenerate_removes_the_stray_page_file() {
+    let tmp = TempDir::new().unwrap();
+    let (state, store) = make_state(&tmp).await;
+    let scopes = seed_scopes(&store).await;
+    let sid = rooted_in_dst_with_stray_page(&state, &store, &scopes).await;
+    let path = page_path(sid);
+
+    let resp = post(
+        &state,
+        "/admin/move-session",
+        json!({ "session_id": sid.to_string(), "project": "dst",
+                "pages": "regenerate", "confirm": true }),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = body_json(resp).await;
+    assert_eq!(body["page"], "regenerated", "{body}");
+    assert_eq!(body["summary"]["pages_regenerated"], 1, "{body}");
+
+    let src_abs = state.wiki.abs_path(scopes.ws, scopes.src, &path);
+    assert!(
+        !src_abs.exists(),
+        "a retired page's file must not linger for the watcher to resurrect"
+    );
+    assert!(!state.wiki.abs_path(scopes.ws, scopes.dst, &path).exists());
+    assert!(
+        store
+            .reader
+            .page_body_by_ids(scopes.ws, scopes.src, path.as_str())
+            .await
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[tokio::test]
+async fn move_session_rehome_batch_regenerate_removes_the_stray_page_file() {
+    let tmp = TempDir::new().unwrap();
+    let (state, store) = make_state(&tmp).await;
+    let scopes = seed_scopes(&store).await;
+    let sid = rooted_in_dst_with_stray_page(&state, &store, &scopes).await;
+    // Observations stamped into `src` make the batch select the session.
+    scatter_observations(&store, sid, scopes.ws, scopes.src, 1).await;
+    let path = page_path(sid);
+
+    let resp = post(
+        &state,
+        "/admin/move-session",
+        json!({ "from_project": "src", "project": "dst",
+                "pages": "regenerate", "confirm": true }),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert!(!state.wiki.abs_path(scopes.ws, scopes.src, &path).exists());
+}
+
+#[tokio::test]
+async fn move_session_rehome_move_refuses_when_destination_file_exists() {
+    let tmp = TempDir::new().unwrap();
+    let (state, store) = make_state(&tmp).await;
+    let scopes = seed_scopes(&store).await;
+    let sid = rooted_in_dst_with_stray_page(&state, &store, &scopes).await;
+    let path = page_path(sid);
+    // The legitimate control is the move test above: it succeeds without this file.
+    let dst_file = state.wiki.abs_path(scopes.ws, scopes.dst, &path);
+    std::fs::create_dir_all(dst_file.parent().unwrap()).unwrap();
+    std::fs::write(&dst_file, "pre-existing destination page").unwrap();
+
+    for confirm in [false, true] {
+        let resp = post(
+            &state,
+            "/admin/move-session",
+            json!({ "session_id": sid.to_string(), "project": "dst",
+                    "pages": "move", "confirm": confirm }),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::CONFLICT, "confirm={confirm}");
+    }
+    assert!(state.wiki.abs_path(scopes.ws, scopes.src, &path).exists());
+    assert_eq!(
+        std::fs::read_to_string(&dst_file).unwrap(),
+        "pre-existing destination page"
+    );
 }

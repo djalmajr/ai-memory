@@ -16,6 +16,7 @@ mod compact_job;
 pub mod human_auth;
 pub mod identity;
 pub mod launch_scope;
+pub mod messages;
 pub mod metrics;
 mod page_patch;
 pub mod self_service_keys;

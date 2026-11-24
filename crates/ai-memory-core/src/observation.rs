@@ -87,6 +87,17 @@ impl ObservationKind {
             Self::Other => "other",
         }
     }
+
+    /// Whether an observation of this kind can corroborate a `_rules/` page
+    /// (#2164, `docs/design-memory-poisoning-provenance.md` Steps 2–3).
+    ///
+    /// Lifecycle and metadata events carry `TrustClass::ModelGenerated` as
+    /// context, never as a rule source; only `user-prompt` (`OperatorAuthored`)
+    /// and `stop` (`ModelGenerated`) can back a `_rules/` emission.
+    #[must_use]
+    pub const fn can_back_rule(self) -> bool {
+        matches!(self, Self::UserPrompt | Self::Stop)
+    }
 }
 
 impl std::str::FromStr for ObservationKind {
@@ -109,6 +120,15 @@ impl std::str::FromStr for ObservationKind {
             ))),
         }
     }
+}
+
+/// A sanitized harness label and the native revision that supplied it.
+#[derive(Debug, Clone)]
+pub struct SessionDisplayName {
+    /// Text shown next to the stable session id.
+    pub name: String,
+    /// Unix nanoseconds of the harness's name update, independent of activity.
+    pub updated_ns: i64,
 }
 
 /// Input for inserting an observation.
@@ -147,6 +167,23 @@ pub struct NewObservation {
     /// clears a value that fails [`crate::Sanitizer::admits_file_path`].
     #[serde(default)]
     pub file_path: Option<String>,
+    /// Trust class assigned once at hook ingress (#2164). `None` falls back to
+    /// [`crate::TrustClass::from_observation_kind`] via
+    /// [`Self::effective_trust_class`].
+    #[serde(default)]
+    pub trust_class: Option<crate::TrustClass>,
+}
+
+impl NewObservation {
+    /// Trust class to persist for this observation: the explicit ingress value
+    /// when set, otherwise derived from [`Self::kind`].
+    #[must_use]
+    pub const fn effective_trust_class(&self) -> crate::TrustClass {
+        match self.trust_class {
+            Some(class) => class,
+            None => crate::TrustClass::from_observation_kind(self.kind),
+        }
+    }
 }
 
 /// Materialised view of an observation row.
@@ -174,6 +211,47 @@ pub struct Observation {
     pub importance: u8,
     /// Wall-clock capture time.
     pub created_at: Timestamp,
+    /// Immutable ingress trust class (V113, #2164).
+    pub trust_class: crate::TrustClass,
+}
+
+/// How a session was launched, when a launcher declares it. Absent (the
+/// common case) means an ordinary interactive session. The set is closed and
+/// parsed once at the hook boundary ([`SessionOrigin::parse_wire`]); only a
+/// recognised token is ever stored, so the `sessions.origin` column holds
+/// either a known value or NULL.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionOrigin {
+    /// An orchestrator or batch runner started this session non-interactively
+    /// (for example a nightly fan-out of agents), and set
+    /// `AI_MEMORY_SESSION_ORIGIN=automation` in the harness environment. The
+    /// profile harvester can be told to skip such sessions' prompts so a
+    /// generated brief is not mistaken for the operator's own preferences
+    /// (#2180). Capture, handoff and recall are unaffected.
+    Automation,
+}
+
+impl SessionOrigin {
+    /// The stored token for this origin.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Automation => "automation",
+        }
+    }
+
+    /// Parse a client-supplied origin token from the hook query string.
+    /// Returns `None` for an empty, unknown or malformed value, so an
+    /// unrecognised origin is treated exactly like an ordinary session rather
+    /// than stored verbatim.
+    #[must_use]
+    pub fn parse_wire(value: &str) -> Option<Self> {
+        match value.trim() {
+            "automation" => Some(Self::Automation),
+            _ => None,
+        }
+    }
 }
 
 /// Input for beginning a session row.
@@ -200,6 +278,12 @@ pub struct NewSession {
     /// store fills it in at write time.
     #[serde(default)]
     pub occurred_at: Option<i64>,
+    /// How the session was launched, when a launcher declared it (#2180).
+    /// `None` is an ordinary interactive session. Only set by the hook ingest
+    /// path, from a validated `AI_MEMORY_SESSION_ORIGIN`; absent everywhere
+    /// else.
+    #[serde(default)]
+    pub origin: Option<SessionOrigin>,
 }
 
 /// Reported cumulative token usage for one session (token-cost visibility).
@@ -261,6 +345,25 @@ mod tests {
             "PostCompaction".parse::<ObservationKind>().unwrap(),
             ObservationKind::PostCompaction,
         );
+    }
+
+    #[test]
+    fn session_origin_parses_only_the_closed_set() {
+        assert_eq!(
+            SessionOrigin::parse_wire("automation"),
+            Some(SessionOrigin::Automation),
+        );
+        // Surrounding whitespace is tolerated, as a hook query value may carry it.
+        assert_eq!(
+            SessionOrigin::parse_wire("  automation "),
+            Some(SessionOrigin::Automation),
+        );
+        // Anything outside the closed set is ignored, so an unknown origin is
+        // treated as an ordinary session rather than stored verbatim (#2180).
+        for unknown in ["", "Automation", "auto", "interactive", "batch", "1"] {
+            assert_eq!(SessionOrigin::parse_wire(unknown), None, "{unknown:?}");
+        }
+        assert_eq!(SessionOrigin::Automation.as_str(), "automation");
     }
 }
 

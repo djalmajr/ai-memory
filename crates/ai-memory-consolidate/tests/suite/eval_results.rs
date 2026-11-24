@@ -73,6 +73,7 @@ async fn eval_reason_is_sanitized_before_pending_storage_with_legitimate_control
                 agent_kind: AgentKind::Other,
                 cwd: None,
                 actor_user: None,
+                origin: None,
             })
             .await
             .unwrap();
@@ -91,6 +92,7 @@ async fn eval_reason_is_sanitized_before_pending_storage_with_legitimate_control
                     body: "retain the checked workflow".into(),
                     importance: 5,
                     file_path: None,
+                    trust_class: None,
                 },
                 &Sanitizer::builtin(),
             ))

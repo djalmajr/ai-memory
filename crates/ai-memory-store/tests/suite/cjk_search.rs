@@ -28,6 +28,7 @@ fn page(
         expires_at: None,
         entities: Vec::new(),
         evidence: Vec::new(),
+        trust_class: None,
     }
 }
 
@@ -235,6 +236,110 @@ async fn superseded_cjk_text_is_hidden_and_startup_repairs_missing_index_rows() 
         .unwrap();
     assert_eq!(after_rebuild.len(), 1);
     assert_eq!(after_rebuild[0].path.as_str(), "repair.md");
+}
+
+/// #2344: once the startup backfill has persisted its watermark (#2337), an
+/// offline maintenance edit that fires a V87 `_au` trigger removes a derived
+/// CJK row at or below that watermark. The trigger lowers the matching CJK
+/// backfill watermark to the edited rowid, so the next open rebuilds the row
+/// and CJK substring search finds the new content again. Without the watermark
+/// lowering the reopen resumes past the hole and the search returns nothing —
+/// the regression that shipped unrepaired with #2337. This exercises the real
+/// maintenance mechanism (a direct source `UPDATE`), not a bare derived-row
+/// delete, so the trigger that owns the repair signal is the one under test.
+#[tokio::test]
+async fn startup_repairs_cjk_rows_edited_offline_past_the_watermark() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut store = Store::open(tmp.path()).unwrap();
+    let (ws, project) = scope(&store, "default", "app").await;
+    store
+        .writer
+        .upsert_page(page(ws, project, "state.md", "状态", "旧版支付服务"))
+        .await
+        .unwrap();
+    let session_id = session(&store, ws, project).await;
+    observe(&store, ws, project, session_id, "旧版微信支付回调").await;
+    store.close().await;
+    drop(store);
+
+    // A warm open/close persists the backfill watermark at the current max
+    // rowid of each source table — the precondition #2337 introduced.
+    let warmed = Store::open(tmp.path()).unwrap();
+    warmed.close().await;
+    drop(warmed);
+
+    // Offline maintenance edits of a page and an observation. Each UPDATE fires
+    // the V87 `_au` trigger, which deletes the stale derived CJK row and (with
+    // the V105 fix) lowers that index's watermark to the edited rowid.
+    {
+        let db = rusqlite::Connection::open(tmp.path().join("db/memory.sqlite")).unwrap();
+        let page_rowid: i64 = db
+            .query_row(
+                "SELECT rowid FROM pages WHERE path = 'state.md' ORDER BY rowid DESC LIMIT 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        db.execute(
+            "UPDATE pages SET body = '新版支付服务上线' WHERE rowid = ?1",
+            rusqlite::params![page_rowid],
+        )
+        .unwrap();
+        let obs_rowid: i64 = db
+            .query_row(
+                "SELECT rowid FROM observations WHERE body = '旧版微信支付回调' LIMIT 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        db.execute(
+            "UPDATE observations SET body = '新版微信支付回调' WHERE rowid = ?1",
+            rusqlite::params![obs_rowid],
+        )
+        .unwrap();
+        // The triggers removed the derived rows: the holes the reopen must fill.
+        for (table, rowid) in [
+            ("pages_cjk_fts", page_rowid),
+            ("observations_cjk_fts", obs_rowid),
+        ] {
+            let present: bool = db
+                .query_row(
+                    &format!("SELECT EXISTS(SELECT 1 FROM {table} WHERE rowid = ?1)"),
+                    rusqlite::params![rowid],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert!(
+                !present,
+                "the _au trigger must delete the stale {table} row"
+            );
+        }
+    }
+
+    store = Store::open(tmp.path()).unwrap();
+    let repaired_page = store
+        .reader
+        .search_pages_for_project(ws, project, "新版支付".into(), 10, None)
+        .await
+        .unwrap();
+    assert_eq!(
+        repaired_page.len(),
+        1,
+        "a page edited offline was not repaired"
+    );
+    assert_eq!(repaired_page[0].path.as_str(), "state.md");
+
+    let repaired_obs = store
+        .reader
+        .search_observations_for_project(ws, project, "新版微信".into(), 10)
+        .await
+        .unwrap();
+    assert_eq!(
+        repaired_obs.len(),
+        1,
+        "an observation edited offline was not repaired"
+    );
+    assert_eq!(repaired_obs[0].session_id, session_id);
 }
 
 #[tokio::test]
@@ -448,4 +553,142 @@ async fn cjk_search_finds_a_word_written_with_the_iteration_mark() {
         !paths.contains(&"country.md"),
         "日々 degraded to a bare 日 character match: {paths:?}"
     );
+}
+
+#[tokio::test]
+async fn arabic_vocalized_and_indic_numerals_search_works() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = Store::open(tmp.path()).unwrap();
+    let (ws, project) = scope(&store, "default", "demo-project").await;
+
+    store
+        .writer
+        .upsert_page(page(
+            ws,
+            project,
+            "team-hr.md",
+            "خطة الموارد البشرية ٢٠٢٦",
+            "أَحْمَدُ المَنْصُورُ يقود مشروع إدارة المعرفة والتوثيق.",
+        ))
+        .await
+        .unwrap();
+
+    // Unvocalized search against vocalized Tashkeel content
+    let hits_name = store
+        .reader
+        .search_pages_for_project(ws, project, "احمد المنصور".into(), 10, None)
+        .await
+        .unwrap();
+    assert_eq!(hits_name.len(), 1);
+    assert_eq!(hits_name[0].path.as_str(), "team-hr.md");
+
+    // Bare Alef + ASCII digits against Hamza-Alef + Eastern Arabic-Indic digits
+    let hits_admin = store
+        .reader
+        .search_pages_for_project(ws, project, "ادارة 2026".into(), 10, None)
+        .await
+        .unwrap();
+    assert_eq!(hits_admin.len(), 1);
+    assert_eq!(hits_admin[0].path.as_str(), "team-hr.md");
+}
+
+#[tokio::test]
+async fn arabic_punctuation_separated_words_are_searchable_independently() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = Store::open(tmp.path()).unwrap();
+    let (ws, project) = scope(&store, "default", "demo-project").await;
+
+    store
+        .writer
+        .upsert_page(page(
+            ws,
+            project,
+            "slash.md",
+            "إدارة/المعرفة",
+            "بوابة التوثيق",
+        ))
+        .await
+        .unwrap();
+    store
+        .writer
+        .upsert_page(page(ws, project, "comma.md", "اللغات", "العربية،الإنجليزية"))
+        .await
+        .unwrap();
+    store
+        .writer
+        .upsert_page(page(ws, project, "hyphen.md", "الفريق", "أحمد-المنصور"))
+        .await
+        .unwrap();
+
+    for (query, expected_path) in [
+        ("اداره", "slash.md"),
+        ("المعرفه", "slash.md"),
+        ("العربيه", "comma.md"),
+        ("الانجليزيه", "comma.md"),
+        ("احمد", "hyphen.md"),
+        ("المنصور", "hyphen.md"),
+    ] {
+        let hits = store
+            .reader
+            .search_pages_for_project(ws, project, query.into(), 10, None)
+            .await
+            .unwrap();
+        let paths: Vec<_> = hits.iter().map(|hit| hit.path.as_str()).collect();
+        assert_eq!(
+            paths,
+            vec![expected_path],
+            "punctuation-separated token failed for query={query}: {paths:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn arabic_indic_numeral_search_is_non_vacuous() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = Store::open(tmp.path()).unwrap();
+    let (ws, project) = scope(&store, "default", "demo-project").await;
+
+    // Contains only Eastern Arabic-Indic digits — no Arabic words shared with queries below.
+    store
+        .writer
+        .upsert_page(page(ws, project, "year-only.md", "archive", "٢٠٢٦"))
+        .await
+        .unwrap();
+    store
+        .writer
+        .upsert_page(page(ws, project, "year-era.md", "archive", "٢٠٢٦م"))
+        .await
+        .unwrap();
+    store
+        .writer
+        .upsert_page(page(ws, project, "decoy.md", "archive", "١٩٩٩"))
+        .await
+        .unwrap();
+
+    // Extended Arabic-Indic (Persian) digits find Eastern Arabic-Indic digits.
+    let hits_extended = store
+        .reader
+        .search_pages_for_project(ws, project, "۲۰۲۶".into(), 10, None)
+        .await
+        .unwrap();
+    let paths: Vec<_> = hits_extended.iter().map(|hit| hit.path.as_str()).collect();
+    assert_eq!(paths, vec!["year-only.md"]);
+
+    // ASCII digits alongside an unrelated Arabic word still match Eastern Arabic-Indic digits.
+    let hits_mixed = store
+        .reader
+        .search_pages_for_project(ws, project, "غيرموجود 2026".into(), 10, None)
+        .await
+        .unwrap();
+    let paths: Vec<_> = hits_mixed.iter().map(|hit| hit.path.as_str()).collect();
+    assert_eq!(paths, vec!["year-only.md"]);
+
+    // Attached ASCII digits + Arabic letter matches attached Indic digits + Arabic letter.
+    let hits_era = store
+        .reader
+        .search_pages_for_project(ws, project, "2026م".into(), 10, None)
+        .await
+        .unwrap();
+    let paths: Vec<_> = hits_era.iter().map(|hit| hit.path.as_str()).collect();
+    assert_eq!(paths, vec!["year-era.md"]);
 }

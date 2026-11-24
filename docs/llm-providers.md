@@ -57,8 +57,9 @@ Recommended defaults:
 | `cursor` | `cursor-grok-4.6-high` | Cursor subscription via the logged-in `agent` CLI. Runs `agent --print --mode ask` (read-only). Does not pass `--yolo`. The default id is the one `agent --list-models` labels "Grok 4.6". |
 | `copilot` | `gpt-5.5` | GitHub Copilot Chat backend via `ai-memory auth login copilot` or `COPILOT_GITHUB_TOKEN`; requires a Copilot subscription. |
 | `gemini` | `gemini-3.5-flash` | Google-hosted option with a generous free tier. |
+| `vertex` | `gemini-3.5-flash` | The same Gemini models through Vertex AI, billed to a Google Cloud project (Cloud credits apply). Uses `gcloud` Application Default Credentials; no API key. |
 | `opencode` | `mimo-v2.6-flash` | OpenCode Go or Zen via `OPENCODE_API_KEY`. Go is the default endpoint; `AI_MEMORY_LLM_BASE_URL` selects Zen. Set `AI_MEMORY_LLM_MODEL` to an id the chosen endpoint serves. |
-| `openai-compat` | no default | OpenRouter, Atlas Cloud, OrcaRouter, Cheaper Inference, API Route, FutureInfra, Ollama, vLLM, LM Studio, and other compatible endpoints. |
+| `openai-compat` | no default | OpenRouter, Atlas Cloud, OrcaRouter, Cheaper Inference, API Route, FutureInfra, Standard Compute, Ollama, vLLM, LM Studio, and other compatible endpoints. |
 | `openai-compat` + `AI_MEMORY_LLM_BASE_URL=https://openrouter.ai/api/v1` | no default (recommended: `anthropic/claude-haiku-4.5`) | Hosted access to a large model catalogue through one key. See [OpenRouter](#openrouter) below and the empirical comparison in [`llm-provider-comparison.md`](llm-provider-comparison.md). |
 
 `openai-oauth` stores a refresh token in `<data_dir>/auth.json` and talks to
@@ -105,6 +106,36 @@ workspace is created under the system temp directory captured at startup.
 export AI_MEMORY_LLM_PROVIDER=cursor
 export AI_MEMORY_LLM_MODEL=cursor-grok-4.6-high
 ai-memory llm-test --provider cursor --model cursor-grok-4.6-high --prompt "Reply with OK"
+```
+
+`vertex` calls the same Gemini models as `gemini`, through Vertex AI instead of
+AI Studio. Usage is billed to a Google Cloud project, so Google Cloud credits
+(free trial, startup and promotional credits) pay for it; they do not pay for
+AI Studio. There is no API key. The provider uses Google Application Default
+Credentials, read from the same places Google's SDKs read them:
+
+- `GOOGLE_APPLICATION_CREDENTIALS`, the path to a service-account key file;
+- otherwise the file `gcloud auth application-default login` writes:
+  `$CLOUDSDK_CONFIG/application_default_credentials.json`, else
+  `~/.config/gcloud/` (`%APPDATA%\gcloud\` on Windows).
+
+`GOOGLE_CLOUD_PROJECT` names the project to bill. Without it, ai-memory uses
+the project the credentials file names (`project_id` in a service-account key,
+`quota_project_id` in a `gcloud` login). `GOOGLE_CLOUD_LOCATION` picks the
+region and defaults to `global`, which serves the newest Gemini models. The
+access token is refreshed before it expires and re-read after a `401`, so a new
+`gcloud` login is picked up without a restart. Workload identity federation,
+service-account impersonation and the GCE metadata server are not supported.
+The project needs the Vertex AI API enabled
+(`gcloud services enable aiplatform.googleapis.com`), and the account needs the
+`roles/aiplatform.user` role. Embeddings are unchanged: `vertex` covers the
+chat provider only.
+
+```bash
+gcloud auth application-default login
+export GOOGLE_CLOUD_PROJECT=my-project
+export AI_MEMORY_LLM_PROVIDER=vertex
+ai-memory llm-test --provider vertex --model gemini-3.5-flash --prompt "Reply with OK"
 ```
 
 Codex credential storage mode `file` is supported. `auto` works only when its
@@ -284,6 +315,78 @@ alone does not redirect embeddings; set `AI_MEMORY_EMBEDDING_BASE_URL` too.
 > startup for that provider; the dynamic value must not be shadowed or
 > duplicated.
 
+> [!TIP]
+> **`openai-compat` can also say what each operation is.** With
+> `AI_MEMORY_LLM_REQUEST_METADATA_HEADERS=true` (`llm_request_metadata_headers
+> = true`), every chat attempt carries, next to `X-Request-Id`:
+>
+> | Header | Value | Sent when |
+> | --- | --- | --- |
+> | `x-ai-memory-workload` | `consolidation`, `profile`, `dream`, `lint`, `auto-improve`, `experience`, `bootstrap`, `query-answer`, `rerank` or `unspecified` | always |
+> | `x-ai-memory-workspace` | workspace name | the operation reads one workspace |
+> | `x-ai-memory-project` | project name | the operation reads one project |
+> | `x-ai-memory-user` | username | the operation acts for one user |
+>
+> A gateway can use them to attribute cost or apply a limit per workload,
+> project or user. A header the operation cannot name with one value is left
+> out, never guessed: a profile classification batch mixing several
+> operators' sentences sends no user, a `memory_query` answer (whose
+> evidence spans projects) sends no scope, and the rerank call sends only the
+> workload. A value that is not a valid HTTP header value (a non-ASCII
+> project name, for example) is also left out. The values are identifiers,
+> never page content. The setting is off by default, only `openai-compat`
+> sends these headers (the official providers, `opencode`, and a fallback to
+> another provider never do), and the four names are refused in
+> `AI_MEMORY_LLM_HEADERS` for `openai-compat` whether or not the setting is
+> on. The setting is server-wide: an `openai-compat` entry in
+> `llm_fallbacks` sends the headers to its own endpoint too, so turn it on
+> only when every `openai-compat` endpoint you configure may see your
+> workspace, project and user names.
+
+### Gateways whose token rotates
+
+`LLM_API_KEY` is read once at startup, so a gateway whose bearer token is
+rewritten in a file (by a login CLI or a secrets agent) needs a restart after
+every rotation. Point `llm_api_key_file` (`AI_MEMORY_LLM_API_KEY_FILE`) at the
+file instead:
+
+```toml
+llm_provider = "openai-compat"
+llm_base_url = "https://gateway.example.com/v1"
+llm_model = "your-model"
+llm_api_key_file = "/path/to/api-key"
+```
+
+The key is cached after the first read. On a `401` the file is read again, and
+the request is retried once only if the key changed; a file still holding the
+rejected key returns the `401` without a second request.
+
+### Falling back when credit or quota runs out
+
+An ordered `[[llm_fallbacks]]` chain moves to the next provider on a transient
+failure and also when a provider says the account is out of credit, quota or
+billing: Anthropic's `400` "credit balance is too low", OpenAI's
+`429 insufficient_quota`, an OpenRouter `402`, a Gemini daily
+`RESOURCE_EXHAUSTED`, a Codex `usage_limit_reached` or a Copilot
+`quota_exceeded`. A plain invalid-key `401` does not fall back. The exhausted
+provider is skipped for `llm_quota_cooldown_secs` (default 900). The next
+call after that tries it again, so it takes over again once topped up.
+
+```toml
+llm_provider = "anthropic"
+llm_model = "claude-sonnet-4-6"
+
+[[llm_fallbacks]]
+provider = "openai"
+model = "gpt-5.4-mini"
+api_key_env = "OPENAI_API_KEY"
+```
+
+`ai-memory status` then shows `primary anthropic/claude-sonnet-4-6 exhausted
+(credit/quota); using fallback openai/gpt-5.4-mini`. The full rule, with the
+per-provider signals, is in
+[`llm-provider-fallback.md`](llm-provider-fallback.md#credit-and-quota-exhaustion).
+
 ### Probing the server's own provider
 
 `ai-memory llm-test` builds a provider from the shell it runs in. That is the
@@ -391,6 +494,12 @@ from the table above.
 short-lived Copilot API token via GitHub's `/copilot_internal/v2/token`, and
 uses the Copilot Chat endpoint with `vscode-chat` integration headers. You can
 also set `COPILOT_GITHUB_TOKEN`, `GH_TOKEN`, or `GITHUB_TOKEN` on the server.
+
+Structured Copilot Chat Completions stopped at the token budget
+(`finish_reason = "length"`) fail with `truncated-response`, even if the
+returned text parses as JSON. This is a terminal failure; increase the output
+budget or reduce the requested output before trying again. Plain text
+completions keep returning the generated text.
 
 > [!TIP]
 > **For the OAuth/subscription backends, prefer a small, fast model** via
@@ -528,11 +637,26 @@ when a slow provider or a fallback chain needs longer to answer. `global=true` a
 hits keep their existing non-RRF ranking. Concurrent provider calls are capped
 at four; saturated queries keep their local ranking without waiting.
 
+`reranker = "decisions-choice"` (or `AI_MEMORY_RERANKER=decisions-choice`) sends one typed `POST /v1/decisions` request to OpenAI for each eligible query.
+It requires `OPENAI_API_KEY` through the existing configuration auth resolver and an explicit `llm_model`; it needs no generative provider.
+The request contains one Choice question over the candidate IDs, with the same query/title/snippet budgets and 30-candidate cap.
+The request body is capped at 64 KiB and the response at 1 MiB.
+Timeouts, refusals, HTTP errors and malformed probabilities keep the local order, without retries or redirects.
+The key goes only to `https://api.openai.com:443`; `llm_base_url` may select an HTTP loopback IP origin for tests, which receives no Authorization header.
+The client ignores inherited proxy settings so loopback traffic stays local.
+
+Choice probabilities express relative competition within the candidate pool, not calibrated relevance.
+Leave `min_relevance` unset globally, in project markers and on individual calls with this backend.
+The existing filter behavior is unchanged; a fixed floor can remove different hits as the pool size changes.
+For an external judge endpoint instead, see the [Jev adapter](jev-reranker-adapter.md).
+
 ## Workload telemetry
 
 `ai-memory status --json` (the root-protected `GET /admin/status` response)
-includes `providers.llm_workloads` whenever an LLM provider is configured. Its
-closed labels are `unspecified`, `consolidation`, `rerank`, `auto-improve`,
+includes `providers.llm_workloads` whenever a generative provider is configured or after a direct Decisions Choice call.
+Choice records its calls in the existing `rerank` row even without a generative provider.
+Validated reported usage remains counted when the answer is refused or invalid; an invalid model or usage envelope supplies no trusted token count.
+The closed labels are `unspecified`, `consolidation`, `rerank`, `auto-improve`,
 `bootstrap`, `query-answer`, `lint`, `profile`, `dream`, and `experience`.
 Each row reports process-lifetime calls, successes and errors, total/max
 latency, fixed-bucket p50/p95 upper bounds, last outcome, and token counts. The
@@ -639,12 +763,14 @@ test against Copilot here; treat it as needing a real-Copilot smoke test
 before relying on it in production.
 
 `AI_MEMORY_EMBEDDING_PROVIDER=local` needs no key and no server at all:
-sentence embeddings run in-process (pure-Rust `all-MiniLM-L6-v2`,
-384-dim), with the model fetched once into `<data_dir>/models/` under
-pinned checksums; see [`docs/local-embeddings.md`](local-embeddings.md).
+sentence embeddings run in-process (pure-Rust `all-MiniLM-L6-v2` by
+default, or `intfloat/multilingual-e5-small` / `multilingual-e5-small` for
+non-English wikis; both 384-dim), with the model fetched once into
+`<data_dir>/models/` under pinned checksums; see
+[`docs/local-embeddings.md`](local-embeddings.md).
 
 See [`docs/install.md#llm-provider-tiers`](install.md#llm-provider-tiers)
-for env vars and Ollama/OpenRouter/Atlas Cloud/OrcaRouter/Cheaper Inference/API Route/FutureInfra
+for env vars and Ollama/OpenRouter/Atlas Cloud/OrcaRouter/Cheaper Inference/API Route/FutureInfra/Standard Compute
 examples, and
 [`docs/llm-provider-comparison.md`](llm-provider-comparison.md)
 for the empirical model comparison.

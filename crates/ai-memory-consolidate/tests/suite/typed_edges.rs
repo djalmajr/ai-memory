@@ -40,6 +40,7 @@ fn req(
         author_id: None,
         actor: ai_memory_core::ActorContext::anonymous(),
         evidence: Vec::new(),
+        trust_class: None,
     }
 }
 
@@ -124,10 +125,11 @@ async fn a_declared_contradiction_is_a_lint_finding_without_an_llm() {
         LintOptions {
             dry_run: true,
             use_llm: false,
-            decay_lambda: 0.02,
+            decay: ai_memory_store::DecayParams::default(),
             embedding: None,
             contradiction_band_min: ai_memory_consolidate::DEFAULT_CONTRADICTION_SIM_LOW,
             contradiction_band_max: ai_memory_consolidate::DEFAULT_CONTRADICTION_SIM_HIGH,
+            keep_llm_findings: false,
         },
     )
     .await
@@ -172,10 +174,11 @@ async fn a_contradiction_to_a_deleted_page_reports_the_stale_declaration() {
         LintOptions {
             dry_run: true,
             use_llm: false,
-            decay_lambda: 0.02,
+            decay: ai_memory_store::DecayParams::default(),
             embedding: None,
             contradiction_band_min: ai_memory_consolidate::DEFAULT_CONTRADICTION_SIM_LOW,
             contradiction_band_max: ai_memory_consolidate::DEFAULT_CONTRADICTION_SIM_HIGH,
+            keep_llm_findings: false,
         },
     )
     .await
@@ -237,10 +240,11 @@ async fn a_contradiction_to_a_soft_deleted_page_reports_the_stale_declaration() 
         LintOptions {
             dry_run: true,
             use_llm: false,
-            decay_lambda: 0.02,
+            decay: ai_memory_store::DecayParams::default(),
             embedding: None,
             contradiction_band_min: ai_memory_consolidate::DEFAULT_CONTRADICTION_SIM_LOW,
             contradiction_band_max: ai_memory_consolidate::DEFAULT_CONTRADICTION_SIM_HIGH,
+            keep_llm_findings: false,
         },
     )
     .await
@@ -309,10 +313,11 @@ async fn lint_supersedes_one_report_and_prunes_the_legacy_daily_pile() {
     let opts = LintOptions {
         dry_run: false,
         use_llm: false,
-        decay_lambda: 0.02,
+        decay: ai_memory_store::DecayParams::default(),
         embedding: None,
         contradiction_band_min: ai_memory_consolidate::DEFAULT_CONTRADICTION_SIM_LOW,
         contradiction_band_max: ai_memory_consolidate::DEFAULT_CONTRADICTION_SIM_HIGH,
+        keep_llm_findings: false,
     };
     let report = run_lint(&store.reader, &wiki, None, ws, proj, opts.clone())
         .await
@@ -361,10 +366,11 @@ async fn a_clean_pass_removes_the_stale_report() {
     let opts = LintOptions {
         dry_run: false,
         use_llm: false,
-        decay_lambda: 0.02,
+        decay: ai_memory_store::DecayParams::default(),
         embedding: None,
         contradiction_band_min: ai_memory_consolidate::DEFAULT_CONTRADICTION_SIM_LOW,
         contradiction_band_max: ai_memory_consolidate::DEFAULT_CONTRADICTION_SIM_HIGH,
+        keep_llm_findings: false,
     };
     run_lint(&store.reader, &wiki, None, ws, proj, opts.clone())
         .await

@@ -20,7 +20,7 @@ RPM, macOS menu bar app). This page covers everything else:
 - [macOS menu bar app](#macos-menu-bar-app)
   (self-contained `.app` + LaunchAgent)
 - [Configuring other agent CLIs](#configuring-other-agent-clis)
-  (Codex, Command Code, IBM Bob, Devin CLI, OpenCode, OpenCode 2, OMP, Pi, Cursor, Claude Desktop, Gemini CLI, Qwen Code, Antigravity CLI, Grok Build CLI, GitHub Copilot CLI, Factory Droid, Meta Muse Code, CodeBuddy Code, Hermes Agent, Zero, ZCode, Kimi Code, Kiro CLI, Cline CLI, Pool, OpenClaw, FreeBuff, VS Code Copilot, Zed, and MCP-only recipes for Warp, Kilo Code, Goose and OpenHuman)
+  (Codex, Command Code, IBM Bob, Devin CLI, OpenCode, OpenCode 2, OMP, Pi, Cursor, Claude Desktop, Gemini CLI, Qwen Code, Antigravity CLI, Grok Build CLI, GitHub Copilot CLI, Factory Droid, Meta Muse Code, CodeBuddy Code, WorkBuddy, Hermes Agent, Zero, ZCode, Kimi Code, Kiro CLI, Cline CLI, Pool, OpenClaw, FreeBuff, VS Code Copilot, Zed, and MCP-only recipes for Warp, Kilo Code, Goose and OpenHuman)
 - [Installing hooks without docker](#installing-hooks-without-docker)
   (curl-based installer)
 - [Running ai-memory without docker](#running-ai-memory-without-docker)
@@ -77,9 +77,10 @@ drop to plain http); BusyBox wget is refused there. The release goes to
 `~/.local/lib/ai-memory`, and `~/.local/bin/ai-memory` becomes a link to the
 binary, so the bundled `hooks/` directory sits beside it and
 `ai-memory upgrade` can later replace both. An `ai-memory` at the link path that
-is not such a link (the Docker wrapper, a hand-built binary) is left alone and
-the script exits. The whole script runs from one function called on its last
-line, so a download cut short runs nothing. To read it before running it:
+is not such a link (the Docker wrapper, a hand-built binary, or a link to one of
+them) is left alone and the script exits. The whole script runs from one
+function called on its last line, so a download cut short runs nothing. To read
+it before running it:
 
 ```bash
 curl -fsSLO https://github.com/akitaonrails/ai-memory/releases/latest/download/install.sh
@@ -92,12 +93,24 @@ sh install.sh
 |---|---|---|
 | `AI_MEMORY_VERSION` | latest | Install this release, e.g. `3.0.0` |
 | `AI_MEMORY_BIN_DIR` | `~/.local/bin` | Where the `ai-memory` link goes |
-| `AI_MEMORY_LIB_DIR` | `~/.local/lib/ai-memory` | Where the release is unpacked |
+| `AI_MEMORY_LIB_DIR` | `~/.local/lib/ai-memory` | Where the release is unpacked; a directory of its own, since a rerun replaces it whole |
 | `AI_MEMORY_RELEASE_BASE_URL` | GitHub Releases | A mirror serving `latest/download/<asset>` and `download/v<version>/<asset>`; the same variable `ai-memory upgrade` reads. The checksum comes from the same origin as the archive, so use only a mirror you control. |
 | `AI_MEMORY_INSTALL_TARGET` | detected | Force `linux-x86_64`, `linux-aarch64`, `macos-x86_64` or `macos-aarch64` |
 
 Relative `AI_MEMORY_BIN_DIR` and `AI_MEMORY_LIB_DIR` paths are resolved from
-the directory where you start `install.sh`.
+the directory where you start `install.sh`. A trailing slash on
+`AI_MEMORY_LIB_DIR` is optional.
+
+Running `install.sh` again replaces its own release in place, and it deletes
+the old lib dir to do so. Before downloading, it therefore refuses a lib dir
+that is the bin dir or a directory above it, and one that holds no release (the
+`ai-memory` binary itself, not a link, beside the `hooks/` bundle). Once the new
+release is unpacked, it also refuses a lib dir holding anything that release
+does not ship, apart from the `ai-memory.new`, `.hooks.new` and `.hooks.old` an
+interrupted `ai-memory upgrade` can leave there. The link is replaced only when
+it points at this install's binary. Each refusal names what it found; move that
+aside, or pick another directory with `AI_MEMORY_LIB_DIR` or
+`AI_MEMORY_BIN_DIR`.
 
 Native Windows has its own script, `install.ps1`, published next to
 `install.sh` with its own `install.ps1.sha256`. In PowerShell (no
@@ -190,7 +203,7 @@ runs, in order, the commands a native install otherwise needs one by one:
    `CODEX_HOME` and similar relocations). The plan numbers each agent and
    says what it was found by (its session store, its MCP config, or for Muse
    its directory), then lists the other agents `--agent` accepts. Cursor,
-   Gemini CLI, Droid and the other agents with no store to look for are
+   Droid and the other agents with no store to look for are
    wired by naming them. OpenCode 1 and 2 share one session store, so a
    detected or named `opencode` runs `opencode --version` once and wires the
    plugin and MCP entry for the major it reports, as `install-mcp --client
@@ -334,16 +347,21 @@ configure ai-memory@ai-memory`:
   `install-mcp`, `install-skills`) to add them anyway.
 - Folderless sessions (a desktop scratch workspace with no project folder)
   are not captured through the plugin.
-- Ten events are wired: `SessionStart`, `UserPromptSubmit`, `PreToolUse`,
-  `PostToolUse`, `PostToolUseFailure`, `PreCompact`, `Stop`, `SessionEnd`,
-  `SubagentStart` and `SubagentStop`. Claude Code fires `PostToolUseFailure`
-  *instead of* `PostToolUse` when a tool fails (a non-zero exit, a thrown
-  error, an MCP error result). The observation records `outcome: error` and
-  the error text, bounded like any tool excerpt and never the tool's
-  arguments; the session page counts failed calls and quotes the newest one;
-  the automatic handoff adds a `Last failed tool call` line. An install made
-  before this fix has nine events; re-run `ai-memory install-hooks --agent
-  claude-code --apply` (or `ai-memory setup`) to add the tenth.
+- Eleven events are wired: `SessionStart`, `UserPromptSubmit`, `PreToolUse`,
+  `PostToolUse`, `PostToolUseFailure`, `PreCompact`, `Stop`, `StopFailure`,
+  `SessionEnd`, `SubagentStart` and `SubagentStop`. Claude Code fires
+  `PostToolUseFailure` *instead of* `PostToolUse` when a tool fails (a
+  non-zero exit, a thrown error, an MCP error result). The observation records
+  `outcome: error` and the error text, bounded like any tool excerpt and never
+  the tool's arguments; the session page counts failed calls and quotes the
+  newest one; the automatic handoff adds a `Last failed tool call` line. It
+  fires `StopFailure` *instead of* `Stop` when an API error ends the turn (a
+  rate limit, an exhausted balance, an overloaded server); that turn end is
+  stored as `stop failure: <error>` with the error and its details, and the
+  error text Claude Code puts in `last_assistant_message` is never captured as
+  a reply. An install made before these fixes has nine or ten events; re-run
+  `ai-memory install-hooks --agent claude-code --apply` (or `ai-memory setup`)
+  to add the rest. `ai-memory upgrade` refreshes the hooks the same way.
 - Factory Droid can install this plugin through its Claude marketplace
   fallback. Its events are recorded as `droid`, and when `install-hooks
   --agent droid` hooks deliver the same event (`~/.factory/hooks.json`, or
@@ -397,6 +415,11 @@ settings hook), and without the binary Codex reports a failed hook instead
 of the launcher's silent no-op. Changing it would also change the command
 Codex keys hook trust on.
 
+On Windows, native background upload and backfill workers inherit only their
+own standard streams. They cannot keep the hook executor's output pipes open
+while waiting for the server. Session-start backlog recovery and handoff
+delivery still run synchronously before context is injected.
+
 Codex runs plugin hooks and `~/.codex/hooks.json` hooks side by side, and an
 untrusted settings hook is skipped silently, so the plugin cannot safely drop
 its copy the way the Claude Code plugin does. Keep one: `ai-memory setup`
@@ -425,6 +448,17 @@ docker run -d --name ai-memory \
     akitaonrails/ai-memory:latest
 ```
 
+> Replace `<server-ip>` with the address clients put in `AI_MEMORY_SERVER_URL`;
+> do not paste the placeholder. The server compares it with the HTTP `Host`
+> header of each request, not with the caller's source IP. If the placeholder
+> stays, or the value differs from the address clients use, every non-loopback
+> request fails with `403 Forbidden: forbidden host`, even with a valid auth
+> token, because the host check runs first. When clients may use either a LAN
+> IP or a hostname, list both:
+> `-e AI_MEMORY_ALLOWED_HOSTS="192.168.1.50,homelab.local,localhost,127.0.0.1"`.
+> The port is optional in each entry: `192.168.1.50` and `192.168.1.50:49374`
+> both match.
+
 See [Security](../README.md#security) in the README for why
 `AI_MEMORY_AUTH_TOKEN` and `AI_MEMORY_ALLOWED_HOSTS` are both required for
 normal non-loopback binds. Bearer auth does not encrypt traffic: use the ready
@@ -437,6 +471,19 @@ redirect direct HTTP access to that hostname. Do not set it for direct HTTP:
 browsers then correctly withhold the session cookie.
 
 ### Client side (the laptop)
+
+> The `ai-memory` commands below need a native binary or wrapper installed on
+> this machine; the Docker image is not enough. They change files on the laptop
+> (`~/.claude.json` and the agent's hook config), which a container started with
+> `docker run --rm` cannot write. If you only have Docker so far, install the
+> client first. On Windows, follow [docs/windows.md](windows.md) and pick
+> Scenario B, C or D depending on whether you use Docker Desktop, a prebuilt
+> binary or a source build. Elsewhere, see
+> [Running ai-memory without docker](#running-ai-memory-without-docker);
+> `mise use -g github:akitaonrails/ai-memory` covers most setups. Check with
+> `ai-memory --version` before continuing. If it prints "command not found",
+> the install has not put the binary on this shell's `PATH` yet (on Windows,
+> open a new terminal so the installer's PATH change applies).
 
 ```bash
 export AI_MEMORY_SERVER_URL="http://<server-ip>:49374"
@@ -482,6 +529,14 @@ up hook-command changes. `setup-agent` and `backup-agents` only know the
 user-level file. Claude Code only; other agents keep their user-level hook
 files.
 
+Common client-side errors:
+
+| Symptom | Cause | Fix |
+|---|---|---|
+| `ai-memory: command not found` (or PowerShell `The term 'ai-memory' is not recognized`) | No native client is installed on this machine. Only the Docker image exists, and it cannot write your local config files. | Install the native client (see the note above), open a new terminal and retry. |
+| `Error: GET /admin/status: server returned 403 Forbidden: forbidden host` | The server's `AI_MEMORY_ALLOWED_HOSTS` does not include the address you connect through, often because `<server-ip>` was left as placeholder text in the server's `docker run`. | On the server, set `AI_MEMORY_ALLOWED_HOSTS` to the real address (see [Server side](#server-side-the-homelab-host)), restart that container, then run `ai-memory status` from the client again. |
+| `401 Unauthorized` | `AI_MEMORY_AUTH_TOKEN` on the client differs from the token the server started with. | Use the same token value on both sides. `generate-auth-token` makes a new random token each time it runs; it does not fetch the existing one. |
+
 `--session-aware` is an optional Claude Code MCP mode:
 
 ```bash
@@ -510,6 +565,19 @@ project files from the checkout, not from the config dir. The
 Docker wrapper forwards the variable for config roots under its existing
 `$HOME` bind mount; use the native binary when the relocated root is outside
 `$HOME`.
+
+On macOS and Linux the native hook commands name the binary and the data dir
+relative to your home when they sit under it, as
+`"$HOME/.local/share/ai-memory/native-runner/ai-memory" --data-dir "$HOME/..."`,
+so a settings file kept in a dotfiles repo works for another user or machine
+with the same layout, and re-applying leaves it unchanged. A path outside
+`$HOME`, or one with `"`, `$`, `` ` `` or `\` in it, stays absolute. Pass
+`--absolute-paths` to `install-hooks` or `setup`, or set
+`AI_MEMORY_HOOK_ABSOLUTE_PATHS=1` (which `upgrade` also honours), to keep
+absolute paths everywhere. The agent must run the hook with `HOME` set, because
+the `"$HOME/..."` form expands it in the shell; if the agent cannot provide `HOME`,
+use `--absolute-paths`. Hermes and Pool always get absolute paths, because
+they do not run the command through a shell.
 
 The CLI commands (`bootstrap`, `status`, `search`, `lint`, `auto-improve`,
 `curator`, `pending-writes`, etc.) inherit the two env vars automatically. So do
@@ -1063,8 +1131,11 @@ each server once with `ai-memory server add <name> --url <url> --root <dir>
 --auth-token-stdin`, then set `server = "<name>"` in each repository's
 `.ai-memory.toml`. Repositories without the key keep using the server
 `install-hooks` configured. A profile that does not resolve drops the event
-instead of falling back. Native hook commands route profiles; the generated
-TypeScript integrations and the script hooks drop routed repositories. See
+instead of falling back. Native hook commands route profiles, and the generated
+OpenCode plugins (`opencode`, `opencode2`) route a profile repository through
+that native hook (passing `--expected-profile`, so a divergent walk or a missing
+binary drops rather than falls back); the other generated integrations and the
+script hooks still drop routed repositories. See
 [`marker-file.md`](marker-file.md#routing-capture-to-another-server-server).
 
 Some agent harnesses attach the assistant's final turn to their `Stop` event;
@@ -1085,6 +1156,9 @@ opt-in**: enable the server first, then the client:
    ai-memory install-hooks --agent claude-code --capture-assistant --apply
    # Codex is supported too — its Stop payload carries last_assistant_message:
    ai-memory install-hooks --agent codex --capture-assistant --apply
+   # Pi has no raw assistant field, so its extension funnels the reply through
+   # the native binary:
+   ai-memory install-hooks --agent pi --capture-assistant --apply
    ```
 
 The client sanitizes (built-in patterns) and truncates the excerpt before it
@@ -1092,9 +1166,13 @@ touches the spool or wire; the server re-scrubs with its `[sanitize]` patterns
 before storing. If either side is off, or the marker is malformed, the Stop
 stays empty. Re-running `install-hooks` without `--capture-assistant` preserves
 an existing opt-in. To remove it, run `ai-memory uninstall --only hooks
---apply --yes`, then reinstall without the flag. `--capture-assistant` is Claude Code, Codex and
-OpenCode 2 (`--agent opencode2`) on a native hook platform only; on any other agent or the script fallback the
-installer refuses it rather than enabling something that cannot take effect. Assistant text is
+--apply --yes`, then reinstall without the flag. `--capture-assistant` is Claude Code, Codex,
+OpenCode 2 (`--agent opencode2`) and Pi on a native hook platform only; on any other agent or the script fallback the
+installer refuses it rather than enabling something that cannot take effect. Pi reaches the reply
+differently from the others — it has no raw assistant field, so its extension reads the final
+`role: "assistant"` message from the saved session and pipes it through the native `ai-memory hook`
+binary (never over the extension's own HTTP), which is the only path that runs the sanitizer.
+Assistant text is
 privacy-sensitive. Read the `SECURITY.md` notes on what it can contain and where
 it flows (consolidation/reviewer prompts, and out to a cloud LLM provider if one
 is configured) before enabling it.
@@ -1334,7 +1412,8 @@ native `ai-memory` binary and `hooks/` tree, governs the existing LaunchAgent
 `config.toml`, the data directory, and logs. It does not replace those tools
 with a second dashboard.
 
-Needs a Rust toolchain and Xcode / Swift 6 (the same as a source build):
+Needs rustup, which applies the Rust version pinned in `rust-toolchain.toml`
+(a Homebrew or distro `rust` does not), and Xcode 16.2 or later (Swift 6):
 
 ```bash
 git clone https://github.com/akitaonrails/ai-memory
@@ -1533,10 +1612,11 @@ the reinstall adds `SessionStart`.
 
 ### Devin CLI
 
-Devin uses `~/.devin/config.json` for MCP servers and `~/.devin/hooks.v1.json`
-for lifecycle hooks by default. If you prefer one combined Devin config file,
-pass `--config-file ~/.devin/config.json` to `install-hooks`; ai-memory then
-merges the hook entries under that file's `hooks` key.
+Devin keeps user-level configuration under `~/.config/devin/` on
+Linux/macOS/WSL (`%APPDATA%\devin\` on Windows): `mcp_config.json` for MCP
+servers and the `hooks` key inside `config.json` for lifecycle hooks. For
+project-level hooks, pass `--config-file .devin/hooks.v1.json` to
+`install-hooks`; ai-memory then writes the flat project event map.
 
 ```bash
 ai-memory install-mcp --client devin --apply \
@@ -1586,11 +1666,13 @@ ai-memory install-hooks --agent kimi-code --apply \
 ```
 
 `install-hooks` merges `[[hooks]]` entries into `config.toml`, preserving the
-provider/model settings the same file holds. Entries cover 10 events
+provider/model settings the same file holds. Entries cover 12 events
 (`SessionStart`, `SessionEnd`, `UserPromptSubmit`, `PreToolUse`, `PostToolUse`,
 `PostToolUseFailure` (Kimi Code reports tool failures separately from
-successful calls; it reuses the post-tool-use handler), `Stop`,
-`SubagentStart`, `SubagentStop`, and `PreCompact`) and default to
+successful calls; it reuses the post-tool-use handler), `Stop`, `StopFailure`
+and `Interrupt` (both fire in place of `Stop` when an error ends the turn or
+the user interrupts it, and reuse the stop handler), `SubagentStart`,
+`SubagentStop`, and `PreCompact`) and default to
 native `ai-memory hook --event … --agent kimi-code` commands on local installs
 (local spool plus batched delivery, capture-policy v1 enforced); the staged
 script bundle under `~/.local/share/ai-memory/hooks/kimi-code/` is the
@@ -1717,12 +1799,13 @@ install writes a stdio `ai-memory mcp-bridge --no-session-id` entry instead of
 putting the bearer in `headers`. Hooks are merged into the root `hooks`
 object, preserving other settings and handlers. Each entry runs the native
 `ai-memory hook --event … --agent qwen-code` command with an empty matcher;
-there is no script bundle. Ten events are wired: `SessionStart`,
+there is no script bundle. Eleven events are wired: `SessionStart`,
 `UserPromptSubmit`, `PreToolUse`, `PostToolUse`, `PostToolUseFailure` (Qwen
 fires it instead of `PostToolUse` when a tool throws), `PreCompact`, `Stop`,
-`SessionEnd`, `SubagentStart` and `SubagentStop`. Capture exclusions apply to
-Qwen's Gemini-like tools (`write_file`, `read_file`, `run_shell_command`,
-`grep_search`, `glob`). User-prompt capture uses only Qwen's
+`StopFailure` (fired instead of `Stop` when an API error or loop detection
+ends the turn), `SessionEnd`, `SubagentStart` and `SubagentStop`. Capture
+exclusions apply to Qwen's Gemini-like tools (`write_file`, `read_file`,
+`run_shell_command`, `grep_search`, `glob`). User-prompt capture uses only Qwen's
 provenance-bearing `submitted_prompt`; automated continuation or retry content
 that appears only in `prompt` is not stored or interpreted as a reload request.
 
@@ -2177,11 +2260,70 @@ CodeBuddy's hook documentation and the payloads reported on v2.164 to
 v2.167; the maintainers have not yet run it end to end. Start a new
 CodeBuddy session after installing so it loads the hooks.
 
+### WorkBuddy
+
+WorkBuddy (`workbuddy`), Tencent's coding agent, reads lifecycle hooks from
+the `hooks` key of `~/.workbuddy/settings.json` and MCP servers from the
+`mcpServers` map of `~/.workbuddy/mcp.json`. Both installers mimic their
+Tencent CodeBuddy and Claude Code counterparts:
+
+```bash
+ai-memory install-hooks --agent workbuddy --apply
+ai-memory install-mcp --client workbuddy --apply
+ai-memory install-skills --scope global --agent workbuddy
+```
+
+Without `--apply` each command prints the block to merge by hand, and
+`ai-memory setup-agent --agent workbuddy` prints the hook block for a host
+that runs WorkBuddy against a remote server. Running `--apply` again changes
+nothing.
+
+WorkBuddy takes CodeBuddy's Claude Code-shaped hook contract: it sends
+`session_id`, `cwd`, `tool_name`, `tool_input` and `tool_response` on stdin
+with Claude Code's tool names, so each entry runs the native
+`ai-memory hook --event … --agent workbuddy` command with an empty matcher.
+There is no script bundle; the local spool, bearer auth and
+`[capture] ignore_paths` apply. Six events are wired: `SessionStart`,
+`UserPromptSubmit`, `PreToolUse`, `PostToolUse`, `PreCompact` and `Stop`.
+
+The `SessionStart` hook delivers the prior session's handoff through
+`hookSpecificOutput.additionalContext`, which WorkBuddy appends to the
+session. With nothing to deliver, the `SessionStart` and `UserPromptSubmit`
+hooks print nothing, since WorkBuddy appends their output too.
+
+**WorkBuddy never fires a `SessionEnd` event.** `Stop` is a turn boundary,
+not a session end, so an idle WorkBuddy session stays open. Close it with
+`ai-memory finalize-session --agent workbuddy` after the final turn; that
+writes the summary page and hands the baton to the next session. There is no
+managed workstream and no transcript backfill.
+
+The MCP entry uses Claude Code's HTTP shape (`type: "http"`, `url`, optional
+`headers`) under `mcpServers`. When the install's bearer comes from
+`[auth].bearer_token_file`, `install-mcp` writes the session-less `mcp-bridge`
+stdio entry instead, so the token never enters `mcp.json`; a client with a
+session id of its own is not assumed, so pass explicit `workspace` and
+`project` on project-scoped MCP calls.
+
+**The new server is not usable until WorkBuddy trusts it.** After
+`install-mcp --apply`, open WorkBuddy's **custom connector** settings
+(自定义连接器) and approve the newly added `ai-memory` MCP server. Until it is
+trusted, the entry sits in `mcp.json` but ai-memory's tools do not appear in
+the session.
+
+Skills go into `~/.workbuddy/skills` (global) or `.workbuddy/skills`
+(project). `ai-memory setup` wires WorkBuddy when `~/.workbuddy` exists, and
+`ai-memory uninstall` removes the hook entries. Start a new WorkBuddy session
+after installing so it loads the hooks.
+
 ### Hermes Agent (Nous Research)
 
-Hermes declares lifecycle hooks in the `hooks:` block of
-`~/.hermes/config.yaml` (`$HERMES_HOME/config.yaml`). `install-hooks --agent
-hermes` (alias `hermes-agent`) prints the block to paste there:
+Hermes declares lifecycle hooks in the `hooks:` block of its home's
+`config.yaml`: `$HERMES_HOME/config.yaml` when that is set, else
+`%LOCALAPPDATA%\hermes\config.yaml` on Windows and `~/.hermes/config.yaml`
+everywhere else (the Windows setup does not export `HERMES_HOME`), with
+`$HERMES_DATA_DIR_SUFFIX` appended to the default's name.
+`install-hooks --agent hermes` (alias `hermes-agent`) prints the block to
+paste there:
 
 ```bash
 ai-memory install-hooks --agent hermes --server-url "http://homelab:49374"
@@ -2191,22 +2333,23 @@ Hermes splits each configured `command` with `shlex.split` and runs it with
 **no shell**, passing the event JSON on stdin, so the generated entry invokes
 the native `ai-memory hook` command directly (the same exec-form shape Zero and
 ZCode use) and there is no script bundle to stage. ai-memory never writes the
-file, `--apply` included: `~/.hermes/config.yaml` is YAML you also edit, and
+file, `--apply` included: the Hermes `config.yaml` is YAML you also edit, and
 Hermes gates user hooks behind its own acceptance prompt (`hooks_auto_accept`).
 Paste the block, let Hermes accept it, and restart Hermes and its gateway.
 
 Hermes runs a hook only when its exact `(event, command)` pair is in that
 home's `shell-hooks-allowlist.json`, or when `hooks_auto_accept`,
 `--accept-hooks` or `HERMES_ACCEPT_HOOKS` approves it. Each profile
-(`~/.hermes/profiles/<name>`) is a home of its own with its own allowlist, so
-pasting the block into a profile's `config.yaml` is not enough: approve it
+(`<Hermes home>/profiles/<name>`) is a home of its own with its own allowlist,
+so pasting the block into a profile's `config.yaml` is not enough: approve it
 there once with `hermes -p <name> --accept-hooks chat`, or run `hermes -p
 <name>` and accept the prompt. A gateway has no terminal to prompt on, so it
 skips an unapproved hook and logs `not allowlisted — skipped` on every event.
 `ai-memory doctor` checks the root home and every profile and names each
-profile whose ai-memory hooks are not approved. It reads both files and never
-changes them, and it cannot see a `HERMES_ACCEPT_HOOKS` set only in the
-gateway's environment.
+profile whose ai-memory hooks are not approved. It resolves the Hermes home the
+same way Hermes does (`$HERMES_HOME`, else the platform default), reads both
+files and never changes them, and it cannot see a `HERMES_ACCEPT_HOOKS` set
+only in the gateway's environment.
 
 Six events are wired, each with a 20-second timeout:
 
@@ -2238,13 +2381,13 @@ existing absolute directory. A multiplexing gateway serves every profile from
 the default profile's process and exports only the default profile's
 `terminal.cwd`, so inside a gateway the variable is used only for events the
 `default` profile fired. Another profile's events keep the process directory
-unless that profile's own Hermes home (`~/.hermes/profiles/<name>`, under the
-gateway's `HERMES_HOME` when it is set) carries an `.ai-memory.toml`; then the
-hook routes them by that marker. This is how the bots of one gateway reach the
-project they work for:
+unless that profile's own Hermes home (`<Hermes home>/profiles/<name>`, under
+the gateway's `HERMES_HOME` when it is set) carries an `.ai-memory.toml`; then
+the hook routes them by that marker. This is how the bots of one gateway reach
+the project they work for:
 
 ```toml
-# ~/.hermes/profiles/sc-seo/.ai-memory.toml
+# ~/.hermes/profiles/sc-seo/.ai-memory.toml   (%LOCALAPPDATA%\hermes\profiles\sc-seo on Windows)
 workspace = "default"
 project = "smart-compost"
 ```
@@ -2272,8 +2415,10 @@ under a profile's `HERMES_HOME` is seen only when the command runs with that
 For MCP, `ai-memory install-mcp --client hermes` prints an `mcp_servers:` entry
 for the same file (see [mcp-install.md](mcp-install.md#hermes-agent)). Hermes
 does not read MCP server instructions, so also install the skills:
-`ai-memory install-skills --scope global --agent hermes` writes them to
-`~/.hermes/skills`. No managed workstream (`ai-memory run hermes`) is claimed.
+`ai-memory install-skills --scope global --agent hermes` writes them to the
+Hermes home's `skills/` (`$HERMES_HOME`, else `%LOCALAPPDATA%\hermes` on
+Windows and `~/.hermes` elsewhere). No managed workstream
+(`ai-memory run hermes`) is claimed.
 
 ### OpenCode
 
@@ -2450,6 +2595,13 @@ The Pi and OMP extensions use distinct filenames (`ai-memory-pi.ts` and
 `ai-memory-omp.ts`) so installing one never overwrites the other. They are
 not interchangeable: only Pi's bridges MCP tools.
 
+If ai-memory tools are missing, check the extension's startup warning. Discovery
+runs when the extension loads; a failed `initialize` or `tools/list` request does
+not stop lifecycle capture, but leaves the tools unavailable. Start or restore
+the server, check its URL and credentials, then run `/reload` in Pi to load the
+extension and discover the tools again. Starting a new session alone does not
+retry discovery.
+
 #### OMP profiles
 
 `omp --profile <name>` relocates OMP's agent home to
@@ -2491,6 +2643,54 @@ ai-memory install-mcp --client pi --server-url "http://homelab:49374/mcp"
 
 Restart Pi after installing or changing the extension. OMP / Oh My Pi remains
 separate and continues to use `.omp` paths.
+
+#### Pi codemode
+
+By default the extension declares every ai-memory tool to the model, schema
+included. To reach them through Pi's `codemode` tool instead, set this in
+ai-memory's `config.toml` (or `AI_MEMORY_PI_TOOL_EXPOSURE=codemode`) and
+regenerate the extension:
+
+```toml
+pi_tool_exposure = "codemode"
+```
+
+```bash
+ai-memory install-hooks --agent pi --apply
+```
+
+Each tool is then registered with Pi's
+[`exposure: "codemode"`](https://github.com/earendil-works/pi/blob/main/packages/coding-agent/docs/extensions.md#tool-exposure):
+codemode scripts can list and call it, and the model no longer receives its
+schema unless you activate the tool yourself. Tool names, the session headers
+that route each call to the current project, and lifecycle capture stay the
+same. Preview output and every later `--apply` (including the refresh that
+`ai-memory upgrade` runs) read the same setting, so regenerating keeps your
+choice. Set it back to `direct`, or remove it, to return to the default.
+
+#### Pi selective direct/deferred tools (`pi_direct_tools`)
+
+To keep a small set of ai-memory tools directly declared to the model while
+deferring the remaining schemas behind Pi's `tool_search`, set
+`pi_direct_tools` in `config.toml` (or `AI_MEMORY_PI_DIRECT_TOOLS` as a JSON
+array) and regenerate the extension:
+
+```toml
+pi_direct_tools = ["memory_query", "memory_briefing"]
+```
+
+```bash
+ai-memory install-hooks --agent pi --apply
+```
+
+Listed tools register with `exposure: "direct"`, all other ai-memory tools
+register with `exposure: "deferred"`, a concise `promptGuidelines` hint is
+attached once so the model knows to use `tool_search` for deferred memory
+tools, and `session_start` activates `tool_search` when Pi exposes
+`getActiveTools`/`setActiveTools`. Set `pi_direct_tools = []` to defer every
+ai-memory tool while still activating `tool_search`. `pi_direct_tools` is
+mutually exclusive with `pi_tool_exposure = "codemode"`. Remove the key to
+return to the default extension output.
 
 ### Bind mounts vs docker cp
 
@@ -2913,7 +3113,7 @@ No dedicated mise plugin or
 registry entry is required; the backend works against any repo whose
 release assets follow this naming convention. By default mise also holds back
 the very newest release for a short safety window
-([`minimum_release_age`](https://mise.jdx.dev/dev-tools/github-backend.html)),
+([`minimum_release_age`](https://mise.jdx.dev/configuration/settings.html#minimum_release_age)),
 so a fresh tag may resolve to the previous version for a day or so; pin an
 exact tag with `mise use -g github:akitaonrails/ai-memory@1.30.0` to bypass
 that.
@@ -3001,7 +3201,8 @@ ai-memory works in three intensity tiers:
 | **+ Codex credential reuse** | Same LLM features using the Codex CLI-owned login without copying or owning its refresh token | `AI_MEMORY_LLM_PROVIDER=codex` + an authenticated Codex CLI | Uses your ChatGPT subscription |
 | **+ GitHub Copilot** | Same LLM features using a GitHub Copilot subscription | `AI_MEMORY_LLM_PROVIDER=copilot` + `ai-memory auth login copilot` or `COPILOT_GITHUB_TOKEN` | Uses your Copilot subscription |
 | **+ Cursor subscription** | Same LLM features using the logged-in Cursor Agent CLI. Read-only `--mode ask`; does not pass `--yolo` | `AI_MEMORY_LLM_PROVIDER=cursor` + `agent` on `PATH` (or `AI_MEMORY_CURSOR_AGENT`) | Uses your Cursor subscription |
-| **+ LLM reranking** | At most one relevance pass over up to 30 bounded project/scopes search candidates; normal order is preserved on invalid, failed, timed-out, or concurrency-saturated responses | `AI_MEMORY_RERANKER=llm` + any configured LLM provider | One LLM call per eligible query, at most four concurrently |
+| **+ Google Cloud credits** | Same LLM features with Gemini through Vertex AI, billed to a Google Cloud project so Cloud credits pay for it | `AI_MEMORY_LLM_PROVIDER=vertex` + `gcloud auth application-default login` (or `GOOGLE_APPLICATION_CREDENTIALS`) + `GOOGLE_CLOUD_PROJECT` | Billed to your Google Cloud project |
+| **+ LLM reranking** | At most one relevance pass over up to 30 bounded project/scopes search candidates; normal order is preserved on invalid, failed, timed-out, or concurrency-saturated responses | `AI_MEMORY_RERANKER=llm` + any configured LLM provider, or `AI_MEMORY_RERANKER=decisions-choice` + `OPENAI_API_KEY` + `llm_model` (direct OpenAI Decisions) | One provider call per eligible query, at most four concurrently |
 | **+ Hybrid retrieval** | Adds vector cosine similarity to FTS5 + entity + graph RRF. Better recall on paraphrased queries | `AI_MEMORY_EMBEDDING_PROVIDER=openai` + `OPENAI_API_KEY` (or `EMBEDDING_API_KEY`) | ~$0.0001 / page on backfill |
 
 ### Recommended models (chosen as defaults)
@@ -3018,6 +3219,7 @@ If you set only the provider, ai-memory picks a sensible default:
 | `AI_MEMORY_LLM_PROVIDER=copilot` | `gpt-5.5` | GitHub Copilot Chat backend. ai-memory stores a GitHub user token in `<data_dir>/auth.json`, exchanges it for a short-lived Copilot API token, and refreshes before expiry. |
 | `AI_MEMORY_LLM_PROVIDER=cursor` | `cursor-grok-4.6-high` | Cursor subscription via `agent --print --mode ask --trust`. No API key and no `--yolo`. This id is "Grok 4.6" in `agent --list-models`. Override the binary with `AI_MEMORY_CURSOR_AGENT`. Any other id from that list works as `AI_MEMORY_LLM_MODEL`. |
 | `AI_MEMORY_LLM_PROVIDER=gemini` | `gemini-3.5-flash` | Google's hosted option with a generous free tier. ai-memory disables Gemini 3.5 Flash's default dynamic thinking so hidden thought tokens do not truncate strict JSON. Set `GEMINI_API_KEY` (or `GOOGLE_API_KEY`). |
+| `AI_MEMORY_LLM_PROVIDER=vertex` | `gemini-3.5-flash` | The same Gemini models through Vertex AI, billed to a Google Cloud project (Cloud credits apply; they do not cover AI Studio). Authenticates with `gcloud auth application-default login` or a service-account key in `GOOGLE_APPLICATION_CREDENTIALS`. `GOOGLE_CLOUD_PROJECT` picks the project and `GOOGLE_CLOUD_LOCATION` the region (default `global`). See [LLM providers](llm-providers.md). |
 | `AI_MEMORY_LLM_PROVIDER=opencode` | `mimo-v2.6-flash` | [OpenCode](https://opencode.ai) cloud API. Defaults to the **Go** endpoint, `opencode.ai/zen/go/v1`, a cost-optimised model subset. Published Responses models, including GPT-5.6 Luna and GPT-6 Luna, use `/responses`; supported Claude and Qwen Messages models use `/messages`. MiniMax M3/M2.7 and Qwen3.8 Max use Messages on Go and Chat Completions on Zen; Go Muse Contributor models use Responses. Changing the base URL reselects the transport and preserves request settings. See the [Go](https://opencode.ai/docs/go/#endpoints) and [Zen](https://opencode.ai/docs/zen/#endpoints) endpoint tables. For **Zen**'s full catalogue, set `AI_MEMORY_LLM_BASE_URL=https://opencode.ai/zen/v1` plus an `AI_MEMORY_LLM_MODEL` from it, such as `claude-sonnet-5-5`; the default model id is Go's. Requests identify ai-memory by version and reuse one session header across related attempts. Both endpoints take `OPENCODE_API_KEY` (key from `opencode.ai/auth`). Alias: `opencode-zen` (historical); it selects Go like the others, and the endpoint is chosen by the base URL, not the alias, with no automatic billing-product switch. |
 | `AI_MEMORY_EMBEDDING_PROVIDER=openai` | `text-embedding-3-small` (1536-dim) | 5× cheaper than `-3-large` with marginal recall loss. |
 | `AI_MEMORY_EMBEDDING_PROVIDER=openai` + `AI_MEMORY_EMBEDDING_BASE_URL=https://openrouter.ai/api/v1` | `openai/text-embedding-3-small` via [OpenRouter](https://openrouter.ai) | Uses `EMBEDDING_API_KEY`, else reuses `LLM_API_KEY` or `OPENAI_API_KEY`, with the OpenAI-compatible embedding client. |
@@ -3363,6 +3565,23 @@ current ids. Keys are created in the
 [FutureInfra console](https://futureinfra.ai/console/?screen=ai-router). This
 example configures the LLM only; configure embeddings separately.
 
+[Standard Compute](https://standardcompute.com) is an OpenAI-compatible LLM
+gateway and also uses the existing `openai-compat` provider. Supply a
+Standard Compute API key:
+
+```bash
+-e AI_MEMORY_LLM_PROVIDER=openai-compat
+-e AI_MEMORY_LLM_BASE_URL=https://api.stdcmpt.com/v1
+-e AI_MEMORY_LLM_MODEL=standardcompute
+-e LLM_API_KEY="$STANDARDCOMPUTE_API_KEY"
+```
+
+The `standardcompute` model id is routed: each request goes to a capable model
+from those you've enabled. To pin a specific model instead, use an id from
+`GET https://api.stdcmpt.com/v1/models`. See the
+[Standard Compute docs](https://docs.standardcompute.com) for details. This
+example configures the LLM only; configure embeddings separately.
+
 OpenAI-compatible structured calls use the operation's JSON Schema by default:
 
 ```bash
@@ -3502,6 +3721,7 @@ docker run --rm akitaonrails/ai-memory:latest --help     # full subcommand tree
 | `workstreams [--workspace NAME] [--project NAME] [--limit N] [--json]` | host wrapper or native binary | List recent workstreams selectable from the current checkout, including current selection and linked harnesses, without exposing paths or native session ids |
 | `rename-workstream (--from NAME \| --workstream-id ID) --to NAME [--workspace NAME] [--project NAME] [--json]` | host wrapper or native binary | Retitle one workstream selectable from the current checkout; metadata only, so the stable id, the ledger, the listing order, and the current selection are unaffected |
 | `workstream-search [query]` | managed child or thin HTTP client | Search the complete visible managed-workstream ledger; the managed child receives its workstream id automatically |
+| `call [tool] [json-arguments]` | thin HTTP client or native binary | Call any MCP tool of the configured server from a shell (`call memory_query '{"query":"wal mode"}'`), or list the tools and their input schemas when no tool is named |
 | `status` | `docker exec` | Counts, paths, derived-index diagnostics, and passive LLM/embedding provider health |
 | `search "<query>"` | `docker exec` | Wiki FTS5 search + bounded source authority; use MCP `memory_query` for entity/graph/vector RRF |
 | `write-page` | `docker exec` | Manual page write (atomic + indexed) |
@@ -3544,6 +3764,7 @@ Re-running the command is safe. If a project still has the old long ai-memory
 block between line-anchored markers, the refresh replaces that block in place
 with the slim snippet, leaves unrelated instructions before and after it alone,
 and writes a timestamped `.bak-*` backup before changing an existing file.
+Updates within the same second add a numeric suffix to keep each prior version.
 Managed skill files contain an ai-memory ownership marker; same-name user skills
 without that marker are preserved unless you explicitly force replacement.
 Their embedded payloads use LF line endings on every release platform, so CLI
@@ -3592,7 +3813,7 @@ Default skill target roots:
 | Scope | `--agent claude-code` | `--agent agents` | `--agent devin` | `--agent grok` | `--agent copilot-cli` | `--agent hermes` | `--agent antigravity` |
 |---|---|---|---|---|---|---|---|
 | `project` | `.claude/skills` | `.agents/skills` | `.devin/skills` | `.grok/skills` | `.github/skills` | `.hermes/skills` | `.agents/skills` |
-| `global` | `~/.claude/skills` | `~/.agents/skills` | Windows: `%APPDATA%\devin\skills`; non-Windows: `~/.devin/skills` | `$GROK_HOME/skills` (default `~/.grok/skills`), plus the first-turn rule `$GROK_HOME/rules/ai-memory-handoff.md` | `$COPILOT_HOME/skills` (default `~/.copilot/skills`) | `~/.hermes/skills` | both `~/.gemini/config/skills` (Antigravity App and IDE) and `~/.gemini/antigravity-cli/skills` (Antigravity CLI) |
+| `global` | `~/.claude/skills` | `~/.agents/skills` | Windows: `%APPDATA%\devin\skills`; non-Windows: `~/.config/devin/skills` | `$GROK_HOME/skills` (default `~/.grok/skills`), plus the first-turn rule `$GROK_HOME/rules/ai-memory-handoff.md` | `$COPILOT_HOME/skills` (default `~/.copilot/skills`) | `$HERMES_HOME/skills` (default `~/.hermes/skills`; Windows `%LOCALAPPDATA%\hermes\skills`) | both `~/.gemini/config/skills` (Antigravity App and IDE) and `~/.gemini/antigravity-cli/skills` (Antigravity CLI) |
 
 Each managed skill is written as `<root>/<skill-name>/SKILL.md`.
 
@@ -3620,7 +3841,7 @@ remains opt-in and keeps its interval-only behavior (no startup catch-up).
 
 `reconcile_tombstones_deleted_pages` (default `false`, also under
 `[maintenance]`) is a separate, experimental opt-in: it lets the watcher's
-own 30s reconcile pass (not the scheduled jobs above) tombstone an
+own 300s reconcile pass (not the scheduled jobs above) tombstone an
 OKF-imported content page (session summary pages are excluded; see
 `docs/okf.md`) whose file has disappeared from disk, after it has been
 missing on two consecutive passes and survived a circuit breaker that
@@ -3896,9 +4117,9 @@ home-directory labels can prevent the helper container from reaching agent
 config even when its UID and GID match the host user. The wrapper checks both
 the host enforcement mode and the engine's advertised security options. For the
 short-lived helper commands that touch host files (`install-*`, `setup-agent`,
-`uninstall`, `backup`, `restore`, and `bootstrap`), it adds `--security-opt
-label=disable`; thin-client commands remain confined when they use the named
-data volume and implicit configuration. An explicit `--config` path or a valid
+`uninstall`, `backup`, `restore`, `bootstrap`, and `doctor`), it adds
+`--security-opt label=disable`; thin-client commands remain confined when they
+use the named data volume and implicit configuration. An explicit `--config` path or a valid
 host-backed `AI_MEMORY_DATA_DIR` also activates the host-file treatment. This
 relaxes SELinux label confinement only for that trusted helper invocation. It
 does not modify the long-lived ai-memory server, which uses an engine-managed
@@ -3909,6 +4130,10 @@ unmapped UID and a confined label block reads just as hard, and the failure is
 misleading: it degrades silently to `no .git found at /work; bootstrapping
 from README/docs/rules only` before dying with `Permission denied (os error
 13)`.
+
+`doctor` also reads host files: the home marker and local harness session
+stores. Without the host-file treatment, a denied read of the home marker
+is reported as `invalid home route map`, even when the marker does not exist.
 
 The two engines report these facts under different keys. Docker answers
 `docker info --format '{{.SecurityOptions}}'`; podman has no such field and
@@ -3964,6 +4189,9 @@ GitHub Release, refuses an unverified update, pulls the latest Docker
 image, refreshes the checksum-verified native host client, rewrites previously
 staged hook registrations to that native command when supported, and
 prints how to restart the server container so the new binary is used.
+If installing the native host client fails, the upgrade reports an error
+before refreshing hooks. The next host command that checks for updates can
+retry the client installation.
 Re-running `install-hooks --apply` remains idempotent: ai-memory
 replaces only the hook entries it owns and leaves unrelated hooks alone.
 When a Compose file is found, the wrapper first verifies that its project owns
@@ -4018,6 +4246,42 @@ the binary is genuine. Point it only at origins you control. Prefer an
 `https://` base; a plain-`http://` base has no transit protection, so an
 on-path attacker can substitute both the archive and its matching checksum.
 Each response body is capped at 128 MiB.
+
+When no `server_url` or `AI_MEMORY_SERVER_URL` is set, the Claude Code
+refresh reuses the endpoint shared by its installed native hooks and leaves
+the hook credential files alone. If the hook commands use different URLs,
+contain inline credentials, or cannot be safely re-rendered as native hooks,
+upgrade refreshes the staged scripts and keeps the existing settings. To
+update those hooks, re-run `ai-memory install-hooks --apply --agent claude-code`
+with the original connection options.
+
+### Hook files after an update
+
+`ai-memory upgrade` rewrites the hook scripts and generated integrations it
+staged when a release changes them; it is the only update path that does. Every
+other way of updating leaves the installed files at their old version:
+
+- package-managed installs (Homebrew, AUR, Scoop, Nix, `/usr`), which `upgrade`
+  refuses and hands to the package manager;
+- a binary copied into place by hand, which never touches the hooks tree;
+- project-scoped hook installs, which live in each checkout instead of the
+  data-dir hooks tree.
+
+After any of those, run the installer for every agent whose hooks you use:
+
+```bash
+ai-memory install-hooks --agent <agent> --apply
+# project-scoped install, in each checkout:
+ai-memory install-hooks --agent <agent> --apply --scope project
+```
+
+This matters when a project's `.ai-memory.toml` sets `[handoff]
+deliver_on_session_start = true` or `[recovery] deliver_on_session_start =
+true` to override a server-wide `false`, as described in
+[marker-file.md](marker-file.md): the current clients forward the declared
+value (`handoff=1` / `recovery=1`), while an old hook file sends only the `0`
+opt-out and the project override has no effect. A marker set to `false` keeps
+working without the refresh, because old files already send `0`.
 
 ### Server container you run yourself, native client on the host
 

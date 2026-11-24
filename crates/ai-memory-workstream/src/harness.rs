@@ -155,6 +155,8 @@ pub enum ManagedHarness {
     Antigravity,
     /// GitHub Copilot CLI (`copilot`).
     Copilot,
+    /// Google Gemini CLI (`gemini`).
+    Gemini,
 }
 
 impl ManagedHarness {
@@ -175,6 +177,7 @@ impl ManagedHarness {
             "grok" | "grok-build" => Some(Self::Grok),
             "antigravity" | "antigravity-cli" | "agy" => Some(Self::Antigravity),
             "copilot" | "copilot-cli" => Some(Self::Copilot),
+            "gemini" | "gemini-cli" => Some(Self::Gemini),
             _ => None,
         }
     }
@@ -214,6 +217,7 @@ impl ManagedHarness {
             Self::Grok => AgentKind::Grok,
             Self::Antigravity => AgentKind::AntigravityCli,
             Self::Copilot => AgentKind::CopilotCli,
+            Self::Gemini => AgentKind::GeminiCli,
         }
     }
 
@@ -240,6 +244,7 @@ impl ManagedHarness {
             Self::Grok => "grok",
             Self::Antigravity => "agy",
             Self::Copilot => "copilot",
+            Self::Gemini => "gemini",
         }
     }
 
@@ -261,6 +266,7 @@ impl ManagedHarness {
             Self::Grok => "grok",
             Self::Antigravity => "antigravity",
             Self::Copilot => "copilot",
+            Self::Gemini => "gemini",
         }
     }
 }
@@ -441,12 +447,19 @@ pub fn build_launch_plan_with_env_lookup(
     for id in expected.as_deref().into_iter().chain(linked_session_id) {
         ai_memory_core::NativeSessionIdentity::parse(id, &ai_memory_core::Sanitizer::builtin())?;
     }
-    // Command Code and Copilot also resolve a session name or an id prefix;
-    // only an exact UUID identifies the session before launch.
-    if matches!(
-        harness,
-        ManagedHarness::CommandCode | ManagedHarness::Copilot
-    ) {
+    // Command Code, Copilot, and Gemini also resolve a session name, index, or
+    // keyword (`latest`) on `--resume`; only an exact UUID identifies the
+    // session before launch. Claude's `--resume` also takes a session name or a
+    // transcript path, while its `--session-id` names the id itself and stays
+    // subject to the identity check in `run`.
+    let claude_resume =
+        harness == ManagedHarness::Claude && flag_value(&args, &["--resume", "-r"]).is_some();
+    if claude_resume
+        || matches!(
+            harness,
+            ManagedHarness::CommandCode | ManagedHarness::Copilot | ManagedHarness::Gemini
+        )
+    {
         expected = expected.filter(|value| Uuid::parse_str(value).is_ok());
     }
     let mode = launch_mode(harness, &args);
@@ -471,7 +484,7 @@ pub fn build_launch_plan_with_env_lookup(
             }
             ManagedHarness::Codex => {
                 if let Some(id) = linked_session_id {
-                    let noninteractive = first_arg_is(&args, "exec");
+                    let noninteractive = codex_exec(&args);
                     let mut resumed = if noninteractive {
                         vec![
                             OsString::from("exec"),
@@ -588,6 +601,21 @@ pub fn build_launch_plan_with_env_lookup(
                     expected = Some(id);
                 }
             }
+            ManagedHarness::Gemini => {
+                // Gemini CLI accepts a caller-chosen UUID on `--session-id` for
+                // a fresh session and resumes an existing session with
+                // `--resume <id>`.
+                let id = linked_session_id
+                    .map(str::to_owned)
+                    .unwrap_or_else(|| Uuid::new_v4().to_string());
+                let selector = if linked_session_id.is_some() {
+                    "--resume"
+                } else {
+                    "--session-id"
+                };
+                args.extend([OsString::from(selector), OsString::from(&id)]);
+                expected = Some(id);
+            }
         }
     }
 
@@ -614,17 +642,11 @@ pub fn apply_yolo(harness: ManagedHarness, args: &mut Vec<OsString>) {
         ManagedHarness::Omp => None,
         ManagedHarness::Kimi => Some("--yolo"),
         ManagedHarness::CommandCode => Some("--yolo"),
-        ManagedHarness::Kiro => {
-            if kiro_selects_non_default_engine(args) {
-                None
-            } else {
-                Some("--trust-all-tools")
-            }
-        }
-        ManagedHarness::KiroV3 => None,
+        ManagedHarness::Kiro | ManagedHarness::KiroV3 => return apply_kiro_yolo(harness, args),
         ManagedHarness::Grok => Some("--yolo"),
         ManagedHarness::Antigravity => Some("--dangerously-skip-permissions"),
         ManagedHarness::Copilot => Some("--yolo"),
+        ManagedHarness::Gemini => Some("--yolo"),
     };
     if let Some(flag) = flag {
         // Kimi's `--yolo` has hidden aliases (`--yes`, `--auto-approve`) and
@@ -635,12 +657,12 @@ pub fn apply_yolo(harness: ManagedHarness, args: &mut Vec<OsString>) {
         let present: &[&str] = match harness {
             ManagedHarness::Kimi => &["--yolo", "-y", "--yes", "--auto-approve", "--auto"],
             ManagedHarness::CommandCode => &["--yolo", "--dangerously-skip-permissions"],
-            // A narrower native trust set is an explicit user choice and must
-            // never be widened by the wrapper.
-            ManagedHarness::Kiro => &["--trust-all-tools", "-a", "--trust-tools"],
             ManagedHarness::Grok => &["--yolo", "--always-approve"],
             // Copilot documents `--allow-all` as the same permission set.
             ManagedHarness::Copilot => &["--yolo", "--allow-all"],
+            // Gemini documents `-y` as the short alias of `--yolo` and
+            // `--approval-mode` as the explicit approval-mode selector.
+            ManagedHarness::Gemini => &["--yolo", "-y", "--approval-mode"],
             _ => &[flag],
         };
         if !has_flag(args, present) {
@@ -651,6 +673,50 @@ pub fn apply_yolo(harness: ManagedHarness, args: &mut Vec<OsString>) {
         args.push(OsString::from("--settings"));
         args.push(OsString::from(CLAUDE_BYPASS_SETTINGS));
     }
+}
+
+/// Kiro's `--yolo`: `--trust-all-tools`, which kiro-cli accepts only as a
+/// `chat` option. The root command rejects it, and a bare `kiro-cli` is
+/// `kiro-cli chat`, whose options include every global one, so a launch
+/// without `chat` gets both words up front. The v2 and v3 engines both honor
+/// it, and v3 still applies its `permissions.yaml` denies. Other subcommands
+/// (`mcp`, `login`) take no trust flag, and neither does a help or version
+/// request, which starts no session: `chat` rejects the root's `--version`
+/// and `--help-all`. A narrower native trust set is an explicit user choice
+/// and is never widened. Checked against kiro-cli 3.1.0:
+/// <https://kiro.dev/docs/reference/cli-commands/>,
+/// <https://kiro.dev/docs/cli/v3/>.
+fn apply_kiro_yolo(harness: ManagedHarness, args: &mut Vec<OsString>) {
+    if kiro_yolo_engine_is_unverified(harness, args)
+        || has_flag(args, &["--trust-all-tools", "-a", "--trust-tools"])
+        || has_flag(args, KIRO_INFO_FLAGS)
+    {
+        return;
+    }
+    let trust = OsString::from("--trust-all-tools");
+    match kiro_root_positional(args) {
+        Some(index) if args[index] == OsStr::new("chat") => args.insert(index + 1, trust),
+        Some(_) => {}
+        None => {
+            let mut chat = vec![OsString::from("chat"), trust];
+            chat.append(args);
+            *args = chat;
+        }
+    }
+}
+
+/// Whether `--yolo` has no verified Kiro flag for this launch: an
+/// `--agent-engine` other than v2 or v3, which no adapter models. kiro-cli
+/// accepts it next to `--v3`, which selects the v3 harness (and is what the
+/// v3 plan prepends), so the engine value decides, not `--v3`.
+#[must_use]
+pub fn kiro_yolo_engine_is_unverified(harness: ManagedHarness, args: &[OsString]) -> bool {
+    matches!(harness, ManagedHarness::Kiro | ManagedHarness::KiroV3)
+        && has_flag(args, &["--agent-engine"])
+        && !matches!(
+            flag_value(args, &["--agent-engine"]).as_deref(),
+            Some("v2" | "v3")
+        )
 }
 
 /// The `--settings` value Claude's `--yolo` adds on top of
@@ -719,7 +785,7 @@ pub fn is_interactive_session_invocation(
 fn noninteractive_invocation(harness: ManagedHarness, args: &[OsString]) -> bool {
     match harness {
         ManagedHarness::Claude => has_flag(args, &["--print", "-p"]),
-        ManagedHarness::Codex => first_arg_is(args, "exec"),
+        ManagedHarness::Codex => codex_exec(args),
         ManagedHarness::OpenCode | ManagedHarness::OpenCode2 => first_arg_is(args, "run"),
         ManagedHarness::Crush => first_arg_is(args, "run"),
         ManagedHarness::Pi | ManagedHarness::Omp => has_flag(args, &["--print", "-p"]),
@@ -735,16 +801,21 @@ fn noninteractive_invocation(harness: ManagedHarness, args: &[OsString]) -> bool
         ManagedHarness::Antigravity => has_flag(args, &["--print", "-p", "--prompt"]),
         // `-i`/`--interactive` seeds a prompt and keeps the session open.
         ManagedHarness::Copilot => has_flag(args, &["--prompt", "-p"]),
+        // `-i`/`--prompt-interactive` seeds a prompt and keeps the session open.
+        ManagedHarness::Gemini => has_flag(args, &["--prompt", "-p"]),
     }
 }
 
+/// Kiro's help and version flags. `-v` is verbose there (the version short
+/// flag is `-V`).
+const KIRO_INFO_FLAGS: &[&str] = &["--help", "-h", "--version", "-V", "--help-all"];
+
 fn launch_mode(harness: ManagedHarness, args: &[OsString]) -> LaunchMode {
-    // Kiro's `-v` is verbose (its version short flag is `-V`), so the
-    // generic version-flag check must not send `kiro-cli -v` through
-    // unmanaged.
+    // Kiro's `-v` is verbose, so the generic version-flag check must not send
+    // `kiro-cli -v` through unmanaged.
     let version_flags: &[&str] = if matches!(harness, ManagedHarness::Kiro | ManagedHarness::KiroV3)
     {
-        &["--help", "-h", "--version", "-V", "--help-all"]
+        KIRO_INFO_FLAGS
     } else {
         &["--help", "-h", "--version", "-v"]
     };
@@ -754,6 +825,19 @@ fn launch_mode(harness: ManagedHarness, args: &[OsString]) -> LaunchMode {
         return LaunchMode::Passthrough;
     }
     if harness == ManagedHarness::CommandCode && has_flag(args, &["--list-models", "--ide-setup"]) {
+        return LaunchMode::Passthrough;
+    }
+    if harness == ManagedHarness::Gemini
+        && has_flag(
+            args,
+            &[
+                "--list-sessions",
+                "--delete-session",
+                "--list-extensions",
+                "-l",
+            ],
+        )
+    {
         return LaunchMode::Passthrough;
     }
     if matches!(harness, ManagedHarness::Kiro | ManagedHarness::KiroV3) {
@@ -777,7 +861,7 @@ fn launch_mode(harness: ManagedHarness, args: &[OsString]) -> LaunchMode {
         }
     }
     if harness == ManagedHarness::Codex
-        && first_arg_is(args, "exec")
+        && codex_exec(args)
         && args
             .get(1)
             .and_then(|arg| arg.to_str())
@@ -817,10 +901,12 @@ fn launch_mode(harness: ManagedHarness, args: &[OsString]) -> LaunchMode {
             "sandbox",
             "debug",
             "apply",
+            "a",
             "archive",
             "delete",
             "unarchive",
             "cloud",
+            "cloud-tasks",
             "exec-server",
             "features",
             "help",
@@ -1018,6 +1104,19 @@ fn launch_mode(harness: ManagedHarness, args: &[OsString]) -> LaunchMode {
             "workflow",
         ]
         .as_slice(),
+        // Every root command in Gemini CLI 0.64.0 (`gemini --help`), including
+        // singular aliases (`extension`, `skill`, `hook`).
+        ManagedHarness::Gemini => [
+            "mcp",
+            "extensions",
+            "extension",
+            "skills",
+            "skill",
+            "hooks",
+            "hook",
+            "gemma",
+        ]
+        .as_slice(),
     };
     let first = if matches!(harness, ManagedHarness::Kiro | ManagedHarness::KiroV3) {
         kiro_root_subcommand(args)
@@ -1043,8 +1142,7 @@ pub fn has_native_session_selector(harness: ManagedHarness, args: &[OsString]) -
         ManagedHarness::Codex => {
             first_arg_is(args, "resume")
                 || first_arg_is(args, "fork")
-                || args.first().and_then(|arg| arg.to_str()) == Some("exec")
-                    && args.get(1).and_then(|arg| arg.to_str()) == Some("resume")
+                || codex_exec(args) && args.get(1).and_then(|arg| arg.to_str()) == Some("resume")
         }
         ManagedHarness::OpenCode | ManagedHarness::OpenCode2 => {
             has_flag(args, &["--session", "-s", "--continue", "-c", "--fork"])
@@ -1119,6 +1217,11 @@ pub fn has_native_session_selector(harness: ManagedHarness, args: &[OsString]) -
             args,
             &["--resume", "-r", "--continue", "--session-id", "--connect"],
         ),
+        // `--resume`/`-r`, `--session-id`, and `--session-file` are mutually
+        // exclusive explicit session selectors in Gemini CLI.
+        ManagedHarness::Gemini => {
+            has_flag(args, &["--resume", "-r", "--session-id", "--session-file"])
+        }
     }
 }
 
@@ -1126,9 +1229,7 @@ fn explicit_session_id(harness: ManagedHarness, args: &[OsString]) -> Option<Str
     match harness {
         ManagedHarness::Claude => flag_value(args, &["--resume", "-r", "--session-id"]),
         ManagedHarness::Codex => {
-            if first_arg_is(args, "exec")
-                && args.get(1).and_then(|arg| arg.to_str()) == Some("resume")
-            {
+            if codex_exec(args) && args.get(1).and_then(|arg| arg.to_str()) == Some("resume") {
                 args.get(2)
                     .and_then(|value| value.to_str())
                     .filter(|value| !value.starts_with('-'))
@@ -1153,6 +1254,7 @@ fn explicit_session_id(harness: ManagedHarness, args: &[OsString]) -> Option<Str
         // after the fact, from the conversation store.
         ManagedHarness::Antigravity => flag_value(args, &["--conversation"]),
         ManagedHarness::Copilot => flag_value(args, &["--resume", "-r", "--session-id"]),
+        ManagedHarness::Gemini => flag_value(args, &["--resume", "-r", "--session-id"]),
     }
 }
 
@@ -1160,15 +1262,33 @@ fn first_arg_is(args: &[OsString], expected: &str) -> bool {
     args.first().and_then(|value| value.to_str()) == Some(expected)
 }
 
+/// `codex exec`, or `codex e`: Codex's CLI aliases `exec` as `e` (and `apply`
+/// as `a`, `cloud` as `cloud-tasks`), so both spellings run the same command.
+fn codex_exec(args: &[OsString]) -> bool {
+    first_arg_is(args, "exec") || first_arg_is(args, "e")
+}
+
 fn kiro_root_subcommand(args: &[OsString]) -> Option<&str> {
+    args.get(kiro_root_positional(args)?)?.to_str()
+}
+
+/// Index of the first root positional (the subcommand), skipping global flags
+/// and the values of the ones that take a value. An argument that is not UTF-8
+/// counts as the positional, so nothing is placed before or after it.
+fn kiro_root_positional(args: &[OsString]) -> Option<usize> {
     let mut index = 0;
     while index < args.len() {
-        let value = args.get(index)?.to_str()?;
-        if matches!(value, "--agent" | "--resume-id") {
+        let Some(value) = args[index].to_str() else {
+            return Some(index);
+        };
+        if matches!(value, "--agent" | "--resume-id" | "--repo") {
             index += 2;
             continue;
         }
-        if value.starts_with("--agent=") || value.starts_with("--resume-id=") {
+        if ["--agent=", "--resume-id=", "--repo="]
+            .iter()
+            .any(|prefix| value.starts_with(prefix))
+        {
             index += 1;
             continue;
         }
@@ -1176,7 +1296,7 @@ fn kiro_root_subcommand(args: &[OsString]) -> Option<&str> {
             index += 1;
             continue;
         }
-        return Some(value);
+        return Some(index);
     }
     None
 }
@@ -1309,6 +1429,7 @@ pub fn store_override_vars(harness: ManagedHarness) -> &'static [&'static str] {
         ManagedHarness::Kiro | ManagedHarness::KiroV3 => &["KIRO_HOME"],
         ManagedHarness::Grok => &["GROK_HOME"],
         ManagedHarness::Copilot => &["COPILOT_HOME"],
+        ManagedHarness::Gemini => &["GEMINI_CLI_HOME"],
         ManagedHarness::Crush | ManagedHarness::CommandCode | ManagedHarness::Antigravity => &[],
     }
 }
@@ -1794,6 +1915,9 @@ fn environment_session_dir_with(
         ManagedHarness::Antigravity => None,
         // Sessions live under `<COPILOT_HOME>/session-state/<id>/`.
         ManagedHarness::Copilot => value("COPILOT_HOME").map(|dir| dir.join("session-state")),
+        // `GEMINI_CLI_HOME` overrides `os.homedir()`, so sessions live under
+        // `<GEMINI_CLI_HOME>/.gemini/tmp/<project>/chats/`.
+        ManagedHarness::Gemini => value("GEMINI_CLI_HOME").map(|dir| dir.join(".gemini/tmp")),
     }
 }
 
@@ -1909,6 +2033,38 @@ mod tests {
         assert_eq!(plan.mode, LaunchMode::Session);
     }
 
+    /// `e`, `a` and `cloud-tasks` are Codex's own aliases for `exec`,
+    /// `apply` and `cloud`, so they launch exactly like the full names.
+    #[test]
+    fn codex_subcommand_aliases_launch_like_their_full_names() {
+        let native = vec![
+            OsString::from("e"),
+            OsString::from("--json"),
+            OsString::from("continue here"),
+        ];
+        let plan =
+            build_launch_plan(ManagedHarness::Codex, None, native, Some("codex-id")).unwrap();
+        assert_eq!(
+            strings(&plan.args),
+            ["exec", "resume", "codex-id", "--json", "continue here"]
+        );
+        assert!(!allows_native_session_adoption(
+            ManagedHarness::Codex,
+            &[OsString::from("e"), OsString::from("continue here")]
+        ));
+        for alias in ["a", "cloud-tasks"] {
+            let plan = build_launch_plan(
+                ManagedHarness::Codex,
+                None,
+                vec![OsString::from(alias)],
+                Some("codex-id"),
+            )
+            .unwrap();
+            assert_eq!(plan.mode, LaunchMode::Passthrough, "{alias}");
+            assert_eq!(strings(&plan.args), [alias]);
+        }
+    }
+
     #[test]
     fn explicit_codex_exec_resume_wins() {
         let native = vec![
@@ -1975,6 +2131,62 @@ mod tests {
         .unwrap();
         assert_eq!(strings(&plan.args), ["--session=chosen", "--auto"]);
         assert_eq!(plan.expected_session_id.as_deref(), Some("chosen"));
+    }
+
+    /// Claude Code resolves `--resume` by session id, session name, or the
+    /// absolute path of a transcript:
+    /// <https://code.claude.com/docs/en/sessions#resume-a-session>.
+    #[test]
+    fn claude_explicit_resume_identifies_a_session_only_by_exact_uuid() {
+        let exact = "0cb916db-26aa-40f2-86b5-1ba81b225fd2";
+        for (native, expected) in [
+            (
+                vec![OsString::from("--resume"), OsString::from(exact)],
+                Some(exact),
+            ),
+            (vec![OsString::from(format!("-r={exact}"))], Some(exact)),
+            (
+                vec![OsString::from("--session-id"), OsString::from(exact)],
+                Some(exact),
+            ),
+            // A name or a transcript path resolves natively; neither is the
+            // id the session reports, so nothing is known before launch.
+            (
+                vec![OsString::from("--resume"), OsString::from("my-feature")],
+                None,
+            ),
+            (
+                vec![
+                    OsString::from("--resume"),
+                    OsString::from(format!("/tmp/sessions/{exact}.jsonl")),
+                ],
+                None,
+            ),
+            // `--session-id` names the id itself. A malformed one is kept so
+            // the run refuses it instead of launching with no identity.
+            (
+                vec![OsString::from("--session-id"), OsString::from("chosen")],
+                Some("chosen"),
+            ),
+            (vec![OsString::from("--continue")], None),
+        ] {
+            let plan =
+                build_launch_plan(ManagedHarness::Claude, None, native.clone(), Some("linked"))
+                    .unwrap();
+            assert_eq!(plan.args, native, "{native:?} must stay byte-identical");
+            assert_eq!(plan.expected_session_id.as_deref(), expected, "{native:?}");
+        }
+        // The privacy check on the original bytes still runs before the UUID
+        // filter, so a selector that looks like a secret never launches.
+        let bad = "sk-abcdefghijklmnopqrstuvwx";
+        let refused = build_launch_plan(
+            ManagedHarness::Claude,
+            None,
+            vec![OsString::from("--resume"), OsString::from(bad)],
+            None,
+        );
+        assert!(refused.is_err(), "a dirty selector must be refused");
+        assert!(!format!("{:#}", refused.unwrap_err()).contains(bad));
     }
 
     #[test]
@@ -3655,25 +3867,151 @@ mod tests {
         );
     }
 
+    fn kiro_yolo(harness: ManagedHarness, native: &[&str]) -> Vec<String> {
+        let mut args: Vec<OsString> = native.iter().map(OsString::from).collect();
+        apply_yolo(harness, &mut args);
+        strings(&args)
+    }
+
     #[test]
-    fn kiro_yolo_maps_only_to_the_v2_permission_flag() {
-        let mut args = Vec::new();
-        apply_yolo(ManagedHarness::Kiro, &mut args);
-        assert_eq!(strings(&args), ["--trust-all-tools"]);
-
-        for already in ["--trust-all-tools", "-a", "--trust-tools=fs_read"] {
-            let mut args = vec![OsString::from(already)];
-            apply_yolo(ManagedHarness::Kiro, &mut args);
-            assert_eq!(strings(&args), [already]);
+    fn kiro_yolo_places_trust_all_tools_right_after_chat_on_both_engines() {
+        for harness in [ManagedHarness::Kiro, ManagedHarness::KiroV3] {
+            assert_eq!(kiro_yolo(harness, &[]), ["chat", "--trust-all-tools"]);
+            assert_eq!(
+                kiro_yolo(harness, &["--v3"]),
+                ["chat", "--trust-all-tools", "--v3"]
+            );
+            assert_eq!(
+                kiro_yolo(harness, &["chat", "hi"]),
+                ["chat", "--trust-all-tools", "hi"]
+            );
+            assert_eq!(
+                kiro_yolo(harness, &["-v", "chat", "--no-interactive", "hi"]),
+                ["-v", "chat", "--trust-all-tools", "--no-interactive", "hi"]
+            );
+            // An agent named `chat` is the value of `--agent`, not the subcommand.
+            assert_eq!(
+                kiro_yolo(harness, &["--agent", "chat"]),
+                ["chat", "--trust-all-tools", "--agent", "chat"]
+            );
+            assert_eq!(
+                kiro_yolo(harness, &["--resume-id=abc", "chat"]),
+                ["--resume-id=abc", "chat", "--trust-all-tools"]
+            );
+            // The root's value-taking flags: their values are never the subcommand.
+            assert_eq!(
+                kiro_yolo(harness, &["--cloud", "--repo", "owner/name"]),
+                [
+                    "chat",
+                    "--trust-all-tools",
+                    "--cloud",
+                    "--repo",
+                    "owner/name"
+                ]
+            );
+            assert_eq!(
+                kiro_yolo(harness, &["--repo=owner/name", "chat"]),
+                ["--repo=owner/name", "chat", "--trust-all-tools"]
+            );
         }
+        assert_eq!(
+            kiro_yolo(ManagedHarness::Kiro, &["chat", "--agent-engine", "v2"]),
+            ["chat", "--trust-all-tools", "--agent-engine", "v2"]
+        );
+    }
 
-        let mut v3 = vec![OsString::from("--v3")];
-        apply_yolo(ManagedHarness::Kiro, &mut v3);
-        assert_eq!(strings(&v3), ["--v3"]);
+    #[test]
+    fn kiro_yolo_never_widens_a_native_trust_choice_and_is_idempotent() {
+        for already in ["--trust-all-tools", "-a", "--trust-tools=fs_read"] {
+            for harness in [ManagedHarness::Kiro, ManagedHarness::KiroV3] {
+                assert_eq!(kiro_yolo(harness, &["chat", already]), ["chat", already]);
+            }
+        }
+        let mut args = Vec::new();
+        apply_yolo(ManagedHarness::KiroV3, &mut args);
+        apply_yolo(ManagedHarness::KiroV3, &mut args);
+        assert_eq!(strings(&args), ["chat", "--trust-all-tools"]);
+    }
 
-        let mut managed_v3 = vec![OsString::from("--v3")];
-        apply_yolo(ManagedHarness::KiroV3, &mut managed_v3);
-        assert_eq!(strings(&managed_v3), ["--v3"]);
+    #[test]
+    fn kiro_yolo_leaves_other_subcommands_and_unmodeled_engines_alone() {
+        for native in [
+            &["login"][..],
+            &["--agent", "reviewer", "mcp"],
+            &["-vv", "doctor"],
+            &["--version"],
+            &["-V"],
+            &["--help-all"],
+            &["chat", "--help"],
+        ] {
+            assert_eq!(kiro_yolo(ManagedHarness::Kiro, native), native);
+        }
+        let v1 = ["chat", "--agent-engine", "v1"].map(OsString::from);
+        let v3_plan = build_launch_plan(ManagedHarness::KiroV3, None, v1.to_vec(), None).unwrap();
+        assert_eq!(strings(&v3_plan.args)[0], "--v3");
+        assert!(kiro_yolo_engine_is_unverified(
+            ManagedHarness::KiroV3,
+            &v3_plan.args
+        ));
+        let mut args = v3_plan.args.clone();
+        apply_yolo(ManagedHarness::KiroV3, &mut args);
+        assert_eq!(args, v3_plan.args);
+        for harness in [ManagedHarness::Kiro, ManagedHarness::KiroV3] {
+            assert!(kiro_yolo_engine_is_unverified(harness, &v1), "{harness:?}");
+            assert_eq!(
+                kiro_yolo(harness, &["chat", "--agent-engine", "v1"]),
+                ["chat", "--agent-engine", "v1"],
+                "{harness:?}"
+            );
+        }
+        for verified in [
+            &["--v3"][..],
+            &["--mode", "vibe"],
+            &["--agent-engine", "v2"],
+            &[],
+        ] {
+            let args: Vec<OsString> = verified.iter().map(OsString::from).collect();
+            assert!(
+                !kiro_yolo_engine_is_unverified(ManagedHarness::Kiro, &args),
+                "{verified:?}"
+            );
+            assert!(
+                !kiro_yolo_engine_is_unverified(ManagedHarness::KiroV3, &args),
+                "{verified:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn kiro_yolo_on_a_managed_v3_resume_keeps_the_planned_selectors() {
+        let mut plan = build_launch_plan(
+            ManagedHarness::KiroV3,
+            None,
+            Vec::new(),
+            Some("sess_3f6d1c2a-0000-4000-8000-000000000aaa"),
+        )
+        .unwrap();
+        apply_yolo(ManagedHarness::KiroV3, &mut plan.args);
+        assert_eq!(
+            strings(&plan.args),
+            [
+                "chat",
+                "--trust-all-tools",
+                "--v3",
+                "--resume-id",
+                "sess_3f6d1c2a-0000-4000-8000-000000000aaa"
+            ]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn kiro_yolo_treats_a_non_utf8_root_argument_as_the_subcommand() {
+        use std::os::unix::ffi::OsStringExt as _;
+        let bad = OsString::from_vec(vec![0xff]);
+        let mut args = vec![OsString::from("-v"), bad.clone()];
+        apply_yolo(ManagedHarness::Kiro, &mut args);
+        assert_eq!(args, [OsString::from("-v"), bad]);
     }
 
     #[test]
@@ -3874,6 +4212,8 @@ mod tests {
             ManagedHarness::Omp,
             ManagedHarness::Kimi,
             ManagedHarness::Grok,
+            ManagedHarness::Copilot,
+            ManagedHarness::Gemini,
         ]
         .into_iter()
         .chain(hookless)
@@ -3938,5 +4278,192 @@ mod tests {
         .unwrap();
         assert_eq!(plan.expected_session_id.as_deref(), Some("vendor-界-01"));
         assert!(plan.args.iter().any(|arg| arg == "vendor-界-01"));
+    }
+
+    #[test]
+    fn gemini_fresh_and_linked_resume_inject_native_selectors() {
+        let fresh = build_launch_plan(
+            ManagedHarness::Gemini,
+            None,
+            vec![OsString::from("--model"), OsString::from("gemini-2.5-pro")],
+            None,
+        )
+        .unwrap();
+        assert_eq!(fresh.mode, LaunchMode::Session);
+        let generated = fresh.expected_session_id.as_deref().unwrap();
+        assert!(Uuid::parse_str(generated).is_ok());
+        assert_eq!(
+            strings(&fresh.args),
+            ["--model", "gemini-2.5-pro", "--session-id", generated]
+        );
+
+        let linked = "4c1ea47e-b134-4efe-a3d1-217a5d5c4e5d";
+        let resumed = build_launch_plan(
+            ManagedHarness::Gemini,
+            None,
+            vec![OsString::from("--model"), OsString::from("gemini-2.5-pro")],
+            Some(linked),
+        )
+        .unwrap();
+        assert_eq!(resumed.mode, LaunchMode::Session);
+        assert_eq!(resumed.expected_session_id.as_deref(), Some(linked));
+        assert_eq!(
+            strings(&resumed.args),
+            ["--model", "gemini-2.5-pro", "--resume", linked]
+        );
+    }
+
+    #[test]
+    fn gemini_explicit_selectors_always_win_over_linked_session() {
+        let exact = "4c1ea47e-b134-4efe-a3d1-217a5d5c4e5d";
+        for (native, expected) in [
+            (
+                vec![OsString::from("--resume"), OsString::from(exact)],
+                Some(exact),
+            ),
+            (
+                vec![OsString::from("-r"), OsString::from(exact)],
+                Some(exact),
+            ),
+            (
+                vec![OsString::from("--session-id"), OsString::from(exact)],
+                Some(exact),
+            ),
+            (
+                vec![OsString::from(format!("--session-id={exact}"))],
+                Some(exact),
+            ),
+            // Index and "latest" resolve natively; they identify no UUID before launch.
+            (
+                vec![OsString::from("--resume"), OsString::from("latest")],
+                None,
+            ),
+            (vec![OsString::from("--resume"), OsString::from("5")], None),
+            (
+                vec![
+                    OsString::from("--session-file"),
+                    OsString::from("/tmp/session.json"),
+                ],
+                None,
+            ),
+        ] {
+            let plan = build_launch_plan(
+                ManagedHarness::Gemini,
+                None,
+                native.clone(),
+                Some("linked-id"),
+            )
+            .unwrap();
+            assert_eq!(plan.args, native, "{native:?} must stay byte-identical");
+            assert_eq!(plan.expected_session_id.as_deref(), expected, "{native:?}");
+            assert!(!allows_native_session_adoption(
+                ManagedHarness::Gemini,
+                &native
+            ));
+        }
+    }
+
+    #[test]
+    fn gemini_utility_subcommands_and_flags_are_passed_through() {
+        for utility in [
+            "mcp",
+            "extensions",
+            "extension",
+            "skills",
+            "skill",
+            "hooks",
+            "hook",
+            "gemma",
+        ] {
+            let plan = build_launch_plan(
+                ManagedHarness::Gemini,
+                None,
+                vec![OsString::from(utility)],
+                Some("linked"),
+            )
+            .unwrap();
+            assert_eq!(plan.mode, LaunchMode::Passthrough, "{utility}");
+            assert_eq!(strings(&plan.args), [utility]);
+        }
+        for flag in [
+            "--help",
+            "-h",
+            "--version",
+            "-v",
+            "--list-sessions",
+            "--delete-session",
+            "--list-extensions",
+            "-l",
+        ] {
+            let plan = build_launch_plan(
+                ManagedHarness::Gemini,
+                None,
+                vec![OsString::from(flag)],
+                None,
+            )
+            .unwrap();
+            assert_eq!(plan.mode, LaunchMode::Passthrough, "{flag}");
+            assert_eq!(strings(&plan.args), [flag]);
+        }
+    }
+
+    #[test]
+    fn gemini_prompt_blocks_adoption_but_interactive_seed_does_not() {
+        for args in [
+            vec![OsString::from("-p"), OsString::from("summarize")],
+            vec![OsString::from("--prompt=summarize")],
+        ] {
+            assert!(!allows_native_session_adoption(
+                ManagedHarness::Gemini,
+                &args
+            ));
+            let plan = build_launch_plan(ManagedHarness::Gemini, None, args, None).unwrap();
+            assert_eq!(plan.mode, LaunchMode::Session);
+        }
+        assert!(allows_native_session_adoption(
+            ManagedHarness::Gemini,
+            &[OsString::from("-i"), OsString::from("summarize")]
+        ));
+    }
+
+    #[test]
+    fn gemini_yolo_avoids_duplicating_short_flag_or_approval_mode() {
+        let mut plain = vec![OsString::from("--model"), OsString::from("gemini-2.5-pro")];
+        apply_yolo(ManagedHarness::Gemini, &mut plain);
+        assert_eq!(strings(&plain), ["--model", "gemini-2.5-pro", "--yolo"]);
+
+        for already in [
+            vec!["--yolo"],
+            vec!["-y"],
+            vec!["--approval-mode", "auto_edit"],
+            vec!["--approval-mode=yolo"],
+        ] {
+            let mut args: Vec<OsString> = already.iter().map(OsString::from).collect();
+            apply_yolo(ManagedHarness::Gemini, &mut args);
+            assert_eq!(strings(&args), already, "{already:?} must not duplicate");
+        }
+    }
+
+    #[test]
+    fn gemini_names_and_home_override_are_wired() {
+        for name in ["gemini", "gemini-cli"] {
+            assert_eq!(
+                ManagedHarness::from_name(name),
+                Some(ManagedHarness::Gemini)
+            );
+        }
+        assert_eq!(ManagedHarness::Gemini.agent_kind(), AgentKind::GeminiCli);
+        assert_eq!(ManagedHarness::Gemini.executable(), "gemini");
+        assert_eq!(ManagedHarness::Gemini.as_str(), "gemini");
+        assert!(!ManagedHarness::Gemini.lacks_session_end_hook());
+        assert_eq!(
+            store_override_vars(ManagedHarness::Gemini),
+            ["GEMINI_CLI_HOME"]
+        );
+        let get = |name: &str| (name == "GEMINI_CLI_HOME").then(|| OsString::from("/stores/g"));
+        assert_eq!(
+            environment_session_dir_with(ManagedHarness::Gemini, None, None, get).as_deref(),
+            Some(std::path::Path::new("/stores/g/.gemini/tmp"))
+        );
     }
 }

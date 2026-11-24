@@ -3,6 +3,8 @@
 //! no extra binary; a new file must be declared below.
 
 mod admission;
+mod admission_bot_wake;
 mod auto_improve_admission;
 mod ledger_files;
+mod trust_class;
 mod wiki_git_ledgers;

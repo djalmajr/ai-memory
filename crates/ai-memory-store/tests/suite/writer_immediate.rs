@@ -65,6 +65,7 @@ async fn writer_hook_admission_survives_external_write_lock_held_during_read_the
         agent_kind: AgentKind::Codex,
         cwd: Some(PathBuf::from("/repo")),
         actor_user: None,
+        origin: None,
     };
     let raw_obs = NewObservation {
         occurred_at: None,
@@ -78,6 +79,7 @@ async fn writer_hook_admission_survives_external_write_lock_held_during_read_the
         body: "the writer must wait out an external checkpoint".into(),
         importance: 5,
         file_path: None,
+        trust_class: None,
     };
 
     let started = Instant::now();

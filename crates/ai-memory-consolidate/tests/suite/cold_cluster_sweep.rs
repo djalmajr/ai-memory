@@ -81,6 +81,7 @@ async fn write(fx: &Fixture, path: &str, body: &str) -> PageId {
             author_id: None,
             actor: ActorContext::anonymous(),
             evidence: Vec::new(),
+            trust_class: None,
         })
         .await
         .unwrap()
@@ -107,6 +108,7 @@ async fn write_with_summary(fx: &Fixture, path: &str, body: &str, summary: &str)
             author_id: None,
             actor: ActorContext::anonymous(),
             evidence: Vec::new(),
+            trust_class: None,
         })
         .await
         .unwrap()
@@ -342,6 +344,8 @@ async fn concurrent_member_write_skips_dedup_batch(edit_survivor: bool) {
             failure_policy: FailurePolicy::Reject,
             events: vec![AdmissionOp::WritePage],
             blocking: true,
+            projects: Vec::new(),
+            headers: Vec::new(),
         }])
         .unwrap(),
     );
@@ -379,6 +383,7 @@ async fn concurrent_member_write_skips_dedup_batch(edit_survivor: bool) {
                 author_id: None,
                 actor: ActorContext::anonymous(),
                 evidence: Vec::new(),
+                trust_class: None,
             })
             .await
             .unwrap();

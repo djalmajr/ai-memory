@@ -21,7 +21,7 @@ use crate::auth::{AuthRequirement, CopilotAuth, ProviderAuth};
 use crate::embedding::{Embedder, OpenAiCompatEmbedder, OpenAiEmbedder, VoyageEmbedder};
 use crate::error::{LlmError, LlmResult};
 use crate::google::GoogleEmbedder;
-use crate::openai::REQUEST_ID_HEADER;
+use crate::openai::{REQUEST_ID_HEADER, REQUEST_METADATA_HEADERS};
 use crate::provider::LlmProvider;
 
 /// LLM providers available to ai-memory.
@@ -48,6 +48,9 @@ pub enum ProviderChoice {
     OpenCode,
     /// Cursor subscription via the logged-in `agent` CLI (`--print --mode ask`).
     Cursor,
+    /// Google Gemini through Vertex AI, billed to a Google Cloud project and
+    /// authenticated with Application Default Credentials.
+    Vertex,
 }
 
 impl ProviderChoice {
@@ -65,6 +68,7 @@ impl ProviderChoice {
             Self::AnthropicOAuth => "anthropic-oauth",
             Self::OpenCode => "opencode",
             Self::Cursor => "cursor",
+            Self::Vertex => "vertex",
         }
     }
 
@@ -92,6 +96,7 @@ impl ProviderChoice {
                 env_var: "OPENCODE_API_KEY",
             },
             Self::Cursor => AuthRequirement::CursorCli,
+            Self::Vertex => AuthRequirement::GoogleAdc,
         }
     }
 
@@ -157,6 +162,12 @@ pub struct ProviderConfig {
     /// through this rather than per-provider special cases. Parsed once from
     /// `AI_MEMORY_LLM_HEADERS` by `Config::load`; empty by default.
     pub extra_headers: crate::ExtraHeaders,
+    /// OpenAI-compat only: send the `x-ai-memory-*` request metadata headers
+    /// (the operation's workload, and the workspace, project and username
+    /// it names) on every chat attempt. Opt-in, off by default, ignored by
+    /// every other provider. Sourced once from
+    /// `AI_MEMORY_LLM_REQUEST_METADATA_HEADERS` by `Config::load`.
+    pub request_metadata_headers: bool,
 }
 
 /// Embedding providers available to ai-memory.
@@ -171,10 +182,10 @@ pub enum EmbedderChoice {
     /// OpenAI-compatible embeddings endpoint (Ollama / LM Studio /
     /// vLLM). Keyless-capable; base URL, model, and dim are required.
     OpenAiCompat,
-    /// In-process pure-Rust embeddings (all-MiniLM-L6-v2, 384-dim) —
-    /// no API key, no server. Requires the model files under
-    /// `<data_dir>/models/` (fetched at serve startup or dropped in
-    /// manually; docs/local-embeddings.md).
+    /// In-process pure-Rust embeddings (`all-MiniLM-L6-v2` by default, or
+    /// `intfloat/multilingual-e5-small`; both 384-dim) — no API key, no
+    /// server. Requires the model files under `<data_dir>/models/` (fetched
+    /// at serve startup or dropped in manually; docs/local-embeddings.md).
     #[cfg(feature = "local-embeddings")]
     Local,
     /// GitHub Copilot's OpenAI-compatible `/embeddings` endpoint. Reuses the
@@ -293,7 +304,8 @@ pub fn build_embedder(config: EmbedderConfig) -> LlmResult<Arc<dyn Embedder>> {
             let models_dir = config.models_dir.ok_or_else(|| {
                 LlmError::NotConfigured("local embeddings need the data dir's models/ root".into())
             })?;
-            Arc::new(crate::local::LocalEmbedder::load(&models_dir)?)
+            let spec = crate::local::resolve_local_model(&config.model)?;
+            Arc::new(crate::local::LocalEmbedder::load_model(&models_dir, spec)?)
         }
         EmbedderChoice::Copilot => {
             let auth = config.copilot_auth.ok_or_else(|| {
@@ -325,7 +337,9 @@ pub fn try_default_embedding_dim(provider: EmbedderChoice, model: &str) -> Optio
         (EmbedderChoice::Voyage, "voyage-3-large") => Some(1024),
         (EmbedderChoice::Voyage, _) => Some(1024),
         #[cfg(feature = "local-embeddings")]
-        (EmbedderChoice::Local, _) => Some(crate::local::LOCAL_DIM),
+        (EmbedderChoice::Local, model) => {
+            crate::local::resolve_local_model(model).ok().map(|s| s.dim)
+        }
         (EmbedderChoice::Google, "gemini-embedding-2") => Some(768),
         (EmbedderChoice::Google, "gemini-embedding-001") => Some(768),
         (EmbedderChoice::Google, _) => Some(768),
@@ -425,6 +439,18 @@ pub fn build_provider(config: ProviderConfig) -> LlmResult<Arc<dyn LlmProvider>>
                     .with_extra_headers(extra_headers),
             ))
         }
+        ProviderChoice::Vertex => {
+            let auth = config.auth.require_vertex_auth()?;
+            let mut provider = GeminiProvider::new_vertex(auth, config.model)?;
+            if let Some(url) = config.base_url {
+                provider = provider.with_base_url(url);
+            }
+            Ok(Arc::new(
+                provider
+                    .with_timeout_secs(timeout)
+                    .with_extra_headers(extra_headers),
+            ))
+        }
         ProviderChoice::OpenAiCompat => {
             let base = config
                 .base_url
@@ -441,16 +467,36 @@ pub fn build_provider(config: ProviderConfig) -> LlmResult<Arc<dyn LlmProvider>>
                      with the logical operation id"
                 )));
             }
+            // Refused whether or not the metadata is on: a gateway that reads
+            // these names must never see a static value posing as a
+            // per-operation one, and turning the setting on later must not
+            // turn a working configuration into a startup failure.
+            if let Some(name) = REQUEST_METADATA_HEADERS
+                .into_iter()
+                .find(|name| extra_headers.contains(name))
+            {
+                return Err(LlmError::NotConfigured(format!(
+                    "AI_MEMORY_LLM_HEADERS must not set {name}: the openai-compat \
+                     provider reserves it for the per-operation request metadata \
+                     (llm_request_metadata_headers)"
+                )));
+            }
             let extra_headers = with_default_openrouter_headers(&base, extra_headers);
+            let mut provider =
+                OpenAiCompatProvider::new(base, config.auth.optional_api_key(), config.model)?;
+            if let Some(path) = config.auth.api_key_file() {
+                provider = provider.with_api_key_file(path);
+            }
             Ok(Arc::new(
-                OpenAiCompatProvider::new(base, config.auth.optional_api_key(), config.model)?
+                provider
                     .with_strict(config.compat_strict)
                     .with_disable_thinking(config.compat_disable_thinking)
                     .with_stream(config.compat_stream)?
                     .with_timeout_secs(timeout)
                     .with_reasoning_effort(config.reasoning_effort)
                     .with_extra_headers(extra_headers)
-                    .with_request_id_header(),
+                    .with_request_id_header()
+                    .with_request_metadata_headers(config.request_metadata_headers),
             ))
         }
         ProviderChoice::OpenAiOAuth => {
@@ -546,6 +592,7 @@ mod tests {
             ProviderChoice::AnthropicOAuth,
             ProviderChoice::Codex,
             ProviderChoice::Cursor,
+            ProviderChoice::Vertex,
         ] {
             assert!(
                 !choice.endpoint_is_operator_chosen(),
@@ -602,6 +649,41 @@ mod tests {
         assert_eq!(
             ProviderChoice::Cursor.auth_requirement(),
             AuthRequirement::CursorCli
+        );
+        assert_eq!(ProviderChoice::Vertex.name(), "vertex");
+        assert_eq!(
+            ProviderChoice::Vertex.auth_requirement(),
+            AuthRequirement::GoogleAdc
+        );
+    }
+
+    #[test]
+    fn vertex_without_credentials_fails_before_any_request() {
+        let cfg = ProviderConfig {
+            provider: ProviderChoice::Vertex,
+            model: "gemini-3.5-flash".into(),
+            auth: ProviderAuth::vertex(
+                None,
+                None,
+                "global".into(),
+                crate::CredentialSource::TokenFile,
+            ),
+            base_url: None,
+            compat_strict: false,
+            compat_disable_thinking: false,
+            compat_stream: None,
+            request_timeout_secs: crate::DEFAULT_REQUEST_TIMEOUT_SECS,
+            reasoning_effort: None,
+            extra_headers: crate::ExtraHeaders::default(),
+            request_metadata_headers: false,
+        };
+        let err = match build_provider(cfg) {
+            Ok(_) => panic!("vertex must not build without credentials"),
+            Err(err) => err,
+        };
+        assert!(
+            matches!(err, LlmError::NotConfigured(ref msg) if msg.contains("GOOGLE_APPLICATION_CREDENTIALS")),
+            "{err}"
         );
     }
 
@@ -689,6 +771,7 @@ mod tests {
             request_timeout_secs: crate::DEFAULT_REQUEST_TIMEOUT_SECS,
             reasoning_effort: None,
             extra_headers: crate::ExtraHeaders::default(),
+            request_metadata_headers: false,
         };
 
         let err = match build_provider(cfg) {
@@ -710,6 +793,7 @@ mod tests {
             request_timeout_secs: crate::DEFAULT_REQUEST_TIMEOUT_SECS,
             reasoning_effort: None,
             extra_headers,
+            request_metadata_headers: false,
         }
     }
 
@@ -764,6 +848,30 @@ mod tests {
         );
     }
 
+    /// The request metadata names are reserved the same way, whether or not
+    /// the metadata is on, so enabling it later never breaks a working
+    /// configuration and a static value never poses as a per-operation one.
+    #[test]
+    fn openai_compat_refuses_a_static_request_metadata_header() {
+        for name in REQUEST_METADATA_HEADERS {
+            for enabled in [false, true] {
+                let headers =
+                    crate::ExtraHeaders::parse([format!("{}: static", name.to_uppercase())])
+                        .expect("valid");
+                let mut config = compat_config(headers);
+                config.request_metadata_headers = enabled;
+                let err = match build_provider(config) {
+                    Ok(_) => panic!("{name} must be refused at startup"),
+                    Err(err) => err,
+                };
+                let rendered = err.to_string();
+                assert!(matches!(err, LlmError::NotConfigured(_)), "{rendered}");
+                assert!(rendered.contains(name), "{rendered}");
+                assert!(rendered.contains("openai-compat"), "{rendered}");
+            }
+        }
+    }
+
     /// The refusal is scoped to the provider that owns the header: the same
     /// static entry is a legitimate operator configuration everywhere else.
     #[test]
@@ -783,6 +891,7 @@ mod tests {
             request_timeout_secs: crate::DEFAULT_REQUEST_TIMEOUT_SECS,
             reasoning_effort: None,
             extra_headers: headers,
+            request_metadata_headers: false,
         };
         assert!(
             build_provider(cfg).is_ok(),
@@ -815,7 +924,7 @@ mod tests {
         let provider = build_provider(cfg).expect("provider builds");
         let operation_id = crate::LlmOperationId::new();
         provider
-            .complete_with_operation_id(crate::ChatRequest::user_prompt("hi"), operation_id)
+            .complete_with_operation_id(crate::ChatRequest::user_prompt("hi"), operation_id.clone())
             .await
             .expect("completion succeeds");
 
@@ -847,5 +956,50 @@ mod tests {
                 .and_then(|value| value.to_str().ok()),
             Some(crate::DEFAULT_USER_AGENT),
         );
+    }
+
+    #[cfg(feature = "local-embeddings")]
+    #[test]
+    fn try_default_embedding_dim_resolves_local_models_and_rejects_unknown() {
+        assert_eq!(
+            try_default_embedding_dim(EmbedderChoice::Local, "all-MiniLM-L6-v2"),
+            Some(384)
+        );
+        assert_eq!(
+            try_default_embedding_dim(EmbedderChoice::Local, "intfloat/multilingual-e5-small"),
+            Some(384)
+        );
+        assert_eq!(
+            try_default_embedding_dim(EmbedderChoice::Local, "multilingual-e5-small"),
+            Some(384)
+        );
+        assert_eq!(
+            try_default_embedding_dim(EmbedderChoice::Local, "unknown-local-model"),
+            None
+        );
+    }
+
+    #[cfg(feature = "local-embeddings")]
+    #[test]
+    fn build_embedder_rejects_unknown_local_model() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg = EmbedderConfig {
+            provider: EmbedderChoice::Local,
+            model: "unknown-local-model".into(),
+            dim: 384,
+            api_key: SecretString::from(String::new()),
+            base_url: None,
+            models_dir: Some(tmp.path().to_path_buf()),
+            copilot_auth: None,
+            defaulted: false,
+            query_prefix: String::new(),
+            document_prefix: String::new(),
+        };
+        let err = match build_embedder(cfg) {
+            Ok(_) => panic!("unknown local model must be rejected"),
+            Err(err) => err,
+        };
+        assert!(matches!(err, LlmError::NotConfigured(_)), "{err}");
+        assert!(err.to_string().contains("unknown-local-model"), "{err}");
     }
 }

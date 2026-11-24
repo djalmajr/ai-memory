@@ -197,6 +197,19 @@ describe("pages", () => {
       ],
     });
     assert.equal(result.pageId, payloads.NEXT_PAGE_ID);
+    const edits = [{ op: "append", target: "end_of_page", content: "x" }] as const;
+    const globalPatch = { path: "_rules/a.md", expectedPageId: payloads.PAGE_ID, edits };
+    await memory.pages.patch({ ...globalPatch, global: true });
+    assert.deepEqual(server.lastArgs(), {
+      scope: "global",
+      path: "_rules/a.md",
+      expected_page_id: payloads.PAGE_ID,
+      edits: [{ op: "append", target: "end_of_page", content: "x" }],
+    });
+    await assert.rejects(
+      memory.pages.patch({ ...globalPatch, global: true, scope: OTHER }),
+      ArgumentError,
+    );
   });
 
   it("read by path or query, never both, and decodes the page", async () => {
@@ -253,6 +266,33 @@ describe("pages", () => {
     assert.equal(server.requests.length, before);
   });
 
+  it("reads a page from a server that predates section metadata", async () => {
+    const { server, memory } = setup();
+    const { path, page_id, title, body } = payloads.read;
+    server.tools.set("memory_read_page", () => ({ path, page_id, title, body, frontmatter: {} }));
+    const page = await memory.pages.read({ path });
+    assert.equal(page.pageId, page_id);
+    assert.equal(page.body, body);
+    assert.deepEqual(page.sections, []);
+    assert.equal(page.sectionsTruncated, false);
+  });
+
+  it("rejects incomplete or invalid section metadata", async () => {
+    const { server, memory } = setup();
+    const { path, page_id, title, body } = payloads.read;
+    for (const metadata of [
+      { sections: payloads.read.sections },
+      { sections_truncated: false },
+      { sections: null, sections_truncated: false },
+      { sections: payloads.read.sections, sections_truncated: "false" },
+    ]) {
+      server.tools.set("memory_read_page", () => ({
+        path, page_id, title, body, frontmatter: {}, ...metadata,
+      }));
+      await assert.rejects(memory.pages.read({ path }), ProtocolError);
+    }
+  });
+
   it("delete decodes the checkpoints", async () => {
     const { server, memory } = setup();
     server.tools.set("memory_delete_page", () => payloads.del);
@@ -270,6 +310,9 @@ describe("pages", () => {
 
   it("update carries metadata over, applies the change and guards on the read version", async () => {
     const { server, memory } = setup();
+    const readSchema = server.schemas["memory_read_page"];
+    assert.ok(readSchema !== undefined);
+    delete readSchema.properties["max_chars"];
     server.tools.set("memory_read_page", () => payloads.read);
     server.tools.set("memory_write_page", () => payloads.write);
     await memory.pages.update("notes/retries.md", (current) => ({
@@ -294,6 +337,93 @@ describe("pages", () => {
       expected_page_id: payloads.PAGE_ID,
     });
   });
+
+  it("update carries a scalar profile stack tag and clears explicit enforcement", async () => {
+    const { server, memory } = setup();
+    server.tools.set("memory_read_page", () => ({
+      ...payloads.read,
+      path: "profile/style/types.md",
+      frontmatter: { applies_to: "typescript", enforced_by: "eslint rule" },
+    }));
+    server.tools.set("memory_write_page", () => payloads.write);
+    await memory.pages.update("profile/style/types.md", () => ({ enforcedBy: null }), {
+      scope: { workspace: "default", project: "_global" },
+    });
+    assert.deepEqual(server.lastArgs(), {
+      workspace: "default",
+      project: "_global",
+      path: "profile/style/types.md",
+      body: payloads.read.body,
+      applies_to: ["typescript"],
+      expected_page_id: payloads.PAGE_ID,
+    });
+  });
+
+  it("update rereads a truncated page and guards on the complete version", async () => {
+    const { server, memory } = setup();
+    const complete = "x".repeat(12_344) + "!";
+    server.tools.set("memory_read_page", (args) =>
+      args["max_chars"] === undefined
+        ? {
+            ...payloads.read,
+            body: complete.slice(0, 12_000) + "\n[body truncated]",
+            truncated: true,
+            total_chars: complete.length,
+          }
+        : {
+            ...payloads.read,
+            page_id: payloads.NEXT_PAGE_ID,
+            body: complete,
+            truncated: false,
+            total_chars: complete.length,
+          },
+    );
+    server.tools.set("memory_write_page", () => payloads.write);
+
+    let callbacks = 0;
+    await memory.pages.update("notes/retries.md", (current) => {
+      callbacks += 1;
+      assert.equal(current.body, complete);
+      assert.equal(current.pageId, payloads.NEXT_PAGE_ID);
+      return { tags: ["retagged"] };
+    });
+    assert.equal(callbacks, 1);
+    const calls = server.toolCalls();
+    assert.deepEqual(calls.map((call) => call.name), [
+      "memory_read_page", "memory_read_page", "memory_write_page",
+    ]);
+    assert.equal(calls[0]?.args["max_chars"], undefined);
+    assert.equal(calls[1]?.args["max_chars"], 64_000);
+    assert.equal(calls[2]?.args["body"], complete);
+    assert.equal(calls[2]?.args["expected_page_id"], payloads.NEXT_PAGE_ID);
+  });
+
+  for (const [initialSize, expectedReads] of [[64_001, 1], [12_345, 2]] as const) {
+    it(`update refuses an incomplete page after ${expectedReads} read(s)`, async () => {
+      const { server, memory } = setup();
+      server.tools.set("memory_read_page", (args) => ({
+        ...payloads.read,
+        body: "partial body",
+        truncated: true,
+        total_chars: args["max_chars"] === undefined ? initialSize : 64_001,
+      }));
+      server.tools.set("memory_write_page", () => payloads.write);
+      let callbacks = 0;
+      await assert.rejects(
+        memory.pages.update("notes/retries.md", () => {
+          callbacks += 1;
+          return { tags: ["retagged"] };
+        }),
+        (error: unknown) =>
+          error instanceof ProtocolError && error.message.includes("complete page body"),
+      );
+      assert.equal(callbacks, 0);
+      assert.deepEqual(
+        server.toolCalls().map((call) => call.name),
+        Array.from({ length: expectedReads }, () => "memory_read_page"),
+      );
+    });
+  }
 
   it("update writes nothing when the change function throws", async () => {
     const { server, memory } = setup();
@@ -440,6 +570,8 @@ describe("handoffs", () => {
       shared: true,
     });
     assert.equal(begun.handoffId, payloads.HANDOFF_ID);
+    assert.equal(begun.truncated, undefined);
+    assert.equal(begun.truncatedFields, undefined);
     assert.ok(!("cwd" in server.lastArgs()));
 
     const listed = await memory.handoffs.list({ limit: 5 });
@@ -463,6 +595,54 @@ describe("handoffs", () => {
       any_owner: true,
     });
     assert.equal(cancelled.cancelled, true);
+  });
+
+  it("begin decodes the truncation report", async () => {
+    const { server, memory } = setup();
+    server.tools.set("memory_handoff_begin", () => ({
+      handoff_id: payloads.HANDOFF_ID,
+      truncated: true,
+      truncated_fields: {
+        summary: { original_chars: 3001, stored_chars: 3000 },
+        open_questions: { original_items: 30, stored_items: 20, original_chars: 80, stored_chars: 50 },
+      },
+    }));
+    const begun = await memory.handoffs.begin({ summary: "Left off here" });
+    assert.equal(begun.truncated, true);
+    assert.deepEqual(begun.truncatedFields, {
+      summary: { originalChars: 3001, storedChars: 3000, originalItems: undefined, storedItems: undefined },
+      open_questions: { originalChars: 80, storedChars: 50, originalItems: 30, storedItems: 20 },
+    });
+  });
+
+  it("begin skips a malformed truncation entry instead of failing the write", async () => {
+    const { server, memory } = setup();
+    server.tools.set("memory_handoff_begin", () => ({
+      handoff_id: payloads.HANDOFF_ID,
+      truncated: true,
+      truncated_fields: {
+        summary: { original_chars: "3001" },
+        next_steps: { original_chars: 1501, stored_chars: 1500 },
+      },
+    }));
+    const begun = await memory.handoffs.begin({ summary: "Left off here" });
+    assert.equal(begun.handoffId, payloads.HANDOFF_ID);
+    assert.equal(begun.truncated, true);
+    assert.deepEqual(begun.truncatedFields, {
+      next_steps: { originalChars: 1501, storedChars: 1500, originalItems: undefined, storedItems: undefined },
+    });
+  });
+
+  it("begin ignores a truncated_fields report that is not an object", async () => {
+    const { server, memory } = setup();
+    server.tools.set("memory_handoff_begin", () => ({
+      handoff_id: payloads.HANDOFF_ID,
+      truncated: true,
+      truncated_fields: null,
+    }));
+    const begun = await memory.handoffs.begin({ summary: "Left off here" });
+    assert.equal(begun.handoffId, payloads.HANDOFF_ID);
+    assert.equal(begun.truncatedFields, undefined);
   });
 
   it("accept refuses an unknown status", async () => {
@@ -498,6 +678,22 @@ describe("messages", () => {
       evidence: "tests/export.test.ts:42",
     });
     assert.equal(sent.messageId, payloads.MESSAGE_ID);
+    assert.equal(sent.truncated, undefined);
+    assert.equal(sent.truncatedFields, undefined);
+  });
+
+  it("send decodes the truncation report", async () => {
+    const { server, memory } = setup();
+    server.tools.set("memory_message_send", () => ({
+      message_id: payloads.MESSAGE_ID,
+      truncated: true,
+      truncated_fields: { body: { original_chars: 8001, stored_chars: 8000 } },
+    }));
+    const sent = await memory.messages.send({ to: OTHER, body: "long" });
+    assert.equal(sent.truncated, true);
+    assert.deepEqual(sent.truncatedFields, {
+      body: { originalChars: 8001, storedChars: 8000, originalItems: undefined, storedItems: undefined },
+    });
   });
 
   it("list, pop and cancel decode their results", async () => {
@@ -514,6 +710,20 @@ describe("messages", () => {
     assert.equal(listed.messages[0]?.nature, "reported");
     assert.equal(listed.messages[0]?.evidence, "source message 42");
     assert.equal(listed.messages[0]?.toAgent, null);
+    const paged = await memory.messages.list({
+      box: "outbox",
+      limit: 3,
+      afterId: payloads.MESSAGE_ID,
+    });
+    assert.deepEqual(server.lastArgs(), {
+      workspace: "demo",
+      project: "app",
+      box: "outbox",
+      limit: 3,
+      after_id: payloads.MESSAGE_ID,
+    });
+    assert.equal(paged.messages[0]?.body, "please do X");
+    await assert.rejects(memory.messages.list({ afterId: "" }), ArgumentError);
     const popped = await memory.messages.pop({ messageId: payloads.MESSAGE_ID, agent: "codex" });
     assert.deepEqual(server.lastArgs(), {
       workspace: "demo",
@@ -777,6 +987,8 @@ describe("wire names", () => {
         abstract: "a",
         relations: { fixes: ["x"] },
         expiresAt: "2099-01-01",
+        appliesTo: ["typescript"],
+        enforcedBy: "eslint rule",
         sourceFiles: [{ path: "p", commit: "3f2a9c1" }],
         expectedPageId: "v",
       }),
@@ -790,6 +1002,12 @@ describe("wire names", () => {
           { op: "add_section", anchor: "## B", content: "c" },
           { op: "replace_section", anchor: "C", sectionSha256: "h", content: "d" },
         ],
+      }),
+      memory.pages.patch({
+        path: "global",
+        expectedPageId: "v",
+        edits: [{ op: "append", target: "end_of_page", content: "b" }],
+        global: true,
       }),
       memory.pages.read({ path: "p", includeRelated: true, relatedDepth: 2, maxChars: 500 }),
       memory.pages.read({ path: "global", global: true }),
@@ -846,7 +1064,7 @@ describe("wire names", () => {
         nature: "measured",
         evidence: "test:1",
       }),
-      memory.messages.list({ box: "inbox", limit: 1 }),
+      memory.messages.list({ box: "inbox", limit: 1, afterId: "m" }),
       memory.messages.pop({ messageId: "m", agent: "codex" }),
       memory.messages.cancel({ messageId: "m" }),
     ];

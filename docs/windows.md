@@ -212,10 +212,10 @@ Use the matching `--client` / `--agent` values for other clients, for
 example `codex`, `command-code`, `devin`, `kimi-code`, `kiro-cli`, `cursor`, or `gemini-cli`.
 
 For Devin, `install-mcp --client devin --apply` writes MCP config to
-`%USERPROFILE%\.devin\config.json`. `install-hooks --agent devin --apply`
-writes lifecycle hooks to `%USERPROFILE%\.devin\hooks.v1.json` by default;
-pass `--config-file "%USERPROFILE%\.devin\config.json"` if you want hooks under
-the `hooks` key in Devin's main config file.
+`%APPDATA%\devin\mcp_config.json`. `install-hooks --agent devin --apply`
+writes lifecycle hooks under the `hooks` key of `%APPDATA%\devin\config.json`
+by default; pass `--config-file ".devin\hooks.v1.json"` for project-level
+flat hooks.
 
 For Kiro CLI, `install-mcp --client kiro-cli --apply` writes
 `%USERPROFILE%\.kiro\settings\mcp.json` unless `$env:KIRO_HOME` overrides the
@@ -527,6 +527,43 @@ Remove-ItemProperty -Path HKCU:\Software\Microsoft\Windows\CurrentVersion\Run -N
 `setup --no-service` skips writing the entry but does not remove one that
 already exists. Without the entry, run `ai-memory serve --transport http`
 in a terminal or use the WinSW service below.
+
+#### Security suites that rewrite AI-tool traffic
+
+Some consumer security suites intercept the network traffic of programs they
+classify as AI tools, and of the processes those tools start. This covers
+plain `http://` traffic too, not only HTTPS. A product that re-frames the
+server's response on the way back hands the client a malformed body, and the
+bridge and hooks fail while the server itself is healthy. This was seen with
+the Safe AI feature of Norton 360 Deluxe 26.10, on processes started by
+Antigravity talking to an `http://` server URL. Avast and AVG come from the
+same vendor and may behave the same way.
+
+Only the applications the product recognizes are affected. On the machine
+above, Safe AI listed Claude, Claude Code, Google Antigravity IDE and Visual
+Studio Code; DeepSeek Harness and Hermes Agent were not on the list, and
+their bridge and hooks to the same server kept working. The list grows with
+product updates, so an agent that works today can start failing after one.
+One agent failing while another on the same machine works points at this
+cause rather than at the server.
+
+**Symptoms.** `ai-memory mcp-bridge` or `ai-memory hook` fails with an HTTP
+decoding error such as `Invalid chunk size line: missing size digit`. The
+response arrives with `Transfer-Encoding: chunked` in place of
+`Content-Length`, but the body is not chunk-encoded. The same request from a
+terminal you opened yourself succeeds. MCP tools and hook capture stop
+together, and only for the agent the product protects.
+
+**How to tell.** Look for the agent in the product's list of protected AI
+tools (in Norton: Safe AI, the tab listing your AI tools). If the error goes away after you turn the
+feature off and restart the agent, the product was the cause.
+
+**What to do.** Turn the feature off (in Norton, switch off Safe AI), then
+restart the agent so the bridge reconnects. This is a different problem from
+the untrusted interception root in
+[HTTPS via a reverse proxy](https-via-proxy.md#outbound-llm-calls-fail-behind-a-tls-inspecting-firewall):
+it happens on plain HTTP as well, and installing the product's root
+certificate does not fix it.
 
 ### A real Windows service
 

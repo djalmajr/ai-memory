@@ -9,7 +9,7 @@ use askama::Template;
 use axum::extract::rejection::QueryRejection;
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
-use axum::response::{Html, IntoResponse, Response};
+use axum::response::{IntoResponse, Response};
 
 use crate::markdown;
 use crate::state::WebState;
@@ -184,7 +184,7 @@ pub(crate) async fn handler(
     }
     .render())
     {
-        Ok(html) => Html(html).into_response(),
+        Ok(html) => super::private_page(html),
         Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
     }
 }
@@ -229,6 +229,19 @@ async fn namespace_or_not_found(
         return not_found_response(i18n);
     }
     let prefix = format!("{namespace}/");
+    // Ask whether the namespace holds a live page before loading the
+    // project's pages. The answer for an unmatched path is no, and answering
+    // "not found" by listing every page in the project made each stale link
+    // or probe cost a full read.
+    match state
+        .reader
+        .has_unexpired_page_under_prefix(workspace, project, &prefix)
+        .await
+    {
+        Ok(true) => {}
+        Ok(false) => return not_found_response(i18n),
+        Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    }
     let all = match state.reader.list_unexpired_pages(workspace, project).await {
         Ok(p) => p,
         Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
@@ -298,7 +311,7 @@ async fn namespace_or_not_found(
     }
     .render())
     {
-        Ok(html) => Html(html).into_response(),
+        Ok(html) => super::private_page(html),
         Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
     }
 }
@@ -318,6 +331,9 @@ pub(crate) fn localized_refusal_response(
     refusal: &ai_memory_store::ScopeResolutionError,
 ) -> Response {
     if refusal.is_forbidden() {
+        // Unmarked (no PasswordChangeRequired): the HTML auth redirect shows
+        // this project refusal as-is instead of sending the user to the
+        // change-password form.
         (
             StatusCode::FORBIDDEN,
             if i18n.tag() == "en" {
@@ -348,5 +364,54 @@ pub(crate) fn not_found_response(i18n: &ai_memory_core::i18n::Localizer) -> Resp
     let html = NotFoundView { i18n: i18n.clone() }
         .render()
         .unwrap_or_else(|_| "<h1>Not found</h1>".to_owned());
-    (StatusCode::NOT_FOUND, Html(html)).into_response()
+    let mut response = super::private_page(html);
+    *response.status_mut() = StatusCode::NOT_FOUND;
+    response
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use axum::Router;
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode, header};
+    use axum::routing::get;
+    use tower::ServiceExt;
+
+    use crate::html_auth::{HtmlAuthRedirectConfig, html_auth_redirect_mw};
+
+    /// A project the viewer may not read is a refusal to show, not a
+    /// password gate: behind the browser redirect layer it must stay a 403
+    /// rather than send the viewer to the change-password form.
+    #[tokio::test]
+    async fn project_refusal_is_not_redirected_to_change_password() {
+        let cfg = Arc::new(HtmlAuthRedirectConfig::from_mount("", "/web"));
+        let router = Router::new()
+            .route(
+                "/w/default/private",
+                get(|| async {
+                    super::refusal_response(&ai_memory_store::ScopeResolutionError::Forbidden(
+                        "not authorized for project private".into(),
+                    ))
+                }),
+            )
+            .layer(axum::middleware::from_fn_with_state(
+                cfg,
+                html_auth_redirect_mw,
+            ));
+        let resp = router
+            .oneshot(
+                Request::builder()
+                    .uri("/w/default/private")
+                    .header(header::ACCEPT, "text/html")
+                    .header("sec-fetch-dest", "document")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        assert!(resp.headers().get(header::LOCATION).is_none());
+    }
 }

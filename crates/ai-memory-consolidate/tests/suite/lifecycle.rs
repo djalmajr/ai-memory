@@ -205,6 +205,7 @@ async fn m8_retention_lifecycle_end_to_end() {
                 author_id: None,
                 actor: ai_memory_core::ActorContext::anonymous(),
                 evidence: Vec::new(),
+                trust_class: None,
             })
             .await
             .expect("write page");
@@ -428,10 +429,11 @@ async fn m8_retention_lifecycle_end_to_end() {
         ai_memory_consolidate::LintOptions {
             dry_run: true,
             use_llm: true,
-            decay_lambda: ai_memory_store::DecayParams::default().lambda,
+            decay: ai_memory_store::DecayParams::default(),
             embedding: None,
             contradiction_band_min: ai_memory_consolidate::DEFAULT_CONTRADICTION_SIM_LOW,
             contradiction_band_max: ai_memory_consolidate::DEFAULT_CONTRADICTION_SIM_HIGH,
+            keep_llm_findings: false,
         },
     )
     .await
@@ -517,6 +519,7 @@ async fn ttl_expiry_lifecycle_end_to_end() {
             author_id: None,
             actor: ai_memory_core::ActorContext::anonymous(),
             evidence: Vec::new(),
+            trust_class: None,
         })
     };
 
@@ -766,6 +769,7 @@ async fn aged_decay_cleanup_stays_within_the_requested_scope() {
             author_id: None,
             actor: ai_memory_core::ActorContext::anonymous(),
             evidence: Vec::new(),
+            trust_class: None,
         })
         .await
         .expect("write tombstone fixture");
@@ -877,6 +881,7 @@ async fn rewritten_decay_eviction_removes_the_file_and_entire_version_chain() {
         author_id: None,
         actor: ai_memory_core::ActorContext::anonymous(),
         evidence: Vec::new(),
+        trust_class: None,
     };
     let first = wiki
         .write_page(write("# Rewritten\nfirst-version-marker", "first-entity"))
@@ -980,6 +985,7 @@ async fn hard_delete_preserves_a_page_recreated_at_the_same_path() {
         author_id: None,
         actor: ai_memory_core::ActorContext::anonymous(),
         evidence: Vec::new(),
+        trust_class: None,
     };
     let first = wiki
         .write_page(write("# Recreated\nold one"))

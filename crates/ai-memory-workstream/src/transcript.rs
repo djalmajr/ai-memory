@@ -148,6 +148,7 @@ const fn journal_rewrites_in_place(harness: ManagedHarness) -> bool {
             | ManagedHarness::KiroV3
             | ManagedHarness::Grok
             | ManagedHarness::Copilot
+            | ManagedHarness::Gemini
     )
 }
 
@@ -155,6 +156,13 @@ const fn journal_rewrites_in_place(harness: ManagedHarness) -> bool {
 struct SqlCursor {
     updated: i64,
     id: String,
+    // OpenCode's native stores stamp `time_updated` with millisecond
+    // `Date.now()`, not a unique revision number, so an in-place update keeps
+    // the same `(updated, id)` pair. The boundary fingerprints every record at
+    // `updated` so a same-millisecond revision is detected as changed instead
+    // of silently skipped. Legacy cursors omit it and fall back to id ordering.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    boundary: Vec<RecordRevision>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -162,13 +170,30 @@ struct CrushCursor {
     updated: i64,
     id: String,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    boundary: Vec<CrushRevision>,
+    boundary: Vec<RecordRevision>,
 }
 
+/// A record's id paired with a content fingerprint, so a cursor can tell an
+/// unchanged boundary record from an in-place revision at the same timestamp.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-struct CrushRevision {
+struct RecordRevision {
     id: String,
     digest: String,
+}
+
+/// Whether a boundary already acknowledges `revision`: an exact fingerprint
+/// match when fingerprints were captured, else the legacy id-ordering fallback
+/// for a cursor persisted before boundaries existed.
+fn boundary_acknowledges(
+    boundary: &[RecordRevision],
+    boundary_id: &str,
+    revision: &RecordRevision,
+) -> bool {
+    if boundary.is_empty() {
+        revision.id.as_str() <= boundary_id
+    } else {
+        boundary.iter().any(|known| known == revision)
+    }
 }
 
 /// Export unseen visible transcript records for one native session.
@@ -532,31 +557,18 @@ fn transcript_baseline_blocking(
     session_dir: Option<&Path>,
     native_session_id: &str,
 ) -> Result<String> {
-    let sql_cursor = |db: PathBuf, sql: &str| -> Result<String> {
-        let connection = Connection::open_with_flags(
-            &db,
-            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
-        )?;
-        let cursor = connection
-            .query_row(sql, params![native_session_id], |row| {
-                Ok(SqlCursor {
-                    updated: row.get(0)?,
-                    id: row.get(1)?,
-                })
-            })
-            .optional()?
-            .unwrap_or_default();
-        Ok(serde_json::to_string(&cursor)?)
-    };
+    let sql_cursor =
+        |db: PathBuf, capture: &dyn Fn(&Connection, &str) -> Result<SqlCursor>| -> Result<String> {
+            let connection = Connection::open_with_flags(
+                &db,
+                OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+            )?;
+            let cursor = capture(&connection, native_session_id)?;
+            Ok(serde_json::to_string(&cursor)?)
+        };
     match harness {
-        ManagedHarness::OpenCode => sql_cursor(
-            opencode_db(home, session_dir),
-            "SELECT p.time_updated, p.id FROM part p WHERE p.session_id = ?1 ORDER BY p.time_updated DESC, p.id DESC LIMIT 1",
-        ),
-        ManagedHarness::OpenCode2 => sql_cursor(
-            opencode_db(home, session_dir),
-            "SELECT time_updated, id FROM session_message WHERE session_id = ?1 ORDER BY time_updated DESC, id DESC LIMIT 1",
-        ),
+        ManagedHarness::OpenCode => sql_cursor(opencode_db(home, session_dir), &opencode_cursor),
+        ManagedHarness::OpenCode2 => sql_cursor(opencode_db(home, session_dir), &opencode2_cursor),
         ManagedHarness::Crush => crush_cursor(
             &Connection::open_with_flags(
                 crush_db(home, cwd, session_dir),
@@ -740,12 +752,17 @@ pub fn claude_session_ran_in_background(
         return Ok(false);
     };
     let reader = BufReader::new(File::open(&path)?);
-    for line in reader.lines() {
+    // Split on bytes: a line that is not UTF-8 is one unreadable record, not
+    // a failed scan (`lines()` would end it with an error).
+    for line in reader.split(b'\n') {
         let line = line?;
+        let Ok(line) = std::str::from_utf8(&line) else {
+            continue;
+        };
         if !line.contains("\"sessionKind\"") {
             continue;
         }
-        let Ok(value) = serde_json::from_str::<Value>(&line) else {
+        let Ok(value) = serde_json::from_str::<Value>(line) else {
             continue;
         };
         if value.get("sessionKind").and_then(Value::as_str) == Some("bg")
@@ -874,13 +891,18 @@ pub fn claude_continued_sessions(
         let reader = BufReader::new(File::open(&path)?);
         let mut cleared = false;
         let mut cleared_in_checkout = false;
-        for line in reader.lines() {
+        // Other projects' live transcripts are read too: a line that is not
+        // UTF-8 (one cut mid-write) is skipped instead of failing the scan.
+        for line in reader.split(b'\n') {
             let line = line?;
+            let Ok(line) = std::str::from_utf8(&line) else {
+                continue;
+            };
             let clear_command = line.contains(CLAUDE_CLEAR_COMMAND);
             if !clear_command && !line.contains(&attached_marker) {
                 continue;
             }
-            let Ok(value) = serde_json::from_str::<Value>(&line) else {
+            let Ok(value) = serde_json::from_str::<Value>(line) else {
                 continue;
             };
             let Some(session) = value.get("sessionId").and_then(Value::as_str) else {
@@ -1312,15 +1334,19 @@ fn export_jsonl_range(
             Sha256::new(),
         )
     };
-    let (mut reader, start): (Box<dyn BufRead>, u64) = if compressed {
-        // A zstd stream cannot seek: decode and drop the bytes before `start`.
-        // A shorter stream ends the skip early, which clamps `start` the way
-        // `min(len)` clamps it for a plain file.
-        let mut reader = transcript_reader(harness, path, file)?;
-        let skipped = std::io::copy(
-            &mut std::io::Read::by_ref(&mut reader).take(start),
-            &mut std::io::sink(),
-        )?;
+    let mut codex_turn_cwd: Option<String> = None;
+    let (mut reader, start): (Box<dyn BufRead>, u64) = if harness == ManagedHarness::Codex {
+        let mut reader = if compressed {
+            // A zstd stream cannot seek: decode and drop the bytes before `start`.
+            // A shorter stream ends the skip early, which clamps `start` the way
+            // `min(len)` clamps it for a plain file.
+            transcript_reader(harness, path, file)?
+        } else {
+            file.seek(SeekFrom::Start(0))?;
+            Box::new(BufReader::new(file))
+        };
+        let (skipped, cwd) = skip_codex_prefix(&mut reader, start)?;
+        codex_turn_cwd = cwd;
         (reader, skipped)
     } else {
         file.seek(SeekFrom::Start(start))?;
@@ -1335,7 +1361,6 @@ fn export_jsonl_range(
     let mut source_bytes = 0_usize;
     let mut checked_events = 0_usize;
     let mut event_bytes = 0_usize;
-    let mut codex_turn_cwd: Option<String> = None;
     loop {
         line.clear();
         let remaining = len.saturating_sub(offset);
@@ -1553,6 +1578,13 @@ fn export_jsonl_range(
                 &mut events,
                 &mut losses,
             ),
+            ManagedHarness::Gemini => parse_gemini(
+                &value,
+                native_session_id,
+                &record_id,
+                &mut events,
+                &mut losses,
+            ),
             ManagedHarness::OpenCode
             | ManagedHarness::OpenCode2
             | ManagedHarness::Crush
@@ -1566,11 +1598,7 @@ fn export_jsonl_range(
         let record_cwd = match harness {
             ManagedHarness::Claude => value.get("cwd").and_then(Value::as_str),
             ManagedHarness::Codex => {
-                if matches!(
-                    value.get("type").and_then(Value::as_str),
-                    Some("session_meta" | "turn_context")
-                ) && let Some(cwd) = value.pointer("/payload/cwd").and_then(Value::as_str)
-                {
+                if let Some(cwd) = codex_context_cwd(&value) {
                     codex_turn_cwd = Some(cwd.to_owned());
                 }
                 codex_turn_cwd.as_deref()
@@ -1623,6 +1651,51 @@ fn stamp_record_cwd(events: &mut [NewWorkstreamEvent], cwd: Option<&str>) {
             metadata.insert(RECORD_CWD_KEY.into(), Value::String(cwd.to_owned()));
         }
     }
+}
+
+fn codex_context_cwd(value: &Value) -> Option<&str> {
+    if matches!(
+        value.get("type").and_then(Value::as_str),
+        Some("session_meta" | "turn_context")
+    ) {
+        value.pointer("/payload/cwd").and_then(Value::as_str)
+    } else {
+        None
+    }
+}
+
+/// Codex persists a `turn_context` only when the turn context changed
+/// (https://github.com/openai/codex/blob/b1573f102413e96a6481087922bf425231222dee/codex-rs/core/src/session/mod.rs#L5600-L5621).
+fn skip_codex_prefix(reader: &mut impl BufRead, len: u64) -> Result<(u64, Option<String>)> {
+    let mut cwd = None;
+    let mut consumed = 0_u64;
+    let mut line = Vec::new();
+    while consumed < len {
+        line.clear();
+        let limit = (len - consumed).min((MAX_SOURCE_RECORD_BYTES + 1) as u64);
+        let read = reader.by_ref().take(limit).read_until(b'\n', &mut line)?;
+        if read == 0 {
+            break;
+        }
+        consumed += read as u64;
+        if read > MAX_SOURCE_RECORD_BYTES {
+            if !line.ends_with(b"\n") {
+                let (tail, _) = discard_through_newline(
+                    &mut reader.by_ref().take(len - consumed),
+                    &mut |_| {},
+                )?;
+                consumed += tail;
+            }
+            continue;
+        }
+        if line.ends_with(b"\n")
+            && let Ok(value) = serde_json::from_slice::<Value>(&line)
+            && let Some(record_cwd) = codex_context_cwd(&value)
+        {
+            cwd = Some(record_cwd.to_owned());
+        }
+    }
+    Ok((consumed, cwd))
 }
 
 /// Count how many times each rewrite-in-place record identity (the SHA-256 of
@@ -1845,6 +1918,36 @@ fn truthy(value: &Value) -> bool {
     }
 }
 
+/// Codex writes a tool output as a plain string, or as an array of
+/// `input_text` / `input_image` / `input_audio` / `encrypted_content` items
+/// for MCP results and `view_image` (`FunctionCallOutputPayload` in
+/// https://github.com/openai/codex/blob/main/codex-rs/protocol/src/models.rs).
+/// The text items are joined the way Codex's own
+/// `function_call_output_content_items_to_text` joins them.
+fn codex_tool_output(payload: &Value, losses: &mut Vec<String>) -> String {
+    if let Some(text) = first_string(payload, &["output", "content", "text"]) {
+        return text.to_string();
+    }
+    let Some(items) = payload.get("output").and_then(Value::as_array) else {
+        return String::new();
+    };
+    let mut texts = Vec::new();
+    for item in items {
+        match (
+            item.get("type").and_then(Value::as_str),
+            item.get("text").and_then(Value::as_str),
+        ) {
+            (Some("input_text"), Some(text)) => {
+                if !text.trim().is_empty() {
+                    texts.push(text);
+                }
+            }
+            _ => losses.push("Codex non-text tool-output items were intentionally excluded".into()),
+        }
+    }
+    texts.join("\n")
+}
+
 fn parse_codex(
     value: &Value,
     session: &str,
@@ -1925,7 +2028,7 @@ fn parse_codex(
             );
         }
         "function_call_output" | "custom_tool_call_output" | "tool_result" => {
-            let body = first_string(payload, &["output", "content", "text"]).unwrap_or("");
+            let body = codex_tool_output(payload, losses);
             push_event(
                 events,
                 AgentKind::Codex,
@@ -1934,7 +2037,7 @@ fn parse_codex(
                 0,
                 WorkstreamEventKind::ToolResult,
                 Some("tool"),
-                body,
+                &body,
                 timestamp(value),
                 with_tool_use_id(json!({}), first_string(payload, &["call_id"])),
             );
@@ -2005,7 +2108,7 @@ fn parse_pi_family(
                     losses,
                 ),
                 "tool" | "toolResult" | "tool_result" => {
-                    let body = message.get("content").map(value_text).unwrap_or_default();
+                    let body = tool_result_text(agent, message.get("content"), losses);
                     let tool = first_string(message, &["toolName", "tool", "name"]);
                     push_event(
                         events,
@@ -2153,7 +2256,7 @@ fn parse_kimi(
                             Some("assistant"),
                             &format!("{name}: {arguments}"),
                             occurred_at.clone(),
-                            json!({"tool": name}),
+                            with_tool_use_id(json!({"tool": name}), first_string(call, &["id"])),
                         );
                     }
                 }
@@ -2170,7 +2273,10 @@ fn parse_kimi(
                         Some("tool"),
                         &body,
                         occurred_at,
-                        json!({}),
+                        with_tool_use_id(
+                            json!({}),
+                            first_string(message, &["toolCallId", "tool_call_id"]),
+                        ),
                     );
                 }
                 _ => {}
@@ -2976,7 +3082,7 @@ fn parse_grok(
                     Some("assistant"),
                     &format!("{name}: {arguments}"),
                     timestamp(value),
-                    json!({"tool": name}),
+                    with_tool_use_id(json!({"tool": name}), first_string(call, &["id"])),
                 );
             }
         }
@@ -2992,7 +3098,10 @@ fn parse_grok(
                 Some("tool"),
                 &body,
                 timestamp(value),
-                json!({}),
+                with_tool_use_id(
+                    json!({}),
+                    first_string(value, &["tool_call_id", "toolCallId"]),
+                ),
             );
         }
         "backend_tool_call" => {
@@ -3162,6 +3271,233 @@ fn parse_copilot(
     }
 }
 
+/// Gemini CLI JSONL session records (verified on 0.64.0 / 0.66.0).
+/// Line 0 is the `{sessionId, projectHash, startTime, lastUpdated, kind}`
+/// header; subsequent lines are message records (`type: "user" | "gemini" | ...`),
+/// metadata updates (`$set`), in-place patches (`$patch`), or rewinds
+/// (`$rewindTo`). Only visible user/assistant text and completed tool
+/// calls/results are imported; hidden `thoughts`, system prompts, binary
+/// parts, and provider metadata (`tokens`, `model`) are excluded.
+fn parse_gemini(
+    value: &Value,
+    session: &str,
+    record_id: &str,
+    events: &mut Vec<NewWorkstreamEvent>,
+    losses: &mut Vec<String>,
+) {
+    if value.get("$set").is_some() {
+        return;
+    }
+    if value.get("$rewindTo").is_some() {
+        losses.push("Gemini CLI session rewind records are not replayed".into());
+        return;
+    }
+    if value.get("$patch").is_some() {
+        losses.push("Gemini CLI in-place message patch records are not replayed".into());
+        return;
+    }
+    // Line 0 metadata header carries sessionId + projectHash and no `type`.
+    let Some(record_type) = value.get("type").and_then(Value::as_str) else {
+        return;
+    };
+    let occurred_at = timestamp(value);
+    match record_type {
+        "system" => {
+            losses.push("Gemini CLI system prompt records were intentionally excluded".into());
+        }
+        "user" => {
+            let text = gemini_content_text(value.get("content"), losses);
+            if !text.trim().is_empty() {
+                push_event(
+                    events,
+                    AgentKind::GeminiCli,
+                    session,
+                    record_id,
+                    0,
+                    WorkstreamEventKind::Message,
+                    Some("user"),
+                    &text,
+                    occurred_at,
+                    json!({}),
+                );
+            }
+        }
+        "gemini" => {
+            if value
+                .get("thoughts")
+                .and_then(Value::as_array)
+                .is_some_and(|thoughts| !thoughts.is_empty())
+            {
+                losses.push("Gemini CLI hidden reasoning was intentionally excluded".into());
+            }
+            let text = gemini_content_text(value.get("content"), losses);
+            let mut block_index = 0_usize;
+            if !text.trim().is_empty() {
+                push_event(
+                    events,
+                    AgentKind::GeminiCli,
+                    session,
+                    record_id,
+                    block_index,
+                    WorkstreamEventKind::Message,
+                    Some("assistant"),
+                    &text,
+                    occurred_at.clone(),
+                    json!({}),
+                );
+                block_index += 1;
+            }
+            let tool_calls = value
+                .get("toolCalls")
+                .and_then(Value::as_array)
+                .map_or(&[][..], Vec::as_slice);
+            for call in tool_calls {
+                let Some(status) = call.get("status").and_then(Value::as_str) else {
+                    continue;
+                };
+                if !matches!(status, "success" | "error" | "cancelled") {
+                    continue;
+                }
+                let name = first_string(call, &["name"]).unwrap_or("tool");
+                let call_id = first_string(call, &["id"]);
+                let call_ts = timestamp(call).or_else(|| occurred_at.clone());
+                let args = call.get("args").map(compact_json).unwrap_or_default();
+                push_event(
+                    events,
+                    AgentKind::GeminiCli,
+                    session,
+                    record_id,
+                    block_index,
+                    WorkstreamEventKind::ToolCall,
+                    Some("assistant"),
+                    &format!("{name}: {args}"),
+                    call_ts.clone(),
+                    with_tool_use_id(json!({"tool": name}), call_id),
+                );
+                block_index += 1;
+
+                let result_text = gemini_tool_result_text(call, status, losses);
+                if !result_text.trim().is_empty() {
+                    push_event(
+                        events,
+                        AgentKind::GeminiCli,
+                        session,
+                        record_id,
+                        block_index,
+                        WorkstreamEventKind::ToolResult,
+                        Some("tool"),
+                        &result_text,
+                        call_ts,
+                        with_tool_use_id(json!({"status": status}), call_id),
+                    );
+                    block_index += 1;
+                }
+            }
+        }
+        "info" | "warning" | "error" => {}
+        _ => {}
+    }
+}
+
+fn gemini_content_text(content: Option<&Value>, losses: &mut Vec<String>) -> String {
+    let Some(content) = content else {
+        return String::new();
+    };
+    match content {
+        Value::String(text) => text.clone(),
+        Value::Array(parts) => {
+            let mut texts = Vec::new();
+            let mut saw_binary = false;
+            for part in parts {
+                match part {
+                    Value::String(text) if !text.is_empty() => texts.push(text.clone()),
+                    Value::Object(map) => {
+                        if map.contains_key("inlineData") || map.contains_key("fileData") {
+                            saw_binary = true;
+                            continue;
+                        }
+                        if let Some(text) = map.get("text").and_then(Value::as_str)
+                            && !text.is_empty()
+                        {
+                            texts.push(text.to_owned());
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            if saw_binary {
+                losses.push("Gemini CLI binary payloads were intentionally excluded".into());
+            }
+            texts.join("\n")
+        }
+        Value::Object(map) => {
+            if map.contains_key("inlineData") || map.contains_key("fileData") {
+                losses.push("Gemini CLI binary payloads were intentionally excluded".into());
+                return String::new();
+            }
+            map.get("text")
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+                .unwrap_or_default()
+        }
+        _ => String::new(),
+    }
+}
+
+fn gemini_tool_result_text(call: &Value, status: &str, losses: &mut Vec<String>) -> String {
+    if let Some(result) = call.get("result") {
+        let extracted = gemini_tool_result_parts(result, losses);
+        if !extracted.trim().is_empty() {
+            return extracted;
+        }
+    }
+    if let Some(display) = call.get("resultDisplay").and_then(Value::as_str)
+        && !display.trim().is_empty()
+    {
+        return display.to_owned();
+    }
+    match status {
+        "error" => "error".to_owned(),
+        "cancelled" => "cancelled".to_owned(),
+        _ => String::new(),
+    }
+}
+
+fn gemini_tool_result_parts(value: &Value, losses: &mut Vec<String>) -> String {
+    match value {
+        Value::String(text) => text.clone(),
+        Value::Array(items) => items
+            .iter()
+            .map(|item| gemini_tool_result_parts(item, losses))
+            .filter(|text| !text.trim().is_empty())
+            .collect::<Vec<_>>()
+            .join("\n"),
+        Value::Object(map) => {
+            if map.contains_key("inlineData") || map.contains_key("fileData") {
+                losses.push("Gemini CLI binary payloads were intentionally excluded".into());
+                return String::new();
+            }
+            if let Some(response) = map
+                .get("functionResponse")
+                .and_then(|fr| fr.get("response"))
+            {
+                if let Some(error) = response.get("error").and_then(Value::as_str) {
+                    return format!("error: {error}");
+                }
+                if let Some(output) = response.get("output").and_then(Value::as_str) {
+                    return output.to_owned();
+                }
+                return value_text(response);
+            }
+            map.get("text")
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+                .unwrap_or_default()
+        }
+        _ => String::new(),
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn parse_content_blocks(
     agent: AgentKind,
@@ -3244,7 +3580,7 @@ fn parse_content_blocks(
                 );
             }
             "tool_result" | "toolResult" => {
-                let body = block.get("content").map(value_text).unwrap_or_default();
+                let body = tool_result_text(agent, block.get("content"), losses);
                 if claude_managed_packet_echo(agent, &body) {
                     losses.push(
                         "Claude managed workstream delivery packets were intentionally excluded"
@@ -3277,9 +3613,44 @@ fn parse_content_blocks(
                     agent.as_str()
                 ));
             }
+            // Claude `image` / `document` blocks (https://docs.anthropic.com/en/api/messages)
+            // and Codex `input_image` items (`ContentItem` in
+            // https://github.com/openai/codex/blob/main/codex-rs/protocol/src/models.rs).
+            "image" | "document" | "input_image" => {
+                losses.push(format!(
+                    "{} message attachments were intentionally excluded",
+                    agent.as_str()
+                ));
+            }
             _ => {}
         }
     }
+}
+
+/// An image block in a tool result has no text field, so `value_text` would
+/// store the whole block, base64 data included, as the result's content.
+fn tool_result_text(agent: AgentKind, content: Option<&Value>, losses: &mut Vec<String>) -> String {
+    let Some(content) = content else {
+        return String::new();
+    };
+    let Value::Array(items) = content else {
+        return value_text(content);
+    };
+    let mut texts = Vec::new();
+    for item in items {
+        if item.get("type").and_then(Value::as_str) == Some("image") {
+            losses.push(format!(
+                "{} image tool results were intentionally excluded",
+                agent.as_str()
+            ));
+            continue;
+        }
+        let text = value_text(item);
+        if !text.is_empty() {
+            texts.push(text);
+        }
+    }
+    texts.join("\n")
 }
 
 fn claude_managed_packet_echo(agent: AgentKind, body: &str) -> bool {
@@ -3330,6 +3701,63 @@ fn export_opencode(
     export_opencode_range(home, session_dir, session, source_cursor, None)
 }
 
+/// Fingerprint one OpenCode part so a same-millisecond in-place revision is
+/// distinguishable from the record the cursor already acknowledged.
+fn opencode_revision(id: &str, part: &str) -> RecordRevision {
+    let seed = format!("{id}\0{part}");
+    RecordRevision {
+        id: id.to_owned(),
+        digest: format!("{:x}", Sha256::digest(seed.as_bytes())),
+    }
+}
+
+/// Capture OpenCode's end-of-session cursor, fingerprinting every part sharing
+/// the newest `time_updated` so a later in-place revision at that millisecond is
+/// still emitted. Pins one read snapshot when the caller holds none.
+fn opencode_cursor(connection: &Connection, session: &str) -> Result<SqlCursor> {
+    let _snapshot = if connection.is_autocommit() {
+        Some(connection.unchecked_transaction()?)
+    } else {
+        None
+    };
+    let newest = connection
+        .query_row(
+            "SELECT p.time_updated, p.id FROM part p WHERE p.session_id = ?1 \
+             ORDER BY p.time_updated DESC, p.id DESC LIMIT 1",
+            [session],
+            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
+        )
+        .optional()?;
+    let Some((updated, id)) = newest else {
+        return Ok(SqlCursor::default());
+    };
+    let mut statement = connection.prepare(
+        "SELECT p.id, p.data FROM part p WHERE p.session_id = ?1 AND p.time_updated = ?2 \
+         ORDER BY p.id LIMIT ?3",
+    )?;
+    let boundary = statement
+        .query_map(
+            params![session, updated, (MAX_SOURCE_RECORDS + 1) as i64],
+            |row| {
+                Ok(opencode_revision(
+                    &row.get::<_, String>(0)?,
+                    &row.get::<_, String>(1)?,
+                ))
+            },
+        )?
+        .collect::<Result<Vec<_>, _>>()?;
+    if boundary.len() > MAX_SOURCE_RECORDS {
+        return Err(anyhow!(
+            "OpenCode cursor boundary exceeds the {MAX_SOURCE_RECORDS} source-record limit"
+        ));
+    }
+    Ok(SqlCursor {
+        updated,
+        id,
+        boundary,
+    })
+}
+
 fn export_opencode_range(
     home: &Path,
     session_dir: Option<&Path>,
@@ -3348,6 +3776,9 @@ fn export_opencode_range(
             db.display()
         )
     })?;
+    // The event query and the recomputed cursor must share one snapshot so a
+    // native WAL commit between them cannot advance the cursor past unseen rows.
+    let _snapshot = connection.unchecked_transaction()?;
     let cursor = source_cursor
         .and_then(|raw| serde_json::from_str::<SqlCursor>(raw).ok())
         .unwrap_or_default();
@@ -3358,26 +3789,35 @@ fn export_opencode_range(
         .unwrap_or(SqlCursor {
             updated: i64::MAX,
             id: "\u{10ffff}".to_string(),
+            boundary: Vec::new(),
         });
+    // A boundary-carrying cursor re-reads every part at its timestamp and
+    // re-emits only the revisions whose fingerprint changed; a legacy cursor
+    // without one keeps the strict id-ordering scan.
+    let revisit_boundary = i64::from(!cursor.boundary.is_empty());
+    let query_limit = MAX_SOURCE_RECORDS
+        .checked_add(cursor.boundary.len())
+        .and_then(|value| value.checked_add(1))
+        .ok_or_else(|| anyhow!("OpenCode transcript query limit overflow"))?;
     let mut statement = connection.prepare(
         "SELECT p.id, p.time_updated, length(m.data), length(p.data), m.data, p.data
          FROM part p JOIN message m ON m.id = p.message_id
-         WHERE p.session_id = ?1 AND (p.time_updated > ?2 OR (p.time_updated = ?2 AND p.id > ?3))
-           AND (p.time_updated < ?4 OR (p.time_updated = ?4 AND p.id <= ?5))
+         WHERE p.session_id = ?1
+           AND (p.time_updated > ?2 OR (p.time_updated = ?2 AND (?3 = 1 OR p.id > ?4)))
+           AND p.time_updated <= ?5
          ORDER BY p.time_updated, p.id
          LIMIT ?6",
     )?;
     let mut rows = statement.query(params![
         session,
         cursor.updated,
+        revisit_boundary,
         cursor.id,
         upper.updated,
-        upper.id,
-        (MAX_SOURCE_RECORDS + 1) as i64
+        query_limit as i64
     ])?;
     let mut events = Vec::new();
     let mut losses = Vec::new();
-    let mut next_cursor = cursor;
     let mut source_bytes = 0_usize;
     let mut checked_events = 0_usize;
     let mut event_bytes = 0_usize;
@@ -3402,10 +3842,16 @@ fn export_opencode_range(
         let id = row.get::<_, String>(0)?;
         let message_raw = row.get::<_, String>(4)?;
         let part_raw = row.get::<_, String>(5)?;
-        next_cursor = SqlCursor {
-            updated,
-            id: id.clone(),
-        };
+        let revision = opencode_revision(&id, &part_raw);
+        if updated == cursor.updated
+            && boundary_acknowledges(&cursor.boundary, &cursor.id, &revision)
+        {
+            continue;
+        }
+        if updated == upper.updated && !boundary_acknowledges(&upper.boundary, &upper.id, &revision)
+        {
+            continue;
+        }
         let Ok(message) = serde_json::from_str::<Value>(&message_raw) else {
             losses.push(format!("malformed OpenCode message for part {id}"));
             continue;
@@ -3423,6 +3869,11 @@ fn export_opencode_range(
             0,
         )?;
     }
+    let next_cursor = if final_cursor.is_some() {
+        upper
+    } else {
+        opencode_cursor(&connection, session)?
+    };
     Ok(ExportedTranscript {
         native_session_id: session.to_string(),
         source_cursor: Some(serde_json::to_string(&next_cursor)?),
@@ -3442,15 +3893,35 @@ fn export_crush(
     export_crush_range(home, cwd, session_dir, session, source_cursor, None)
 }
 
-fn crush_revision(id: &str, role: &str, parts: &str, is_summary: i64) -> CrushRevision {
+fn crush_revision(id: &str, role: &str, parts: &str, is_summary: i64) -> RecordRevision {
     let seed = format!("{id}\0{role}\0{is_summary}\0{parts}");
-    CrushRevision {
+    RecordRevision {
         id: id.to_owned(),
         digest: format!("{:x}", Sha256::digest(seed.as_bytes())),
     }
 }
 
 fn crush_cursor(connection: &Connection, session: &str) -> Result<CrushCursor> {
+    crush_cursor_inner(
+        connection,
+        session,
+        #[cfg(test)]
+        None,
+    )
+}
+
+fn crush_cursor_inner(
+    connection: &Connection,
+    session: &str,
+    #[cfg(test)] after_newest: Option<&dyn Fn()>,
+) -> Result<CrushCursor> {
+    // Exports already hold a snapshot; a standalone baseline needs the same
+    // protection across its timestamp and revision queries.
+    let _snapshot = if connection.is_autocommit() {
+        Some(connection.unchecked_transaction()?)
+    } else {
+        None
+    };
     let newest = connection
         .query_row(
             "SELECT updated_at, id FROM messages WHERE session_id = ?1 \
@@ -3462,6 +3933,10 @@ fn crush_cursor(connection: &Connection, session: &str) -> Result<CrushCursor> {
     let Some((updated, id)) = newest else {
         return Ok(CrushCursor::default());
     };
+    #[cfg(test)]
+    if let Some(after_newest) = after_newest {
+        after_newest();
+    }
     let mut statement = connection.prepare(
         "SELECT id, role, parts, is_summary_message FROM messages \
          WHERE session_id = ?1 AND updated_at = ?2 ORDER BY id LIMIT ?3",
@@ -3490,20 +3965,12 @@ fn crush_cursor(connection: &Connection, session: &str) -> Result<CrushCursor> {
     })
 }
 
-fn crush_revision_is_known(cursor: &CrushCursor, revision: &CrushRevision) -> bool {
-    if cursor.boundary.is_empty() {
-        revision.id <= cursor.id
-    } else {
-        cursor.boundary.iter().any(|known| known == revision)
-    }
+fn crush_revision_is_known(cursor: &CrushCursor, revision: &RecordRevision) -> bool {
+    boundary_acknowledges(&cursor.boundary, &cursor.id, revision)
 }
 
-fn crush_revision_is_within(cursor: &CrushCursor, revision: &CrushRevision) -> bool {
-    if cursor.boundary.is_empty() {
-        revision.id <= cursor.id
-    } else {
-        cursor.boundary.iter().any(|known| known == revision)
-    }
+fn crush_revision_is_within(cursor: &CrushCursor, revision: &RecordRevision) -> bool {
+    boundary_acknowledges(&cursor.boundary, &cursor.id, revision)
 }
 
 fn export_crush_range(
@@ -3514,12 +3981,36 @@ fn export_crush_range(
     source_cursor: Option<&str>,
     final_cursor: Option<&str>,
 ) -> Result<ExportedTranscript> {
+    export_crush_range_inner(
+        home,
+        cwd,
+        session_dir,
+        session,
+        source_cursor,
+        final_cursor,
+        #[cfg(test)]
+        None,
+    )
+}
+
+fn export_crush_range_inner(
+    home: &Path,
+    cwd: &Path,
+    session_dir: Option<&Path>,
+    session: &str,
+    source_cursor: Option<&str>,
+    final_cursor: Option<&str>,
+    #[cfg(test)] after_rows: Option<&dyn Fn()>,
+) -> Result<ExportedTranscript> {
     let db = crush_db(home, cwd, session_dir);
     let connection = Connection::open_with_flags(
         &db,
         OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
     )
     .with_context(|| format!("opening Crush session database {} read-only", db.display()))?;
+    // The cursor must acknowledge only revisions visible to the event query,
+    // even if the native WAL writer commits before that cursor is collected.
+    let _snapshot = connection.unchecked_transaction()?;
     let cursor = source_cursor
         .and_then(|raw| serde_json::from_str::<CrushCursor>(raw).ok())
         .unwrap_or_default();
@@ -3610,6 +4101,10 @@ fn export_crush_range(
             &mut source_bytes,
             0,
         )?;
+    }
+    #[cfg(test)]
+    if let Some(after_rows) = after_rows {
+        after_rows();
     }
     let next_cursor = if final_cursor.is_some() {
         upper
@@ -3745,6 +4240,8 @@ fn parse_opencode(
         }
         "tool" => {
             let name = first_string(part, &["tool", "name"]).unwrap_or("tool");
+            // https://github.com/anomalyco/opencode/blob/c63a93995f1e5c28dd73cc032dcb224780f208ff/packages/schema/src/v1/session.ts#L315-L322
+            let call_id = first_string(part, &["callID"]);
             let state = part.get("state").unwrap_or(&Value::Null);
             let input = state.get("input").map(compact_json).unwrap_or_default();
             push_event(
@@ -3757,7 +4254,7 @@ fn parse_opencode(
                 Some("assistant"),
                 &format!("{name}: {input}"),
                 None,
-                json!({"tool": name}),
+                with_tool_use_id(json!({"tool": name}), call_id),
             );
             let status = state.get("status").and_then(Value::as_str);
             // V1 terminal failures store their visible result in `error`, not
@@ -3782,11 +4279,14 @@ fn parse_opencode(
                     Some("tool"),
                     &output,
                     None,
-                    if status == Some("error") {
-                        json!({"status": status, "is_error": true})
-                    } else {
-                        json!({"status": status})
-                    },
+                    with_tool_use_id(
+                        if status == Some("error") {
+                            json!({"status": status, "is_error": true})
+                        } else {
+                            json!({"status": status})
+                        },
+                        call_id,
+                    ),
                 );
             }
         }
@@ -3826,9 +4326,15 @@ fn push_event(
     if content.trim().is_empty() {
         return;
     }
-    let content = truncate_utf8(content, MAX_EVENT_BYTES);
+    // The id keeps the plain byte cut so an event read before this change
+    // replays with the same id; only the stored text drops a cut token.
+    let identity = truncate_utf8(content, MAX_EVENT_BYTES);
+    let content = truncate_utf8_whole_tokens(content, MAX_EVENT_BYTES);
+    if content.trim().is_empty() {
+        return;
+    }
     let seed = format!(
-        "{}\0{session}\0{record_id}\0{block}\0{}\0{content}",
+        "{}\0{session}\0{record_id}\0{block}\0{}\0{identity}",
         agent.as_str(),
         kind.as_str()
     );
@@ -3873,6 +4379,9 @@ fn locate_session_file(
         }
         let exact = root.join(id).join("events.jsonl");
         return Ok(session_path_matches(harness, &exact, id, cwd)?.then_some(exact));
+    }
+    if harness == ManagedHarness::Gemini && Uuid::parse_str(id).is_err() {
+        return Ok(None);
     }
     if harness == ManagedHarness::Claude {
         // The project folder is the cwd with every character outside
@@ -4124,6 +4633,19 @@ fn transcript_file(harness: ManagedHarness, path: &Path) -> bool {
                 .and_then(|name| name.to_str())
                 .is_some_and(|name| Uuid::parse_str(name).is_ok());
     }
+    if harness == ManagedHarness::Gemini {
+        // `<tmp>/<project>/chats/session-*.jsonl` only; logs and other temp
+        // files under `<tmp>/<project>/` are not transcripts.
+        return path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.starts_with("session-") && name.ends_with(".jsonl"))
+            && path
+                .parent()
+                .and_then(|dir| dir.file_name())
+                .and_then(|name| name.to_str())
+                == Some("chats");
+    }
     if compressed_codex_rollout(harness, path) {
         return !cursor_path(harness, path).exists();
     }
@@ -4171,7 +4693,68 @@ fn cursor_path(harness: ManagedHarness, path: &Path) -> PathBuf {
 /// Open a transcript for sequential reads, decompressing a compressed Codex
 /// rollout.
 fn open_transcript(harness: ManagedHarness, path: &Path) -> std::io::Result<Box<dyn BufRead>> {
-    transcript_reader(harness, path, File::open(path)?)
+    transcript_reader(harness, path, open_regular_transcript(path)?)
+}
+
+/// Open `path` only when it is a regular file and still the same file once
+/// open. A transcript location is derived from a harness home and a native
+/// session id, so the caller's earlier checks race a symlink swapped in
+/// afterwards; `O_NOFOLLOW` refuses a final-component symlink, `O_NONBLOCK`
+/// keeps a FIFO swapped in from blocking the read forever, and the descriptor
+/// comparison refuses a path whose ancestor became a symlink in the meantime.
+fn open_regular_transcript(path: &Path) -> std::io::Result<File> {
+    let before = fs::symlink_metadata(path)?;
+    if !before.is_file() {
+        return Err(not_a_regular_file(path));
+    }
+    let file = open_no_follow(path)?;
+    let after = file.metadata()?;
+    if !after.is_file() {
+        return Err(not_a_regular_file(path));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+        if before.dev() != after.dev() || before.ino() != after.ino() {
+            return Err(not_a_regular_file(path));
+        }
+    }
+    // The descriptor's own path is the one the checks above admitted; an
+    // ancestor swapped for a symlink after them would still resolve here.
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::io::AsRawFd as _;
+        if fs::read_link(format!("/proc/self/fd/{}", file.as_raw_fd()))
+            .is_ok_and(|opened| opened != path)
+        {
+            return Err(not_a_regular_file(path));
+        }
+    }
+    Ok(file)
+}
+
+fn not_a_regular_file(path: &Path) -> std::io::Error {
+    std::io::Error::new(
+        std::io::ErrorKind::InvalidInput,
+        format!("{} is not a regular file", path.display()),
+    )
+}
+
+/// `O_NOFOLLOW` refuses a final-component symlink and `O_NONBLOCK` a FIFO, the
+/// way the Antigravity transcript reader opens its own files. Reads of a
+/// regular file are unaffected.
+#[cfg(unix)]
+fn open_no_follow(path: &Path) -> std::io::Result<File> {
+    use std::os::unix::fs::OpenOptionsExt as _;
+    fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(path)
+}
+
+#[cfg(not(unix))]
+fn open_no_follow(path: &Path) -> std::io::Result<File> {
+    File::open(path)
 }
 
 /// [`open_transcript`] over a file already opened at `path`.
@@ -4440,7 +5023,8 @@ fn session_header(harness: ManagedHarness, path: &Path) -> Result<Option<(String
             | ManagedHarness::KiroV3
             | ManagedHarness::Grok
             | ManagedHarness::Antigravity
-            | ManagedHarness::Copilot => (None, None),
+            | ManagedHarness::Copilot
+            | ManagedHarness::Gemini => (None, None),
         };
         if let (Some(id), Some(cwd)) = (id, cwd) {
             return Ok(Some((id.to_string(), PathBuf::from(cwd))));
@@ -4533,9 +5117,74 @@ fn session_header_for_cwd(
 ) -> Result<Option<(String, PathBuf)>> {
     if harness == ManagedHarness::KiroV3 {
         kiro_v3_session_header(path, cwd)
+    } else if harness == ManagedHarness::Gemini {
+        gemini_session_header_for_cwd(path, cwd)
     } else {
         session_header(harness, path)
     }
+}
+
+/// Gemini CLI opens every `chats/session-*.jsonl` with a metadata line
+/// containing `sessionId` (UUID) and `projectHash` (hex SHA-256 of the
+/// checkout path). Open with [`open_regular_transcript`] so symlinks and
+/// non-regular files are refused, and fail closed unless `projectHash` matches
+/// the exact current checkout.
+fn gemini_session_header_for_cwd(path: &Path, cwd: &Path) -> Result<Option<(String, PathBuf)>> {
+    let Ok(file) = open_regular_transcript(path) else {
+        return Ok(None);
+    };
+    let mut reader = BufReader::new(file);
+    let CappedLine::Line(line) = read_capped_line(&mut reader, MAX_EVENT_BYTES)? else {
+        return Ok(None);
+    };
+    let Ok(header) = serde_json::from_str::<Value>(&line) else {
+        return Ok(None);
+    };
+    let (Some(id), Some(project_hash)) = (
+        header.get("sessionId").and_then(Value::as_str),
+        header.get("projectHash").and_then(Value::as_str),
+    ) else {
+        return Ok(None);
+    };
+    if Uuid::parse_str(id).is_err()
+        || project_hash.len() != 64
+        || !project_hash.bytes().all(|byte| byte.is_ascii_hexdigit())
+    {
+        return Ok(None);
+    }
+    let matches_cwd = gemini_checkout_hashes(cwd)
+        .iter()
+        .any(|candidate| candidate.eq_ignore_ascii_case(project_hash));
+    if !matches_cwd {
+        return Ok(None);
+    }
+    Ok(Some((id.to_string(), cwd.to_path_buf())))
+}
+
+/// SHA-256 hex digests Gemini CLI's `getProjectHash` can produce for `cwd`
+/// (both the raw path and its canonicalized path).
+fn gemini_checkout_hashes(cwd: &Path) -> Vec<String> {
+    let mut candidates = Vec::new();
+    let mut push_path = |path: &Path| {
+        let raw = path.to_string_lossy();
+        let digest = format!("{:x}", Sha256::digest(raw.as_bytes()));
+        if !candidates.contains(&digest) {
+            candidates.push(digest);
+        }
+        #[cfg(windows)]
+        {
+            let slashed = raw.replace('\\', "/");
+            let slash_digest = format!("{:x}", Sha256::digest(slashed.as_bytes()));
+            if !candidates.contains(&slash_digest) {
+                candidates.push(slash_digest);
+            }
+        }
+    };
+    push_path(cwd);
+    if let Ok(canonical) = cwd.canonicalize() {
+        push_path(&canonical);
+    }
+    candidates
 }
 
 /// Kimi sessions are self-describing in `<session-dir>/state.json` — the wire
@@ -5391,6 +6040,8 @@ fn percent_decode(value: &str) -> String {
     while index < bytes.len() {
         if bytes[index] == b'%'
             && let Some(hex) = bytes.get(index + 1..index + 3)
+            // `from_str_radix` also takes a sign: `%+5` must stay verbatim.
+            && hex.iter().all(u8::is_ascii_hexdigit)
             && let Ok(hex) = std::str::from_utf8(hex)
             && let Ok(byte) = u8::from_str_radix(hex, 16)
         {
@@ -5719,6 +6370,64 @@ fn export_opencode2(
     export_opencode2_range(home, session_dir, session, source_cursor, None)
 }
 
+/// Fingerprint one OpenCode 2 message so a same-millisecond in-place revision is
+/// distinguishable from the record the cursor already acknowledged.
+fn opencode2_revision(id: &str, message_type: &str, data: &str) -> RecordRevision {
+    let seed = format!("{id}\0{message_type}\0{data}");
+    RecordRevision {
+        id: id.to_owned(),
+        digest: format!("{:x}", Sha256::digest(seed.as_bytes())),
+    }
+}
+
+/// Capture OpenCode 2's end-of-session cursor, fingerprinting every message
+/// sharing the newest `time_updated`. Pins one read snapshot when the caller
+/// holds none.
+fn opencode2_cursor(connection: &Connection, session: &str) -> Result<SqlCursor> {
+    let _snapshot = if connection.is_autocommit() {
+        Some(connection.unchecked_transaction()?)
+    } else {
+        None
+    };
+    let newest = connection
+        .query_row(
+            "SELECT time_updated, id FROM session_message WHERE session_id = ?1 \
+             ORDER BY time_updated DESC, id DESC LIMIT 1",
+            [session],
+            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
+        )
+        .optional()?;
+    let Some((updated, id)) = newest else {
+        return Ok(SqlCursor::default());
+    };
+    let mut statement = connection.prepare(
+        "SELECT id, type, data FROM session_message \
+         WHERE session_id = ?1 AND time_updated = ?2 ORDER BY id LIMIT ?3",
+    )?;
+    let boundary = statement
+        .query_map(
+            params![session, updated, (MAX_SOURCE_RECORDS + 1) as i64],
+            |row| {
+                Ok(opencode2_revision(
+                    &row.get::<_, String>(0)?,
+                    &row.get::<_, String>(1)?,
+                    &row.get::<_, String>(2)?,
+                ))
+            },
+        )?
+        .collect::<Result<Vec<_>, _>>()?;
+    if boundary.len() > MAX_SOURCE_RECORDS {
+        return Err(anyhow!(
+            "OpenCode cursor boundary exceeds the {MAX_SOURCE_RECORDS} source-record limit"
+        ));
+    }
+    Ok(SqlCursor {
+        updated,
+        id,
+        boundary,
+    })
+}
+
 fn export_opencode2_range(
     home: &Path,
     session_dir: Option<&Path>,
@@ -5737,6 +6446,9 @@ fn export_opencode2_range(
             db.display()
         )
     })?;
+    // The event query and the recomputed cursor must share one snapshot so a
+    // native WAL commit between them cannot advance the cursor past unseen rows.
+    let _snapshot = connection.unchecked_transaction()?;
     let cursor = source_cursor
         .and_then(|raw| serde_json::from_str::<SqlCursor>(raw).ok())
         .unwrap_or_default();
@@ -5747,24 +6459,33 @@ fn export_opencode2_range(
         .unwrap_or(SqlCursor {
             updated: i64::MAX,
             id: "\u{10ffff}".to_string(),
+            boundary: Vec::new(),
         });
+    // A boundary-carrying cursor re-reads every message at its timestamp and
+    // re-emits only the revisions whose fingerprint changed; a legacy cursor
+    // without one keeps the strict id-ordering scan.
+    let revisit_boundary = i64::from(!cursor.boundary.is_empty());
+    let query_limit = MAX_SOURCE_RECORDS
+        .checked_add(cursor.boundary.len())
+        .and_then(|value| value.checked_add(1))
+        .ok_or_else(|| anyhow!("OpenCode transcript query limit overflow"))?;
     let mut statement = connection.prepare(
         "SELECT id, time_updated, type, length(data), data FROM session_message \
-         WHERE session_id = ?1 AND (time_updated > ?2 OR (time_updated = ?2 AND id > ?3)) \
-           AND (time_updated < ?4 OR (time_updated = ?4 AND id <= ?5)) \
+         WHERE session_id = ?1 \
+           AND (time_updated > ?2 OR (time_updated = ?2 AND (?3 = 1 OR id > ?4))) \
+           AND time_updated <= ?5 \
          ORDER BY time_updated, id LIMIT ?6",
     )?;
     let mut rows = statement.query(params![
         session,
         cursor.updated,
+        revisit_boundary,
         cursor.id,
         upper.updated,
-        upper.id,
-        (MAX_SOURCE_RECORDS + 1) as i64
+        query_limit as i64
     ])?;
     let mut events = Vec::new();
     let mut losses = Vec::new();
-    let mut next_cursor = cursor;
     let mut source_bytes = 0_usize;
     let mut checked_events = 0_usize;
     let mut event_bytes = 0_usize;
@@ -5788,10 +6509,16 @@ fn export_opencode2_range(
         let updated = row.get::<_, i64>(1)?;
         let message_type = row.get::<_, String>(2)?;
         let data_raw = row.get::<_, String>(4)?;
-        next_cursor = SqlCursor {
-            updated,
-            id: id.clone(),
-        };
+        let revision = opencode2_revision(&id, &message_type, &data_raw);
+        if updated == cursor.updated
+            && boundary_acknowledges(&cursor.boundary, &cursor.id, &revision)
+        {
+            continue;
+        }
+        if updated == upper.updated && !boundary_acknowledges(&upper.boundary, &upper.id, &revision)
+        {
+            continue;
+        }
         let Ok(data) = serde_json::from_str::<Value>(&data_raw) else {
             losses.push(format!("malformed OpenCode 2 message {id}"));
             continue;
@@ -5805,6 +6532,11 @@ fn export_opencode2_range(
             0,
         )?;
     }
+    let next_cursor = if final_cursor.is_some() {
+        upper
+    } else {
+        opencode2_cursor(&connection, session)?
+    };
     Ok(ExportedTranscript {
         native_session_id: session.to_string(),
         source_cursor: Some(serde_json::to_string(&next_cursor)?),
@@ -6124,6 +6856,7 @@ fn session_root(harness: ManagedHarness, home: &Path, override_dir: Option<&Path
         ManagedHarness::Grok => home.join(".grok/sessions"),
         ManagedHarness::Antigravity => home.join(".gemini/antigravity-cli/conversations"),
         ManagedHarness::Copilot => home.join(".copilot/session-state"),
+        ManagedHarness::Gemini => home.join(".gemini/tmp"),
     }
 }
 
@@ -6266,6 +6999,39 @@ fn truncate_utf8(value: &str, max: usize) -> &str {
     &value[..end]
 }
 
+/// [`truncate_utf8`] that also drops a token the cut lands inside.
+///
+/// This cut runs before the sanitizer, which only sees the text later in the
+/// hook. A credential whose tail is cut off can fall below every pattern's
+/// minimum length (`sk-` needs 16 characters after the prefix) and survive
+/// as a verbatim prefix; when an earlier secret is then redacted to a short
+/// marker, that prefix can move inside the later caps. So when the cut falls
+/// inside a run of credential characters, the whole run goes. A record that
+/// is one unbroken run longer than the cap keeps nothing.
+fn truncate_utf8_whole_tokens(value: &str, max: usize) -> &str {
+    let cut = truncate_utf8(value, max);
+    let rest = &value[cut.len()..];
+    let splits_token = rest.chars().next().is_some_and(is_credential_char)
+        && cut.chars().next_back().is_some_and(is_credential_char);
+    if !splits_token {
+        return cut;
+    }
+    match cut
+        .char_indices()
+        .rev()
+        .find(|(_, c)| !is_credential_char(*c))
+    {
+        Some((at, c)) => &cut[..at + c.len_utf8()],
+        None => "",
+    }
+}
+
+/// Characters a credential the sanitizer recognizes can contain: key bodies,
+/// base64 and JWT segments, and percent-encoding.
+fn is_credential_char(c: char) -> bool {
+    c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '+' | '/' | '=' | '%')
+}
+
 fn modified(path: &Path) -> Option<SystemTime> {
     fs::metadata(path).ok()?.modified().ok()
 }
@@ -6298,6 +7064,127 @@ fn deduplicate_losses(losses: Vec<String>) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A transcript location is derived from a harness home and a native
+    /// session id, so the file itself can be a symlink planted after the
+    /// caller's checks. A directory is refused on every platform; the real
+    /// file still opens.
+    #[test]
+    fn a_non_regular_transcript_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("session.jsonl");
+        std::fs::write(&real, b"{\"type\":\"user\"}\n").unwrap();
+        assert!(
+            open_regular_transcript(&real).is_ok(),
+            "the file a session names still opens"
+        );
+        let error =
+            open_regular_transcript(dir.path()).expect_err("a directory is not a transcript");
+        assert!(error.to_string().contains("not a regular file"), "{error}");
+    }
+
+    /// A symlink, a dangling link and a link reached through `open_transcript`
+    /// are refused. Unix-only, like the Antigravity reader's own symlink tests:
+    /// Windows needs a privilege to create the link.
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_transcript_is_refused() {
+        use std::os::unix::fs::symlink;
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("session.jsonl");
+        std::fs::write(&real, b"{\"type\":\"user\"}\n").unwrap();
+
+        let link = dir.path().join("link.jsonl");
+        symlink(&real, &link).unwrap();
+        let error = open_regular_transcript(&link).expect_err("a symlink must be refused");
+        assert!(error.to_string().contains("not a regular file"), "{error}");
+        assert!(
+            open_transcript(ManagedHarness::Codex, &link).is_err(),
+            "the refusal holds through open_transcript"
+        );
+
+        let dangling = dir.path().join("dangling.jsonl");
+        symlink(dir.path().join("missing.jsonl"), &dangling).unwrap();
+        assert!(open_regular_transcript(&dangling).is_err());
+    }
+
+    #[test]
+    fn the_event_cut_drops_a_token_it_lands_inside() {
+        // (input, max, kept)
+        let cases = [
+            ("short", 64, "short"),
+            ("alpha beta", 7, "alpha "),
+            ("alpha beta", 6, "alpha "),
+            ("alpha beta", 5, "alpha"),
+            ("key=sk-ABCDEFGH tail", 10, ""),
+            ("note: key=sk-ABCDEFGH", 15, "note: "),
+            ("\"sk-ABC\",\"sk-DEF\"", 12, "\"sk-ABC\",\""),
+            ("é sk-ABCDEF", 6, "é "),
+            ("unbrokenrun", 4, ""),
+        ];
+        for (input, max, kept) in cases {
+            assert_eq!(
+                truncate_utf8_whole_tokens(input, max),
+                kept,
+                "{input:?} at {max}"
+            );
+        }
+    }
+
+    /// The audit construction: a long fake key fills the event up to the
+    /// 128 KiB cut, and a second fake key straddles it. The plain byte cut
+    /// left `sk-` plus 15 characters, below the `sk-` rule's 16; the sanitizer
+    /// then shrinks the first key to a marker, and the fragment fit inside
+    /// the hook's 64 KiB and the store's 16 KiB caps verbatim.
+    #[test]
+    fn a_key_straddling_the_event_cut_never_reaches_storage_as_a_fragment() {
+        let content = format!(
+            "sk-{} sk-{}",
+            "A".repeat(MAX_EVENT_BYTES - 22),
+            "B".repeat(40)
+        );
+        let mut events = Vec::new();
+        push_event(
+            &mut events,
+            AgentKind::ClaudeCode,
+            "session",
+            "record",
+            0,
+            WorkstreamEventKind::Annotation,
+            Some("user"),
+            &content,
+            None,
+            json!({}),
+        );
+        let [event] = events.as_slice() else {
+            panic!("one event expected, got {}", events.len());
+        };
+        // The hook (scrub, then 64 KiB) and the store (scrub, then 16 KiB).
+        let sanitizer = ai_memory_core::Sanitizer::default();
+        let hooked =
+            ai_memory_core::truncate_utf8_bytes(&sanitizer.scrub(&event.content), 64 * 1024);
+        let stored = ai_memory_core::truncate_utf8_bytes(&sanitizer.scrub(&hooked), 16 * 1024);
+        assert!(
+            !stored.contains("sk-AAAA"),
+            "the full key is redacted: {stored}"
+        );
+        assert!(
+            !stored.contains("BBB"),
+            "a key fragment reached storage: {stored}"
+        );
+        // The id still comes from the plain byte cut, so an event read
+        // before this change replays under the same id.
+        let seed = format!(
+            "{}\0session\0record\00\0{}\0{}",
+            AgentKind::ClaudeCode.as_str(),
+            WorkstreamEventKind::Annotation.as_str(),
+            truncate_utf8(&content, MAX_EVENT_BYTES)
+        );
+        assert_eq!(
+            event.event_id,
+            format!("native:{:x}", Sha256::digest(seed.as_bytes()))
+        );
+    }
 
     #[test]
     fn checkout_path_comparison_fails_closed_when_canonicalization_fails() {
@@ -6369,7 +7256,8 @@ mod tests {
                     | ManagedHarness::KiroV3
                     | ManagedHarness::Grok
                     | ManagedHarness::Antigravity
-                    | ManagedHarness::Copilot => {
+                    | ManagedHarness::Copilot
+                    | ManagedHarness::Gemini => {
                         unreachable!()
                     }
                 },
@@ -6820,6 +7708,88 @@ mod tests {
         assert_eq!(
             transcript_interval_digests(&exact.events),
             transcript_interval_digests(&delta.events)
+        );
+    }
+
+    #[test]
+    fn tool_result_images_are_excluded_not_stored_as_json() {
+        let claude = json!({"type":"user","uuid":"u","message":{"role":"user","content":[
+            {"type":"tool_result","tool_use_id":"t1","content":[
+                {"type":"text","text":"screenshot taken"},
+                {"type":"image","source":{"type":"base64","media_type":"image/png","data":"cHJpdmF0ZSBpbWFnZQ=="}}
+            ]},
+            {"type":"tool_result","tool_use_id":"t2","content":[
+                {"type":"image","source":{"type":"base64","media_type":"image/png","data":"cHJpdmF0ZSBpbWFnZQ=="}}
+            ]}
+        ]}});
+        let pi = json!({"type":"message","message":{"role":"toolResult","toolCallId":"t3","toolName":"read","content":[
+            {"type":"text","text":"read image"},
+            {"type":"image","data":"cHJpdmF0ZSBpbWFnZQ==","mimeType":"image/png"}
+        ]}});
+        let mut events = Vec::new();
+        let mut losses = Vec::new();
+        parse_claude(&claude, "session", "claude", &mut events, &mut losses);
+        parse_pi_family(
+            AgentKind::Pi,
+            &pi,
+            "session",
+            "pi",
+            &mut events,
+            &mut losses,
+        );
+
+        let results = events
+            .iter()
+            .map(|event| {
+                (
+                    event.metadata["tool_use_id"].as_str().unwrap(),
+                    event.content.as_str(),
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(results, [("t1", "screenshot taken"), ("t3", "read image")]);
+        assert!(
+            events
+                .iter()
+                .all(|event| !event.content.contains("cHJpdmF0ZSBpbWFnZQ")),
+            "image data reached the ledger"
+        );
+        assert_eq!(losses.len(), 3);
+        assert!(
+            losses
+                .iter()
+                .all(|loss| loss.ends_with("image tool results were intentionally excluded"))
+        );
+    }
+
+    #[test]
+    fn message_attachments_are_recorded_as_losses() {
+        let claude = json!({"type":"user","uuid":"u","message":{"role":"user","content":[
+            {"type":"text","text":"what is wrong here?"},
+            {"type":"image","source":{"type":"base64","media_type":"image/png","data":"cHJpdmF0ZSBpbWFnZQ=="}},
+            {"type":"document","source":{"type":"base64","media_type":"application/pdf","data":"cHJpdmF0ZSBwZGY="}}
+        ]}});
+        let codex = json!({"type":"response_item","payload":{"type":"message","role":"user","content":[
+            {"type":"input_text","text":"compare with this"},
+            {"type":"input_image","image_url":"data:image/png;base64,cHJpdmF0ZSBpbWFnZQ=="}
+        ]}});
+        let mut events = Vec::new();
+        let mut losses = Vec::new();
+        parse_claude(&claude, "session", "claude", &mut events, &mut losses);
+        parse_codex(&codex, "session", "codex", &mut events, &mut losses);
+
+        let messages = events
+            .iter()
+            .map(|event| event.content.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(messages, ["what is wrong here?", "compare with this"]);
+        assert_eq!(
+            losses,
+            [
+                "claude-code message attachments were intentionally excluded",
+                "claude-code message attachments were intentionally excluded",
+                "codex message attachments were intentionally excluded",
+            ]
         );
     }
 
@@ -7938,6 +8908,157 @@ mod tests {
         );
     }
 
+    /// A native WAL writer may commit after the event query is exhausted.
+    /// Its unseen row must remain outside the returned cursor until the next read.
+    #[test]
+    fn crush_export_cursor_covers_only_its_event_snapshot() {
+        let temp = tempfile::tempdir().unwrap();
+        let cwd = temp.path().join("repo");
+        let data = cwd.join(".crush");
+        fs::create_dir_all(&data).unwrap();
+        let db = data.join("crush.db");
+        let writer = Connection::open(&db).unwrap();
+        writer
+            .execute_batch(
+                "PRAGMA journal_mode=WAL;
+             CREATE TABLE messages(id TEXT PRIMARY KEY, session_id TEXT, role TEXT,
+                 parts TEXT, updated_at INTEGER, is_summary_message INTEGER);",
+            )
+            .unwrap();
+        let insert = |connection: &Connection, id: &str, text: &str, updated: i64| {
+            connection
+                .execute(
+                    "INSERT INTO messages VALUES (?1, 's', 'assistant', ?2, ?3, 0)",
+                    params![
+                        id,
+                        json!([{"type":"text","data":{"text":text}}]).to_string(),
+                        updated
+                    ],
+                )
+                .unwrap();
+        };
+        insert(&writer, "before", "before export", 100);
+        let during = || {
+            std::thread::scope(|scope| {
+                scope
+                    .spawn(|| {
+                        let writer = Connection::open(&db).unwrap();
+                        insert(&writer, "during", "during export", 200);
+                    })
+                    .join()
+                    .unwrap();
+            });
+        };
+        let first =
+            export_crush_range_inner(temp.path(), &cwd, None, "s", None, None, Some(&during))
+                .unwrap();
+        assert_eq!(kinds_and_contents(&first), [("message", "before export")]);
+        let cursor: CrushCursor =
+            serde_json::from_str(first.source_cursor.as_deref().unwrap()).unwrap();
+        assert_eq!(
+            cursor.updated, 100,
+            "the cursor must use the event query's snapshot"
+        );
+        assert_eq!(
+            cursor
+                .boundary
+                .iter()
+                .map(|revision| revision.id.as_str())
+                .collect::<Vec<_>>(),
+            ["before"]
+        );
+        assert!(first.losses.is_empty());
+
+        insert(&writer, "after", "after export", 300);
+        let second =
+            export_crush(temp.path(), &cwd, None, "s", first.source_cursor.as_deref()).unwrap();
+        assert_eq!(
+            kinds_and_contents(&second),
+            [("message", "during export"), ("message", "after export")]
+        );
+        assert!(second.losses.is_empty());
+        assert!(
+            export_crush(
+                temp.path(),
+                &cwd,
+                None,
+                "s",
+                second.source_cursor.as_deref()
+            )
+            .unwrap()
+            .events
+            .is_empty()
+        );
+    }
+
+    /// Cursor timestamps and revision fingerprints must describe one snapshot,
+    /// including when a same-second insert lands between its two queries.
+    #[test]
+    fn crush_baseline_cursor_revisions_share_the_timestamp_snapshot() {
+        let temp = tempfile::tempdir().unwrap();
+        let db = temp.path().join("crush.db");
+        let writer = Connection::open(&db).unwrap();
+        writer
+            .execute_batch(
+                "PRAGMA journal_mode=WAL;
+             CREATE TABLE messages(id TEXT PRIMARY KEY, session_id TEXT, role TEXT,
+                 parts TEXT, updated_at INTEGER, is_summary_message INTEGER);",
+            )
+            .unwrap();
+        let before = json!([{"type":"text","data":{"text":"before baseline"}}]).to_string();
+        writer
+            .execute(
+                "INSERT INTO messages VALUES ('m', 's', 'assistant', ?1, 100, 0)",
+                [&before],
+            )
+            .unwrap();
+        let reader = Connection::open_with_flags(&db, OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
+        let during = || {
+            std::thread::scope(|scope| {
+                scope
+                    .spawn(|| {
+                        let writer = Connection::open(&db).unwrap();
+                        let after =
+                            json!([{"type":"text","data":{"text":"during baseline"}}]).to_string();
+                        writer
+                            .execute(
+                                "INSERT INTO messages VALUES ('z', 's', 'assistant', ?1, 100, 0)",
+                                [&after],
+                            )
+                            .unwrap();
+                    })
+                    .join()
+                    .unwrap();
+            });
+        };
+        let cursor = crush_cursor_inner(&reader, "s", Some(&during)).unwrap();
+        assert_eq!(
+            cursor.boundary,
+            [crush_revision("m", "assistant", &before, 0)]
+        );
+        let next = export_crush(
+            temp.path(),
+            temp.path(),
+            Some(temp.path()),
+            "s",
+            Some(&serde_json::to_string(&cursor).unwrap()),
+        )
+        .unwrap();
+        assert_eq!(kinds_and_contents(&next), [("message", "during baseline")]);
+        assert!(
+            export_crush(
+                temp.path(),
+                temp.path(),
+                Some(temp.path()),
+                "s",
+                next.source_cursor.as_deref()
+            )
+            .unwrap()
+            .events
+            .is_empty()
+        );
+    }
+
     /// Claude Code writes `cwd` on every record and Codex in each
     /// `turn_context`; each event carries the cwd of the record it came from,
     /// so an import resolves relative tool arguments from where the call ran.
@@ -7995,6 +9116,52 @@ mod tests {
             .map(|event| event.metadata.get(RECORD_CWD_KEY).and_then(Value::as_str))
             .collect();
         assert_eq!(cwds, [root.to_str(), docs.to_str()], "{events:?}");
+    }
+
+    #[test]
+    fn incremental_codex_export_keeps_the_turn_cwd_from_before_the_cursor() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("repo");
+        let docs = root.join("docs");
+        let codex = temp.path().join("codex.jsonl");
+        let item = |text: &str| json!({"type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":text}]}});
+        let lines = |values: &[Value]| {
+            values
+                .iter()
+                .map(|line| format!("{line}\n"))
+                .collect::<String>()
+        };
+        fs::write(
+            &codex,
+            lines(&[
+                json!({"type":"session_meta","payload":{"id":"s","cwd":root}}),
+                item("first turn"),
+                json!({"type":"turn_context","payload":{"cwd":docs}}),
+                item("second turn"),
+            ]),
+        )
+        .unwrap();
+        let first = export_jsonl(ManagedHarness::Codex, &codex, "s", None).unwrap();
+        let mut file = fs::OpenOptions::new().append(true).open(&codex).unwrap();
+        std::io::Write::write_all(&mut file, lines(&[item("same turn, later")]).as_bytes())
+            .unwrap();
+        let next = export_jsonl(
+            ManagedHarness::Codex,
+            &codex,
+            "s",
+            first.source_cursor.as_deref(),
+        )
+        .unwrap();
+        assert_eq!(next.events.len(), 1, "{:?}", next.events);
+        assert_eq!(
+            next.events[0]
+                .metadata
+                .get(RECORD_CWD_KEY)
+                .and_then(Value::as_str),
+            docs.to_str(),
+            "{:?}",
+            next.events
+        );
     }
 
     #[test]
@@ -8712,6 +9879,37 @@ mod tests {
         assert_eq!(find("unrelated"), None);
     }
 
+    /// The scan reads every Claude transcript written since the launch,
+    /// including other projects' live sessions. A line that is not UTF-8 (a
+    /// record cut inside a multibyte character while it is being written) is
+    /// one unreadable record, not a reason to stop following this launch's
+    /// `/clear`.
+    #[test]
+    fn claude_continued_session_skips_a_line_that_is_not_utf8() {
+        let temp = tempfile::tempdir().unwrap();
+        let cwd = temp.path().join("repo");
+        let project = temp.path().join(".claude/projects/-repo");
+        fs::create_dir_all(&cwd).unwrap();
+        fs::create_dir_all(&project).unwrap();
+        let started_at = SystemTime::now() - Duration::from_secs(60);
+        let clear = json!({
+            "type": "user",
+            "sessionId": "cleared",
+            "cwd": cwd,
+            "message": {"role": "user", "content": CLAUDE_CLEAR_COMMAND},
+        });
+        let turn =
+            json!({"type": "user", "sessionId": "cleared", "session_id": "launch", "cwd": cwd});
+        fs::write(project.join("cleared.jsonl"), format!("{clear}\n{turn}\n")).unwrap();
+        let mut partial = b"{\"type\":\"user\",\"message\":\"caf".to_vec();
+        partial.push(0xc3);
+        fs::write(project.join("busy.jsonl"), partial).unwrap();
+
+        let found = claude_continued_session(temp.path(), &cwd, None, "launch", started_at)
+            .expect("an unreadable record does not fail the scan");
+        assert_eq!(found, Some(ClaudeContinuation::Cleared("cleared".into())));
+    }
+
     #[test]
     fn claude_continued_session_follows_only_this_launchs_clear() {
         let temp = tempfile::tempdir().unwrap();
@@ -9118,6 +10316,46 @@ mod tests {
     }
 
     #[test]
+    fn codex_adapter_reads_tool_output_content_items() {
+        let value = json!({
+            "type":"response_item",
+            "timestamp":"2026-01-01T00:00:00Z",
+            "payload":{
+                "type":"function_call_output",
+                "call_id":"call-1",
+                "output":[
+                    {"type":"input_text","text":"42 files"},
+                    {"type":"input_image","image_url":"data:image/png;base64,cHJpdmF0ZQ=="},
+                    {"type":"input_text","text":"  "},
+                    {"type":"input_text","text":"done"}
+                ]
+            }
+        });
+        let mut events = Vec::new();
+        let mut losses = Vec::new();
+        parse_codex(&value, "session", "record", &mut events, &mut losses);
+        assert_eq!(events.len(), 1, "array tool output must not be dropped");
+        assert_eq!(events[0].kind, WorkstreamEventKind::ToolResult);
+        assert_eq!(events[0].content, "42 files\ndone");
+        assert_eq!(events[0].metadata["tool_use_id"], "call-1");
+        assert!(!events[0].content.contains("base64"));
+        assert_eq!(
+            losses,
+            ["Codex non-text tool-output items were intentionally excluded"]
+        );
+
+        let string_form = json!({
+            "type":"response_item",
+            "payload":{"type":"custom_tool_call_output","call_id":"call-2","output":"plain"}
+        });
+        let mut events = Vec::new();
+        let mut losses = Vec::new();
+        parse_codex(&string_form, "session", "record", &mut events, &mut losses);
+        assert_eq!(events[0].content, "plain");
+        assert!(losses.is_empty());
+    }
+
+    #[test]
     fn codex_adapter_keeps_current_top_level_compaction_shape() {
         let value = json!({
             "type":"compacted",
@@ -9198,6 +10436,132 @@ mod tests {
         assert_eq!(events[0].role.as_deref(), Some("tool"));
         assert!(events[0].content.contains("file contents"));
         assert_eq!(events[0].metadata["tool"], "read");
+    }
+
+    #[test]
+    fn opencode_cursor_keeps_same_millisecond_revisions() {
+        check_opencode_cursor_revisions(ManagedHarness::OpenCode);
+    }
+
+    #[test]
+    fn opencode2_cursor_keeps_same_millisecond_revisions() {
+        check_opencode_cursor_revisions(ManagedHarness::OpenCode2);
+    }
+
+    /// OpenCode's native stores stamp `time_updated` with millisecond
+    /// `Date.now()`, so updating a record in place keeps the same `(updated, id)`
+    /// pair. The incremental cursor must still re-emit that revision (and a
+    /// same-millisecond insert) without replaying unchanged records, keep exact
+    /// recovery intervals, and stay compatible with pair-only legacy cursors.
+    fn check_opencode_cursor_revisions(harness: ManagedHarness) {
+        let home = tempfile::tempdir().unwrap();
+        let db = opencode_db(home.path(), None);
+        fs::create_dir_all(db.parent().unwrap()).unwrap();
+        let connection = Connection::open(&db).unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE message(id TEXT PRIMARY KEY, session_id TEXT, data TEXT);\
+                 CREATE TABLE part(id TEXT PRIMARY KEY, message_id TEXT, session_id TEXT,\
+                                   time_updated INTEGER, data TEXT);\
+                 CREATE TABLE session_message(id TEXT PRIMARY KEY, session_id TEXT, type TEXT,\
+                                             time_updated INTEGER, data TEXT);\
+                 INSERT INTO message VALUES ('m', 's', '{\"role\":\"assistant\"}');",
+            )
+            .unwrap();
+        let write = |id: &str, updated: i64, text: &str| {
+            let (sql, data) = if harness == ManagedHarness::OpenCode {
+                (
+                    "INSERT OR REPLACE INTO part VALUES (?1, 'm', 's', ?2, ?3)",
+                    json!({"type":"text", "text":text}),
+                )
+            } else {
+                (
+                    "INSERT OR REPLACE INTO session_message VALUES (?1, 's', 'assistant', ?2, ?3)",
+                    json!({"content":[{"type":"text", "text":text}]}),
+                )
+            };
+            connection
+                .execute(sql, params![id, updated, data.to_string()])
+                .unwrap();
+        };
+        let export = |start: Option<&str>, end: Option<&str>| {
+            export_transcript_blocking(harness, home.path(), home.path(), None, "s", start, end)
+                .unwrap()
+        };
+
+        // An empty session has no revision to acknowledge, so its baseline stays
+        // the pair-only shape old installs already persisted.
+        let empty =
+            transcript_baseline_blocking(harness, home.path(), home.path(), None, "s").unwrap();
+        assert_eq!(
+            serde_json::from_str::<Value>(&empty).unwrap(),
+            json!({"updated":0, "id":""})
+        );
+
+        write("2000", 100, "unchanged");
+        write("f000", 100, "first");
+        let first = export(Some(&empty), None);
+        // The incremental export from the empty cursor matches a full export.
+        assert_eq!(
+            transcript_interval_digests(&first.events),
+            transcript_interval_digests(&export(None, None).events)
+        );
+        assert_eq!(exported_texts(&first), ["unchanged", "first"]);
+        // The returned cursor equals a standalone baseline of the same snapshot.
+        let baseline =
+            transcript_baseline_blocking(harness, home.path(), home.path(), None, "s").unwrap();
+        assert_eq!(first.source_cursor.as_deref(), Some(baseline.as_str()));
+
+        // A lower-id insert and an in-place update, both at the saved timestamp.
+        write("1000", 100, "same-millisecond insert");
+        write("f000", 100, "same-millisecond update");
+        let second = export(Some(&baseline), None);
+        assert_eq!(
+            exported_texts(&second),
+            ["same-millisecond insert", "same-millisecond update"],
+            "the lower-id insert and the same-(timestamp, id) update must both surface"
+        );
+        // Re-exporting the acknowledged snapshot replays nothing: the unchanged
+        // boundary record is not re-emitted.
+        assert!(
+            export(second.source_cursor.as_deref(), None)
+                .events
+                .is_empty()
+        );
+
+        // Exact ranges still bound by the captured endpoints, old and new.
+        assert_eq!(
+            exported_texts(&export(None, Some(&baseline))),
+            ["unchanged"]
+        );
+        let exact = export(Some(&baseline), second.source_cursor.as_deref());
+        assert_eq!(exported_texts(&exact), exported_texts(&second));
+
+        // A later millisecond advances past the recovered boundary cleanly.
+        write("g000", 101, "next-millisecond control");
+        let third = export(second.source_cursor.as_deref(), None);
+        assert_eq!(exported_texts(&third), ["next-millisecond control"]);
+        assert!(
+            export(third.source_cursor.as_deref(), None)
+                .events
+                .is_empty()
+        );
+
+        // A legacy pair-only cursor (no boundary) still deserializes and keeps
+        // its original strict id-ordering semantics at the boundary timestamp.
+        let legacy = json!({"updated":100, "id":"f000"}).to_string();
+        assert_eq!(
+            exported_texts(&export(Some(&legacy), None)),
+            ["next-millisecond control"]
+        );
+        assert_eq!(
+            exported_texts(&export(None, Some(&legacy))),
+            [
+                "same-millisecond insert",
+                "unchanged",
+                "same-millisecond update"
+            ]
+        );
     }
 
     #[test]
@@ -9338,6 +10702,26 @@ mod tests {
                 .is_empty()
         );
         assert_eq!(fs::read(&db).unwrap(), before);
+    }
+
+    #[test]
+    fn opencode_tool_calls_and_results_keep_their_call_id() {
+        let message = json!({"role":"assistant"});
+        let part = json!({
+            "type":"tool",
+            "callID":"call-1",
+            "tool":"bash",
+            "state":{"status":"completed","input":{"command":"ls"},"output":"file"}
+        });
+        let mut events = Vec::new();
+        let mut losses = Vec::new();
+        parse_opencode(&message, &part, "s1", "p1", &mut events, &mut losses);
+
+        assert_eq!(events.len(), 2, "{events:?}");
+        assert_eq!(events[0].kind, WorkstreamEventKind::ToolCall);
+        assert_eq!(events[0].metadata["tool_use_id"], "call-1");
+        assert_eq!(events[1].kind, WorkstreamEventKind::ToolResult);
+        assert_eq!(events[1].metadata["tool_use_id"], "call-1");
     }
 
     /// Beta store fixture: `session_v2` + `session_message` with the shapes
@@ -10121,7 +11505,10 @@ mod tests {
         assert_eq!(export.events[1].content, "visible answer");
         assert_eq!(export.events[2].content, "bash: {\"cmd\":\"ls\"}");
         assert_eq!(export.events[2].metadata["tool"], "bash");
+        // The native id pairs the result with its call, as on the loop path.
+        assert_eq!(export.events[2].metadata["tool_use_id"], "call_1");
         assert_eq!(export.events[3].role.as_deref(), Some("tool"));
+        assert_eq!(export.events[3].metadata["tool_use_id"], "call_1");
         assert_eq!(export.events[4].content, "compact summary");
         assert_eq!(export.events[5].content, "loop visible answer");
         assert_eq!(export.events[6].content, "Read: {\"path\":\"README.md\"}");
@@ -10428,6 +11815,9 @@ mod tests {
                 ),
             ]
         );
+        // The native id pairs the result with its call.
+        assert_eq!(export.events[2].metadata["tool_use_id"], "call-1");
+        assert_eq!(export.events[3].metadata["tool_use_id"], "call-1");
         assert!(
             export
                 .losses
@@ -10739,6 +12129,296 @@ mod tests {
 
         // Re-reading from scratch yields identical event ids.
         let replay = export_jsonl(ManagedHarness::Copilot, &path, "s", None).unwrap();
+        assert_eq!(replay.events[0].event_id, first.events[0].event_id);
+        assert_eq!(replay.events[1].event_id, second.events[0].event_id);
+    }
+
+    #[tokio::test]
+    async fn gemini_discovery_and_export_enforce_exact_checkout_isolation() {
+        let temp = tempfile::tempdir().unwrap();
+        let cwd = temp.path().join("repo");
+        let foreign = temp.path().join("other-repo");
+        let root = temp.path().join("gemini-tmp");
+        fs::create_dir_all(&cwd).unwrap();
+        fs::create_dir_all(&foreign).unwrap();
+
+        let matching_id = "4c1ea47e-b134-4efe-a3d1-217a5d5c4e5d";
+        let foreign_id = "9b2eb58f-c245-4fef-b4e2-328b6e6d5f6e";
+        let cwd_hash = format!(
+            "{:x}",
+            Sha256::digest(cwd.canonicalize().unwrap().to_string_lossy().as_bytes())
+        );
+        let foreign_hash = format!(
+            "{:x}",
+            Sha256::digest(foreign.canonicalize().unwrap().to_string_lossy().as_bytes())
+        );
+
+        let matching_chats = root.join("repo").join("chats");
+        let foreign_chats = root.join("other-repo").join("chats");
+        fs::create_dir_all(&matching_chats).unwrap();
+        fs::create_dir_all(&foreign_chats).unwrap();
+
+        let matching_path = matching_chats.join("session-2026-11-23T13-00-4c1ea47e.jsonl");
+        fs::write(
+            &matching_path,
+            format!(
+                "{}\n{}\n",
+                json!({
+                    "sessionId": matching_id,
+                    "projectHash": cwd_hash,
+                    "startTime": "2026-11-23T13:00:00.000Z",
+                    "lastUpdated": "2026-11-23T13:01:00.000Z",
+                    "kind": "main"
+                }),
+                json!({
+                    "id": "m1",
+                    "timestamp": "2026-11-23T13:00:05.000Z",
+                    "type": "user",
+                    "content": [{"text": "hello from repo"}]
+                })
+            ),
+        )
+        .unwrap();
+
+        let foreign_path = foreign_chats.join("session-2026-11-23T13-00-9b2eb58f.jsonl");
+        fs::write(
+            &foreign_path,
+            format!(
+                "{}\n{}\n",
+                json!({
+                    "sessionId": foreign_id,
+                    "projectHash": foreign_hash,
+                    "startTime": "2026-11-23T13:00:00.000Z",
+                    "lastUpdated": "2026-11-23T13:01:00.000Z",
+                    "kind": "main"
+                }),
+                json!({
+                    "id": "f1",
+                    "timestamp": "2026-11-23T13:00:05.000Z",
+                    "type": "user",
+                    "content": [{"text": "secret from foreign checkout"}]
+                })
+            ),
+        )
+        .unwrap();
+
+        let sessions =
+            list_native_sessions(ManagedHarness::Gemini, temp.path(), &cwd, Some(&root), 8)
+                .await
+                .unwrap();
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].native_session_id, matching_id);
+
+        // Legitimate control: matching checkout exports cleanly.
+        let control = export_transcript(
+            ManagedHarness::Gemini,
+            temp.path(),
+            &cwd,
+            Some(&root),
+            matching_id,
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(control.events.len(), 1);
+        assert_eq!(control.events[0].content, "hello from repo");
+        assert_eq!(control.events[0].agent, AgentKind::GeminiCli);
+
+        // Foreign checkout session cannot be located or exported from `cwd`.
+        assert!(
+            !native_session_exists(
+                ManagedHarness::Gemini,
+                temp.path(),
+                &cwd,
+                Some(&root),
+                foreign_id,
+            )
+            .unwrap()
+        );
+        assert!(
+            export_transcript(
+                ManagedHarness::Gemini,
+                temp.path(),
+                &cwd,
+                Some(&root),
+                foreign_id,
+                None,
+            )
+            .await
+            .is_err()
+        );
+
+        assert_eq!(
+            session_root(ManagedHarness::Gemini, temp.path(), None),
+            temp.path().join(".gemini/tmp")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn gemini_session_header_refuses_symlinks() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().unwrap();
+        let cwd = temp.path().join("repo");
+        fs::create_dir_all(&cwd).unwrap();
+        let cwd_hash = format!(
+            "{:x}",
+            Sha256::digest(cwd.canonicalize().unwrap().to_string_lossy().as_bytes())
+        );
+        let id = "4c1ea47e-b134-4efe-a3d1-217a5d5c4e5d";
+        let real = temp.path().join("real.jsonl");
+        fs::write(
+            &real,
+            format!("{}\n", json!({"sessionId": id, "projectHash": cwd_hash})),
+        )
+        .unwrap();
+        let link = temp.path().join("session-link.jsonl");
+        symlink(&real, &link).unwrap();
+
+        assert_eq!(
+            gemini_session_header_for_cwd(&link, &cwd).unwrap(),
+            None,
+            "symlinked Gemini session file must be refused"
+        );
+        assert_eq!(
+            gemini_session_header_for_cwd(&real, &cwd)
+                .unwrap()
+                .map(|(found, _)| found),
+            Some(id.to_string())
+        );
+    }
+
+    #[test]
+    fn gemini_export_imports_visible_records_and_excludes_private_state() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("session-2026-11-23T13-00-4c1ea47e.jsonl");
+        let records = [
+            json!({
+                "sessionId": "4c1ea47e-b134-4efe-a3d1-217a5d5c4e5d",
+                "projectHash": "0".repeat(64),
+                "startTime": "2026-11-23T13:00:00.000Z",
+                "kind": "main"
+            }),
+            json!({"$set": {"lastUpdated": "2026-11-23T13:00:01.000Z"}}),
+            json!({"id": "sys-1", "type": "system", "content": "private system prompt"}),
+            json!({
+                "id": "u1",
+                "timestamp": "2026-11-23T13:00:02.000Z",
+                "type": "user",
+                "content": [
+                    {"text": "read note.txt"},
+                    {"inlineData": {"mimeType": "image/png", "data": "AAAA"}}
+                ]
+            }),
+            json!({
+                "id": "g1",
+                "timestamp": "2026-11-23T13:00:03.000Z",
+                "type": "gemini",
+                "model": "gemini-2.5-pro",
+                "thoughts": [{"subject": "plan", "description": "private chain of thought"}],
+                "content": "Checking note.txt.",
+                "toolCalls": [
+                    {
+                        "id": "tc-1",
+                        "name": "read_file",
+                        "args": {"path": "note.txt"},
+                        "status": "success",
+                        "result": [{"functionResponse": {"id": "tc-1", "name": "read_file", "response": {"output": "hello\n"}}}]
+                    },
+                    {
+                        "id": "tc-2",
+                        "name": "run_shell_command",
+                        "args": {"command": "ls"},
+                        "status": "executing"
+                    },
+                    {
+                        "id": "tc-3",
+                        "name": "read_file",
+                        "args": {"path": "missing.txt"},
+                        "status": "error",
+                        "result": [{"functionResponse": {"id": "tc-3", "name": "read_file", "response": {"error": "not found"}}}]
+                    }
+                ]
+            }),
+            json!({"$rewindTo": "u1"}),
+            json!({"$patch": {"id": "g1", "content": "patched"}}),
+        ];
+        let body = records
+            .iter()
+            .map(|record| format!("{record}\n"))
+            .collect::<String>();
+        fs::write(&path, body).unwrap();
+
+        let export = export_jsonl(ManagedHarness::Gemini, &path, "gemini-session", None).unwrap();
+        let contents: Vec<_> = export
+            .events
+            .iter()
+            .map(|event| (event.kind, event.content.as_str()))
+            .collect();
+        assert_eq!(
+            contents,
+            [
+                (WorkstreamEventKind::Message, "read note.txt"),
+                (WorkstreamEventKind::Message, "Checking note.txt."),
+                (
+                    WorkstreamEventKind::ToolCall,
+                    "read_file: {\"path\":\"note.txt\"}"
+                ),
+                (WorkstreamEventKind::ToolResult, "hello\n"),
+                (
+                    WorkstreamEventKind::ToolCall,
+                    "read_file: {\"path\":\"missing.txt\"}"
+                ),
+                (WorkstreamEventKind::ToolResult, "error: not found"),
+            ]
+        );
+        assert!(export.events.iter().all(|event| {
+            event.agent == AgentKind::GeminiCli
+                && !event.content.contains("private")
+                && !event.content.contains("AAAA")
+        }));
+        for expected in [
+            "system prompt records",
+            "binary payloads",
+            "hidden reasoning",
+            "rewind records",
+            "patch records",
+        ] {
+            assert!(
+                export.losses.iter().any(|loss| loss.contains(expected)),
+                "missing loss annotation for {expected}"
+            );
+        }
+        let cursor: FileCursor = serde_json::from_str(&export.source_cursor.unwrap()).unwrap();
+        assert!(cursor.prefix_sha256.is_some());
+    }
+
+    #[test]
+    fn gemini_export_is_incremental_and_holds_back_an_incomplete_record() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("session-2026-11-23T13-00-4c1ea47e.jsonl");
+        let first_line = json!({"id": "u1", "type": "user", "content": "one"});
+        let second_line = json!({"id": "g1", "type": "gemini", "content": "two"});
+        let partial = second_line.to_string();
+        fs::write(&path, format!("{first_line}\n{}", &partial[..10])).unwrap();
+
+        let first = export_jsonl(ManagedHarness::Gemini, &path, "s", None).unwrap();
+        assert_eq!(first.events.len(), 1);
+        assert!(first.losses.is_empty());
+
+        fs::write(&path, format!("{first_line}\n{second_line}\n")).unwrap();
+        let second = export_jsonl(
+            ManagedHarness::Gemini,
+            &path,
+            "s",
+            first.source_cursor.as_deref(),
+        )
+        .unwrap();
+        assert_eq!(second.events.len(), 1);
+        assert_eq!(second.events[0].content, "two");
+
+        let replay = export_jsonl(ManagedHarness::Gemini, &path, "s", None).unwrap();
         assert_eq!(replay.events[0].event_id, first.events[0].event_id);
         assert_eq!(replay.events[1].event_id, second.events[0].event_id);
     }
@@ -11951,6 +13631,11 @@ mod tests {
         assert_eq!(
             path_from_file_uri("file:///tmp/100%done"),
             Some(PathBuf::from("/tmp/100%done"))
+        );
+        // `u8::from_str_radix` accepts a leading `+`, but `%+5` is no escape.
+        assert_eq!(
+            path_from_file_uri("file:///tmp/a%+5b"),
+            Some(PathBuf::from("/tmp/a%+5b"))
         );
         assert_eq!(path_from_file_uri("https://example.com/x"), None);
         assert_eq!(path_from_file_uri("file://"), None);

@@ -354,14 +354,22 @@ pub(crate) fn tool_payload_fields(agent: AgentKind, raw: &Value) -> Option<(&str
         | AgentKind::CopilotCli
         | AgentKind::Muse
         | AgentKind::CodeBuddy
+        | AgentKind::WorkBuddy
         | AgentKind::IbmBob
         | AgentKind::Dsh
         | AgentKind::QwenCode
-        | AgentKind::Qoder => (
+        | AgentKind::Qoder
+        // Devin CLI's PreToolUse / PostToolUse carry `tool_name` /
+        // `tool_input`; an in-tree PostToolUse fixture also has
+        // `tool_use_id` (docs.devin.ai lifecycle-hooks).
+        | AgentKind::Devin => (
             object.get("tool_name")?.as_str()?,
             object.get("tool_use_id").and_then(Value::as_str),
         ),
-        AgentKind::OpenCode => (
+        // The generated OpenClaw plugin posts the same `tool` / `callID` /
+        // `args` shape as OpenCode (`openclaw_plugin.rs`; docs.openclaw.ai
+        // `before_tool_call` / `after_tool_call`).
+        AgentKind::OpenCode | AgentKind::OpenClaw => (
             object.get("tool")?.as_str()?,
             object.get("callID").and_then(Value::as_str),
         ),
@@ -401,6 +409,18 @@ pub(crate) fn tool_payload_fields(agent: AgentKind, raw: &Value) -> Option<(&str
             let (name, id, _) = cline_tool_fields(object)?;
             (name, id)
         }
+        // Kimi Code's PreToolUse / PostToolUse / PostToolUseFailure carry
+        // Claude Code's `tool_name` / `tool_input` plus `tool_call_id`
+        // (MoonshotAI/kimi-code docs/en/customization/hooks.md; the Bash
+        // example reads `payload.tool_input?.command`). Reconstructed
+        // transcript payloads still use `tool_use_id`.
+        AgentKind::KimiCode => (
+            object.get("tool_name")?.as_str()?,
+            object
+                .get("tool_call_id")
+                .or_else(|| object.get("tool_use_id"))
+                .and_then(Value::as_str),
+        ),
         _ => return None,
     };
     Some((name, id))
@@ -441,11 +461,14 @@ pub(crate) fn tool_observation_metadata(
                             | AgentKind::Droid
                             | AgentKind::Muse
                             | AgentKind::CodeBuddy
+                            | AgentKind::WorkBuddy
                             | AgentKind::IbmBob
                             | AgentKind::Dsh
                             | AgentKind::GeminiCli
                             | AgentKind::QwenCode
                             | AgentKind::Qoder
+                            | AgentKind::KimiCode
+                            | AgentKind::Devin
                     ) {
                         "tool_input"
                     } else {
@@ -500,7 +523,10 @@ pub(crate) fn tool_observation_outcome(agent: AgentKind, raw: &Value) -> ToolOut
                 }
             }
         }
-        AgentKind::KiroCli => match raw
+        // Kiro v2 and Devin CLI PostToolUse `tool_response` carry a `success`
+        // boolean. Devin documents `{success, output, error}`
+        // (docs.devin.ai lifecycle-hooks).
+        AgentKind::KiroCli | AgentKind::Devin => match raw
             .get("tool_response")
             .and_then(|response| response.get("success"))
             .and_then(Value::as_bool)
@@ -539,12 +565,18 @@ pub(crate) fn tool_observation_outcome(agent: AgentKind, raw: &Value) -> ToolOut
         // Claude Code's `PostToolUseFailure` carries the same `error` string
         // (<https://code.claude.com/docs/en/hooks>); an aborted call
         // (`is_interrupt`) did not succeed either. Its `PostToolUse` fires
-        // only on success and has no `error` key.
+        // only on success and has no `error` key. Kimi Code's
+        // PostToolUseFailure carries the same `error` string
+        // (MoonshotAI/kimi-code hooks.md).
+        // OpenClaw's `after_tool_call` carries optional `error` (string);
+        // absence of error is not success (docs.openclaw.ai tool-policy).
         AgentKind::Zcode
         | AgentKind::Muse
         | AgentKind::QwenCode
         | AgentKind::Qoder
         | AgentKind::ClaudeCode
+        | AgentKind::KimiCode
+        | AgentKind::OpenClaw
             if raw
                 .get("error")
                 .and_then(Value::as_str)
@@ -1380,11 +1412,16 @@ fn extract(agent: AgentKind, raw: &Value) -> Extracted<'_> {
         // (#1299), so `[capture] ignore_paths` classifies them as Claude's.
         | AgentKind::Muse
         | AgentKind::CodeBuddy
+        // WorkBuddy takes CodeBuddy's Claude Code-shaped tool contract.
+        | AgentKind::WorkBuddy
         | AgentKind::IbmBob
         // DSH's Claude Code hooks bridge forwards the same `tool_name` /
         // `tool_input` pair, so its file and shell calls read the ignore
         // paths exactly as Claude Code's do.
-        | AgentKind::Dsh => object
+        | AgentKind::Dsh
+        // Kimi Code sends the same `tool_name` / `tool_input` pair
+        // (MoonshotAI/kimi-code hooks.md); Read/Write/Edit take `path`.
+        | AgentKind::KimiCode => object
             .get("tool_name")
             .and_then(Value::as_str)
             .map(|name| (name, object.get("tool_input"))),
@@ -2716,10 +2753,11 @@ fn command_base(workdir: Option<&str>, cwd: &str) -> String {
 }
 
 /// The single-path fields of the file and search/list tool schemas.
-const DIRECT_PATH_KEYS: [&str; 7] = [
+const DIRECT_PATH_KEYS: [&str; 8] = [
     "file_path",
     "filePath",
     "path",
+    "Path",
     "absolute_path",
     "AbsolutePath",
     "notebook_path",
@@ -5290,8 +5328,10 @@ mod tests {
             AgentKind::Droid,
             AgentKind::Muse,
             AgentKind::CodeBuddy,
+            AgentKind::WorkBuddy,
             AgentKind::QwenCode,
             AgentKind::Qoder,
+            AgentKind::KimiCode,
             AgentKind::OpenCode,
             AgentKind::Omp,
             AgentKind::Pi,
@@ -5490,6 +5530,71 @@ mod tests {
             );
             assert_eq!(
                 disposition(AgentKind::CodeBuddy, &call(name, control)).disposition(),
+                CaptureDisposition::Keep,
+                "{name}: control"
+            );
+        }
+    }
+
+    /// WorkBuddy takes CodeBuddy's Claude Code-shaped payload, so an ignored
+    /// path in a `Read`, `Write`, `Edit` or `Bash` call drops. Under
+    /// `AgentKind::Other` the same calls are not recognized and keep, so the
+    /// test fails if the WorkBuddy `extract` arm is removed.
+    #[test]
+    fn workbuddy_tool_calls_honor_capture_exclusions() {
+        let policy = CapturePolicy::resolve(
+            CaptureSource::Parsed(&CaptureConfig {
+                ignore_paths: vec!["secret/**".into()],
+            }),
+            "/repo",
+            None,
+        );
+        let call = |name: &str, input: Value| {
+            json!({
+                "hook_event_name": "PreToolUse",
+                "session_id": "workbuddy-session",
+                "cwd": "/repo",
+                "tool_name": name,
+                "tool_input": input,
+                "tool_use_id": "toolu_1",
+            })
+        };
+        let disposition =
+            |agent: AgentKind, raw: &Value| policy.inspect(agent, raw, "/repo").protocol().clone();
+        for (name, input, control) in [
+            (
+                "Read",
+                json!({"file_path": "secret/a"}),
+                json!({"file_path": "src/lib.rs"}),
+            ),
+            (
+                "Write",
+                json!({"file_path": "/repo/secret/a", "content": "x"}),
+                json!({"file_path": "/repo/src/lib.rs", "content": "x"}),
+            ),
+            (
+                "Edit",
+                json!({"file_path": "secret/a", "old_string": "a", "new_string": "b"}),
+                json!({"file_path": "src/lib.rs", "old_string": "a", "new_string": "b"}),
+            ),
+            (
+                "Bash",
+                json!({"command": "cat secret/a"}),
+                json!({"command": "cat src/lib.rs"}),
+            ),
+        ] {
+            assert_eq!(
+                disposition(AgentKind::WorkBuddy, &call(name, input.clone())).disposition(),
+                CaptureDisposition::Drop,
+                "{name}"
+            );
+            assert_eq!(
+                disposition(AgentKind::Other, &call(name, input)).disposition(),
+                CaptureDisposition::Keep,
+                "{name}: without the WorkBuddy mapping the call is not recognized"
+            );
+            assert_eq!(
+                disposition(AgentKind::WorkBuddy, &call(name, control)).disposition(),
                 CaptureDisposition::Keep,
                 "{name}: control"
             );
@@ -6711,6 +6816,165 @@ mod tests {
     }
 
     #[test]
+    fn kimi_code_tool_metadata_uses_documented_fields() {
+        let pre = json!({
+            "tool_name": "Read",
+            "tool_input": {"path": "src/lib.rs"},
+            "tool_call_id": "call-kimi-1",
+        });
+        let metadata = tool_observation_metadata(AgentKind::KimiCode, &pre, true).unwrap();
+        assert_eq!(metadata.tool_family, ToolFamily::File);
+        assert_eq!(metadata.tool_call_id.as_deref(), Some("call-kimi-1"));
+
+        // Reconstructed transcript payloads still use `tool_use_id`.
+        let rebuilt = json!({
+            "tool_name": "Read",
+            "tool_input": {"path": "src/lib.rs"},
+            "tool_use_id": "call-kimi-2",
+        });
+        let metadata = tool_observation_metadata(AgentKind::KimiCode, &rebuilt, true).unwrap();
+        assert_eq!(metadata.tool_call_id.as_deref(), Some("call-kimi-2"));
+
+        let no_input = json!({"tool_name": "Read", "tool_call_id": "call-kimi-1"});
+        assert!(tool_observation_metadata(AgentKind::KimiCode, &no_input, true).is_none());
+
+        assert_eq!(
+            tool_observation_outcome(
+                AgentKind::KimiCode,
+                &json!({"tool_name": "Bash", "error": "disk full"})
+            ),
+            ToolOutcome::Error
+        );
+        assert_eq!(
+            tool_observation_outcome(
+                AgentKind::KimiCode,
+                &json!({"tool_name": "Bash", "tool_output": "ok"})
+            ),
+            ToolOutcome::Unknown
+        );
+
+        let policy = CapturePolicy::resolve(
+            CaptureSource::Parsed(&CaptureConfig {
+                ignore_paths: vec!["docs/adr/**".into()],
+            }),
+            "/repo",
+            None,
+        );
+        let excluded = json!({
+            "tool_name": "Read",
+            "tool_input": {"path": "docs/adr/1.md"},
+            "tool_call_id": "call-kimi-1",
+        });
+        let decision = policy.inspect(AgentKind::KimiCode, &excluded, "/repo");
+        assert_eq!(decision.protocol().disposition(), CaptureDisposition::Drop);
+        assert_eq!(decision.protocol().tool_family(), ToolFamily::File);
+
+        let public = json!({
+            "tool_name": "Read",
+            "tool_input": {"path": "src/lib.rs"},
+            "tool_call_id": "call-kimi-1",
+        });
+        let decision = policy.inspect(AgentKind::KimiCode, &public, "/repo");
+        assert_eq!(decision.protocol().disposition(), CaptureDisposition::Keep);
+    }
+
+    #[test]
+    fn devin_tool_metadata_uses_documented_fields() {
+        let pre = json!({
+            "tool_name": "exec",
+            "tool_input": {"command": "ls", "shell_id": "main"},
+            "tool_use_id": "call_devin_1",
+        });
+        let metadata = tool_observation_metadata(AgentKind::Devin, &pre, true).unwrap();
+        assert_eq!(metadata.tool_family, ToolFamily::NonFile);
+        assert_eq!(metadata.tool_call_id.as_deref(), Some("call_devin_1"));
+
+        let no_input = json!({"tool_name": "exec", "tool_use_id": "call_devin_1"});
+        assert!(tool_observation_metadata(AgentKind::Devin, &no_input, true).is_none());
+
+        assert_eq!(
+            tool_observation_outcome(
+                AgentKind::Devin,
+                &json!({"tool_response": {"success": true, "output": "ok", "error": null}})
+            ),
+            ToolOutcome::Success
+        );
+        assert_eq!(
+            tool_observation_outcome(
+                AgentKind::Devin,
+                &json!({"tool_response": {"success": false, "output": "", "error": "nope"}})
+            ),
+            ToolOutcome::Error
+        );
+        assert_eq!(
+            tool_observation_outcome(AgentKind::Devin, &json!({"tool_name": "exec"})),
+            ToolOutcome::Unknown
+        );
+    }
+
+    #[test]
+    fn openclaw_tool_metadata_uses_documented_fields() {
+        let pre = json!({
+            "tool": "read",
+            "args": {"path": "src/lib.rs"},
+            "callID": "call_openclaw_1",
+        });
+        let metadata = tool_observation_metadata(AgentKind::OpenClaw, &pre, true).unwrap();
+        assert_eq!(metadata.tool_family, ToolFamily::File);
+        assert_eq!(metadata.tool_call_id.as_deref(), Some("call_openclaw_1"));
+
+        let no_input = json!({"tool": "read", "callID": "call_openclaw_1"});
+        assert!(tool_observation_metadata(AgentKind::OpenClaw, &no_input, true).is_none());
+
+        assert_eq!(
+            tool_observation_outcome(
+                AgentKind::OpenClaw,
+                &json!({"tool": "exec", "error": "MARKER_OPENCLAW_ERROR"})
+            ),
+            ToolOutcome::Error
+        );
+        assert_eq!(
+            tool_observation_outcome(
+                AgentKind::OpenClaw,
+                &json!({"tool": "exec", "output": "ok"})
+            ),
+            ToolOutcome::Unknown
+        );
+
+        let policy = CapturePolicy::resolve(
+            CaptureSource::Parsed(&CaptureConfig {
+                ignore_paths: vec!["docs/adr/**".into()],
+            }),
+            "/repo",
+            None,
+        );
+        let dropped = json!({
+            "tool": "read",
+            "args": {"path": "docs/adr/1.md"},
+            "callID": "call_openclaw_drop",
+        });
+        assert_eq!(
+            policy
+                .inspect(AgentKind::OpenClaw, &dropped, "/repo")
+                .protocol()
+                .disposition(),
+            CaptureDisposition::Drop
+        );
+        let kept = json!({
+            "tool": "read",
+            "args": {"path": "src/lib.rs"},
+            "callID": "call_openclaw_keep",
+        });
+        assert_eq!(
+            policy
+                .inspect(AgentKind::OpenClaw, &kept, "/repo")
+                .protocol()
+                .disposition(),
+            CaptureDisposition::Keep
+        );
+    }
+
+    #[test]
     fn command_code_official_tool_shape_is_closed_and_honors_exclusions() {
         let policy = CapturePolicy::resolve(
             CaptureSource::Parsed(&CaptureConfig {
@@ -6870,6 +7134,58 @@ mod tests {
             json!({"toolCall": {"name": "view_file", "args": {"TargetFile": "src/main.rs"}}});
         let decision = policy.inspect(AgentKind::AntigravityCli, &kept, "/repo");
         assert_eq!(decision.protocol().tool_family(), ToolFamily::File);
+        assert_eq!(decision.protocol().disposition(), CaptureDisposition::Keep);
+
+        // Antigravity CLI 1.5.x file tools pass the file path in `args.Path`.
+        for tool in ["read_file", "write_file", "edit_file"] {
+            let ignored = json!({
+                "toolCall": {
+                    "name": tool,
+                    "args": {"Path": "secret/keys.txt"}
+                }
+            });
+            let decision = policy.inspect(AgentKind::AntigravityCli, &ignored, "/repo");
+            assert_eq!(decision.protocol().tool_family(), ToolFamily::File);
+            assert_eq!(
+                decision.protocol().extraction_state(),
+                ExtractionState::Extracted
+            );
+            assert_eq!(decision.protocol().path_count(), 1);
+            assert_eq!(
+                decision.protocol().disposition(),
+                CaptureDisposition::Drop,
+                "tool: {tool}"
+            );
+
+            let kept = json!({
+                "toolCall": {
+                    "name": tool,
+                    "args": {"Path": "src/main.rs"}
+                }
+            });
+            let decision = policy.inspect(AgentKind::AntigravityCli, &kept, "/repo");
+            assert_eq!(decision.protocol().tool_family(), ToolFamily::File);
+            assert_eq!(
+                decision.protocol().extraction_state(),
+                ExtractionState::Extracted
+            );
+            assert_eq!(decision.protocol().path_count(), 1);
+            assert_eq!(
+                decision.protocol().disposition(),
+                CaptureDisposition::Keep,
+                "tool: {tool}"
+            );
+        }
+
+        // Security invariant: call_mcp_tool must still fail closed to Unknown.
+        let mcp = json!({
+            "toolCall": {
+                "name": "call_mcp_tool",
+                "args": {"ServerName": "ai-memory", "ToolName": "memory_query"}
+            }
+        });
+        let decision = policy.inspect(AgentKind::AntigravityCli, &mcp, "/repo");
+        assert_eq!(decision.protocol().tool_family(), ToolFamily::Unknown);
         assert_eq!(decision.protocol().disposition(), CaptureDisposition::Keep);
     }
     #[test]

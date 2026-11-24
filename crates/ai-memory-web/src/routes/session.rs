@@ -14,7 +14,7 @@ use ai_memory_store::{ObservationOrder, ObservationPage};
 use askama::Template;
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
-use axum::response::{Html, IntoResponse, Response};
+use axum::response::{IntoResponse, Response};
 use serde::Deserialize;
 
 use super::api::{
@@ -31,17 +31,33 @@ pub(crate) const DEFAULT_PAGE_SIZE: usize = 50;
 #[derive(Debug, Default, Deserialize)]
 pub(crate) struct SessionQuery {
     /// Observations to skip, in capture order.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "blank_as_none")]
     pub offset: Option<usize>,
     /// Observations per page, clamped like the API's `limit`.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "blank_as_none")]
     pub limit: Option<usize>,
     /// 1-based position to jump to; overrides `offset` with the page that
     /// holds it.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "blank_as_none")]
     pub at: Option<usize>,
     #[serde(flatten)]
     pub usage: crate::operations::UsageQuery,
+}
+
+/// A blank number field reads as omitted. The "Jump to" form submits `at=`
+/// when its field is cleared, and an empty string is not a `usize`, so the
+/// plain `Option<usize>` turned that into axum's 400.
+fn blank_as_none<'de, D>(deserializer: D) -> Result<Option<usize>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    match Option::<String>::deserialize(deserializer)?
+        .as_deref()
+        .map(str::trim)
+    {
+        None | Some("") => Ok(None),
+        Some(raw) => raw.parse().map(Some).map_err(serde::de::Error::custom),
+    }
 }
 
 /// Handler for `GET /w/:workspace/:project/s/:session_id`.
@@ -175,6 +191,11 @@ pub(crate) async fn handler(
         project: project.clone(),
         project_href: project_href(&workspace, &project),
         session_href: base.clone(),
+        retrievals_href: crate::templates::retrievals_href(
+            &workspace,
+            &project,
+            &session_id.to_string(),
+        ),
         session_id: session_id.to_string(),
         agent_kind: session.agent_kind,
         started_at: session.started_at,
@@ -208,7 +229,25 @@ pub(crate) async fn handler(
         observations: rows,
     };
     match view.render() {
-        Ok(html) => Html(html).into_response(),
+        Ok(html) => super::private_page(html),
         Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::SessionQuery;
+    use axum::extract::Query;
+    use axum::http::Uri;
+
+    /// The "Jump to" form submits `at=` when its number field is cleared,
+    /// which must read as "no jump", not axum's 400.
+    #[test]
+    fn session_query_reads_a_blank_field_as_omitted() {
+        let uri: Uri = "/s/x?limit=20&at=&offset=".parse().unwrap();
+        let Query(query) = Query::<SessionQuery>::try_from_uri(&uri).unwrap();
+        assert_eq!(query.limit, Some(20));
+        assert_eq!(query.at, None);
+        assert_eq!(query.offset, None);
     }
 }

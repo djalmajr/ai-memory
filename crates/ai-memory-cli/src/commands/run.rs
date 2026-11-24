@@ -26,11 +26,11 @@ use ai_memory_workstream::{
     inside_ai_jail_here, inspect_repository, is_interactive_session_invocation, jail_checklist,
     jail_spec, jail_toggle, kiro_explicit_session_id, kiro_harness_from_source_cursor,
     kiro_selects_non_default_engine, kiro_selects_v2_engine, kiro_selects_v3_engine,
-    kiro_v3_resume_uses_default_store, list_native_sessions, marked_choices, native_session_exists,
-    native_session_in_checkout, native_store_root, omp_profile_flag, omp_profile_flag_env,
-    parse_jail_toggles, parse_status, server_reach, status_refusal, store_override_vars,
-    transcript_baseline, transcript_interval_digests, usable_ai_jail_here,
-    wait_for_transcript_flush,
+    kiro_v3_resume_uses_default_store, kiro_yolo_engine_is_unverified, list_native_sessions,
+    marked_choices, native_session_exists, native_session_in_checkout, native_store_root,
+    omp_profile_flag, omp_profile_flag_env, parse_jail_toggles, parse_status, server_reach,
+    status_refusal, store_override_vars, transcript_baseline, transcript_interval_digests,
+    usable_ai_jail_here, wait_for_transcript_flush,
 };
 use anyhow::{Context as _, Result, anyhow};
 use clap::ValueEnum as _;
@@ -169,6 +169,14 @@ pub(crate) fn environment_keys_equal(left: &OsStr, right: &OsStr, windows: bool)
 pub(crate) struct ExecutableSearch<'a> {
     path: Option<&'a OsStr>,
     extensions: Option<&'a OsStr>,
+}
+
+impl<'a> ExecutableSearch<'a> {
+    /// Search over an explicit `PATH` and `PATHEXT`, for callers that hold
+    /// the captured process environment rather than an [`EffectiveEnv`].
+    pub(crate) fn new(path: Option<&'a OsStr>, extensions: Option<&'a OsStr>) -> Self {
+        Self { path, extensions }
+    }
 }
 
 const AUTO_HARNESSES: [ManagedHarness; 9] = [
@@ -586,6 +594,7 @@ fn apply_after_run_action(
         };
     args.workstream = Some(outcome.workstream_name.clone());
     args.new_workstream = None;
+    args.or_new = false;
     args.fresh = false;
     // The first launch already noted that `--true-yolo` is `--yolo` now.
     args.yolo |= std::mem::take(&mut args.true_yolo);
@@ -607,6 +616,7 @@ const fn run_harness_choice(harness: ManagedHarness) -> RunHarnessChoice {
         ManagedHarness::Grok => RunHarnessChoice::Grok,
         ManagedHarness::Antigravity => RunHarnessChoice::Antigravity,
         ManagedHarness::Copilot => RunHarnessChoice::Copilot,
+        ManagedHarness::Gemini => RunHarnessChoice::Gemini,
     }
 }
 
@@ -837,6 +847,7 @@ async fn run_once_with_wiring(
             JailLaunch {
                 support: &support,
                 contract: contract.as_ref(),
+                harness: requested_harness.is_some().then_some(provisional_harness),
             },
             &toggles,
             jail_facts.project_config,
@@ -845,6 +856,7 @@ async fn run_once_with_wiring(
         ));
     }
     let may_adopt_native_session = args.new_workstream.is_none() && !force_fresh;
+    let or_new = args.or_new;
     let endpoint = ServerEndpoint::for_checkout_at(config, &repository.cwd).await?;
     let project_id = if let Some(id) = args.project_id {
         Some(id)
@@ -902,6 +914,15 @@ async fn run_once_with_wiring(
         )
         .await;
     }
+    let (legacy_repo_fingerprint, legacy_worktree_fingerprint) = repository
+        .legacy_fingerprints
+        .as_ref()
+        .map_or((None, None), |legacy| {
+            (
+                Some(legacy.repo_fingerprint.clone()),
+                Some(legacy.worktree_fingerprint.clone()),
+            )
+        });
     let mut prepare = PrepareManagedRunRequest {
         project_id,
         workspace: workspace.clone(),
@@ -913,12 +934,15 @@ async fn run_once_with_wiring(
         cwd: repository.cwd.to_string_lossy().into_owned(),
         repo_fingerprint: repository.repo_fingerprint.clone(),
         worktree_fingerprint: repository.worktree_fingerprint.clone(),
+        legacy_repo_fingerprint,
+        legacy_worktree_fingerprint,
         agent: provisional_harness.agent_kind(),
         automatic_harness,
         available_agents: unique_auto_agents(&auto_candidates),
         workstream: args.workstream,
         new_workstream: args.new_workstream,
         force_unlock,
+        fresh: force_fresh,
         lease_owner: lease_owner(),
         repository_identity: project_id
             .is_none()
@@ -928,10 +952,11 @@ async fn run_once_with_wiring(
     let interrupted_before_spawn = CancellationToken::new();
     let interrupt_task = tokio::spawn(capture_interrupts(interrupted_before_spawn.clone()));
     let prepared = async {
-        match prepare_managed_run(
+        match prepare_selected_run(
             &config.i18n,
             &endpoint,
             &prepare,
+            or_new,
             interactive,
             &interrupted_before_spawn,
         )
@@ -956,10 +981,11 @@ async fn run_once_with_wiring(
                 prepare.project_id = Some(scope.project_id);
                 prepare.project.clear();
                 prepare.repository_identity = None;
-                prepare_managed_run(
+                prepare_selected_run(
                     &config.i18n,
                     &endpoint,
                     &prepare,
+                    or_new,
                     interactive,
                     &interrupted_before_spawn,
                 )
@@ -970,13 +996,29 @@ async fn run_once_with_wiring(
     }
     .await
     .context("opening managed workstream; the agent was not started");
-    let prepared = match prepared {
+    let (prepared, created_by_or_new) = match prepared {
         Ok(prepared) => prepared,
         Err(error) => {
             interrupt_task.abort();
             return Err(error);
         }
     };
+    if or_new {
+        // Two full strings, not a `{verb}` interpolation, so each branch is a
+        // translatable diagnostic catalog line.
+        let message = if created_by_or_new {
+            format!("ai-memory: created workstream {}", prepared.workstream_name)
+        } else {
+            format!(
+                "ai-memory: selected existing workstream {}",
+                prepared.workstream_name
+            )
+        };
+        eprintln!("{}", diagnostic(&config.i18n, message));
+    }
+    // A workstream `--or-new` just created is as fresh as `--new`'s: it must
+    // not adopt a native session that predates it.
+    let may_adopt_native_session = may_adopt_native_session && !created_by_or_new;
     if let Some(warning) = prepared.manifest_warning.as_deref() {
         eprintln!(
             "{}",
@@ -1314,18 +1356,15 @@ async fn run_once_with_wiring(
         }
     }
     if yolo_requested {
-        // Kiro's official dangerous mode exists on the v2 engine only
-        // (`--trust-all-tools`); the v3 engine replaced it with
-        // permissions.yaml and documents no CLI equivalent, so the wrapper
-        // maps nothing there and says so instead of failing silently.
-        if harness == ManagedHarness::KiroV3
-            || harness == ManagedHarness::Kiro && kiro_selects_non_default_engine(&plan.args)
-        {
+        // Kiro's v2 and v3 engines take `--trust-all-tools`; an engine no
+        // adapter models gets nothing, and the wrapper says so instead of
+        // failing silently.
+        if kiro_yolo_engine_is_unverified(harness, &plan.args) {
             eprintln!(
                 "{}",
                 config.i18n.diagnostic(
                     "ai-memory: --yolo maps to no verified flag on the selected Kiro engine \
-                 (v3 replaced --trust-all-tools with permissions.yaml); launching without it"
+                 (only v2 and v3 take --trust-all-tools); launching without it"
                 )
             );
         }
@@ -1657,6 +1696,7 @@ async fn run_once_with_wiring(
                     .as_ref()
                     .and_then(|status| status.native_session_id.as_deref())
             {
+                let (quoted_workspace, quoted_project) = finalize_scope_args(&workspace, &project);
                 eprintln!(
                     "{}",
                     diagnostic(
@@ -1666,8 +1706,8 @@ async fn run_once_with_wiring(
                             harness.as_str(),
                             harness.agent_kind().as_str(),
                             SessionId::from_native(linked),
-                            super::render_shared::shell_quote(&workspace),
-                            super::render_shared::shell_quote(&project)
+                            quoted_workspace,
+                            quoted_project
                         )
                     )
                 );
@@ -1938,17 +1978,19 @@ async fn run_once_with_wiring(
             // scope: its hooks are not installed or never fired, or they
             // filed it under another workspace/project.
             Ok(_) => {}
-            Err(error) => eprintln!(
-                "{}",
-                diagnostic(
-                    &config.i18n,
-                    format!(
-                        "ai-memory: could not finalize the {agent} session {session} ({error:#}); run `ai-memory finalize-session --agent {agent} --reopen --session-id {session} --workspace {} --project {}`",
-                        super::render_shared::shell_quote(&workspace),
-                        super::render_shared::shell_quote(&project)
+            Err(error) => {
+                let (quoted_workspace, quoted_project) = finalize_scope_args(&workspace, &project);
+                eprintln!(
+                    "{}",
+                    diagnostic(
+                        &config.i18n,
+                        format!(
+                            "ai-memory: could not finalize the {agent} session {session} ({error:#}); run `ai-memory finalize-session --agent {agent} --reopen --session-id {session} --workspace {} --project {}`",
+                            quoted_workspace, quoted_project
+                        )
                     )
-                )
-            ),
+                );
+            }
         }
     }
     Ok(RunOutcome {
@@ -2048,16 +2090,14 @@ async fn degraded_launch(
     )
     .await?;
     if launch.yolo {
-        // Same Kiro caveat as the online path: v3 has no verified dangerous
-        // mode, so the wrapper maps nothing there and says so.
-        if launch.harness == ManagedHarness::KiroV3
-            || launch.harness == ManagedHarness::Kiro && kiro_selects_non_default_engine(&plan.args)
-        {
+        // Same Kiro caveat as the online path: an engine no adapter models
+        // gets no trust flag, and the wrapper says so.
+        if kiro_yolo_engine_is_unverified(launch.harness, &plan.args) {
             eprintln!(
                 "{}",
                 config.i18n.diagnostic(
                     "ai-memory: --yolo maps to no verified flag on the selected Kiro engine \
-                 (v3 replaced --trust-all-tools with permissions.yaml); launching without it"
+                 (only v2 and v3 take --trust-all-tools); launching without it"
                 )
             );
         }
@@ -3717,6 +3757,7 @@ async fn confirm_yolo_and_maybe_reexec(
         JailLaunch {
             support: &support,
             contract: contract.as_ref(),
+            harness: Some(offer.harness),
         },
         &toggles,
         facts.project_config,
@@ -3759,6 +3800,10 @@ fn jail_contract_for(
 struct JailLaunch<'a> {
     support: &'a JailSupport,
     contract: Option<&'a ContractTarget>,
+    /// The harness this launch was asked for, when it is known before the
+    /// re-exec. `None` on an automatic choice, which the server resolves
+    /// later.
+    harness: Option<ManagedHarness>,
 }
 
 /// What a contract launch needs from [`exec_under_ai_jail`].
@@ -3930,25 +3975,48 @@ fn exec_under_ai_jail(
             folders,
         );
     }
-    // `--agent-state` is a bare toggle: enable it so the harness's own login
-    // state survives ai-jail's ephemeral private home (ai-jail derives the
-    // per-harness state location from the wrapped `run <harness>` it parses).
-    // `--no-save-config` keeps ai-jail from writing these transient flags into
-    // the project `.ai-jail` (see `build_ai_jail_invocation`).
-    let jail_args = build_ai_jail_invocation(
+    let jail_args = legacy_jail_argv(
         &exe,
         &forwarded,
         &present,
-        true,
+        launch.harness,
         launch.support.supports("no-save-config"),
+        toggles,
+        folders,
+    );
+    eprintln!("{}", jail_summary(toggles, project_config, folders));
+    reexec_under_ai_jail(ai_jail, &jail_args, &resolved)
+}
+
+/// Assemble the flag-based ai-jail argv, used when ai-jail predates the
+/// wrapper contract or has no preset for this harness.
+///
+/// `--agent-state` is a bare toggle: enable it so the harness's own login
+/// state survives ai-jail's ephemeral private home (ai-jail derives the
+/// per-harness state location from the wrapped `run <harness>` it parses).
+/// `--no-save-config` keeps ai-jail from writing these transient flags into
+/// the project `.ai-jail` (see `build_ai_jail_invocation`).
+fn legacy_jail_argv(
+    exe: &Path,
+    forwarded: &[OsString],
+    present: &[&'static str],
+    harness: Option<ManagedHarness>,
+    no_save_config: bool,
+    toggles: &[JailToggleChoice],
+    folders: &[super::jail_folders::ExtraFolder],
+) -> Vec<OsString> {
+    build_ai_jail_invocation(
+        exe,
+        forwarded,
+        &jail_launch_env_names(harness, present),
+        true,
+        no_save_config,
         toggles,
         &folders
             .iter()
             .map(|folder| (folder.path.as_path(), folder.writable))
             .collect::<Vec<_>>(),
-    );
-    eprintln!("{}", jail_summary(toggles, project_config, folders));
-    reexec_under_ai_jail(ai_jail, &jail_args, &resolved)
+    )
 }
 
 fn jail_forwarded_args(
@@ -3971,6 +4039,25 @@ fn jail_forwarded_args(
         args.push(OsString::from("--no-exit-prompt"));
     }
     args
+}
+
+/// The forwarded variable names a jail launch may pass for `harness`.
+///
+/// The contract path filters provider credentials per harness in
+/// `harness_env_names`, so a Codex jail never receives an Anthropic key. The
+/// flag-based path has to apply the same rule: without it an old ai-jail, or
+/// a harness ai-jail has no preset for, receives every provider credential the
+/// operator's environment happens to hold.
+fn jail_launch_env_names(
+    harness: Option<ManagedHarness>,
+    present: &[&'static str],
+) -> Vec<&'static str> {
+    match harness {
+        Some(harness) => harness_env_names(harness, present),
+        // An automatically chosen harness is only known after the re-exec, so
+        // there is nothing to filter against yet.
+        None => present.to_vec(),
+    }
 }
 
 /// The [`FORWARDED_ENV_NAMES`] the re-exec passes with `--env NAME`: those set
@@ -5000,7 +5087,7 @@ async fn claude_background_attach_id(
 /// to spawn with "program not found". Resolving to the concrete file keeps the
 /// availability check and the launch agreeing on one answer, and lets the
 /// launch use a path that works.
-pub(super) fn resolve_program(
+pub(crate) fn resolve_program(
     program: &OsStr,
     search: ExecutableSearch<'_>,
 ) -> Option<std::path::PathBuf> {
@@ -5205,6 +5292,7 @@ fn previous_harness_candidates(agent: AgentKind) -> &'static [ManagedHarness] {
         AgentKind::Grok => &[ManagedHarness::Grok],
         AgentKind::AntigravityCli => &[ManagedHarness::Antigravity],
         AgentKind::CopilotCli => &[ManagedHarness::Copilot],
+        AgentKind::GeminiCli => &[ManagedHarness::Gemini],
         _ => &[],
     }
 }
@@ -5569,6 +5657,15 @@ fn choose_native_session(
     }
 }
 
+/// The `--workspace` and `--project` values of a printed `finalize-session`
+/// command, quoted for the shell the operator pastes it into.
+fn finalize_scope_args(workspace: &str, project: &str) -> (String, String) {
+    (
+        super::render_shared::native_shell_quote(workspace),
+        super::render_shared::native_shell_quote(project),
+    )
+}
+
 /// Render a native session id for terminal output, bounded so a long id
 /// cannot flood the line. CodeQL's `rust/cleartext-logging` barrier model
 /// (`.github/codeql/extensions/ai-memory-models/models/log-barriers.model.yml`)
@@ -5911,6 +6008,62 @@ fn complete_prepare_run(
     }
 }
 
+/// `--workstream NAME --or-new`: select NAME, or create it as `--new NAME`
+/// would when the server says it does not exist. The flag is true when this
+/// call created it. Composed from the two existing server operations, so the
+/// lease and duplicate-name guards stay the only arbiters: when another caller
+/// creates NAME between our miss and our create, the create is refused as a
+/// duplicate and we fall back to selecting what that caller made.
+async fn prepare_selected_run(
+    i18n: &ai_memory_core::i18n::Localizer,
+    endpoint: &ServerEndpoint,
+    request: &PrepareManagedRunRequest,
+    or_new: bool,
+    interactive: bool,
+    interrupted: &CancellationToken,
+) -> Result<(PrepareManagedRunResponse, bool)> {
+    let selected = prepare_managed_run(i18n, endpoint, request, interactive, interrupted).await;
+    let Some(name) = request.workstream.as_ref().filter(|_| or_new) else {
+        return selected.map(|prepared| (prepared, false));
+    };
+    match selected {
+        Err(error) if is_missing_workstream(&error) => {
+            let mut create = request.clone();
+            create.workstream = None;
+            create.new_workstream = Some(name.clone());
+            match prepare_managed_run(i18n, endpoint, &create, interactive, interrupted).await {
+                Err(error) if is_duplicate_workstream(&error) => {
+                    prepare_managed_run(i18n, endpoint, request, interactive, interrupted)
+                        .await
+                        .map(|prepared| (prepared, false))
+                }
+                created => created.map(|prepared| (prepared, true)),
+            }
+        }
+        selected => selected.map(|prepared| (prepared, false)),
+    }
+}
+
+fn is_missing_workstream(error: &anyhow::Error) -> bool {
+    error
+        .downcast_ref::<ServerResponseError>()
+        .is_some_and(|response| {
+            response.status() == reqwest::StatusCode::NOT_FOUND
+                && response.body().contains("managed workstream '")
+        })
+}
+
+fn is_duplicate_workstream(error: &anyhow::Error) -> bool {
+    error
+        .downcast_ref::<ServerResponseError>()
+        .is_some_and(|response| {
+            response.status() == reqwest::StatusCode::CONFLICT
+                && response
+                    .body()
+                    .contains("already exists; select it with --workstream")
+        })
+}
+
 async fn prepare_managed_run(
     i18n: &ai_memory_core::i18n::Localizer,
     endpoint: &ServerEndpoint,
@@ -6187,6 +6340,7 @@ const fn managed_harness(choice: RunHarnessChoice) -> ManagedHarness {
         RunHarnessChoice::Grok => ManagedHarness::Grok,
         RunHarnessChoice::Antigravity => ManagedHarness::Antigravity,
         RunHarnessChoice::Copilot => ManagedHarness::Copilot,
+        RunHarnessChoice::Gemini => ManagedHarness::Gemini,
     }
 }
 
@@ -6212,6 +6366,7 @@ const fn managed_harness_from_agent(agent: AgentKind) -> Option<ManagedHarness> 
         AgentKind::Grok => Some(ManagedHarness::Grok),
         AgentKind::AntigravityCli => Some(ManagedHarness::Antigravity),
         AgentKind::CopilotCli => Some(ManagedHarness::Copilot),
+        AgentKind::GeminiCli => Some(ManagedHarness::Gemini),
         _ => None,
     }
 }
@@ -6236,6 +6391,7 @@ pub(crate) fn harness_from_journal_name(name: &str) -> Option<ManagedHarness> {
         "grok" => Some(ManagedHarness::Grok),
         "antigravity" => Some(ManagedHarness::Antigravity),
         "copilot" => Some(ManagedHarness::Copilot),
+        "gemini" => Some(ManagedHarness::Gemini),
         _ => None,
     }
 }
@@ -6263,6 +6419,21 @@ mod tests {
         JailPlan { warn, mode }
     }
 
+    /// The printed `finalize-session` command is pasted into the operator's
+    /// own shell. POSIX `'\''` escaping is not PowerShell's, so a scope with an
+    /// apostrophe must be quoted the native way, as the destructive
+    /// confirmations already are.
+    #[test]
+    fn finalize_scope_args_quote_for_the_native_shell() {
+        let (workspace, project) = finalize_scope_args("Levi's work", "api");
+        assert_eq!(project, "api");
+        if cfg!(windows) {
+            assert_eq!(workspace, "'Levi''s work'");
+        } else {
+            assert_eq!(workspace, r"'Levi'\''s work'");
+        }
+    }
+
     /// Every harness a journal entry can name.
     const EVERY_MANAGED_HARNESS: &[ManagedHarness] = &[
         ManagedHarness::Claude,
@@ -6279,6 +6450,7 @@ mod tests {
         ManagedHarness::Grok,
         ManagedHarness::Antigravity,
         ManagedHarness::Copilot,
+        ManagedHarness::Gemini,
     ];
 
     /// The exact spelling `append_journal_entry` records for each harness,
@@ -6302,6 +6474,7 @@ mod tests {
             ManagedHarness::Grok => "grok",
             ManagedHarness::Antigravity => "antigravity",
             ManagedHarness::Copilot => "copilot",
+            ManagedHarness::Gemini => "gemini",
         }
     }
 
@@ -7199,6 +7372,69 @@ mod tests {
         }
     }
 
+    /// The contract path scopes provider credentials to the harness. The
+    /// flag-based argv has no contract, so it has to apply the same rule:
+    /// otherwise a Codex launch under an older ai-jail carries the operator's
+    /// Anthropic, Gemini, Copilot and OpenRouter keys as well.
+    #[test]
+    fn a_flag_based_launch_forwards_only_its_harness_provider_keys() {
+        const ALL: &[&str] = &[
+            "AI_MEMORY_SERVER_URL",
+            "ANTHROPIC_API_KEY",
+            "OPENAI_API_KEY",
+            "GEMINI_API_KEY",
+            "GOOGLE_API_KEY",
+            "COPILOT_GITHUB_TOKEN",
+            "OPENROUTER_API_KEY",
+        ];
+        let argv = legacy_jail_argv(
+            Path::new("/usr/local/bin/ai-memory"),
+            &[OsString::from("run"), OsString::from("codex")],
+            ALL,
+            Some(ManagedHarness::Codex),
+            true,
+            &[],
+            &[],
+        );
+        let rendered: Vec<String> = argv
+            .iter()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+        assert!(
+            rendered.iter().any(|arg| arg == "OPENAI_API_KEY"),
+            "a Codex jail keeps its own key: {rendered:?}"
+        );
+        for foreign in [
+            "ANTHROPIC_API_KEY",
+            "GEMINI_API_KEY",
+            "GOOGLE_API_KEY",
+            "COPILOT_GITHUB_TOKEN",
+            "OPENROUTER_API_KEY",
+        ] {
+            assert!(
+                !rendered.iter().any(|arg| arg == foreign),
+                "a Codex jail must not receive {foreign}: {rendered:?}"
+            );
+        }
+
+        // An automatic harness is resolved after the re-exec, so it keeps
+        // forwarding what is set rather than guessing.
+        let automatic = legacy_jail_argv(
+            Path::new("/usr/local/bin/ai-memory"),
+            &[],
+            ALL,
+            None,
+            true,
+            &[],
+            &[],
+        );
+        let rendered: Vec<String> = automatic
+            .iter()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+        assert!(rendered.iter().any(|arg| arg == "ANTHROPIC_API_KEY"));
+    }
+
     #[test]
     fn jail_forwarded_names_come_from_the_captured_env_and_resolved_values() {
         let mut config = Config {
@@ -7435,6 +7671,7 @@ mod tests {
             project: Some("repo".into()),
             workstream: None,
             new_workstream: Some("initial".into()),
+            or_new: false,
             executable: None,
             yolo: true,
             true_yolo: true,
@@ -8418,12 +8655,15 @@ mod tests {
             cwd: "/tmp/project".into(),
             repo_fingerprint: "repo".into(),
             worktree_fingerprint: "worktree".into(),
+            legacy_repo_fingerprint: None,
+            legacy_worktree_fingerprint: None,
             agent: AgentKind::Codex,
             automatic_harness: false,
             available_agents: Vec::new(),
             workstream: None,
             new_workstream: None,
             force_unlock: false,
+            fresh: false,
             lease_owner: "workstation:43".into(),
             repository_identity: None,
         };
@@ -8618,6 +8858,199 @@ mod tests {
         );
     }
 
+    fn or_new_request(name: &str) -> PrepareManagedRunRequest {
+        PrepareManagedRunRequest {
+            workstream: Some(name.into()),
+            ..held_lease_request()
+        }
+    }
+
+    fn prepared_workstream(name: &str) -> PrepareManagedRunResponse {
+        PrepareManagedRunResponse {
+            resolved_project: None,
+            workstream_id: WorkstreamId::new(),
+            workstream_name: name.into(),
+            run_id: ManagedRunId::new(),
+            resolved_agent: Some(AgentKind::ClaudeCode),
+            native_session_id: None,
+            source_cursor: None,
+            previous_native_session: None,
+            sync_after: 0,
+            sync_through: 0,
+            may_adopt_existing_session: false,
+            manifest_warning: None,
+        }
+    }
+
+    async fn prepare_or_new(
+        endpoint: &ServerEndpoint,
+        name: &str,
+    ) -> (PrepareManagedRunResponse, bool) {
+        prepare_selected_run(
+            &ai_memory_core::i18n::Localizer::default(),
+            endpoint,
+            &or_new_request(name),
+            true,
+            false,
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn or_new_selects_an_existing_workstream_without_creating() {
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let handler_attempts = Arc::clone(&attempts);
+        let app = Router::new().route(
+            "/workstream/runs",
+            post(move |axum::Json(body): axum::Json<serde_json::Value>| {
+                handler_attempts.fetch_add(1, Ordering::SeqCst);
+                async move {
+                    assert!(
+                        body["new_workstream"].is_null(),
+                        "a resolvable name must never reach the create path"
+                    );
+                    axum::Json(prepared_workstream("401")).into_response()
+                }
+            }),
+        );
+        let (endpoint, server) = serve(app).await;
+        let (prepared, created) = prepare_or_new(&endpoint, "401").await;
+        assert_eq!(prepared.workstream_name, "401");
+        assert!(!created, "an existing workstream is selected, not created");
+        assert_eq!(
+            attempts.load(Ordering::SeqCst),
+            1,
+            "no second (create) attempt"
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn or_new_creates_a_missing_workstream() {
+        let app = Router::new().route(
+            "/workstream/runs",
+            post(
+                move |axum::Json(body): axum::Json<serde_json::Value>| async move {
+                    if body["new_workstream"].is_string() {
+                        axum::Json(prepared_workstream("401")).into_response()
+                    } else {
+                        (
+                            StatusCode::NOT_FOUND,
+                            axum::Json(serde_json::json!({
+                                "error": "managed workstream '401' not found"
+                            })),
+                        )
+                            .into_response()
+                    }
+                },
+            ),
+        );
+        let (endpoint, server) = serve(app).await;
+        let (prepared, created) = prepare_or_new(&endpoint, "401").await;
+        assert_eq!(prepared.workstream_name, "401");
+        assert!(created, "a missing name is created like --new");
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn or_new_falls_back_to_select_when_a_racing_create_wins() {
+        let selects = Arc::new(AtomicUsize::new(0));
+        let handler_selects = Arc::clone(&selects);
+        let app = Router::new().route(
+            "/workstream/runs",
+            post(move |axum::Json(body): axum::Json<serde_json::Value>| {
+                let selects = Arc::clone(&handler_selects);
+                async move {
+                    if body["new_workstream"].is_string() {
+                        // Another caller created the name between our miss and
+                        // our create, so the server refuses ours as a duplicate.
+                        return (
+                            StatusCode::CONFLICT,
+                            axum::Json(serde_json::json!({
+                                "error": "workstream '401' already exists; select it with --workstream"
+                            })),
+                        )
+                            .into_response();
+                    }
+                    if selects.fetch_add(1, Ordering::SeqCst) == 0 {
+                        (
+                            StatusCode::NOT_FOUND,
+                            axum::Json(serde_json::json!({
+                                "error": "managed workstream '401' not found"
+                            })),
+                        )
+                            .into_response()
+                    } else {
+                        axum::Json(prepared_workstream("401")).into_response()
+                    }
+                }
+            }),
+        );
+        let (endpoint, server) = serve(app).await;
+        let (prepared, created) = prepare_or_new(&endpoint, "401").await;
+        assert_eq!(prepared.workstream_name, "401");
+        assert!(
+            !created,
+            "the racing caller's workstream is selected, not reported as ours"
+        );
+        assert_eq!(
+            selects.load(Ordering::SeqCst),
+            2,
+            "miss, then re-select after the duplicate"
+        );
+        server.abort();
+    }
+
+    /// `--or-new` composes the two server calls purely from the status and body
+    /// of the error `prepare_managed_run` returns. These assert the detectors
+    /// match the exact strings `ai-memory-store` emits (workstream.rs) and
+    /// nothing else, so an unrelated 404/409 never turns into a create or a
+    /// re-select.
+    #[test]
+    fn missing_and_duplicate_workstream_detection_matches_store_messages() {
+        use crate::http_client::server_response_error_for_test;
+        let missing = server_response_error_for_test(
+            reqwest::Method::POST,
+            "/workstream/runs",
+            reqwest::StatusCode::NOT_FOUND,
+            serde_json::json!({ "error": "managed workstream '401' not found" }).to_string(),
+        );
+        assert!(is_missing_workstream(&missing));
+        assert!(!is_duplicate_workstream(&missing));
+
+        let duplicate = server_response_error_for_test(
+            reqwest::Method::POST,
+            "/workstream/runs",
+            reqwest::StatusCode::CONFLICT,
+            serde_json::json!({
+                "error": "workstream '401' already exists; select it with --workstream"
+            })
+            .to_string(),
+        );
+        assert!(is_duplicate_workstream(&duplicate));
+        assert!(!is_missing_workstream(&duplicate));
+
+        // A 404 for another reason is not a missing workstream.
+        let other_404 = server_response_error_for_test(
+            reqwest::Method::POST,
+            "/workstream/runs",
+            reqwest::StatusCode::NOT_FOUND,
+            serde_json::json!({ "error": "route not found" }).to_string(),
+        );
+        assert!(!is_missing_workstream(&other_404));
+        // The lease-busy 409 is handled by the retry layer, not by or-new.
+        let lease_busy = server_response_error_for_test(
+            reqwest::Method::POST,
+            "/workstream/runs",
+            reqwest::StatusCode::CONFLICT,
+            serde_json::json!({ "error": "workstream is already active: owned by x:1" })
+                .to_string(),
+        );
+        assert!(!is_duplicate_workstream(&lease_busy));
+    }
+
     #[test]
     fn held_lease_parses_the_store_busy_message() {
         let held = parse_held_lease(
@@ -8708,12 +9141,15 @@ mod tests {
             cwd: "/tmp/project".into(),
             repo_fingerprint: "repo".into(),
             worktree_fingerprint: "worktree".into(),
+            legacy_repo_fingerprint: None,
+            legacy_worktree_fingerprint: None,
             agent: AgentKind::ClaudeCode,
             automatic_harness: false,
             available_agents: Vec::new(),
             workstream: None,
             new_workstream: None,
             force_unlock: false,
+            fresh: false,
             lease_owner: "workstation:43".into(),
             repository_identity: None,
         }
@@ -9217,6 +9653,35 @@ mod tests {
         assert_eq!(
             managed_harness_from_agent(AgentKind::CopilotCli),
             Some(ManagedHarness::Copilot)
+        );
+    }
+
+    #[test]
+    fn gemini_aliases_select_the_managed_adapter() {
+        for name in ["gemini", "gemini-cli"] {
+            let cli = Cli::try_parse_from([
+                OsStr::new("ai-memory"),
+                OsStr::new("run"),
+                OsStr::new(name),
+                OsStr::new("--model"),
+                OsStr::new("gemini-2.5-pro"),
+            ])
+            .unwrap();
+            let CliCommand::Run(args) = cli.command else {
+                panic!("expected run command");
+            };
+            let choice = args.harness.expect("explicit harness");
+            assert_eq!(choice, crate::cli::RunHarnessChoice::Gemini, "{name}");
+            assert_eq!(managed_harness(choice), ManagedHarness::Gemini);
+            assert_eq!(run_harness_choice(ManagedHarness::Gemini), choice);
+            assert_eq!(
+                args.native_args,
+                ["--model", "gemini-2.5-pro"].map(OsString::from).to_vec()
+            );
+        }
+        assert_eq!(
+            managed_harness_from_agent(AgentKind::GeminiCli),
+            Some(ManagedHarness::Gemini)
         );
     }
 
@@ -9739,6 +10204,7 @@ mod tests {
             project: None,
             workstream: None,
             new_workstream: None,
+            or_new: false,
             executable: Some(PathBuf::from("definitely-not-a-harness")),
             yolo: false,
             true_yolo: false,
@@ -10091,6 +10557,7 @@ mod tests {
             project: Some("proj".into()),
             workstream: None,
             new_workstream: None,
+            or_new: false,
             executable: Some(script.clone()),
             yolo: false,
             true_yolo: false,
@@ -10202,6 +10669,7 @@ mod tests {
             project: Some("proj".into()),
             workstream: None,
             new_workstream: None,
+            or_new: false,
             executable: Some(script),
             yolo: false,
             true_yolo: false,
@@ -10792,6 +11260,7 @@ mod tests {
             project: Some("proj".into()),
             workstream: None,
             new_workstream: None,
+            or_new: false,
             executable: Some(script),
             yolo: false,
             true_yolo: false,
@@ -11674,6 +12143,7 @@ mod tests {
             project: Some("proj".into()),
             workstream: None,
             new_workstream: None,
+            or_new: false,
             executable: None,
             profile: None,
             yolo: false,
@@ -11809,6 +12279,7 @@ mod tests {
             project: Some("proj".into()),
             workstream: None,
             new_workstream: None,
+            or_new: false,
             executable: Some(script.clone()),
             yolo: false,
             true_yolo: false,
@@ -12205,6 +12676,101 @@ mod tests {
         server.abort();
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn managed_run_fresh_sends_fresh_flag_and_does_not_prefill_native_session() {
+        let requests = Arc::new(std::sync::Mutex::new(Vec::<PrepareManagedRunRequest>::new()));
+        let linked = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let app = Router::new()
+            .route(
+                "/workstream/runs",
+                post({
+                    let requests = requests.clone();
+                    move |axum::Json(request): axum::Json<PrepareManagedRunRequest>| {
+                        let requests = requests.clone();
+                        async move {
+                            let native_session_id =
+                                (!request.fresh).then(|| "prior-codex-thread".to_owned());
+                            requests.lock().unwrap().push(request);
+                            axum::Json(PrepareManagedRunResponse {
+                                resolved_project: None,
+                                workstream_id: WorkstreamId::new(),
+                                workstream_name: "default".into(),
+                                run_id: ManagedRunId::new(),
+                                resolved_agent: Some(AgentKind::Codex),
+                                native_session_id,
+                                source_cursor: None,
+                                previous_native_session: None,
+                                sync_after: 0,
+                                sync_through: 0,
+                                may_adopt_existing_session: false,
+                                manifest_warning: None,
+                            })
+                        }
+                    }
+                }),
+            )
+            .route(
+                "/workstream/runs/{run_id}/link",
+                post({
+                    let linked = linked.clone();
+                    move || {
+                        let linked = linked.clone();
+                        async move {
+                            linked.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                            StatusCode::NO_CONTENT
+                        }
+                    }
+                }),
+            )
+            .route(
+                "/workstream/runs/{run_id}/finish",
+                post(|| async {
+                    axum::Json(FinishManagedRunResponse {
+                        imported_events: 0,
+                        latest_sequence: 0,
+                    })
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let home = tempfile::tempdir().unwrap();
+        let data = tempfile::tempdir().unwrap();
+        let repo = tempfile::tempdir().unwrap();
+        let (script, _captured) = capture_env_script(repo.path(), "AI_MEMORY_RUN_ID");
+        let mut config = launch_config(home.path(), data.path(), address);
+        config.run_autowire = false;
+
+        let mut args = run_args(RunHarnessChoice::Codex, script.clone(), Vec::new(), &[]);
+        args.fresh = true;
+        args.no_autowire = true;
+        args.no_exit_prompt = true;
+        assert_eq!(run_from(&config, args, repo.path()).await.unwrap(), 0);
+
+        let mut trailing_args = run_args(RunHarnessChoice::Codex, script, Vec::new(), &["--fresh"]);
+        trailing_args.no_autowire = true;
+        trailing_args.no_exit_prompt = true;
+        assert_eq!(
+            run_from(&config, trailing_args, repo.path()).await.unwrap(),
+            0
+        );
+
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        assert!(requests[0].fresh, "--fresh flag sets request.fresh = true");
+        assert!(
+            requests[1].fresh,
+            "trailing --fresh sets request.fresh = true"
+        );
+        assert_eq!(
+            linked.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "--fresh must not pre-link a prior native session"
+        );
+        server.abort();
+    }
+
     fn launch_config(home: &Path, data: &Path, address: std::net::SocketAddr) -> Config {
         let mut config = Config::load(None, Some(home.to_path_buf())).unwrap();
         config.data_dir = data.to_path_buf();
@@ -12227,6 +12793,7 @@ mod tests {
             project: Some("proj".into()),
             workstream: None,
             new_workstream: None,
+            or_new: false,
             executable: Some(executable),
             yolo: false,
             true_yolo: false,

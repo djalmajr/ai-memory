@@ -50,6 +50,8 @@ Split by durability:
 | `logs/` | No. | Tracing output; nothing durable. |
 | `models/` | No. | Local embedder weights, sha256-pinned, redownloaded on first boot per [`local-embeddings.md`](local-embeddings.md). |
 | `.serve.lock` | No. | Server pidfile. |
+| `auth-tokens/`, `auth-token`, `auth-header` | **No — never.** | Plaintext bearer tokens and the hook `Authorization` header (mode `0600`). They grant full access to the server; a mirror push would leak them. The shipped `.gitignore` and `ai-memory-snapshot.sh` exclude them. |
+| `hook-spool/` | No. | Pre-delivery hook spool: transient, drained after delivery, and may hold un-sanitized payload text. Durable memory lives in `wiki/` and `raw/`. |
 | `config.toml` and env files under `~/.config/ai-memory/` | Yes, minus secrets. | Provider config is useful for reproducing an install; API-key env files (`*.env`), OAuth tokens (`auth.json`), and private CA bundles must never land in a mirror. |
 
 If you also need the SQLite index for near-instant recovery (rather than
@@ -178,17 +180,23 @@ cadence):
    listed in `SECRET_EXCLUDES` (`*.env`, `auth.json`, `.secrets`, `*.pem`, `*.key`, `*.crt` by default).
 2. `rsync -a --delete` the config dir under the same exclude rules so
    `config.toml` is captured but env files, OAuth tokens, and private CA
-   bundles are not.
+   bundles are not. A native install may keep its config under `DATA_SRC`.
+   If the default `~/.config/ai-memory/` is absent, skip the separate copy
+   and retain any previously mirrored `config/` files. A directory named
+   explicitly by `CFG_SRC` must exist.
 3. `git add -A && git commit -m "auto: snapshot $(date +%F)"` if anything
    changed; skip if there is no delta.
-4. `git push origin main` with a timeout so a hung network does not block the
-   next run.
+4. `git push origin main` with a timeout. Each run attempts the push so a
+   previously unpushed commit can reach the mirror even if nothing changed.
 5. Run `ai-memory backup --to
    $TARBALL_DIR/ai-memory-$(date +%F).tar.gz` so SQLite is copied through its
    online backup API rather than racing the live WAL. Models are not included;
    redownload them after recovery.
 6. Rotate old tarballs and old script logs on a retention window (30 days by
    default).
+
+A failed mirror push still allows the online backup and rotation to run.
+The script returns a nonzero status so the scheduler can report the failure.
 
 See the example directory's [README](examples/backup/README.md) for the
 install-and-enable steps and non-systemd equivalents (macOS launchd, Windows
@@ -199,9 +207,8 @@ Task Scheduler via WSL, Docker sidecar).
 The mirror repository is a copy of the data dir minus derived state.
 Recovering the full ai-memory install from it is two steps:
 
-1. Clone the mirror onto the target host, then rsync the `data/` and
-   `config/` subtrees into place under the ai-memory data dir and config dir
-   respectively.
+1. Clone the mirror onto the target host. Rsync `data/` to the ai-memory data
+   dir, and copy `config/` to the config dir if the mirror has that subtree.
 2. Rebuild the SQLite index from the recovered markdown:
    [`lifecycle-ops.md#reindex`](lifecycle-ops.md#reindex) walks through this.
    Sessions, observations, handoffs, users/tokens, audit rows, and

@@ -208,6 +208,14 @@ impl OpenAiCompatProvider {
         self
     }
 
+    /// Read the API key from `path` (`llm_api_key_file`) instead of the key
+    /// given to [`Self::new`].
+    #[must_use]
+    pub(crate) fn with_api_key_file(mut self, path: impl Into<std::path::PathBuf>) -> Self {
+        self.inner = self.inner.with_api_key_file(path);
+        self
+    }
+
     /// Forward operator-configured headers to the inner client. Aggregators
     /// and gateways behind an OpenAI-compatible endpoint are the common case
     /// for caller-identifying headers.
@@ -241,6 +249,19 @@ impl OpenAiCompatProvider {
     #[must_use]
     pub(crate) fn with_request_id_header(mut self) -> Self {
         self.inner = self.inner.with_request_id_header();
+        self
+    }
+
+    /// Send the `x-ai-memory-*` request metadata headers (workload, and the
+    /// workspace, project and user the operation names) on every chat
+    /// attempt, next to `X-Request-Id` and from the same operation id, so
+    /// the strict-to-tolerant fallback repeats them. The factory calls this
+    /// with `ProviderConfig::request_metadata_headers` for the configured
+    /// `openai-compat` provider only; [`crate::OpenCodeProvider`] never
+    /// does.
+    #[must_use]
+    pub(crate) fn with_request_metadata_headers(mut self, enabled: bool) -> Self {
+        self.inner = self.inner.with_request_metadata_headers(enabled);
         self
     }
     /// Endpoint the inner client will call. Test-visible so
@@ -337,7 +358,7 @@ impl OpenAiCompatProvider {
                 .complete_structured_raw_with_operation_id(
                     request.clone(),
                     strict_schema,
-                    operation_id,
+                    operation_id.clone(),
                 )
                 .await;
             match strict_result {
@@ -466,8 +487,33 @@ fn is_response_format_rejection(err: &LlmError) -> bool {
 /// either truncates the object early or never closes it. This
 /// version tracks whether we're inside a `"..."` literal and
 /// honours backslash escapes the JSON spec defines.
+///
+/// A balanced span that does not parse as a JSON object is braced prose (a
+/// `{title}` placeholder before the answer), so the search moves past it to
+/// the next one. When none parses, the first balanced span is returned as
+/// before, so a malformed answer still surfaces its own parse error.
 pub(crate) fn first_json_object(s: &str) -> Option<&str> {
     let start = s.find('{')?;
+    let first = &s[start..=balanced_end(s, start)?];
+    let mut span = first;
+    let mut end = start + first.len();
+    loop {
+        if serde_json::from_str::<serde_json::Value>(span).is_ok_and(|v| v.is_object()) {
+            return Some(span);
+        }
+        let Some(next) = s[end..].find('{').map(|i| end + i) else {
+            return Some(first);
+        };
+        let Some(close) = balanced_end(s, next) else {
+            return Some(first);
+        };
+        span = &s[next..=close];
+        end = close + 1;
+    }
+}
+
+/// Byte index of the `}` closing the `{` at `start`, string-aware.
+fn balanced_end(s: &str, start: usize) -> Option<usize> {
     let mut depth = 0_i32;
     let mut in_string = false;
     let mut escape = false;
@@ -489,7 +535,7 @@ pub(crate) fn first_json_object(s: &str) -> Option<&str> {
             b'}' => {
                 depth -= 1;
                 if depth == 0 {
-                    return Some(&s[start..=start + i]);
+                    return Some(start + i);
                 }
             }
             _ => {}
@@ -554,7 +600,7 @@ mod tests {
             .with_request_id_header();
         let operation_id = LlmOperationId::new();
         provider
-            .complete_with_operation_id(ChatRequest::user_prompt("hi"), operation_id)
+            .complete_with_operation_id(ChatRequest::user_prompt("hi"), operation_id.clone())
             .await
             .expect("completion succeeds");
 
@@ -619,7 +665,7 @@ mod tests {
             .complete_structured_raw_with_operation_id(
                 ChatRequest::user_prompt("emit JSON"),
                 schema.clone(),
-                operation_id,
+                operation_id.clone(),
             )
             .await
             .expect("the tolerant fallback parses the JSON");
@@ -718,7 +764,7 @@ mod tests {
             .with_base_url(server.uri());
         let operation_id = LlmOperationId::new();
         provider
-            .complete_with_operation_id(ChatRequest::user_prompt("hi"), operation_id)
+            .complete_with_operation_id(ChatRequest::user_prompt("hi"), operation_id.clone())
             .await
             .expect("completion succeeds");
 
@@ -739,6 +785,236 @@ mod tests {
                 .is_none(),
             "opencode must not gain the openai-compat x-request-id header"
         );
+    }
+
+    fn header_values(request: &wiremock::Request, name: &str) -> Vec<String> {
+        request
+            .headers
+            .get_all(name)
+            .into_iter()
+            .filter_map(|value| value.to_str().ok())
+            .map(str::to_owned)
+            .collect()
+    }
+
+    async fn ok_server() -> MockServer {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(chat_response_with_content("ok")),
+            )
+            .mount(&server)
+            .await;
+        server
+    }
+
+    fn metadata_provider(server: &MockServer, enabled: bool) -> OpenAiCompatProvider {
+        OpenAiCompatProvider::new(server.uri(), None, "model-x")
+            .expect("provider builds")
+            .with_request_id_header()
+            .with_request_metadata_headers(enabled)
+    }
+
+    /// Every workload label reaches the gateway as `x-ai-memory-workload`,
+    /// together with the scope and user the call site named.
+    #[tokio::test]
+    async fn the_metadata_headers_carry_the_workload_and_subject() {
+        for workload in [
+            crate::LlmWorkload::Consolidation,
+            crate::LlmWorkload::Profile,
+            crate::LlmWorkload::Dream,
+            crate::LlmWorkload::Lint,
+            crate::LlmWorkload::Unspecified,
+        ] {
+            let server = ok_server().await;
+            let operation_id =
+                LlmOperationId::for_workload(workload).with_subject(crate::LlmSubject {
+                    workspace: Some("acme".into()),
+                    project: Some("billing-api".into()),
+                    user: Some("alice".into()),
+                });
+            metadata_provider(&server, true)
+                .complete_with_operation_id(ChatRequest::user_prompt("hi"), operation_id)
+                .await
+                .expect("completion succeeds");
+
+            let requests = server.received_requests().await.expect("requests");
+            assert_eq!(requests.len(), 1);
+            for (name, expected) in [
+                (crate::openai::WORKLOAD_HEADER, workload.as_str()),
+                (crate::openai::WORKSPACE_HEADER, "acme"),
+                (crate::openai::PROJECT_HEADER, "billing-api"),
+                (crate::openai::USER_HEADER, "alice"),
+            ] {
+                assert_eq!(header_values(&requests[0], name), vec![expected], "{name}");
+            }
+        }
+    }
+
+    /// Off by default: a configured gateway sees no new header.
+    #[tokio::test]
+    async fn the_metadata_headers_stay_off_unless_enabled() {
+        let server = ok_server().await;
+        let operation_id = LlmOperationId::for_workload(crate::LlmWorkload::Dream).with_subject(
+            crate::LlmSubject {
+                workspace: Some("acme".into()),
+                project: Some("billing-api".into()),
+                user: Some("alice".into()),
+            },
+        );
+        metadata_provider(&server, false)
+            .complete_with_operation_id(ChatRequest::user_prompt("hi"), operation_id)
+            .await
+            .expect("completion succeeds");
+
+        let requests = server.received_requests().await.expect("requests");
+        assert!(request_id_of(&requests[0]).is_some());
+        for name in crate::openai::REQUEST_METADATA_HEADERS {
+            assert!(header_values(&requests[0], name).is_empty(), "{name}");
+        }
+    }
+
+    /// An operation without a single scope or user sends only what it
+    /// knows: never a guessed value, and never an empty header. A value
+    /// that cannot be a header (a control character) is left out too.
+    #[tokio::test]
+    async fn the_metadata_headers_omit_what_the_operation_does_not_know() {
+        let server = ok_server().await;
+        let operation_id = LlmOperationId::for_workload(crate::LlmWorkload::Profile).with_subject(
+            crate::LlmSubject {
+                workspace: Some("acme".into()),
+                project: Some("billing\napi".into()),
+                user: None,
+            },
+        );
+        metadata_provider(&server, true)
+            .complete_with_operation_id(ChatRequest::user_prompt("hi"), operation_id)
+            .await
+            .expect("completion succeeds");
+        metadata_provider(&server, true)
+            .complete_with_operation_id(
+                ChatRequest::user_prompt("hi"),
+                LlmOperationId::for_workload(crate::LlmWorkload::QueryAnswer),
+            )
+            .await
+            .expect("completion succeeds");
+        metadata_provider(&server, true)
+            .complete(ChatRequest::user_prompt("hi"))
+            .await
+            .expect("completion succeeds");
+
+        let requests = server.received_requests().await.expect("requests");
+        assert_eq!(requests.len(), 3);
+        assert_eq!(
+            header_values(&requests[0], crate::openai::WORKLOAD_HEADER),
+            vec!["profile"]
+        );
+        assert_eq!(
+            header_values(&requests[0], crate::openai::WORKSPACE_HEADER),
+            vec!["acme"]
+        );
+        assert!(header_values(&requests[0], crate::openai::PROJECT_HEADER).is_empty());
+        assert!(header_values(&requests[0], crate::openai::USER_HEADER).is_empty());
+        assert_eq!(
+            header_values(&requests[1], crate::openai::WORKLOAD_HEADER),
+            vec!["query-answer"]
+        );
+        assert_eq!(
+            header_values(&requests[2], crate::openai::WORKLOAD_HEADER),
+            vec!["unspecified"]
+        );
+        for request in &requests[1..] {
+            for name in [
+                crate::openai::WORKSPACE_HEADER,
+                crate::openai::PROJECT_HEADER,
+                crate::openai::USER_HEADER,
+            ] {
+                assert!(header_values(request, name).is_empty(), "{name}");
+            }
+        }
+    }
+
+    /// The strict-to-tolerant fallback is a second attempt of the same
+    /// operation: it repeats every metadata header, once per name.
+    #[tokio::test]
+    async fn the_strict_fallback_repeats_the_metadata_headers_once() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(|request: &wiremock::Request| {
+                let body: serde_json::Value =
+                    serde_json::from_slice(&request.body).expect("request body is JSON");
+                if body.get("response_format").is_some() {
+                    ResponseTemplate::new(400)
+                        .set_body_string("unsupported parameter: response_format")
+                } else {
+                    ResponseTemplate::new(200)
+                        .set_body_json(chat_response_with_content(r#"{"ok":true}"#))
+                }
+            })
+            .mount(&server)
+            .await;
+
+        let provider = metadata_provider(&server, true).with_strict(true);
+        let operation_id = LlmOperationId::for_workload(crate::LlmWorkload::Consolidation)
+            .with_subject(crate::LlmSubject {
+                workspace: Some("acme".into()),
+                project: Some("billing-api".into()),
+                user: Some("alice".into()),
+            });
+        provider
+            .complete_structured_raw_with_operation_id(
+                ChatRequest::user_prompt("emit JSON"),
+                json!({
+                    "type": "object",
+                    "properties": { "ok": { "type": "boolean" } },
+                    "required": ["ok"],
+                }),
+                operation_id,
+            )
+            .await
+            .expect("the tolerant fallback parses the JSON");
+
+        let requests = server.received_requests().await.expect("requests");
+        assert_eq!(requests.len(), 2, "strict attempt + tolerant fallback");
+        for request in &requests {
+            for (name, expected) in [
+                (crate::openai::WORKLOAD_HEADER, "consolidation"),
+                (crate::openai::WORKSPACE_HEADER, "acme"),
+                (crate::openai::PROJECT_HEADER, "billing-api"),
+                (crate::openai::USER_HEADER, "alice"),
+            ] {
+                assert_eq!(header_values(request, name), vec![expected], "{name}");
+            }
+        }
+    }
+
+    /// `opencode` routes through this wrapper but never opts in: its
+    /// requests carry no `x-ai-memory-*` metadata.
+    #[tokio::test]
+    async fn the_opencode_transport_never_sends_the_metadata_headers() {
+        let server = ok_server().await;
+        let provider = crate::OpenCodeProvider::new(SecretString::from("sk-test"), "model-x")
+            .expect("provider builds")
+            .with_base_url(server.uri());
+        let operation_id = LlmOperationId::for_workload(crate::LlmWorkload::Dream).with_subject(
+            crate::LlmSubject {
+                workspace: Some("acme".into()),
+                project: Some("billing-api".into()),
+                user: Some("alice".into()),
+            },
+        );
+        provider
+            .complete_with_operation_id(ChatRequest::user_prompt("hi"), operation_id)
+            .await
+            .expect("completion succeeds");
+
+        let requests = server.received_requests().await.expect("requests");
+        assert_eq!(requests.len(), 1);
+        for name in crate::openai::REQUEST_METADATA_HEADERS {
+            assert!(header_values(&requests[0], name).is_empty(), "{name}");
+        }
     }
 
     /// The low-level constructor stays tolerant so wrappers can choose their
@@ -858,6 +1134,19 @@ mod tests {
             Some("{\"a\":{\"b\":2}}"),
         );
         assert_eq!(first_json_object("no json here"), None);
+    }
+
+    /// Prose before the answer can carry its own braces (a `{title}`
+    /// placeholder, a `{…}` aside). Those are balanced but not JSON, so the
+    /// answer object after them must still be found.
+    #[test]
+    fn first_json_object_skips_braced_prose_before_the_answer() {
+        assert_eq!(
+            first_json_object("Fill the {title} field.\n{\"findings\":[]}"),
+            Some("{\"findings\":[]}"),
+        );
+        // A truncated answer still finds nothing rather than an inner object.
+        assert_eq!(first_json_object("{\"findings\":[{\"k\":1}"), None);
     }
 
     // ── strip_reasoning_blocks ───────────────────────────────────────────
