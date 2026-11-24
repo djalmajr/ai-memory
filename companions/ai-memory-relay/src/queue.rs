@@ -554,6 +554,15 @@ impl Queue {
                   WHERE ingest_key = ?1",
                 params![key, now_ms],
             )?;
+            // An unsent event may have been queued longer than the retry
+            // window. Its agent pin must survive the attempt and receipt too.
+            tx.execute(
+                "UPDATE session_agent SET last_seen_ms = MAX(last_seen_ms, ?2)
+                   WHERE (session_id, agent) IN (
+                       SELECT session_id, agent FROM pending WHERE ingest_key = ?1
+                   )",
+                params![key, now_ms],
+            )?;
         }
         tx.commit()?;
         Ok(())
@@ -757,7 +766,8 @@ fn configure(
             }
             conn.execute_batch(
                 "PRAGMA journal_mode=WAL;\nPRAGMA synchronous=FULL;\nPRAGMA foreign_keys=ON;",
-            )?;
+            )
+            .map_err(queue_sqlite_error)?;
             Ok(())
         })();
         match attempt {
@@ -792,6 +802,12 @@ pub(crate) fn is_lock_contention(error: &anyhow::Error) -> bool {
         if matches!(error.code, rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked))
 }
 
+fn queue_sqlite_error(error: rusqlite::Error) -> anyhow::Error {
+    // Keep the typed error for lock retries. Its display already includes
+    // SQLite's message, which the lower-level source may repeat.
+    anyhow::Error::msg(error)
+}
+
 /// Classify an existing file before touching it. Never mutates.
 fn classify(conn: &Connection, path: &Path) -> Result<DbState> {
     let refuse = |detail: String| -> anyhow::Error {
@@ -811,7 +827,7 @@ fn classify(conn: &Connection, path: &Path) -> Result<DbState> {
     );
     // A file that is not a SQLite database fails right here, before any write.
     let objects = objects.map_err(|e| {
-        let error = anyhow::Error::new(e);
+        let error = queue_sqlite_error(e);
         if is_lock_contention(&error) {
             error
         } else {
@@ -829,7 +845,7 @@ fn classify(conn: &Connection, path: &Path) -> Result<DbState> {
     })();
     let meta: HashMap<String, String> = rows
         .map_err(|e| {
-            let error = anyhow::Error::new(e);
+            let error = queue_sqlite_error(e);
             if is_lock_contention(&error) {
                 error
             } else {

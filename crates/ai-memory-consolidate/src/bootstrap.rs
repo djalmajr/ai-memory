@@ -35,7 +35,7 @@ use std::time::Duration;
 
 use ai_memory_core::{PagePath, ProjectId, Tier, WorkspaceId};
 use ai_memory_llm::{
-    ChatMessage, ChatRequest, LlmError, LlmOperationId, LlmProvider, LlmWorkload, Role,
+    ChatMessage, ChatRequest, LlmError, LlmOperationId, LlmProvider, LlmSubject, LlmWorkload, Role,
     complete_structured_with_operation_id,
 };
 use ai_memory_store::ReaderPool;
@@ -65,7 +65,7 @@ const CHARS_PER_TOKEN: usize = 4;
 const ESTIMATE_BUDGET_PERCENT: usize = 80;
 
 /// `budget` shrunk by [`ESTIMATE_BUDGET_PERCENT`].
-const fn with_estimate_margin(budget: usize) -> usize {
+pub(crate) const fn with_estimate_margin(budget: usize) -> usize {
     budget.saturating_mul(ESTIMATE_BUDGET_PERCENT) / 100
 }
 
@@ -269,6 +269,8 @@ pub struct BootstrapOutcome {
 /// to concrete values.
 #[derive(Debug, Clone)]
 pub struct BootstrapConfig {
+    /// Natural language for generated prose; `None` follows the input (#2185).
+    pub output_language: Option<String>,
     /// Project repo root on the client's filesystem. Used by
     /// [`Bootstrap::run`]'s client-side [`collect_sources`] call.
     /// Ignored by [`Bootstrap::process_sources`] — sources arrive
@@ -351,15 +353,16 @@ fn chunk_retry_wait(err: &LlmError, fallback: Duration) -> Duration {
 async fn complete_chunk_with_retry(
     llm: &(dyn LlmProvider + 'static),
     request: ChatRequest,
+    subject: LlmSubject,
     retry_delay: Duration,
 ) -> Result<BootstrapBatch, LlmError> {
     let mut attempt = 1;
-    let operation_id = LlmOperationId::for_workload(LlmWorkload::Bootstrap);
+    let operation_id = LlmOperationId::for_workload(LlmWorkload::Bootstrap).with_subject(subject);
     loop {
         match complete_structured_with_operation_id::<BootstrapBatch>(
             llm,
             request.clone(),
-            operation_id,
+            operation_id.clone(),
         )
         .await
         {
@@ -547,6 +550,8 @@ impl Bootstrap {
             }
         }
 
+        let subject =
+            crate::llm_subject::scope(&self.reader, cfg.workspace_id, Some(cfg.project_id)).await;
         for (idx, chunk) in chunks.iter().enumerate() {
             if completed.contains(&idx) {
                 debug!(
@@ -558,8 +563,12 @@ impl Bootstrap {
             let mut prior: Vec<String> = pages_by_path.keys().cloned().collect();
             prior.sort_unstable();
             let prior_refs: Vec<&str> = prior.iter().map(String::as_str).collect();
-            let request =
+            let mut request =
                 build_chunk_request(chunk, idx + 1, llm_chunks, chunk_budget, &prior_refs);
+            request.system = Some(crate::with_output_language(
+                SYSTEM_PROMPT,
+                cfg.output_language.as_deref(),
+            ));
             info!(
                 chunk = idx + 1,
                 total = llm_chunks,
@@ -570,8 +579,13 @@ impl Bootstrap {
                     .sum::<usize>(),
                 "bootstrap LLM chunk",
             );
-            let batch: BootstrapBatch =
-                complete_chunk_with_retry(&*self.llm, request, BOOTSTRAP_CHUNK_RETRY_DELAY).await?;
+            let batch: BootstrapBatch = complete_chunk_with_retry(
+                &*self.llm,
+                request,
+                subject.clone(),
+                BOOTSTRAP_CHUNK_RETRY_DELAY,
+            )
+            .await?;
 
             let pages_json = serde_json::to_string(&batch.pages).unwrap_or_else(|_| "[]".into());
             self.writer
@@ -631,6 +645,7 @@ impl Bootstrap {
                 author_id: None,
                 actor: ai_memory_core::ActorContext::anonymous(),
                 evidence: Vec::new(),
+                trust_class: None,
             });
         }
         // Plus the manifest itself.
@@ -662,6 +677,7 @@ impl Bootstrap {
             author_id: None,
             actor: ai_memory_core::ActorContext::anonymous(),
             evidence: Vec::new(),
+            trust_class: None,
         });
 
         // #1218: de-link any cross-scope wikilink the model invented before
@@ -1724,6 +1740,18 @@ fn render_manifest_body(input: ManifestRender<'_>) -> String {
 mod tests {
     use super::*;
 
+    #[test]
+    fn output_language_override_extends_system_prompt_only_when_set() {
+        assert_eq!(
+            crate::with_output_language(SYSTEM_PROMPT, None),
+            SYSTEM_PROMPT
+        );
+        let out = crate::with_output_language(SYSTEM_PROMPT, Some("English"));
+        assert!(out.starts_with(SYSTEM_PROMPT));
+        assert!(out.contains("OPERATOR OVERRIDE"));
+        assert!(out.contains("in English"));
+    }
+
     fn rules_labels(repo: &Path) -> Vec<String> {
         collect_project_rules(repo)
             .unwrap()
@@ -1844,9 +1872,10 @@ mod tests {
             permanent: false,
             retry_after: None,
         };
-        let batch = complete_chunk_with_retry(&llm, chunk_request(), Duration::ZERO)
-            .await
-            .expect("a transient failure that clears within the attempt budget must succeed");
+        let batch =
+            complete_chunk_with_retry(&llm, chunk_request(), LlmSubject::default(), Duration::ZERO)
+                .await
+                .expect("a transient failure that clears within the attempt budget must succeed");
         assert!(batch.pages.is_empty());
         assert_eq!(
             llm.calls.load(Ordering::SeqCst),
@@ -1868,9 +1897,10 @@ mod tests {
             permanent: false,
             retry_after: None,
         };
-        let err = complete_chunk_with_retry(&llm, chunk_request(), Duration::ZERO)
-            .await
-            .expect_err("a persistently transient failure must eventually give up");
+        let err =
+            complete_chunk_with_retry(&llm, chunk_request(), LlmSubject::default(), Duration::ZERO)
+                .await
+                .expect_err("a persistently transient failure must eventually give up");
         assert!(err.is_transient());
         assert_eq!(
             llm.calls.load(Ordering::SeqCst),
@@ -1888,9 +1918,10 @@ mod tests {
             permanent: true, // returns Auth — not transient
             retry_after: None,
         };
-        let err = complete_chunk_with_retry(&llm, chunk_request(), Duration::ZERO)
-            .await
-            .expect_err("an auth error must not be retried");
+        let err =
+            complete_chunk_with_retry(&llm, chunk_request(), LlmSubject::default(), Duration::ZERO)
+                .await
+                .expect_err("an auth error must not be retried");
         assert!(!err.is_transient());
         assert_eq!(
             llm.calls.load(Ordering::SeqCst),
@@ -1934,7 +1965,7 @@ mod tests {
             retry_after: Some(Duration::from_secs(1)),
         };
         let started = std::time::Instant::now();
-        complete_chunk_with_retry(&llm, chunk_request(), Duration::ZERO)
+        complete_chunk_with_retry(&llm, chunk_request(), LlmSubject::default(), Duration::ZERO)
             .await
             .expect("the retry after the hinted wait succeeds");
         assert_eq!(llm.calls.load(Ordering::SeqCst), 2);
@@ -2707,6 +2738,7 @@ mod tests {
             dry_run: false,
             force: false,
             resume,
+            output_language: None,
         }
     }
 
@@ -3010,6 +3042,7 @@ mod tests {
                 author_id: None,
                 actor: ai_memory_core::ActorContext::anonymous(),
                 evidence: Vec::new(),
+                trust_class: None,
             })
             .await
             .unwrap();

@@ -131,8 +131,7 @@ pub fn prepare_fts5_query(raw: &str, stopwords: &FtsStopwords) -> String {
         || raw
             .split_whitespace()
             .any(|t| matches!(t, "OR" | "AND" | "NOT" | "NEAR"));
-    let tokens: Vec<String> = raw
-        .split_whitespace()
+    let tokens: Vec<String> = fts5_query_tokens(raw)
         // Bare natural-language queries drop stopwords before the
         // OR-join: with no tokenizer-level stopword list, "the/of/a"
         // match nearly every page and BM25 term frequency lets a page
@@ -207,12 +206,32 @@ pub fn prepare_fts5_query(raw: &str, stopwords: &FtsStopwords) -> String {
         .join(" OR ")
 }
 
-/// Terms stored in the auxiliary CJK index.
+fn fts5_query_tokens(raw: &str) -> impl Iterator<Item = &str> {
+    let mut quoted = false;
+    let mut quotes_left = raw.bytes().filter(|byte| *byte == b'"').count();
+    raw.split(move |ch: char| {
+        if ch == '"' {
+            // Leave an unclosed quote to the existing invalid-query fallback.
+            // Doubled FTS5 quote escapes toggle twice, keeping the phrase open.
+            if quoted || quotes_left > 1 {
+                quoted = !quoted;
+            }
+            quotes_left -= 1;
+        }
+        ch.is_whitespace() && !quoted
+    })
+    .filter(|token| !token.is_empty())
+}
+
+/// Terms stored in the auxiliary CJK/Arabic index.
 ///
 /// Each maximal Han/Kana/Hangul run contributes its scalar values and its
-/// overlapping bigrams. Splitting only those runs keeps punctuation and Latin
-/// text out of the derived index, while the bigrams retain enough adjacency
-/// to avoid the very broad matches a character-only index would produce.
+/// overlapping bigrams. Each maximal Arabic-script or Arabic-Indic numeral run
+/// contributes its normalized form (tashkeel/tatweel/BiDi stripped, letter
+/// variants folded, Arabic-Indic digits mapped to ASCII). Splitting on
+/// punctuation and keeping only CJK/Arabic runs keeps Latin text out of the
+/// derived index, while the bigrams retain enough adjacency to avoid the very
+/// broad matches a character-only index would produce.
 #[must_use]
 pub(crate) fn cjk_index_terms(raw: &str) -> String {
     let mut terms = Vec::new();
@@ -225,14 +244,19 @@ pub(crate) fn cjk_index_terms(raw: &str) -> String {
         }
     }
     append_cjk_terms(&mut terms, &mut run);
+    append_arabic_terms(raw, &mut terms, None);
     terms.join(" ")
 }
 
-/// A MATCH expression for the CJK portion of a bounded user query.
+/// A MATCH expression for the CJK/Arabic portion of a bounded user query.
 ///
 /// `None` is the important common case: callers then execute the existing SQL
-/// byte-for-byte. A multi-scalar run becomes an exact phrase of overlapping
-/// bigrams; a single scalar uses the unigram fallback.
+/// byte-for-byte. A multi-scalar CJK run becomes an exact phrase of overlapping
+/// bigrams; a single scalar uses the unigram fallback. Arabic-script and
+/// Arabic-Indic numeral runs become normalized terms; ASCII digit runs are also
+/// carried alongside an Arabic query so cross-script numeral queries (such as
+/// `"ادارة 2026"` against `"٢٠٢٦"`) hit the normalized index without adding
+/// sidecar queries on Latin-only searches.
 ///
 /// `None` also covers a query carrying `AND` / `NOT` / `NEAR`. This stream is
 /// auxiliary: callers UNION it into the primary stream, so a run-based
@@ -242,6 +266,8 @@ pub(crate) fn cjk_index_terms(raw: &str) -> String {
 /// rebuilding the expression is the real fix; declining the stream meanwhile
 /// restores the pre-#1433 answer instead of an inverted one. `OR` stays,
 /// because the expander reproduces it faithfully.
+/// Quoted queries also stay on the primary stream: extracting each CJK run
+/// independently would discard the phrase's order and adjacency constraints.
 ///
 /// A leading `title:` / `body:` qualifier is carried onto the run's phrase.
 /// This stream is auxiliary — callers UNION it into the primary stream — so a
@@ -252,13 +278,17 @@ pub(crate) fn cjk_index_terms(raw: &str) -> String {
 #[must_use]
 pub(crate) fn prepare_cjk_fts5_query(raw: &str) -> Option<String> {
     let bounded = bounded_query_text(raw);
-    if bounded
-        .split_whitespace()
-        .any(|t| matches!(t, "AND" | "NOT" | "NEAR"))
+    if bounded.contains('"')
+        || bounded
+            .split_whitespace()
+            .any(|t| matches!(t, "AND" | "NOT" | "NEAR"))
     {
         return None;
     }
     let mut phrases = Vec::new();
+    let mut arabic_terms = Vec::new();
+    let mut ascii_digit_phrases = Vec::new();
+    let mut has_arabic_query = false;
     for token in bounded.split_whitespace() {
         // Grouping must not turn `(title:term)` into an unqualified match.
         // Like prepare_fts5_token, peel opening parentheses before the column:
@@ -277,8 +307,122 @@ pub(crate) fn prepare_cjk_fts5_query(raw: &str) -> Option<String> {
             }
         }
         append_cjk_query(&mut phrases, &mut run, column);
+
+        let prefix = column.map_or_else(String::new, |c| format!("{c}:"));
+        let mut ascii_digits = Vec::new();
+        append_arabic_terms(text, &mut arabic_terms, Some(&mut ascii_digits));
+        if !arabic_terms.is_empty() {
+            has_arabic_query = true;
+            for norm in arabic_terms.drain(..) {
+                phrases.push(format!("{prefix}\"{norm}\""));
+            }
+        }
+        for digits in ascii_digits {
+            ascii_digit_phrases.push(format!("{prefix}\"{digits}\""));
+        }
+    }
+    if has_arabic_query {
+        phrases.extend(ascii_digit_phrases);
     }
     (!phrases.is_empty()).then(|| phrases.join(" OR "))
+}
+
+fn is_arabic_block(ch: char) -> bool {
+    matches!(
+        ch as u32,
+        0x0600..=0x06FF
+            | 0x0750..=0x077F
+            | 0x08A0..=0x08FF
+            | 0xFB50..=0xFDFF
+            | 0xFE70..=0xFEFF
+    )
+}
+
+fn is_arabic_ignorable(ch: char) -> bool {
+    matches!(
+        ch,
+        // Arabic Tashkeel (harakat), Tatweel (kashida), and BiDi controls
+        '\u{064B}'..='\u{065F}'
+            | '\u{0670}'
+            | '\u{06D6}'..='\u{06ED}'
+            | '\u{0640}'
+            | '\u{061C}'
+            | '\u{200E}'..='\u{200F}'
+            | '\u{202A}'..='\u{202E}'
+            | '\u{2066}'..='\u{2069}'
+    )
+}
+
+fn is_arabic_or_indic_digit(ch: char) -> bool {
+    ch != '\u{0640}' && ch.is_alphanumeric() && is_arabic_block(ch)
+}
+
+fn is_arabic_run_char(ch: char) -> bool {
+    is_arabic_ignorable(ch) || (ch.is_alphanumeric() && !is_cjk(ch))
+}
+
+fn normalize_arabic_char(ch: char) -> Option<char> {
+    if is_arabic_ignorable(ch) {
+        return None;
+    }
+    match ch {
+        // Normalize Alef variants to bare Alef
+        'أ' | 'إ' | 'آ' | 'ٱ' => Some('ا'),
+        // Normalize Alef Maksura to Yeh, Teh Marbuta to Heh, Hamza carriers
+        'ى' | 'ئ' => Some('ي'),
+        'ة' => Some('ه'),
+        'ؤ' => Some('و'),
+        // Convert Eastern Arabic-Indic (٠-٩) and Extended Arabic-Indic (۰-۹) digits to ASCII
+        '\u{0660}'..='\u{0669}' => {
+            let d = (ch as u32) - 0x0660;
+            Some(char::from_u32(u32::from(b'0') + d).unwrap_or(ch))
+        }
+        '\u{06F0}'..='\u{06F9}' => {
+            let d = (ch as u32) - 0x06F0;
+            Some(char::from_u32(u32::from(b'0') + d).unwrap_or(ch))
+        }
+        c if c.is_alphanumeric() => Some(c),
+        _ => None,
+    }
+}
+
+fn append_arabic_terms(
+    text: &str,
+    terms: &mut Vec<String>,
+    mut ascii_digits: Option<&mut Vec<String>>,
+) {
+    let mut buf = String::new();
+    let mut has_arabic = false;
+
+    let flush = |buf: &mut String,
+                 has_arabic: &mut bool,
+                 terms: &mut Vec<String>,
+                 ascii_digits: &mut Option<&mut Vec<String>>| {
+        if !buf.is_empty() {
+            if *has_arabic {
+                terms.push(std::mem::take(buf));
+            } else if let Some(digits) = ascii_digits.as_deref_mut()
+                && buf.bytes().all(|b| b.is_ascii_digit())
+            {
+                digits.push(std::mem::take(buf));
+            } else {
+                buf.clear();
+            }
+        }
+        *has_arabic = false;
+    };
+
+    for ch in text.chars() {
+        if is_arabic_run_char(ch) {
+            has_arabic |= is_arabic_or_indic_digit(ch);
+            if let Some(norm) = normalize_arabic_char(ch) {
+                buf.push(norm);
+            }
+        } else {
+            flush(&mut buf, &mut has_arabic, terms, &mut ascii_digits);
+        }
+    }
+    flush(&mut buf, &mut has_arabic, terms, &mut ascii_digits);
 }
 
 fn append_cjk_terms(terms: &mut Vec<String>, run: &mut Vec<char>) {
@@ -308,7 +452,7 @@ fn append_cjk_query(phrases: &mut Vec<String>, run: &mut Vec<char>, column: Opti
     run.clear();
 }
 
-fn is_cjk(ch: char) -> bool {
+pub(crate) fn is_cjk(ch: char) -> bool {
     ch.is_alphanumeric()
         && matches!(
         ch as u32,
@@ -475,7 +619,8 @@ fn has_unknown_bare_column(token: &str) -> bool {
 }
 
 fn should_quote_fts5_token(token: &str) -> bool {
-    if token.starts_with('"') && token.ends_with('"') {
+    let phrase = token.strip_suffix('*').unwrap_or(token);
+    if phrase.starts_with('"') && phrase.ends_with('"') {
         return false;
     }
     // Quote any token carrying ASCII punctuation so FTS5 treats it as a literal
@@ -589,6 +734,8 @@ mod tests {
         assert_eq!(prepare_cjk_fts5_query("東京 NOT 大阪"), None);
         assert_eq!(prepare_cjk_fts5_query("東京 AND 大阪"), None);
         assert_eq!(prepare_cjk_fts5_query("東京 NEAR 大阪"), None);
+        assert_eq!(prepare_cjk_fts5_query("\"東京 大阪\""), None);
+        assert_eq!(prepare_cjk_fts5_query("title:\"東京 大阪\""), None);
         // Control: `OR` is the one operator the run expander reproduces, so
         // the auxiliary stream still runs for it — and a lowercase `not` is
         // not FTS5 syntax, so it must not suppress the stream either.
@@ -656,6 +803,40 @@ mod tests {
             query.len()
         );
         assert_parses(&query);
+    }
+
+    #[test]
+    fn arabic_index_and_queries_split_on_punctuation_and_preserve_latin_guard() {
+        assert_eq!(cjk_index_terms("إدارة/المعرفة"), "اداره المعرفه");
+        assert_eq!(cjk_index_terms("العربية،الإنجليزية"), "العربيه الانجليزيه");
+        assert_eq!(cjk_index_terms("أحمد-المنصور"), "احمد المنصور");
+        assert_eq!(cjk_index_terms("plain latin 2026"), "");
+        assert_eq!(cjk_index_terms("hello؟ worldـ"), "");
+
+        let slash = prepare_cjk_fts5_query("إدارة/المعرفة").unwrap();
+        assert_eq!(slash, "\"اداره\" OR \"المعرفه\"");
+        assert_parses(&slash);
+
+        let comma = prepare_cjk_fts5_query("العربية،الإنجليزية").unwrap();
+        assert_eq!(comma, "\"العربيه\" OR \"الانجليزيه\"");
+        assert_parses(&comma);
+
+        let hyphen = prepare_cjk_fts5_query("title:أحمد-المنصور").unwrap();
+        assert_eq!(hyphen, "title:\"احمد\" OR title:\"المنصور\"");
+        assert_parses(&hyphen);
+
+        // Latin/ASCII-only queries (including digits) stay None so no extra
+        // sidecar SQL runs on the common path.
+        assert_eq!(prepare_cjk_fts5_query("latin 2026"), None);
+        assert_eq!(prepare_cjk_fts5_query("2026"), None);
+
+        // Eastern/Extended Arabic-Indic digits normalize to ASCII digits, and
+        // ASCII digits alongside an Arabic query are also carried.
+        assert_eq!(prepare_cjk_fts5_query("٢٠٢٦"), Some("\"2026\"".to_string()));
+        assert_eq!(prepare_cjk_fts5_query("۲۰۲۶"), Some("\"2026\"".to_string()));
+        let mixed = prepare_cjk_fts5_query("ادارة 2026").unwrap();
+        assert_eq!(mixed, "\"اداره\" OR \"2026\"");
+        assert_parses(&mixed);
     }
 
     /// The engine, not this module, is the judge of validity: every
@@ -783,12 +964,9 @@ mod tests {
             prepared,
             "{title title_parts}:handoff OR {body body_parts}:deploy"
         );
-        // Quoted phrases were re-tokenized into escaped-quote form long
-        // before the validation fallback existed; the contract here is
-        // "still valid FTS5 with AND preserved", not byte identity.
         let phrase = prepare_fts5_query("\"exact phrase\" AND deploy");
         assert_parses(&phrase);
-        assert!(phrase.contains(" AND deploy"), "{phrase}");
+        assert_eq!(phrase, "\"exact phrase\" AND deploy");
     }
 
     #[test]
@@ -938,16 +1116,25 @@ mod tests {
     /// A query containing a quoted phrase is treated as explicit FTS5
     /// syntax — `"exact phrase" baz` must not become
     /// `"exact" OR "phrase" OR baz` (which destroys the phrase semantics).
-    /// The exact assertion is "space-joined, not OR-joined"; what the
-    /// individual tokens look like after `prepare_fts5_token` is a
-    /// separate concern (and unchanged from pre-#58 behaviour).
     #[test]
     fn quoted_phrase_query_is_not_or_joined() {
         let q = prepare_fts5_query("\"exact phrase\" baz");
-        assert!(
-            !q.contains(" OR "),
-            "explicit quoted-phrase query must not get OR-joined; got {q}"
-        );
+        assert_eq!(q, "\"exact phrase\" baz");
+    }
+
+    #[test]
+    fn quoted_phrases_keep_filters_groups_escapes_and_prefixes() {
+        for (raw, expected) in [
+            ("title:\"alpha beta\"", "{title title_parts}:\"alpha beta\""),
+            ("body:\"alpha beta\"*", "{body body_parts}:\"alpha beta\"*"),
+            ("(\"alpha beta\") OR gamma", "(\"alpha beta\") OR gamma"),
+            ("\"say \"\"hello\"\" now\"", "\"say \"\"hello\"\" now\""),
+            ("\"alpha beta\"*", "\"alpha beta\"*"),
+            ("\"alpha\tbeta\" gamma", "\"alpha\tbeta\" gamma"),
+        ] {
+            assert_eq!(prepare_fts5_query(raw), expected, "{raw}");
+            assert_parses(expected);
+        }
     }
 
     /// Same escape-hatch logic for parenthesised sub-expressions —

@@ -33,7 +33,7 @@ dependencies = [
 
 [[package]]
 name = "ai-memory-cli"
-version = "3.4.4"
+version = "3.6.0"
 dependencies = [
  "ai-memory-consolidate",
  "ai-memory-core",
@@ -89,13 +89,14 @@ dependencies = [
  "tracing-subscriber",
  "unicode-width",
  "uuid",
+ "win-custody",
  "windows-registry",
  "zip",
 ]
 
 [[package]]
 name = "ai-memory-consolidate"
-version = "3.4.4"
+version = "3.6.0"
 dependencies = [
  "ai-memory-core",
  "ai-memory-llm",
@@ -123,7 +124,7 @@ dependencies = [
 
 [[package]]
 name = "ai-memory-core"
-version = "3.4.4"
+version = "3.6.0"
 dependencies = [
  "fluent-bundle",
  "fluent-syntax",
@@ -142,12 +143,15 @@ dependencies = [
 
 [[package]]
 name = "ai-memory-eval"
-version = "3.4.4"
+version = "3.6.0"
 dependencies = [
  "ai-memory-consolidate",
  "ai-memory-core",
  "ai-memory-llm",
  "anyhow",
+ "candle-core",
+ "candle-nn",
+ "candle-transformers",
  "clap",
  "jiff",
  "reqwest 0.12.28",
@@ -166,7 +170,7 @@ dependencies = [
 
 [[package]]
 name = "ai-memory-hooks"
-version = "3.4.4"
+version = "3.6.0"
 dependencies = [
  "ai-memory-consolidate",
  "ai-memory-core",
@@ -196,7 +200,7 @@ dependencies = [
 
 [[package]]
 name = "ai-memory-llm"
-version = "3.4.4"
+version = "3.6.0"
 dependencies = [
  "ai-memory-core",
  "anyhow",
@@ -208,6 +212,7 @@ dependencies = [
  "jiff",
  "regex",
  "reqwest 0.12.28",
+ "ring",
  "rstest",
  "schemars",
  "secrecy",
@@ -226,7 +231,7 @@ dependencies = [
 
 [[package]]
 name = "ai-memory-mcp"
-version = "3.4.4"
+version = "3.6.0"
 dependencies = [
  "ai-memory-consolidate",
  "ai-memory-core",
@@ -263,7 +268,7 @@ dependencies = [
 
 [[package]]
 name = "ai-memory-store"
-version = "3.4.4"
+version = "3.6.0"
 dependencies = [
  "ai-memory-core",
  "anyhow",
@@ -291,14 +296,14 @@ dependencies = [
 
 [[package]]
 name = "ai-memory-test-support"
-version = "3.4.4"
+version = "3.6.0"
 dependencies = [
  "socket2",
 ]
 
 [[package]]
 name = "ai-memory-web"
-version = "3.4.4"
+version = "3.6.0"
 dependencies = [
  "ai-memory-core",
  "ai-memory-llm",
@@ -325,7 +330,7 @@ dependencies = [
 
 [[package]]
 name = "ai-memory-wiki"
-version = "3.4.4"
+version = "3.6.0"
 dependencies = [
  "ai-memory-core",
  "ai-memory-llm",
@@ -340,7 +345,6 @@ dependencies = [
  "git2",
  "jiff",
  "notify",
- "notify-debouncer-full",
  "reqwest 0.12.28",
  "rusqlite",
  "serde",
@@ -358,7 +362,7 @@ dependencies = [
 
 [[package]]
 name = "ai-memory-workstream"
-version = "3.4.4"
+version = "3.6.0"
 dependencies = [
  "ai-memory-core",
  "anyhow",
@@ -1429,15 +1433,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "file-id"
-version = "0.2.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e1fc6a637b6dc58414714eddd9170ff187ecb0933d4c7024d1abbd23a3cc26e9"
-dependencies = [
- "windows-sys 0.60.2",
-]
-
-[[package]]
 name = "filetime"
 version = "0.2.29"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1531,9 +1526,9 @@ checksum = "77ce24cb58228fbb8aa041425bb1050850ac19177686ea6e0f41a70416f56fdb"
 
 [[package]]
 name = "form_urlencoded"
-version = "1.2.2"
+version = "1.2.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "cb4cb245038516f5f85277875cdaa4f7d2c9a0fa0468de06ed190163b1581fcf"
+checksum = "afa489199eaffb1211795df1c6236ce1ad0d41a6fa45250add73e3b02420f06e"
 dependencies = [
  "percent-encoding",
 ]
@@ -2490,9 +2485,9 @@ dependencies = [
 
 [[package]]
 name = "libz-sys"
-version = "1.1.31"
+version = "1.1.33"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ff20308ecabd635a2dc1dd5834a86c462cca20efba1d5d3ddab1f8aea3455cb2"
+checksum = "fee3f59f4321dab0c78d828942e7aa09d0bd8ad6e78a501977e6bf3d02938045"
 dependencies = [
  "cc",
  "libc",
@@ -2690,19 +2685,6 @@ dependencies = [
  "notify-types",
  "walkdir",
  "windows-sys 0.60.2",
-]
-
-[[package]]
-name = "notify-debouncer-full"
-version = "0.6.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "375bd3a138be7bfeff3480e4a623df4cbfb55b79df617c055cd810ba466fa078"
-dependencies = [
- "file-id",
- "log",
- "notify",
- "notify-types",
- "walkdir",
 ]
 
 [[package]]
@@ -3066,16 +3048,16 @@ dependencies = [
 
 [[package]]
 name = "quinn-udp"
-version = "0.5.14"
+version = "0.5.16"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "addec6a0dcad8a8d96a771f815f0eaf55f9d1805756410b39f5fa81332574cbd"
+checksum = "af66907df18639dcf4db56ca65490cabc4b27a97dbadd96f2926cca73298f016"
 dependencies = [
  "cfg_aliases",
  "libc",
  "once_cell",
  "socket2",
  "tracing",
- "windows-sys 0.60.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -3548,9 +3530,9 @@ dependencies = [
 
 [[package]]
 name = "rustix"
-version = "1.1.4"
+version = "1.1.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b6fe4565b9518b83ef4f91bb47ce29620ca828bd32cb7e408f0062e9930ba190"
+checksum = "e5e76742e5294153d4dde1207dbec5bdd81eef6fabdc0d2118babadabfd858aa"
 dependencies = [
  "bitflags",
  "errno",
@@ -4716,9 +4698,9 @@ checksum = "8ecb6da28b8a351d773b68d5825ac39017e680750f980f3a1a85cd8dd28a47c1"
 
 [[package]]
 name = "url"
-version = "2.5.8"
+version = "2.5.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ff67a8a4397373c3ef660812acab3268222035010ab8680ec4215f38ba3d0eed"
+checksum = "f00cd2407bb42c0ef17be88d4cf020f5cceffd121665bac9b8b9493a369b3b1a"
 dependencies = [
  "form_urlencoded",
  "idna",
@@ -4960,6 +4942,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "58ec80e73fd8baf57bf0d9615554c75348bda990d6d5bbeab964dd068319fecb"
 dependencies = [
  "rustls-pki-types",
+]
+
+[[package]]
+name = "win-custody"
+version = "0.1.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "399f5ddc7e473b74abf5633e31c84917491aa6cf0418ab310dd936645024dbfc"
+dependencies = [
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

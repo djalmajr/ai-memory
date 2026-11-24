@@ -46,7 +46,7 @@ to turn on.
 | `embedding_provider = openai\|voyage\|google\|openai-compat\|copilot` | the text of every stored page |
 | `llm_provider` (and `llm_fallbacks`), off by default | session observations and page text on consolidation, lint, bootstrap, dream, profile and auto-improve runs |
 | `capture_assistant` (double opt-in) | the assistant's final-turn text |
-| `AI_MEMORY_RERANKER=llm` | each live query + bounded page titles/snippets |
+| `AI_MEMORY_RERANKER=llm` or `decisions-choice` | each eligible live query + bounded page titles/snippets; Choice sends them to OpenAI with the candidate page-version IDs |
 | `[[admission_webhooks]]` | every write's page path, frontmatter and body, POSTed to the URL you configured |
 
 1. **Embedding provider.** This is the broadest path by far, and the one
@@ -71,6 +71,11 @@ to turn on.
    that vendor's cloud under your existing login. With no provider
    configured, every one of these features either runs rule-based locally
    or stays off; see `docs/ARCHITECTURE.md` ("Zero-LLM default path").
+   Turning on `llm_request_metadata_headers` additionally sends, as
+   `openai-compat` request headers, the workload name and, when an
+   operation has exactly one, the workspace name, project name and
+   username it acts on: identifiers, never page content
+   ([`docs/llm-providers.md`](docs/llm-providers.md)).
 3. **Assistant/Stop capture** (`SECURITY.md`, "Assistant/Stop capture is
    opt-in and sanitized"). Persisting the coding assistant's final-turn
    text requires a double opt-in: `capture_assistant` on the server *and*
@@ -80,10 +85,12 @@ to turn on.
    cloud provider only through path 2. The flag is global to the install;
    there is no per-project exclusion once it's on.
 4. **LLM-based search reranking** (`SECURITY.md`, "Search reranking is an
-   outbound-data opt-in"). Setting `AI_MEMORY_RERANKER=llm` sends each live
-   query plus bounded page titles/snippets to the configured LLM provider.
-   Leave this unset, or point it at a local provider, to keep queries and
-   recalled snippets on-host.
+   outbound-data opt-in").
+   `AI_MEMORY_RERANKER=llm` sends each eligible live query plus bounded page titles/snippets to the configured generative provider.
+   `AI_MEMORY_RERANKER=decisions-choice` sends them directly to OpenAI Decisions, together with the candidate page-version IDs (time-ordered UUIDs that reveal each version's creation time).
+   Choice sends the key only to the canonical OpenAI HTTPS origin, omits it on HTTP loopback test origins, and rejects redirects.
+   The client ignores inherited proxy settings, including for loopback requests.
+   Leave reranking unset, or use `llm` with a local provider, to keep queries and recalled snippets on-host.
 5. **Admission webhooks.** Every wiki write (create, update, delete, and
    the handoff lifecycle events) runs the configured webhook chain: each
    `[[admission_webhooks]]` entry receives the page's path, frontmatter,

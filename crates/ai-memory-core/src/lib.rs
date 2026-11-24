@@ -32,11 +32,13 @@ pub mod routing_skills;
 pub mod scaffolding;
 pub use scaffolding::{
     is_codex_memory_agent_cwd, looks_like_codex_generated_prompt, looks_like_codex_instructions,
-    looks_like_codex_memory_agent_prompt, looks_like_markup_block, looks_like_scaffolding,
+    looks_like_codex_memory_agent_prompt, looks_like_machine_turn, looks_like_markup_block,
+    looks_like_scaffolding,
 };
 pub mod routing_snippet;
 pub mod sanitize;
 pub mod slots;
+pub mod trust;
 pub mod user;
 mod workstream;
 
@@ -62,8 +64,8 @@ pub use active_project::{
 };
 pub use actor::{
     ActorContext, AuthLevel, AuthorizedViewer, AuthzError, Capability, IdentityKey,
-    LegacyBrowserAuth, OwnerFilter, SKIP_ADMISSION_CHAIN_HEADER, owner_identity, owner_stamp,
-    parse_skip_admission_chain, skip_admission_chain_for,
+    LegacyBrowserAuth, OwnerFilter, PasswordChangeRequired, SKIP_ADMISSION_CHAIN_HEADER,
+    owner_identity, owner_stamp, parse_skip_admission_chain, skip_admission_chain_for,
 };
 pub use agent_backup::{
     AGENT_BACKUP_SCHEMA_VERSION, AgentAssetKind, AgentAssetScope, AgentBackupEntry,
@@ -89,18 +91,18 @@ pub use message::{
 };
 pub use observation::{
     FAILED_TOOL_OUTCOME_LINE, FILE_PATH_MAX_CHARS, NewObservation, NewSession, NewSessionUsage,
-    Observation, ObservationKind, TOOL_BODY_HEADER_MAX_CHARS, TOOL_BODY_SEPARATOR,
-    TOOL_OUTCOME_LINE_PREFIX, TokenCall, TokenCallContext, TokenToolRef, TokenToolRelation,
-    valid_file_path_key,
+    Observation, ObservationKind, SessionDisplayName, SessionOrigin, TOOL_BODY_HEADER_MAX_CHARS,
+    TOOL_BODY_SEPARATOR, TOOL_OUTCOME_LINE_PREFIX, TokenCall, TokenCallContext, TokenToolRef,
+    TokenToolRelation, valid_file_path_key,
 };
 pub use page::{
     FeedbackKind, LinkTarget, MAX_ENTITIES_PER_PAGE, MAX_ENTITY_LEN, NewPage, Page, PageEvidence,
-    PageEvidenceKind, Relation, Tier, frontmatter_entity_names, normalize_entities,
-    normalize_entity, parse_expires_at_instant,
+    PageEvidenceKind, Relation, SourceObservations, Tier, frontmatter_entity_names,
+    normalize_entities, normalize_entity, parse_expires_at_instant,
 };
 pub use routing_snippet::{
-    COMPACT_SNIPPET_BODY, MARKER_END, MARKER_START, SNIPPET_BODY, compact_block, find_marker_line,
-    full_block,
+    COMPACT_SNIPPET_BODY, MARKER_END, MARKER_START, SNIPPET_BODY, compact_block,
+    find_managed_block, find_marker_line, full_block,
 };
 pub use sanitize::{
     OBSERVATION_BODY_MAX_BYTES, SanitizeConfig, Sanitized, Sanitizer, truncate_for_title,
@@ -110,6 +112,7 @@ pub use slots::{
     SLOT_PREFIX, SlotPlacement, SlotVisibility, is_slot_named, is_slot_path, slot_owner,
     slot_placement,
 };
+pub use trust::TrustClass;
 pub use user::{
     ApiCredential, EXTERNAL_API_KEY_PREFIX, MAX_EMAIL_LEN, MAX_HUMAN_PASSWORD_BYTES,
     MAX_USERNAME_LEN, MIN_HUMAN_PASSWORD_BYTES, NATIVE_API_KEY_PREFIX, NewUser,

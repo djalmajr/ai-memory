@@ -24,6 +24,8 @@
 //! * **Gemini**: `generationConfig.responseMimeType = "application/json"`
 //!   plus `responseSchema` (OpenAPI 3 subset; `$ref`s inlined,
 //!   Draft-2020-12 keywords stripped before send).
+//! * **Vertex**: the same Gemini request through Vertex AI, with an OAuth
+//!   token from Google Application Default Credentials instead of an API key.
 //! * **Cursor**: the logged-in `agent` CLI in `--mode ask`. No HTTP client
 //!   and no copied token; `--yolo` is never passed and the child gets an
 //!   allowlisted environment because the prompt is captured session text.
@@ -79,6 +81,7 @@ pub mod auth;
 pub mod codex;
 pub mod copilot;
 pub mod cursor_agent;
+pub mod decisions;
 pub mod embedding;
 pub mod embedding_capacity;
 pub mod error;
@@ -86,6 +89,7 @@ pub mod factory;
 pub mod fallback;
 pub mod gemini;
 pub mod google;
+pub mod google_auth;
 pub mod health;
 #[cfg(feature = "local-embeddings")]
 pub mod local;
@@ -99,8 +103,10 @@ pub mod reranker;
 pub mod routes;
 pub mod types;
 
+mod api_key_file;
 mod auth_file;
 mod codex_responses;
+mod quota;
 mod redirect;
 mod response;
 mod stored_token;
@@ -109,7 +115,8 @@ mod text;
 pub use admission::AdmittedLlmProvider;
 pub use anthropic::AnthropicProvider;
 pub use auth::{
-    AuthRequirement, CodexAuth, CopilotAuth, Credential, CredentialSource, CursorAuth, ProviderAuth,
+    AuthRequirement, CodexAuth, CopilotAuth, Credential, CredentialSource, CursorAuth,
+    ProviderAuth, VertexAuth,
 };
 pub use codex::CodexProvider;
 pub use copilot::{
@@ -121,18 +128,19 @@ pub use copilot::{
 pub use cursor_agent::{
     CURSOR_DEFAULT_MODEL, CursorAgentProvider, cursor_child_env, cursor_executable,
 };
+pub use decisions::DecisionsReranker;
 pub use embedding::{
     Embedder, OpenAiCompatEmbedder, OpenAiEmbedder, QueryVector, SyntheticEmbedder, VoyageEmbedder,
     cosine, embed_search_query,
 };
 pub use embedding_capacity::{EmbeddingCapacity, local_capacity};
-pub use error::{LlmError, LlmResult};
+pub use error::{FailoverClass, LlmError, LlmResult};
 pub use factory::{
     EmbedderChoice, EmbedderConfig, ProviderChoice, ProviderConfig, build_embedder, build_provider,
     default_embedding_dim, try_default_embedding_dim,
 };
-pub use fallback::{CIRCUIT_COOLDOWN, Candidate, FallbackLlmProvider};
-pub use gemini::GeminiProvider;
+pub use fallback::{CIRCUIT_COOLDOWN, Candidate, DEFAULT_QUOTA_COOLDOWN, FallbackLlmProvider};
+pub use gemini::{GeminiProvider, vertex_base_url};
 pub use google::{DEFAULT_MODEL as GOOGLE_DEFAULT_EMBED_MODEL, GoogleEmbedder};
 pub use health::{
     CandidateHealth, LlmTaskChainHealthSnapshot, LlmWorkloadHealthSnapshot, ProviderHealth,
@@ -140,7 +148,11 @@ pub use health::{
     error_status_and_message,
 };
 #[cfg(feature = "local-embeddings")]
-pub use local::{LOCAL_DIM, LOCAL_MODEL, LocalEmbedder, fetch_model, model_present};
+pub use local::{
+    DEFAULT_LOCAL_MODEL, LOCAL_DIM, LOCAL_MODEL, LOCAL_MODELS, LocalEmbedder, LocalModelSpec,
+    MULTILINGUAL_E5_SMALL_MODEL, fetch_model, fetch_model_for, model_dir, model_dir_for,
+    model_present, model_present_for, resolve_local_model,
+};
 pub use oidc::{
     DeviceAuthorizationResponse, OIDC_DEFAULT_SCOPE, OidcDiscovery, OidcExtras, OidcToken,
     OidcTokenResponse, PollOutcome, discover, poll_token_once, refresh_access_token,
@@ -162,7 +174,7 @@ pub use response::{provider_error, provider_error_body};
 pub use routes::LlmProviders;
 pub use stored_token::StoredOAuthToken;
 pub use types::{
-    ChatMessage, ChatRequest, ChatResponse, ExtraHeaders, LlmOperationId, LlmWorkload,
+    ChatMessage, ChatRequest, ChatResponse, ExtraHeaders, LlmOperationId, LlmSubject, LlmWorkload,
     ReasoningEffort, Role, Usage,
 };
 

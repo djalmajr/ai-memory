@@ -22,8 +22,8 @@ use ai_memory_core::{
     UserRole, WorkspaceId, owner_stamp,
 };
 use ai_memory_store::{
-    ClaudeSessionBoundary, ConditionalUpsert, DecayParams, LinkOrAdoptManagedRunSession,
-    ManagedRunSessionLink, PagePrecondition, PrepareWorkstreamRun, Store, StoreError,
+    ConditionalUpsert, DecayParams, LinkOrAdoptManagedRunSession, ManagedRunSessionLink,
+    ManagedSessionBoundary, PagePrecondition, PrepareWorkstreamRun, Store, StoreError,
     WorkstreamSelection,
 };
 
@@ -64,6 +64,7 @@ async fn open_session(
             agent_kind,
             cwd: Some("/repo".into()),
             actor_user: None,
+            origin: None,
         })
         .await
         .unwrap();
@@ -111,6 +112,7 @@ async fn session_end_readers_refuse_foreign_session_ids() {
                 body: "foreign scopes must not read this".into(),
                 importance: 5,
                 file_path: None,
+                trust_class: None,
             },
             &Sanitizer::builtin(),
         ))
@@ -200,6 +202,7 @@ async fn rowid_fetch_refuses_foreign_sessions_with_legitimate_control() {
                         body: format!("{tag} row {i}"),
                         importance: 1,
                         file_path: None,
+                        trust_class: None,
                     },
                     &sanitizer,
                 ))
@@ -312,6 +315,7 @@ async fn a_crossed_repository_session_snapshot_reads_only_its_scope() {
                 body: body.into(),
                 importance: 5,
                 file_path: None,
+                trust_class: None,
             },
             &sanitizer,
         );
@@ -442,6 +446,90 @@ async fn a_crossed_repository_session_snapshot_reads_only_its_scope() {
     );
 }
 
+/// The one thing a snapshot reports past its own scope is a number. A crossed
+/// session's digest holds only the snapshot's rows, but the idle end's stamp
+/// and `ended_observation_count` count every row of the session, so the stamp
+/// needs the whole session's count from the digest's own snapshot. The scoped
+/// summary is the control that the rows stay partitioned, and another
+/// session's row must not be counted.
+#[tokio::test]
+async fn a_crossed_session_snapshot_counts_the_whole_session_as_a_number_only() {
+    use ai_memory_core::{NewObservation, ObservationKind, Sanitized, Sanitizer};
+
+    let tmp = tempfile::tempdir().unwrap();
+    let store = Store::open(tmp.path()).unwrap();
+    let ws = store.writer.get_or_create_workspace("acme").await.unwrap();
+    let home = store
+        .writer
+        .get_or_create_project(ws, "home", None)
+        .await
+        .unwrap();
+    let elsewhere = store
+        .writer
+        .get_or_create_project(ws, "elsewhere", None)
+        .await
+        .unwrap();
+    let session = open_session(&store, ws, home, AgentKind::Codex).await;
+    let unrelated = open_session(&store, ws, home, AgentKind::Codex).await;
+    let sanitizer = Sanitizer::builtin();
+    for (sid, proj) in [
+        (session, home),
+        (session, home),
+        (session, elsewhere),
+        (unrelated, home),
+    ] {
+        let obs = Sanitized::new(
+            NewObservation {
+                occurred_at: None,
+                session_id: sid,
+                workspace_id: ws,
+                project_id: proj,
+                kind: ObservationKind::UserPrompt,
+                extension: None,
+                source_event: None,
+                title: "prompt".into(),
+                body: "body".into(),
+                importance: 5,
+                file_path: None,
+                trust_class: None,
+            },
+            &sanitizer,
+        );
+        store.writer.insert_observation(obs).await.unwrap();
+    }
+
+    let from_home = store
+        .reader
+        .read_session_observations(ws, home, session, |snap| {
+            Ok((
+                snap.kind_summary()?.total,
+                snap.whole_session_observation_count()?,
+            ))
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        from_home,
+        (2, 3),
+        "the summary stays in the snapshot's scope, the generation count does not"
+    );
+    let from_elsewhere = store
+        .reader
+        .read_session_observations_in_scope(ws, elsewhere, session, |snap| {
+            Ok((
+                snap.kind_summary()?.total,
+                snap.whole_session_observation_count()?,
+            ))
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        from_elsewhere,
+        (1, 3),
+        "the same count from the other scope"
+    );
+}
+
 fn page(ws: WorkspaceId, proj: ProjectId, path: &str, title: &str, body: &str) -> NewPage {
     NewPage {
         workspace_id: ws,
@@ -457,6 +545,7 @@ fn page(ws: WorkspaceId, proj: ProjectId, path: &str, title: &str, body: &str) -
         expires_at: None,
         entities: Vec::new(),
         evidence: Vec::new(),
+        trust_class: None,
     }
 }
 
@@ -2137,6 +2226,7 @@ async fn startup_claim_rechecks_the_source_and_sweeps_only_quiet_open_batons() {
 
                     occurred_at: None,
                     file_path: None,
+                    trust_class: None,
                 },
                 &Sanitizer::builtin(),
             ))
@@ -2387,7 +2477,7 @@ async fn managed_claude_clear_rechecks_scope_owner_checkout_and_lease() {
         assert_eq!(
             store
                 .writer
-                .relink_managed_claude_session(rejected, ClaudeSessionBoundary::Clear)
+                .relink_managed_session(rejected, ManagedSessionBoundary::Clear)
                 .await
                 .unwrap(),
             ManagedRunSessionLink::Refused,
@@ -2415,7 +2505,7 @@ async fn managed_claude_clear_rechecks_scope_owner_checkout_and_lease() {
     assert_eq!(
         store
             .writer
-            .relink_managed_claude_session(input("expired"), ClaudeSessionBoundary::Clear)
+            .relink_managed_session(input("expired"), ManagedSessionBoundary::Clear)
             .await
             .unwrap(),
         ManagedRunSessionLink::Refused
@@ -2428,7 +2518,7 @@ async fn managed_claude_clear_rechecks_scope_owner_checkout_and_lease() {
     assert_eq!(
         store
             .writer
-            .relink_managed_claude_session(input("cleared"), ClaudeSessionBoundary::Clear)
+            .relink_managed_session(input("cleared"), ManagedSessionBoundary::Clear)
             .await
             .unwrap(),
         ManagedRunSessionLink::Exact(run.run_id)
@@ -2442,7 +2532,7 @@ async fn managed_claude_clear_rechecks_scope_owner_checkout_and_lease() {
     assert_eq!(
         store
             .writer
-            .relink_managed_claude_session(input("original"), ClaudeSessionBoundary::Clear)
+            .relink_managed_session(input("original"), ManagedSessionBoundary::Clear)
             .await
             .unwrap(),
         ManagedRunSessionLink::Refused
@@ -2451,7 +2541,7 @@ async fn managed_claude_clear_rechecks_scope_owner_checkout_and_lease() {
     assert_eq!(
         store
             .writer
-            .relink_managed_claude_session(input("terminal"), ClaudeSessionBoundary::Clear)
+            .relink_managed_session(input("terminal"), ManagedSessionBoundary::Clear)
             .await
             .unwrap(),
         ManagedRunSessionLink::Refused
@@ -2512,7 +2602,7 @@ async fn managed_claude_resume_relinks_only_to_a_session_its_workstream_held() {
         async move {
             store
                 .writer
-                .relink_managed_claude_session(i, boundary)
+                .relink_managed_session(i, boundary)
                 .await
                 .unwrap()
         }
@@ -2545,7 +2635,7 @@ async fn managed_claude_resume_relinks_only_to_a_session_its_workstream_held() {
     assert_eq!(
         link(
             input(run.run_id, "cleared", &alice),
-            ClaudeSessionBoundary::Clear
+            ManagedSessionBoundary::Clear
         )
         .await,
         ManagedRunSessionLink::Exact(run.run_id)
@@ -2565,7 +2655,7 @@ async fn managed_claude_resume_relinks_only_to_a_session_its_workstream_held() {
         }),
     ] {
         assert_eq!(
-            link(i, ClaudeSessionBoundary::Resume).await,
+            link(i, ManagedSessionBoundary::Resume).await,
             ManagedRunSessionLink::Refused,
             "{case}"
         );
@@ -2578,7 +2668,7 @@ async fn managed_claude_resume_relinks_only_to_a_session_its_workstream_held() {
     assert_eq!(
         link(
             input(run.run_id, "original", &alice),
-            ClaudeSessionBoundary::Clear
+            ManagedSessionBoundary::Clear
         )
         .await,
         ManagedRunSessionLink::Refused,
@@ -2593,7 +2683,7 @@ async fn managed_claude_resume_relinks_only_to_a_session_its_workstream_held() {
     assert_eq!(
         link(
             input(run.run_id, "original", &alice),
-            ClaudeSessionBoundary::Resume
+            ManagedSessionBoundary::Resume
         )
         .await,
         ManagedRunSessionLink::Refused,
@@ -2609,7 +2699,7 @@ async fn managed_claude_resume_relinks_only_to_a_session_its_workstream_held() {
     assert_eq!(
         link(
             input(run.run_id, "original", &alice),
-            ClaudeSessionBoundary::Resume
+            ManagedSessionBoundary::Resume
         )
         .await,
         ManagedRunSessionLink::Exact(run.run_id)
@@ -2632,7 +2722,7 @@ async fn managed_claude_resume_relinks_only_to_a_session_its_workstream_held() {
     assert_eq!(
         link(
             input(other.run_id, "cleared", &alice),
-            ClaudeSessionBoundary::Resume
+            ManagedSessionBoundary::Resume
         )
         .await,
         ManagedRunSessionLink::Refused,
@@ -2654,7 +2744,7 @@ async fn managed_claude_resume_relinks_only_to_a_session_its_workstream_held() {
     assert_eq!(
         link(
             input(run.run_id, "cleared", &alice),
-            ClaudeSessionBoundary::Resume
+            ManagedSessionBoundary::Resume
         )
         .await,
         ManagedRunSessionLink::Refused,
@@ -2669,11 +2759,375 @@ async fn managed_claude_resume_relinks_only_to_a_session_its_workstream_held() {
     assert_eq!(
         link(
             input(run.run_id, "cleared", &alice),
-            ClaudeSessionBoundary::Resume
+            ManagedSessionBoundary::Resume
         )
         .await,
         ManagedRunSessionLink::Exact(run.run_id),
         "once the parallel run ends, the held id resumes again"
+    );
+}
+
+/// An ID-selected Codex run pre-linked to `N` may relink on `SessionStart`
+/// (`Clear` for `startup`/`clear` to a fresh thread `F`, `Resume` for `resume`
+/// to an existing thread `S` in the same scope/operator not held by another
+/// active run), while enforcing every boundary check: foreign workspace/project,
+/// foreign operator, shared ownership, wrong cwd, wrong agent, dirty id, lapsed
+/// lease, terminal run, non-SessionStart (`Other`), another active run's
+/// session, a foreign workstream's session, and a foreign captured session.
+#[tokio::test]
+async fn managed_codex_relink_rechecks_scope_owner_checkout_lease_and_parallel_runs() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = Store::open(tmp.path()).unwrap();
+    let (ws, proj) = scope(&store).await;
+    let other_ws = store
+        .writer
+        .get_or_create_workspace("elsewhere")
+        .await
+        .unwrap();
+    let other_proj = store
+        .writer
+        .get_or_create_project(ws, "other", None)
+        .await
+        .unwrap();
+    let alice = operator("alice");
+    let bob = operator("bob");
+    let prepare = |workspace_id, project_id, tree: &str, lease: &str, owner: String| {
+        let store = &store;
+        let tree = tree.to_owned();
+        let lease = lease.to_owned();
+        async move {
+            store
+                .writer
+                .prepare_workstream_run_owned(
+                    PrepareWorkstreamRun {
+                        scope_by_id: true,
+                        workspace_id,
+                        project_id,
+                        repo_fingerprint: "codex-relink-repo".into(),
+                        worktree_fingerprint: tree,
+                        cwd: "/repo".into(),
+                        agent: AgentKind::Codex,
+                        automatic_harness: false,
+                        available_agents: Vec::new(),
+                        selection: WorkstreamSelection::Current,
+                        lease_owner: lease,
+                    },
+                    Some(owner),
+                )
+                .await
+                .unwrap()
+        }
+    };
+    let run = prepare(ws, proj, "tree-a", "codex-a", alice.clone()).await;
+    let input = |run_id, native: &str| LinkOrAdoptManagedRunSession {
+        supplied_run_id: run_id,
+        workspace_id: ws,
+        project_id: proj,
+        cwd: "/repo".into(),
+        agent: AgentKind::Codex,
+        native_session_id: native.into(),
+        owner_user: Some(alice.clone()),
+    };
+    let current = |run_id| {
+        let store = &store;
+        async move {
+            store
+                .reader
+                .managed_run_status(run_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .native_session_id
+        }
+    };
+
+    // Pre-link to prior thread `N`.
+    assert_eq!(
+        store
+            .writer
+            .link_or_adopt_managed_run_session(input(run.run_id, "thread-n"))
+            .await
+            .unwrap(),
+        ManagedRunSessionLink::Exact(run.run_id)
+    );
+    store
+        .writer
+        .accept_managed_run_context(run.run_id)
+        .await
+        .unwrap();
+
+    // Non-SessionStart (`Other`) cannot switch away from `thread-n`.
+    assert_eq!(
+        store
+            .writer
+            .link_or_adopt_managed_run_session(input(run.run_id, "thread-other"))
+            .await
+            .unwrap(),
+        ManagedRunSessionLink::Refused
+    );
+
+    // Every boundary mismatch is refused for both Clear and Resume.
+    for boundary in [
+        ManagedSessionBoundary::Clear,
+        ManagedSessionBoundary::Resume,
+    ] {
+        for case in [
+            "workspace",
+            "project",
+            "owner",
+            "shared",
+            "cwd",
+            "agent",
+            "dirty-id",
+        ] {
+            let mut rejected = input(run.run_id, case);
+            match case {
+                "workspace" => rejected.workspace_id = other_ws,
+                "project" => rejected.project_id = other_proj,
+                "owner" => rejected.owner_user = Some(bob.clone()),
+                "shared" => rejected.owner_user = None,
+                "cwd" => rejected.cwd = "/other-checkout".into(),
+                "agent" => rejected.agent = AgentKind::ClaudeCode,
+                "dirty-id" => rejected.native_session_id = "sk-abcdefghijklmnopqrstuvwx".into(),
+                _ => unreachable!(),
+            }
+            assert_eq!(
+                store
+                    .writer
+                    .relink_managed_session(rejected, boundary)
+                    .await
+                    .unwrap(),
+                ManagedRunSessionLink::Refused,
+                "{boundary:?}/{case}"
+            );
+            assert_eq!(current(run.run_id).await.as_deref(), Some("thread-n"));
+        }
+    }
+
+    // Lapsed lease is refused; renewing restores relinking.
+    let conn = rusqlite::Connection::open(store.db_path()).unwrap();
+    conn.execute(
+        "UPDATE managed_runs SET lease_expires_at = 1 WHERE id = ?1",
+        [run.run_id.as_bytes()],
+    )
+    .unwrap();
+    assert_eq!(
+        store
+            .writer
+            .relink_managed_session(input(run.run_id, "thread-f"), ManagedSessionBoundary::Clear)
+            .await
+            .unwrap(),
+        ManagedRunSessionLink::Refused
+    );
+    store
+        .writer
+        .heartbeat_managed_run(run.run_id)
+        .await
+        .unwrap();
+
+    // `Clear` (Codex `startup`/`clear`) relinks to fresh thread `F`, and refuses
+    // rewinding to already-bound `thread-n`.
+    assert_eq!(
+        store
+            .writer
+            .relink_managed_session(input(run.run_id, "thread-f"), ManagedSessionBoundary::Clear)
+            .await
+            .unwrap(),
+        ManagedRunSessionLink::Exact(run.run_id)
+    );
+    assert_eq!(current(run.run_id).await.as_deref(), Some("thread-f"));
+    assert_eq!(
+        store
+            .writer
+            .relink_managed_session(input(run.run_id, "thread-n"), ManagedSessionBoundary::Clear)
+            .await
+            .unwrap(),
+        ManagedRunSessionLink::Refused
+    );
+
+    // `Resume` relinks to an existing same-scope thread `S` even if this
+    // workstream did not hold it before.
+    assert_eq!(
+        store
+            .writer
+            .relink_managed_session(
+                input(run.run_id, "thread-s"),
+                ManagedSessionBoundary::Resume
+            )
+            .await
+            .unwrap(),
+        ManagedRunSessionLink::Exact(run.run_id)
+    );
+    assert_eq!(current(run.run_id).await.as_deref(), Some("thread-s"));
+
+    // `Resume` refuses a session currently held by another active run.
+    let parallel = prepare(ws, proj, "tree-b", "codex-b", alice.clone()).await;
+    assert_eq!(
+        store
+            .writer
+            .link_or_adopt_managed_run_session(input(parallel.run_id, "thread-live"))
+            .await
+            .unwrap(),
+        ManagedRunSessionLink::Exact(parallel.run_id)
+    );
+    assert_eq!(
+        store
+            .writer
+            .relink_managed_session(
+                input(run.run_id, "thread-live"),
+                ManagedSessionBoundary::Resume
+            )
+            .await
+            .unwrap(),
+        ManagedRunSessionLink::Refused
+    );
+
+    // `Resume` refuses a session bound to a foreign project's workstream.
+    let foreign_run = prepare(ws, other_proj, "tree-foreign", "codex-f", alice.clone()).await;
+    let mut foreign_link = input(foreign_run.run_id, "thread-foreign-proj");
+    foreign_link.project_id = other_proj;
+    assert_eq!(
+        store
+            .writer
+            .link_or_adopt_managed_run_session(foreign_link)
+            .await
+            .unwrap(),
+        ManagedRunSessionLink::Exact(foreign_run.run_id)
+    );
+    store
+        .writer
+        .cancel_managed_run(foreign_run.run_id)
+        .await
+        .unwrap();
+    assert_eq!(
+        store
+            .writer
+            .relink_managed_session(
+                input(run.run_id, "thread-foreign-proj"),
+                ManagedSessionBoundary::Resume
+            )
+            .await
+            .unwrap(),
+        ManagedRunSessionLink::Refused
+    );
+
+    // `Resume` refuses a session previously held by another operator's run.
+    let bob_run = prepare(ws, proj, "tree-bob", "codex-bob", bob.clone()).await;
+    let mut bob_link = input(bob_run.run_id, "thread-bob");
+    bob_link.owner_user = Some(bob.clone());
+    assert_eq!(
+        store
+            .writer
+            .link_or_adopt_managed_run_session(bob_link)
+            .await
+            .unwrap(),
+        ManagedRunSessionLink::Exact(bob_run.run_id)
+    );
+    store
+        .writer
+        .cancel_managed_run(bob_run.run_id)
+        .await
+        .unwrap();
+    assert_eq!(
+        store
+            .writer
+            .relink_managed_session(
+                input(run.run_id, "thread-bob"),
+                ManagedSessionBoundary::Resume
+            )
+            .await
+            .unwrap(),
+        ManagedRunSessionLink::Refused
+    );
+
+    // Terminal run refuses relink.
+    store.writer.cancel_managed_run(run.run_id).await.unwrap();
+    assert_eq!(
+        store
+            .writer
+            .relink_managed_session(
+                input(run.run_id, "thread-after-cancel"),
+                ManagedSessionBoundary::Clear
+            )
+            .await
+            .unwrap(),
+        ManagedRunSessionLink::Refused
+    );
+}
+
+#[tokio::test]
+async fn prepare_workstream_run_fresh_leaves_native_session_unset() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = Store::open(tmp.path()).unwrap();
+    let (ws, proj) = scope(&store).await;
+    let base = |lease: &str| PrepareWorkstreamRun {
+        scope_by_id: true,
+        workspace_id: ws,
+        project_id: proj,
+        repo_fingerprint: "fresh-repo".into(),
+        worktree_fingerprint: "fresh-tree".into(),
+        cwd: "/repo".into(),
+        agent: AgentKind::Codex,
+        automatic_harness: false,
+        available_agents: Vec::new(),
+        selection: WorkstreamSelection::Current,
+        lease_owner: lease.into(),
+    };
+    let first = store
+        .writer
+        .prepare_workstream_run(base("first"))
+        .await
+        .unwrap();
+    assert!(
+        store
+            .writer
+            .link_managed_run_session(first.run_id, AgentKind::Codex, "prior-thread")
+            .await
+            .unwrap()
+    );
+    store.writer.cancel_managed_run(first.run_id).await.unwrap();
+
+    // Control: normal prepare copies `prior-thread`.
+    let resumed = store
+        .writer
+        .prepare_workstream_run_owned_with_options(base("resumed"), None, false, false)
+        .await
+        .unwrap();
+    assert_eq!(resumed.native_session_id.as_deref(), Some("prior-thread"));
+    assert_eq!(
+        store
+            .reader
+            .managed_run_status(resumed.run_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .native_session_id
+            .as_deref(),
+        Some("prior-thread")
+    );
+    store
+        .writer
+        .cancel_managed_run(resumed.run_id)
+        .await
+        .unwrap();
+
+    // `--fresh` leaves `managed_runs.native_session_id` as NULL and `sync_after = 0`.
+    let fresh = store
+        .writer
+        .prepare_workstream_run_owned_with_options(base("fresh"), None, false, true)
+        .await
+        .unwrap();
+    assert_eq!(fresh.native_session_id, None);
+    assert_eq!(fresh.sync_after, 0);
+    assert_eq!(
+        store
+            .reader
+            .managed_run_status(fresh.run_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .native_session_id,
+        None
     );
 }
 
@@ -4523,6 +4977,7 @@ async fn another_operators_observations_lift_their_session_page_in_a_shared_proj
             agent_kind: AgentKind::Codex,
             cwd: Some("/repo".into()),
             actor_user: Some(operator("operator-b")),
+            origin: None,
         })
         .await
         .unwrap();
@@ -4575,6 +5030,7 @@ async fn owned_session(
             agent_kind: AgentKind::Codex,
             cwd: Some("/repo".into()),
             actor_user: owner,
+            origin: None,
         })
         .await
         .unwrap();
@@ -4758,6 +5214,7 @@ async fn owned_session_purge_refuses_foreign_shared_and_wrong_scope_sessions() {
                 agent_kind: AgentKind::Codex,
                 cwd: None,
                 actor_user: owner.map(str::to_string),
+                origin: None,
             })
             .await
             .unwrap();
@@ -4908,6 +5365,7 @@ async fn owned_session_purge_refuses_cross_project_cascades_with_admin_control()
             agent_kind: AgentKind::Codex,
             cwd: None,
             actor_user: Some("user:cascade-alice".into()),
+            origin: None,
         })
         .await
         .unwrap();
@@ -4923,6 +5381,7 @@ async fn owned_session_purge_refuses_cross_project_cascades_with_admin_control()
         importance: 5,
         occurred_at: None,
         file_path: None,
+        trust_class: None,
     };
     store
         .writer
@@ -5654,6 +6113,7 @@ async fn interrupted_recovery_refuses_foreign_scope_owner_and_receiver_with_cont
                 agent_kind: AgentKind::Codex,
                 cwd: Some("/repo".into()),
                 actor_user: Some(operator(owner)),
+                origin: None,
             })
             .await
             .unwrap();
@@ -5672,6 +6132,7 @@ async fn interrupted_recovery_refuses_foreign_scope_owner_and_receiver_with_cont
                     body: format!("private evidence {index}"),
                     importance: 5,
                     file_path: None,
+                    trust_class: None,
                 },
                 &Sanitizer::builtin(),
             ))
@@ -5778,6 +6239,7 @@ async fn interrupted_recovery_ignores_foreign_scope_work_and_batons_with_control
                 body: "private evidence".into(),
                 importance: 5,
                 file_path: None,
+                trust_class: None,
             },
             &Sanitizer::builtin(),
         )
@@ -5885,6 +6347,7 @@ async fn file_observation(
                 body: "tool_family: file\noutcome: ok".into(),
                 importance: 5,
                 file_path: file_path.map(str::to_owned),
+                trust_class: None,
             },
             &Sanitizer::default(),
         ))
@@ -6096,6 +6559,7 @@ async fn a_refused_link_names_the_holder_only_for_the_runs_own_operator_and_harn
                 agent_kind,
                 cwd: Some("/repo".into()),
                 actor_user: actor_user.map(operator),
+                origin: None,
             })
             .await
             .unwrap();
@@ -6173,6 +6637,7 @@ async fn agent_mismatch_names_the_bound_agent_only_to_an_admitted_owner() {
         agent_kind,
         cwd: Some("/repo".into()),
         actor_user: owner.map(str::to_owned),
+        origin: None,
     };
     let event = |id: SessionId| {
         Sanitized::new(
@@ -6188,6 +6653,7 @@ async fn agent_mismatch_names_the_bound_agent_only_to_an_admitted_owner() {
                 body: "body".into(),
                 importance: 3,
                 file_path: None,
+                trust_class: None,
             },
             &Sanitizer::builtin(),
         )
@@ -6302,6 +6768,7 @@ async fn an_explicit_handoff_from_a_live_session_is_delivered_and_claimed_once()
                 importance: 5,
                 occurred_at: None,
                 file_path: None,
+                trust_class: None,
             },
             &Sanitizer::builtin(),
         ))

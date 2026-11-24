@@ -88,6 +88,7 @@ async fn seed_page_in(
         expires_at: None,
         entities: Vec::new(),
         evidence: Vec::new(),
+        trust_class: None,
     };
     store.writer.upsert_page(page).await.unwrap();
     proj
@@ -192,6 +193,7 @@ async fn status_carries_the_consolidation_queue_and_its_failed_sessions() {
             agent_kind: ai_memory_core::AgentKind::Codex,
             cwd: Some("/repo".into()),
             actor_user: None,
+            origin: None,
         })
         .await
         .unwrap();
@@ -284,6 +286,7 @@ async fn status_counts_missing_embeddings_against_configured_triple() {
             author_id: None,
             actor: ActorContext::anonymous(),
             evidence: Vec::new(),
+            trust_class: None,
         })
         .await
         .unwrap();
@@ -333,6 +336,7 @@ async fn status_counts_missing_embeddings_against_configured_triple() {
             author_id: None,
             actor: ActorContext::anonymous(),
             evidence: Vec::new(),
+            trust_class: None,
         })
         .await
         .unwrap();
@@ -375,6 +379,7 @@ async fn list_projects_returns_workspace_project_pairs() {
             expires_at: None,
             entities: Vec::new(),
             evidence: Vec::new(),
+            trust_class: None,
         })
         .await
         .unwrap();
@@ -502,6 +507,7 @@ async fn project_coordinate_reports_all_statuses_and_never_mutates() {
             expires_at: None,
             entities: Vec::new(),
             evidence: Vec::new(),
+            trust_class: None,
         })
         .await
         .unwrap();

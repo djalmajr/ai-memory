@@ -100,6 +100,7 @@ async fn harness() -> Harness {
             expires_at: None,
             entities: vec![],
             evidence: vec![],
+            trust_class: None,
         })
         .await
         .unwrap();
@@ -176,6 +177,8 @@ fn rejecting_chain(address: std::net::SocketAddr, events: Vec<AdmissionOp>) -> A
         failure_policy: FailurePolicy::Reject,
         events,
         blocking: true,
+        projects: Vec::new(),
+        headers: Vec::new(),
     }])
     .unwrap()
 }

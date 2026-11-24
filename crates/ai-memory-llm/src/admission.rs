@@ -260,6 +260,7 @@ impl AdmittedLlmProvider {
         // local serialization guarantee.
         let permit = self.acquire().await?;
         let result = match action().await {
+            Err(error) if error.is_quota_exhausted() => Err(error),
             Err(error) if error.is_ambiguous_delivery() => {
                 let jitter = u64::from(uuid::Uuid::new_v4().as_bytes()[0] % self.jitter_max_secs);
                 let delay = self.ambiguous_cooldown + Duration::from_secs(jitter);
@@ -326,7 +327,7 @@ impl LlmProvider for AdmittedLlmProvider {
     ) -> LlmResult<ChatResponse> {
         self.execute(&request, None, || {
             self.inner
-                .complete_with_operation_id(request.clone(), operation_id)
+                .complete_with_operation_id(request.clone(), operation_id.clone())
         })
         .await
     }
@@ -350,7 +351,7 @@ impl LlmProvider for AdmittedLlmProvider {
             self.inner.complete_structured_raw_with_operation_id(
                 request.clone(),
                 schema.clone(),
-                operation_id,
+                operation_id.clone(),
             )
         })
         .await
@@ -751,6 +752,24 @@ mod tests {
         assert_eq!(inner.calls.load(Ordering::Acquire), 2);
     }
 
+    #[tokio::test]
+    async fn exhausted_quota_does_not_replay_a_429_with_retry_after() {
+        let inner = Arc::new(ScriptedProvider::new(vec![
+            Err(LlmError::RateLimited {
+                body: r#"{"error":{"code":"insufficient_quota"}}"#.into(),
+                retry_after_secs: Some(0),
+            }),
+            response(),
+        ]));
+        let guard = AdmittedLlmProvider::new(inner.clone(), None, None).unwrap();
+        let error = guard
+            .complete(ChatRequest::user_prompt("x"))
+            .await
+            .unwrap_err();
+        assert_eq!(error.class(), "quota-exhausted");
+        assert_eq!(inner.calls.load(Ordering::Acquire), 1);
+    }
+
     // Mutation captured: returning the second 502 directly lets an outer
     // fast-retry loop issue a third request after the delayed replay.
     #[tokio::test]
@@ -827,7 +846,7 @@ mod tests {
                     "properties": { "ok": { "type": "boolean" } },
                     "required": ["ok"],
                 }),
-                operation_id,
+                operation_id.clone(),
             )
             .await
             .expect("the delayed replay succeeds");

@@ -257,7 +257,7 @@ fn build_plugin(
 
 import {{ definePluginEntry }} from "openclaw/plugin-sdk/plugin-entry";
 import {{ execFileSync }} from "node:child_process";
-import {{ closeSync, existsSync, mkdirSync, opendirSync, openSync, readFileSync as readMarkerText, readSync, readdirSync, renameSync, statSync, unlinkSync, writeFileSync }} from "node:fs";
+import {{ closeSync, existsSync, mkdirSync, opendirSync, openSync, readFileSync as readMarkerText, readSync, readdirSync, renameSync, rmdirSync, statSync, unlinkSync, writeFileSync }} from "node:fs";
 import {{ basename, dirname, join, resolve, sep }} from "node:path";
 import {{ homedir }} from "node:os";
 
@@ -434,6 +434,11 @@ async function fetchHandoff(event: any, ctx: any): Promise<string | undefined> {
   if (CAPTURE_MODE === "allowlist" && !findMarker(currentCwd)) return undefined;
   const url = new URL(`${{SERVER}}/handoff`);
   url.searchParams.set("agent", AGENT);
+  // An external-capture run shares its project with the owner's own sessions,
+  // so it offers the baton rather than consuming it (#2148): claim=0 makes the
+  // server announce the handoff for an explicit memory_handoff_accept. Parity
+  // with the native hook and the shell/PowerShell bundles.
+  if (captureOwnedExternally()) url.searchParams.set("claim", "0");
   if (!applyMarkerParams(url, currentCwd)) return undefined;
   try {{
     // The body is prepended to the prompt, so a redirect is refused: a
@@ -593,6 +598,10 @@ mod tests {
         assert!(plugin.contains("tomlKey(body, \"project_strategy\")"));
         assert!(plugin.contains("tomlKey(body, \"drop_subagent_captures\")"));
         assert!(plugin.contains("url.searchParams.set(\"drop_subagent\", dropSubagent)"));
+        assert!(
+            plugin.contains("url.searchParams.set(\"default_result_limit\", defaultResultLimit)")
+        );
+        assert!(plugin.contains("url.searchParams.set(\"min_relevance\", minRelevance)"));
         assert!(plugin.contains("url.searchParams.set(\"profile_contribute\", profileContribute)"));
         assert!(plugin.contains("url.searchParams.set(\"profile_consume\", profileConsume)"));
         assert!(plugin.contains("function tomlFlag"));
@@ -608,8 +617,9 @@ mod tests {
                 "tomlScopedFlag(body, \"deliver_on_session_start\", \"recovery\", false)"
             )
         );
-        assert!(plugin.contains("url.searchParams.set(\"handoff\", \"0\")"));
-        assert!(plugin.contains("url.searchParams.set(\"recovery\", \"0\")"));
+        assert!(plugin.contains("function deliveryFlag"));
+        assert!(plugin.contains("url.searchParams.set(\"handoff\", handoffValue)"));
+        assert!(plugin.contains("url.searchParams.set(\"recovery\", recoveryValue)"));
         assert!(plugin.contains("url.searchParams.set(\"briefing_budget\", briefingBudget)"));
         // #668: same settings-walk as the shared ts_apply_marker_params
         // (install_hooks.rs) — the two applyMarkerParams copies stay
@@ -627,7 +637,7 @@ mod tests {
         assert!(plugin.contains("boundary ??= dir;"));
         assert!(plugin.contains("function repoRootProject"));
         assert!(plugin.contains("repoProjectCache.set(cwd, project);"));
-        assert_eq!(plugin.matches("windowsHide: true").count(), 3);
+        assert_eq!(plugin.matches("windowsHide: true").count(), 5); // three before, plus the spool dir's whoami and icacls
         assert!(plugin.contains("--git-common-dir"));
         assert!(
             plugin
@@ -1071,7 +1081,7 @@ mod tests {
         let plugin = build_plugin("http://127.0.0.1:49374", None, None, "denylist");
         assert!(
             plugin.contains(
-                "if (captureServerRouted(cwd)) return { disposition: \"drop\", payload };"
+                "const serverRoute = captureServerRouted(cwd); if (serverRoute) return { disposition: \"drop\", ...(serverRoute.profile ? { serverRoutedProfile: serverRoute.profile } : {}), payload };"
             ),
             "{plugin}"
         );

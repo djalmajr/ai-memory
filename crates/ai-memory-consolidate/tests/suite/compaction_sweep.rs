@@ -86,6 +86,7 @@ async fn write(
             author_id: None,
             actor: ActorContext::anonymous(),
             evidence: Vec::new(),
+            trust_class: None,
         })
         .await
         .unwrap()
@@ -218,6 +219,8 @@ async fn compaction_does_not_supersede_a_concurrent_fresh_write() {
             failure_policy: FailurePolicy::Reject,
             events: vec![AdmissionOp::WritePage],
             blocking: true,
+            projects: Vec::new(),
+            headers: Vec::new(),
         }])
         .unwrap(),
     );
@@ -753,6 +756,7 @@ async fn flag_off_keeps_an_already_compacted_residue_terminal() {
             author_id: None,
             actor: ActorContext::anonymous(),
             evidence: Vec::new(),
+            trust_class: None,
         })
         .await
         .unwrap();

@@ -60,6 +60,13 @@ pub trait Reranker: Send + Sync {
     /// Model identifier backing this reranker.
     fn model(&self) -> &str;
 
+    /// Whether the stage can cancel the request when its wait budget expires.
+    /// Providers using shared LLM admission must keep the permit until the
+    /// outstanding request settles.
+    fn cancel_on_stage_timeout(&self) -> bool {
+        false
+    }
+
     /// Score every candidate against `query`. Implementations may return
     /// scores in any order, but must return exactly one finite `[0, 1]`
     /// score for every candidate. Callers reject malformed or partial
@@ -74,14 +81,14 @@ pub trait Reranker: Send + Sync {
 /// Per-candidate snippet budget in the rerank prompt. Enough to judge
 /// relevance, small enough that 30 candidates stay well inside a
 /// single request.
-const SNIPPET_BUDGET_BYTES: usize = 600;
+pub(crate) const SNIPPET_BUDGET_BYTES: usize = 600;
 /// Title budget in the rerank prompt.
-const TITLE_BUDGET_BYTES: usize = 200;
+pub(crate) const TITLE_BUDGET_BYTES: usize = 200;
 /// Query budget in the rerank prompt.
-const QUERY_BUDGET_BYTES: usize = 1_000;
+pub(crate) const QUERY_BUDGET_BYTES: usize = 1_000;
 const ELLIPSIS_BYTES: usize = "…".len();
 
-fn truncate_prompt_value(value: &str, max_bytes: usize) -> String {
+pub(crate) fn truncate_prompt_value(value: &str, max_bytes: usize) -> String {
     if value.len() <= max_bytes {
         return value.to_owned();
     }
@@ -323,18 +330,26 @@ impl RerankStage {
         };
         let candidates: Vec<RerankCandidate> =
             hits.iter().take(candidate_count).map(candidate).collect();
-        // The caller can stop waiting at `timeout`, but cancelling an HTTP LLM
-        // future here would release admission while the server may still be
-        // decoding it. Keep the bounded rerank task and its gate permit alive
-        // until the provider resolves or reaches its own timeout.
-        let task_reranker = Arc::clone(reranker);
-        let task_query = query.to_owned();
-        let task_candidates = candidates.clone();
-        let rerank_task = tokio::spawn(async move {
-            let _permit = permit;
-            task_reranker.rerank(&task_query, &task_candidates).await
-        });
-        let scored = match tokio::time::timeout(timeout, rerank_task).await {
+        let outcome = if reranker.cancel_on_stage_timeout() {
+            tokio::time::timeout(timeout, async {
+                let _permit = permit;
+                Ok(reranker.rerank(query, &candidates).await)
+            })
+            .await
+        } else {
+            // A generative provider may still be decoding after the caller
+            // stops waiting. Let the admitted request settle before giving up
+            // its stage and provider permits.
+            let task_reranker = Arc::clone(reranker);
+            let task_query = query.to_owned();
+            let task_candidates = candidates.clone();
+            let task = tokio::spawn(async move {
+                let _permit = permit;
+                task_reranker.rerank(&task_query, &task_candidates).await
+            });
+            tokio::time::timeout(timeout, task).await
+        };
+        let scored = match outcome {
             Ok(Ok(Ok(scores))) => scores,
             Ok(Ok(Err(e))) => {
                 // Redacted fields only: the `Display` of a provider
@@ -727,7 +742,13 @@ mod tests {
         assert_eq!(input["candidates"][0]["title"], candidates[0].title);
         assert_eq!(input["candidates"][0]["text"], candidates[0].snippet);
         assert_eq!(
-            provider.operation_id.lock().unwrap().unwrap().workload(),
+            provider
+                .operation_id
+                .lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .workload(),
             LlmWorkload::Rerank
         );
     }

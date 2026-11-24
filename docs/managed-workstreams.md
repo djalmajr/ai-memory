@@ -2,7 +2,7 @@
 
 `ai-memory run` is an opt-in launcher that lets one logical coding session move
 between Claude Code, Codex, OpenCode, Pi, Crush, Kimi Code, Command Code, Kiro
-CLI v2/v3, OMP, Grok Build CLI, Antigravity CLI, and GitHub Copilot CLI. Direct agent launches
+CLI v2/v3, OMP, Grok Build CLI, Antigravity CLI, GitHub Copilot CLI, and Gemini CLI. Direct agent launches
 keep their existing ai-memory behavior. There is no global mode toggle and no
 `switch` command: using `run` selects the current workstream and transparently
 creates or resumes the correct native session for the requested harness.
@@ -244,7 +244,7 @@ available through `ai-memory workstream-search`.
 
 ```text
 ai-memory run [--workspace NAME] [--project NAME]
-              [--workstream NAME | --new NAME] [--executable PATH]
+              [--workstream NAME [--or-new] | --new NAME] [--executable PATH]
               [--yolo] [--fresh] [--force-unlock] [--no-exit-prompt] [--profile NAME]
               [--env KEY=VALUE]... [--env-file PATH] [--require-server]
               [claude|claude*|codex|opencode|opencode2|pi|crush|omp|kimi|command-code|kiro|grok|antigravity|copilot]
@@ -255,6 +255,20 @@ The default is the most recently selected workstream for the current repository
 and worktree, creating one named `default` on first use. `--new NAME` starts an
 independent line of work; `--workstream NAME` returns to one. These are optional
 branching controls; they do not switch harnesses.
+
+`--workstream NAME --or-new` is the "open the workstream for NAME" selector for
+a wrapper that does not want to look the name up first: it selects `NAME` when
+it exists (resume, lease check, chooser, `--fresh` all as usual) and creates it,
+exactly as `--new NAME` would, when the server reports it does not. The run line
+says which branch it took — `selected existing workstream NAME` or `created
+workstream NAME` — so a typo that silently starts a new line of work is visible
+at once. `--or-new` requires `--workstream` and cannot be combined with `--new`.
+The select-or-create is composed from the two existing server calls, so the
+duplicate-name guard stays the only arbiter: if another caller creates `NAME`
+between the miss and the create, that create is refused and `--or-new` selects
+what the other caller made rather than reporting a creation. Without the flag,
+`--workstream` still fails on a missing name and `--new` still fails on a
+duplicate.
 
 List the workstreams available to those selectors without launching a harness:
 
@@ -348,9 +362,15 @@ sessions already linked to the selected workstream remain resumable.
 ID-selected runs require a reachable server. Their SessionStart context and
 capture hooks use the run's pinned project after validating the launching
 operator, active lease, harness and native session. Startup and initial binding
-also require the original checkout. A stale, expired or foreign pinned run is
-refused rather than routed by the ambiguous name. Existing runs retain their
-original marker/name routing; the additive schema flag defaults to off.
+also require the original checkout. On `SessionStart`, Claude Code (`clear`,
+`resume`) and Codex (`startup`, `clear`, `resume`) may atomically relink an
+active pinned run to a fresh or same-scope resumed native session under the
+same scope, operator, checkout, lease, and foreign-session checks; a stale
+shared Codex daemon carrying a terminal pinned run ID falls through on
+`SessionStart` to single-candidate adoption of the sole live unlinked run. A
+non-Codex or non-`SessionStart` stale, expired or foreign pinned run is refused
+rather than routed by the ambiguous name. Existing runs retain their original
+marker/name routing; the additive schema flag defaults to off.
 
 The wire requests for `/workstream/runs` and `/workstream/recent` accept an
 optional `project_id`, mutually exclusive with a non-empty `project`. Clients
@@ -465,8 +485,9 @@ launch harness for the highlighted row. Each row remembers its choice while you
 navigate. `auto` is the initial choice and preserves bare `ai-memory run`'s
 discovery of the newest usable session; the remaining choices are supported
 harness executables detected in the host `PATH`. Enter launches the displayed
-workstream/harness combination. Escape clears a non-empty search, then cancels
-when the search is empty; Ctrl-C always cancels.
+workstream/harness combination. When the harness exits, including after Ctrl+C,
+the workstream picker reopens with an updated list. Escape clears a non-empty
+search, then returns to the shell when the search is empty; Ctrl-C always cancels.
 
 Just type to filter workstream names with a case-insensitive substring search;
 there is no search mode or prefix key. Results update immediately, and every
@@ -516,7 +537,7 @@ takes precedence: ai-memory resumes the most recently linked harness that still
 has a usable local session. It never chooses a newer but obsolete session from
 another harness merely because that file has a later timestamp. Kiro's v2 and
 v3 candidates share one server agent identity, but the selected native engine
-flavor remains exact. OMP, Grok, Antigravity, and Copilot remain available explicitly
+flavor remains exact. OMP, Grok, Antigravity, Copilot, and Gemini remain available explicitly
 but are not in the automatic pool. OpenCode's resolved major contributes one
 adapter to the pool, so shared V1/V2 storage never duplicates a candidate.
 
@@ -723,7 +744,18 @@ Crush cursors fingerprint every message revision in the newest one-second
 timestamp bucket. This preserves inserts whose UUID sorts below the prior
 cursor and edits whose native timestamp did not advance. Exact recovery ranges
 also retain the captured endpoint fingerprints, so a revision written later in
-that second is not pulled backward into an earlier interval.
+that second is not pulled backward into an earlier interval. Each import reads
+its events and cursor from one SQLite snapshot, so a concurrent native write
+remains available to the next import. Baseline cursor timestamps and revision
+fingerprints also share one snapshot.
+
+OpenCode V1 and OpenCode 2 cursors fingerprint the same way, over the newest
+`time_updated` millisecond bucket. Both native stores stamp `time_updated` with
+`Date.now()` rather than a unique revision number, so an in-place update keeps
+the same `(time_updated, id)` pair; the boundary fingerprints let the next
+export re-emit a same-millisecond revision or lower-id insert without replaying
+unchanged records. A pair-only cursor persisted before these fingerprints still
+deserializes and keeps its original strict id-ordering scan.
 
 Search and tail also return optional `source_record_id` and `metadata` fields.
 The text CLI prints the source record and correlation metadata as escaped JSON;
@@ -854,6 +886,9 @@ journal entries; correlated entries are quarantined before that pass and can
 only be deleted after a later clean pass and exact transcript replay. If the
 server is still unreachable, `recover` exits successfully
 and prints the remaining spool/journal counts and startup guidance.
+When the server is reachable but the journal is unreadable, `recover` still
+drains the hook spool. It preserves the journal for repair, reports its error
+alongside the spool counts, and exits with status 1.
 
 To restore the strict behavior (fail with the usual "could not reach …"
 diagnosis and never start the agent), pass `--require-server`, set
@@ -908,6 +943,7 @@ change does not add an atomic disk/SQL seal or change lease/retry policy.
 | Grok Build CLI | generated `--session-id` | `--resume <id>` | `$GROK_HOME/sessions/*/*/chat_history.jsonl` |
 | Antigravity CLI | native default creation | `--conversation <id>` | `~/.gemini/antigravity-cli/conversations/<id>.db` metadata; user prompts from `history.jsonl`, falling back to that conversation's bounded `brain/<id>/.system_generated/logs/transcript{,_full}.jsonl` for print mode (assistant and tool steps come from lifecycle-hook capture) |
 | GitHub Copilot CLI | generated `--session-id` | `--resume=<id>` | `$COPILOT_HOME/session-state/<uuid>/events.jsonl` (`COPILOT_HOME` defaults to `~/.copilot`) |
+| Gemini CLI | generated `--session-id` | `--resume <id>` | `$GEMINI_CLI_HOME/.gemini/tmp/<project>/chats/session-*.jsonl` (`GEMINI_CLI_HOME` defaults to `$HOME`) |
 
 OMP's agent directory is `~/.omp/agent` for the default profile and
 `~/.omp/profiles/<name>/agent` for a named profile. `PI_CONFIG_DIR` changes the
@@ -931,10 +967,15 @@ The default executable is `command-code` on Unix and `cmdc` on native Windows;
 The experimental unsandboxed Mod API is not used.
 
 An explicit native selector such as Claude's `--resume`, OpenCode's `--session`,
-Codex's `resume`, Antigravity's `--conversation` / `--continue`, or Copilot's
-`--resume` / `--continue` / `--session-id` / `--connect` wins.
+Codex's `resume`, Antigravity's `--conversation` / `--continue`, Copilot's
+`--resume` / `--continue` / `--session-id` / `--connect`, or Gemini's
+`--resume` / `-r` / `--session-id` / `--session-file` wins.
 ai-memory links the selected native session and resets an unrelated adapter
-cursor rather than assuming it belongs to the old session.
+cursor rather than assuming it belongs to the old session. Claude's `--resume`
+also takes a session name or the absolute path of a transcript; neither is the
+session id, so ai-memory links the id the session reports at start. A
+transcript resumed by path from outside `~/.claude/projects` is linked but not
+imported, because the adapter reads only that directory.
 
 When the linked Claude session is a Claude Code background session that is
 still running in the daemon, Claude refuses `--resume <id>` when another flag
@@ -1063,9 +1104,12 @@ the harness's native dangerous mode. The translation is Claude Code
 Crush `--yolo`, Kimi Code `--yolo`, Command Code `--yolo`, Kiro CLI v2
 `--trust-all-tools`, Grok Build CLI `--yolo` (equivalent to its
 `--always-approve` option), Antigravity CLI
-`--dangerously-skip-permissions`, and GitHub Copilot CLI `--yolo` (equivalent
-to its `--allow-all` option). Kiro v3 replaced the trust-all flag with
-`permissions.yaml`, so ai-memory prints a notice and adds no unverified flag.
+`--dangerously-skip-permissions`, GitHub Copilot CLI `--yolo` (equivalent
+to its `--allow-all` option), and Gemini CLI `--yolo` (avoiding duplicates with
+`-y`, `--yolo`, or `--approval-mode`). Kiro takes `--trust-all-tools` on both engines,
+but only as a `chat` option, so ai-memory places it right after `chat`, or
+starts the launch with `chat --trust-all-tools` when it has no subcommand. An
+`--agent-engine` other than v2 or v3 gets a notice and no unverified flag.
 OMP currently needs no added flag. ai-memory does not add a duplicate when the
 translated native flag is already present.
 
@@ -1176,10 +1220,12 @@ uses its default-home v3 settings/hooks for that process, and first-launch
 auto-wire wires that default home rather than `KIRO_HOME`. Fresh launches and
 versions that store the session below the configured root keep `KIRO_HOME`
 unchanged. Every candidate still needs exact id, schema, and checkout metadata.
-The v2 `--yolo` translation is `--trust-all-tools`; an explicit narrower
-`--trust-tools` choice is never widened. V3 documents no equivalent CLI flag.
-See Kiro's current
-[session management](https://kiro.dev/docs/cli/chat/session-management/) and
+The `--yolo` translation is `--trust-all-tools` after `chat` on both engines;
+v3 keeps applying `permissions.yaml` denies under it, and an explicit narrower
+`--trust-tools` choice is never widened. Other subcommands (`mcp`, `login`)
+and help or version requests get no trust flag. See Kiro's current
+[session management](https://kiro.dev/docs/cli/chat/session-management/),
+[CLI commands](https://kiro.dev/docs/reference/cli-commands/) and
 [v3 compatibility](https://kiro.dev/docs/cli/v3/) references.
 
 Grok needs no ai-memory hook installation for managed delivery either. Grok
@@ -1250,6 +1296,26 @@ harnesses, so the bare name means the CLI here, while `install-mcp --client
 copilot` keeps meaning VS Code Copilot. The native contract was verified
 against GitHub Copilot CLI 1.0.92. Copilot is not part of the no-argument
 auto-detection set; name it explicitly.
+
+Gemini CLI accepts a caller-chosen UUID on `--session-id` for a fresh session
+and resumes an existing session with `--resume <id>`. Explicit user selectors
+(`--resume`, `-r`, `--session-id`, `--session-file`) always win, utility
+subcommands (`mcp`, `extensions`, `skills`, `hooks`, `gemma`) and one-shot
+listing/deletion/help/version flags (`--list-sessions`, `--delete-session`,
+`--list-extensions`, `-l`, `-h`/`--help`, `-v`/`--version`) pass through
+without session flags, and `-p`/`--prompt` blocks first-use adoption. Sessions
+are read read-only from `$GEMINI_CLI_HOME/.gemini/tmp/<project>/chats/session-*.jsonl`
+(default `$HOME/.gemini/tmp/...`): discovery refuses symlinks and non-regular
+files and requires the metadata header's `projectHash` (SHA-256 of the checkout
+path) to match the exact current checkout. Export imports visible user and
+assistant text plus completed tool calls and results; hidden `thoughts`, system
+prompts, binary payloads, and provider metadata (`tokens`, `model`) are
+excluded, and `$rewindTo`/`$patch` records are noted as bounded losses. Context
+is delivered by Gemini CLI's existing `SessionStart` hook. `--yolo` maps to
+Gemini CLI's `--yolo` without duplicating `-y`, `--yolo`, or `--approval-mode`.
+The managed launcher accepts `gemini` and `gemini-cli`. Verified against Gemini
+CLI 0.64.0 / 0.66.0. Gemini CLI is not part of the no-argument auto-detection
+set; name it explicitly.
 
 Crush needs no ai-memory hook installation for managed mode. The launcher reads
 its one-time context from the server, copies the global Crush JSON the launch
@@ -1405,7 +1471,7 @@ atomic operation.
 
 
 ai-memory's managed adapters do not write to Claude, Codex, OpenCode, Pi, Crush,
-Kimi Code, Command Code, Kiro, OMP, Grok, Antigravity, or Copilot private stores. The
+Kimi Code, Command Code, Kiro, OMP, Grok, Antigravity, Copilot, or Gemini private stores. The
 launched harness retains normal ownership of its own session writes. Adapters read only
 documented or observed local session formats. Provider credentials, encrypted
 content, system/developer prompt records, and hidden reasoning are not copied. The
@@ -1425,7 +1491,8 @@ renamed, absolute-path session locators used by Claude Code, Codex, OpenCode,
 Pi, Kimi Code (`state.json`'s `cwd` or legacy `workDir`), Command Code (v3
 header `cwd`), Kiro v2
 (`<uuid>.json`'s `cwd`), Kiro v3 (`session.json`'s `workspacePaths`), OMP,
-Antigravity, and Copilot (`session.start`'s `context.cwd`) may still reference
+Antigravity, Copilot (`session.start`'s `context.cwd`), and Gemini (`projectHash`
+derived from the checkout path) may still reference
 the old path; Crush's project-local `.crush`
 database moves with the checkout.
 

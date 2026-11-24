@@ -160,6 +160,7 @@ async fn session(h: &Harness, owner: Option<&str>) -> SessionId {
             agent_kind: AgentKind::Codex,
             cwd: None,
             actor_user: owner.map(|name| format!("user:{name}")),
+            origin: None,
         })
         .await
         .unwrap();
@@ -334,6 +335,7 @@ async fn management_refuses_foreign_ids_shared_deletion_and_missing_csrf_with_ad
                 author_id: Some(h.alice.user),
                 actor: ActorContext::default(),
                 evidence: vec![],
+                trust_class: None,
             })
             .await
             .unwrap();
@@ -621,6 +623,8 @@ async fn management_purge_admission_rejection_preserves_rows_and_files() {
         failure_policy: FailurePolicy::Reject,
         events: vec![AdmissionOp::PurgeSession],
         blocking: true,
+        projects: Vec::new(),
+        headers: Vec::new(),
     }])
     .unwrap();
     let h = harness_with_chain(Some(chain)).await;
@@ -640,6 +644,7 @@ async fn management_purge_admission_rejection_preserves_rows_and_files() {
             author_id: Some(h.alice.user),
             actor: ActorContext::default(),
             evidence: vec![],
+            trust_class: None,
         })
         .await
         .unwrap();
@@ -765,6 +770,7 @@ async fn management_pagination_reports_its_limit_and_keeps_pages_disjoint() {
                     importance: 5,
                     occurred_at: None,
                     file_path: None,
+                    trust_class: None,
                 },
                 &Sanitizer::default(),
             ))

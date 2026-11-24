@@ -218,6 +218,10 @@ pub enum Command {
     /// Accepts either `--path` (exact path) or a positional query that
     /// searches FTS5 and fetches the top matching page.
     ReadPage(ReadPageArgs),
+    /// Call one MCP tool of the configured server from the shell, or list the
+    /// tools and their input schemas when no tool is named. For agents that
+    /// cannot load MCP.
+    Call(CallArgs),
     /// Write or update a wiki page atomically (also indexes it in the store).
     WritePage(WritePageArgs),
     /// Delete a single wiki page. The server routes scope resolution
@@ -460,6 +464,14 @@ pub struct RunArgs {
     /// Create and select a fresh named workstream.
     #[arg(long = "new", conflicts_with = "workstream")]
     pub new_workstream: Option<String>,
+    /// With `--workstream NAME`: create NAME as `--new NAME` would when it does
+    /// not exist yet, instead of failing. An existing NAME resumes as usual.
+    #[arg(
+        long = "or-new",
+        requires = "workstream",
+        conflicts_with = "new_workstream"
+    )]
+    pub or_new: bool,
     /// Override the native harness executable path.
     #[arg(long)]
     pub executable: Option<PathBuf>,
@@ -620,6 +632,9 @@ pub enum RunHarnessChoice {
     /// here the way `install-mcp --client copilot` does.
     #[value(name = "copilot", alias = "copilot-cli")]
     Copilot,
+    /// Google Gemini CLI (`gemini`).
+    #[value(name = "gemini", alias = "gemini-cli")]
+    Gemini,
 }
 
 /// Parses the `run` harness positional, additionally wildcarding every
@@ -1012,9 +1027,13 @@ pub struct UserGrantArgs {
     /// The workspace the project lives in.
     #[arg(long, default_value = "default")]
     pub workspace: String,
-    /// The project, by name.
-    #[arg(long)]
-    pub project: String,
+    /// The project, by name. Required unless `--all-projects` is given.
+    #[arg(long, required_unless_present = "all_projects")]
+    pub project: Option<String>,
+    /// Grant every project of the workspace, present and future, instead of
+    /// one project. Never implied: leaving `--project` out is an error.
+    #[arg(long, conflicts_with = "project")]
+    pub all_projects: bool,
     /// `read` or `write`. Required: a level left unsaid is not guessed at.
     #[arg(long)]
     pub level: String,
@@ -1029,9 +1048,13 @@ pub struct UserRevokeArgs {
     /// The workspace the project lives in.
     #[arg(long, default_value = "default")]
     pub workspace: String,
-    /// The project, by name.
-    #[arg(long)]
-    pub project: String,
+    /// The project, by name. Required unless `--all-projects` is given.
+    #[arg(long, required_unless_present = "all_projects")]
+    pub project: Option<String>,
+    /// Revoke the grant on the whole workspace instead of one project's.
+    /// Project grants the user holds inside the workspace stay in force.
+    #[arg(long, conflicts_with = "project")]
+    pub all_projects: bool,
 }
 
 /// Arguments for `user grants`.
@@ -1083,17 +1106,18 @@ pub enum ProfileCommand {
     Status(ProfileScopeArgs),
     /// List the profile's entries.
     List(ProfileScopeArgs),
-    /// Print one entry (`profile/` prefix optional).
+    /// Print one entry (`profile/` prefix and `.md` suffix optional).
     Show {
-        /// Entry path, e.g. `tools/pnpm.md`.
+        /// Entry path, e.g. `tools/pnpm` or `tools/pnpm.md`.
         path: String,
         #[command(flatten)]
         scope: ProfileScopeArgs,
     },
-    /// Remove one entry (`profile/` prefix optional). Git keeps its history,
-    /// and the harvester leaves the topic alone until you state it again.
+    /// Remove one entry (`profile/` prefix and `.md` suffix optional). Git
+    /// keeps its history, and the harvester leaves the topic alone until you
+    /// state it again.
     Forget {
-        /// Entry path, e.g. `tools/pnpm.md`.
+        /// Entry path, e.g. `tools/pnpm` or `tools/pnpm.md`.
         path: String,
         #[command(flatten)]
         scope: ProfileScopeArgs,
@@ -1206,11 +1230,13 @@ pub enum UserCommand {
     Enable(UserEnableArgs),
     /// Update display name, email, and/or role (`root` or `user`).
     Patch(UserPatchArgs),
-    /// Grant a user `read` or `write` on a project, or change the level they
-    /// hold (#708). Grants decide access to `restricted` projects; an `open`
-    /// project admits every user — see `ai-memory project access`.
+    /// Grant a user `read` or `write` on a project, or with `--all-projects`
+    /// on every project of a workspace, or change the level they hold (#708).
+    /// Grants decide access to `restricted` projects; an `open` project admits
+    /// every user — see `ai-memory project access`.
     Grant(UserGrantArgs),
-    /// Take away whatever a user holds on a project.
+    /// Take away whatever a user holds on a project, or with `--all-projects`
+    /// their grant on the whole workspace.
     Revoke(UserRevokeArgs),
     /// List grants: one user's with `--user`, else every grant on the server.
     Grants(UserGrantsArgs),
@@ -1938,7 +1964,8 @@ pub enum InstallSkillsAgent {
     ClaudeCode,
     /// Cross-agent `.agents/skills` directory.
     Agents,
-    /// Devin's `.devin/skills` directory.
+    /// Devin's `.devin/skills` (project) or `~/.config/devin/skills` /
+    /// `%APPDATA%\devin\skills` (global) directory.
     Devin,
     /// Grok Build CLI's `.grok/skills` directory.
     Grok,
@@ -1952,6 +1979,9 @@ pub enum InstallSkillsAgent {
     /// `~/.gemini/antigravity-cli/skills` (CLI).
     #[value(alias = "antigravity-cli", alias = "agy")]
     Antigravity,
+    /// Tencent WorkBuddy's `.workbuddy/skills` directory.
+    #[value(name = "workbuddy", alias = "work-buddy")]
+    WorkBuddy,
     /// Install into both Claude Code and `.agents` skill directories.
     Both,
 }
@@ -2179,6 +2209,10 @@ pub struct SetupArgs {
     /// holds the write end, so the page goes away with the app.
     #[arg(long, requires = "web", hide = true)]
     pub stop_on_stdin_eof: bool,
+    /// Write the absolute, shell-quoted exe and data dir into the hook commands
+    /// that `setup` installs, instead of the `"$HOME/..."` form.
+    #[arg(long)]
+    pub absolute_paths: bool,
 }
 
 /// Arguments for `status`.
@@ -2375,6 +2409,27 @@ pub struct ReadPageArgs {
     /// Emit the page as JSON (includes frontmatter).
     #[arg(long)]
     pub json: bool,
+}
+
+/// Arguments for `call`.
+#[derive(Debug, Args)]
+pub struct CallArgs {
+    /// MCP tool name (e.g. `memory_query`). Omit to list the server's tools
+    /// with their input schemas.
+    pub tool: Option<String>,
+    /// The tool's arguments as one JSON object (e.g. '{"query":"wal mode"}').
+    /// A call that names no `workspace`, `project`, `project_id` or `global`
+    /// gets the current project's scope when the tool accepts one.
+    #[arg(value_parser = parse_json_object)]
+    pub arguments: Option<serde_json::Map<String, serde_json::Value>>,
+}
+
+fn parse_json_object(raw: &str) -> Result<serde_json::Map<String, serde_json::Value>, String> {
+    match serde_json::from_str(raw) {
+        Ok(serde_json::Value::Object(object)) => Ok(object),
+        Ok(_) => Err("expected a JSON object".to_owned()),
+        Err(error) => Err(format!("invalid JSON: {error}")),
+    }
 }
 
 /// Arguments for `delete-page`.
@@ -2592,7 +2647,8 @@ pub enum AgentChoice {
     /// via the MCP `memory_handoff_accept` tool.
     Zero,
     /// Devin CLI — JSON-config hooks in
-    /// `~/.devin/hooks.v1.json` or `~/.devin/config.json` hooks key.
+    /// `~/.config/devin/config.json` (`%APPDATA%\devin\config.json` on Windows)
+    /// under the `"hooks"` key, or project-level `.devin/hooks.v1.json`.
     /// Native `ai-memory hook --event` integration using Devin-specific
     /// hook scripts. Devin consumes the handoff via
     /// `hookSpecificOutput.additionalContext` on `SessionStart`.
@@ -2635,7 +2691,8 @@ pub enum AgentChoice {
     #[value(alias = "zai")]
     Zcode,
     /// Hermes Agent (Nous Research) — lifecycle hooks declared in the `hooks:`
-    /// block of `~/.hermes/config.yaml`. Hermes runs each `command` through
+    /// block of the Hermes home's `config.yaml` (`$HERMES_HOME`, else
+    /// `%LOCALAPPDATA%\hermes` on Windows and `~/.hermes` elsewhere). Hermes runs each `command` through
     /// `shlex.split` with the event JSON on stdin and **no shell**, so
     /// ai-memory's native `hook` subcommand is invoked directly (exec form,
     /// like Zero and ZCode). ai-memory wires the tool events and the session
@@ -2645,7 +2702,7 @@ pub enum AgentChoice {
     /// including after resuming an old native session. When the community
     /// memory-provider plugin is installed under `$HERMES_HOME/plugins`, only
     /// the tool events are wired, since the plugin owns the rest.
-    /// `~/.hermes/config.yaml` is NOT written: it is YAML the installer would
+    /// That `config.yaml` is NOT written: it is YAML the installer would
     /// have to splice, and Hermes gates user hooks behind its own acceptance
     /// prompt (`hooks_auto_accept`), so `install-hooks --agent hermes` prints
     /// the ready-to-paste block.
@@ -2691,6 +2748,15 @@ pub enum AgentChoice {
     /// stdout (`hookSpecificOutput.additionalContext`) carries the handoff.
     #[value(name = "codebuddy", alias = "code-buddy")]
     CodeBuddy,
+    /// Tencent WorkBuddy (`workbuddy`) — lifecycle hooks merged into the
+    /// `hooks` key of `~/.workbuddy/settings.json`. WorkBuddy takes CodeBuddy's
+    /// Claude Code-shaped hook payloads on stdin, so each entry runs
+    /// ai-memory's native `hook` command directly; there is no script bundle.
+    /// SessionStart stdout (`hookSpecificOutput.additionalContext`) carries
+    /// the handoff. WorkBuddy fires no `SessionEnd`, so a finished session
+    /// closes with `ai-memory finalize-session --agent workbuddy`.
+    #[value(name = "workbuddy", alias = "work-buddy")]
+    WorkBuddy,
     /// IBM Bob IDE — lifecycle hooks merged into the `hooks` key of
     /// `~/.bob/settings/settings.json`. Bob sends Claude Code-shaped payloads
     /// and injects plain `SessionStart` stdout into the model context.
@@ -2759,6 +2825,7 @@ impl AgentChoice {
             Self::Droid => AgentKind::Droid,
             Self::Muse => AgentKind::Muse,
             Self::CodeBuddy => AgentKind::CodeBuddy,
+            Self::WorkBuddy => AgentKind::WorkBuddy,
             Self::IbmBob => AgentKind::IbmBob,
             Self::Dsh => AgentKind::Dsh,
             Self::Cline => AgentKind::Cline,
@@ -2786,6 +2853,7 @@ impl AgentChoice {
             | Self::Droid
             | Self::Muse
             | Self::CodeBuddy
+            | Self::WorkBuddy
             | Self::IbmBob
             | Self::Cline
             | Self::QwenCode => None,
@@ -2960,7 +3028,7 @@ pub enum McpClient {
     /// entry schema is strict: unknown keys make it drop the server
     /// silently, so the generated entry carries nothing else.
     Zcode,
-    /// Devin CLI — `~/.devin/config.json`.
+    /// Devin CLI — `~/.config/devin/mcp_config.json` (`%APPDATA%\devin\mcp_config.json` on Windows).
     Devin,
     /// xAI Grok Build CLI — `~/.grok/config.toml` under
     /// `[mcp_servers.<name>]` with native HTTP `url` + `headers`.
@@ -2994,6 +3062,12 @@ pub enum McpClient {
     /// Qoder CLI and IDE — user-level `~/.qoder/settings.json`, with a
     /// stdio `ai-memory mcp-bridge --no-session-id` entry under `mcpServers`.
     Qoder,
+    /// Tencent WorkBuddy (`workbuddy`) — user-level `~/.workbuddy/mcp.json`,
+    /// servers under the root `mcpServers` map with `type: "http"` + `url`
+    /// and an optional `headers` bearer, the shape Claude Code uses. Pair
+    /// with `install-hooks --agent workbuddy` for lifecycle capture.
+    #[value(name = "workbuddy", alias = "work-buddy")]
+    WorkBuddy,
     /// GitHub Copilot CLI — `$COPILOT_HOME/mcp-config.json` (default
     /// `~/.copilot/mcp-config.json`), servers under the root `mcpServers` map
     /// with `type: "http"` + `url` + optional `headers` (#1040). Pair with
@@ -3060,8 +3134,8 @@ pub enum McpClient {
     /// installed separately with `install-hooks --agent dsh`.
     #[value(alias = "deepseek-harness", alias = "deepseek_harness")]
     Dsh,
-    /// Hermes Agent (Nous Research) — the `mcp_servers:` map of
-    /// `~/.hermes/config.yaml`. Print-only (--apply is refused): ai-memory has
+    /// Hermes Agent (Nous Research) — the `mcp_servers:` map of the Hermes
+    /// home's `config.yaml`. Print-only (--apply is refused): ai-memory has
     /// no YAML editor for that file, which the operator also edits. The entry
     /// is a stdio `ai-memory mcp-bridge --no-session-id`, so it carries no
     /// token. Lifecycle capture is installed separately with `install-hooks
@@ -3104,6 +3178,8 @@ pub enum LlmProviderChoice {
     Openai,
     /// Google Gemini (Generative Language API).
     Gemini,
+    /// Google Gemini through Vertex AI (Google Cloud billing, `gcloud` credentials).
+    Vertex,
     /// OpenAI-compatible local (Ollama, vLLM, LM Studio).
     OpenaiCompat,
     /// OpenAI ChatGPT/Codex OAuth backend.
@@ -3442,6 +3518,15 @@ pub struct HookArgs {
     /// `capture_assistant`. No effect on other events (#196).
     #[arg(long)]
     pub capture_assistant: bool,
+    /// Fail closed unless this repository resolves to exactly this server
+    /// profile. A generated plugin that forwards a server-profile repository to
+    /// the native hook (rather than dropping it) passes the profile name it
+    /// read from the marker here; the native hook re-resolves the route from the
+    /// cwd and, if it is not exactly this profile, emits nothing rather than
+    /// delivering to the install default or a different profile (#2122, #992). A
+    /// value is a validated profile name, never a token.
+    #[arg(long)]
+    pub expected_profile: Option<String>,
 }
 
 /// Arguments for hidden `hook-drain`.
@@ -3571,6 +3656,11 @@ pub struct InstallHooksArgs {
     /// `PI_PROFILE`; `default` selects the default profile.
     #[arg(long)]
     pub profile: Option<String>,
+    /// Write the absolute, shell-quoted exe and data dir into hook commands
+    /// instead of the `"$HOME/..."` form. `AI_MEMORY_HOOK_ABSOLUTE_PATHS=1`
+    /// opts out the same way.
+    #[arg(long)]
+    pub absolute_paths: bool,
 }
 
 /// Arguments for `install-mcp`.
@@ -4146,11 +4236,12 @@ mod tests {
             (
                 args.user.as_str(),
                 args.workspace.as_str(),
-                args.project.as_str(),
+                args.project.as_deref(),
                 args.level.as_str()
             ),
-            ("alice", "acme", "api", "write")
+            ("alice", "acme", Some("api"), "write")
         );
+        assert!(!args.all_projects);
         assert!(
             Cli::try_parse_from([
                 "ai-memory",
@@ -4181,6 +4272,47 @@ mod tests {
             Cli::try_parse_from(argv).unwrap_or_else(|e| panic!("{argv:?}: {e}"));
         }
         assert!(Cli::try_parse_from(["ai-memory", "grant", "list"]).is_err());
+    }
+
+    /// A workspace grant is asked for by name. Leaving `--project` out must
+    /// stay an error, or a forgotten flag would widen a grant from one
+    /// project to every project of the workspace.
+    #[test]
+    fn a_workspace_grant_needs_all_projects_and_never_follows_a_missing_project() {
+        let grant = |tail: &[&'static str]| {
+            let mut argv = vec!["ai-memory", "user", "grant", "--user", "alice"];
+            argv.extend_from_slice(tail);
+            Cli::try_parse_from(argv)
+        };
+        let parsed = grant(&["--workspace", "acme", "--all-projects", "--level", "read"])
+            .expect("a workspace grant parses");
+        let Command::User(UserArgs {
+            command: UserCommand::Grant(args),
+        }) = parsed.command
+        else {
+            panic!("expected user grant");
+        };
+        assert!(args.all_projects);
+        assert_eq!(args.project, None);
+        assert_eq!(args.workspace, "acme");
+
+        assert!(
+            grant(&["--workspace", "acme", "--level", "read"]).is_err(),
+            "no --project and no --all-projects is refused"
+        );
+        assert!(
+            grant(&["--project", "api", "--all-projects", "--level", "read"]).is_err(),
+            "one project and every project together is refused"
+        );
+
+        let revoke = |tail: &[&'static str]| {
+            let mut argv = vec!["ai-memory", "user", "revoke", "--user", "alice"];
+            argv.extend_from_slice(tail);
+            Cli::try_parse_from(argv)
+        };
+        assert!(revoke(&["--workspace", "acme", "--all-projects"]).is_ok());
+        assert!(revoke(&["--workspace", "acme"]).is_err());
+        assert!(revoke(&["--project", "api", "--all-projects"]).is_err());
     }
 
     #[test]
@@ -5019,6 +5151,48 @@ mod tests {
     }
 
     #[test]
+    fn run_or_new_requires_workstream_and_conflicts_with_new() {
+        // The happy path: `--or-new` rides on `--workstream NAME`.
+        let cli = Cli::try_parse_from([
+            "ai-memory",
+            "run",
+            "--workstream",
+            "401",
+            "--or-new",
+            "claude",
+        ])
+        .expect("--workstream NAME --or-new parses");
+        let Command::Run(args) = cli.command else {
+            panic!("expected run command");
+        };
+        assert_eq!(args.workstream.as_deref(), Some("401"));
+        assert!(args.or_new, "--or-new sets the flag");
+        assert!(args.new_workstream.is_none());
+
+        // `--or-new` alone has no workstream to fall back on.
+        let error = Cli::try_parse_from(["ai-memory", "run", "--or-new", "claude"])
+            .expect_err("--or-new without --workstream must be rejected");
+        assert_eq!(
+            error.kind(),
+            clap::error::ErrorKind::MissingRequiredArgument
+        );
+
+        // `--or-new` and `--new` name two different create intents.
+        let error = Cli::try_parse_from([
+            "ai-memory",
+            "run",
+            "--workstream",
+            "401",
+            "--or-new",
+            "--new",
+            "402",
+            "claude",
+        ])
+        .expect_err("--or-new must conflict with --new");
+        assert_eq!(error.kind(), clap::error::ErrorKind::ArgumentConflict);
+    }
+
+    #[test]
     fn run_env_file_flag_parses_as_a_path() {
         let cli = Cli::try_parse_from([
             "ai-memory",
@@ -5265,6 +5439,27 @@ mod tests {
             assert_eq!(args.agent, AgentChoice::CodeBuddy);
             assert_eq!(args.agent.kind(), ai_memory_core::AgentKind::CodeBuddy);
             assert_eq!(args.agent.script_hook_subdir(), None);
+        }
+    }
+
+    #[test]
+    fn workbuddy_install_hooks_and_mcp_parse_with_both_aliases() {
+        for alias in ["workbuddy", "work-buddy"] {
+            let hooks = Cli::try_parse_from(["ai-memory", "install-hooks", "--agent", alias])
+                .unwrap_or_else(|error| panic!("{alias}: {error}"));
+            let Command::InstallHooks(args) = hooks.command else {
+                panic!("expected install-hooks");
+            };
+            assert_eq!(args.agent, AgentChoice::WorkBuddy);
+            assert_eq!(args.agent.kind(), ai_memory_core::AgentKind::WorkBuddy);
+            assert_eq!(args.agent.script_hook_subdir(), None);
+
+            let mcp = Cli::try_parse_from(["ai-memory", "install-mcp", "--client", alias])
+                .unwrap_or_else(|error| panic!("{alias}: {error}"));
+            let Command::InstallMcp(args) = mcp.command else {
+                panic!("expected install-mcp");
+            };
+            assert_eq!(args.client, McpClient::WorkBuddy);
         }
     }
 

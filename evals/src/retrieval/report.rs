@@ -45,6 +45,10 @@ pub struct Report {
     /// Evidence reachability (`--reachability` only).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reachability: Option<ReachabilityReport>,
+    /// Protocol, pinned models, stage timings and source-window provenance
+    /// for the opt-in Raw-RAG engine. Absent on existing server/grep reports.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub raw_rag: Option<super::raw_rag::Metadata>,
     pub slices: BTreeMap<String, SliceMetrics>,
     pub per_question: Vec<QuestionScore>,
 }
@@ -115,9 +119,12 @@ impl IngestSummary {
     }
 }
 
-/// Ingest and reachability sections for one config, empty when absent.
+/// Additional sections for one config, empty when absent.
 fn extras_md(r: &Report) -> String {
     let mut md = String::new();
+    if let Some(metadata) = &r.raw_rag {
+        md.push_str(&super::raw_rag::markdown(metadata));
+    }
     if let Some(i) = &r.ingest {
         md.push_str(&format!(
             "\n### Ingest\n\n- mode: {} (date prefix: {}), concurrency {}\n\
@@ -145,6 +152,21 @@ fn extras_md(r: &Report) -> String {
     }
     if let Some(reach) = &r.reachability {
         md.push_str(&super::reachability::to_markdown(&reach.slices));
+    }
+    let mut active = 0;
+    let mut inactive = 0;
+    for status in r.per_question.iter().filter_map(|q| q.vector_stream_active) {
+        if status {
+            active += 1;
+        } else {
+            inactive += 1;
+        }
+    }
+    if active + inactive > 0 {
+        let unreported = r.per_question.len() - active - inactive;
+        md.push_str(&format!(
+            "\n### Query vector stream\n\n- active: {active}\n- inactive: {inactive}\n- unreported: {unreported}\n"
+        ));
     }
     md
 }
@@ -303,7 +325,9 @@ pub fn to_markdown(r: &Report) -> String {
     md.push_str(&slices_table_md(r));
     md.push_str(&qa_table_md(r));
     md.push_str(&extras_md(r));
-    md.push_str(METRIC_NOTES);
+    if r.raw_rag.is_none() {
+        md.push_str(METRIC_NOTES);
+    }
     md
 }
 
@@ -513,6 +537,7 @@ mod tests {
             qa: None,
             ingest: None,
             reachability: None,
+            raw_rag: None,
             slices,
             per_question: vec![],
         }
@@ -642,8 +667,32 @@ mod tests {
             context_tokens: 0,
             ingest_ms: 0,
             raw_hits: 0,
+            vector_stream_active: None,
             qa: None,
         }
+    }
+
+    #[test]
+    fn reports_distinguish_inactive_and_unreported_vector_streams() {
+        let mut report = report("embeddings=local", 0.5, 0.5, 0.5);
+        report.per_question = vec![
+            question("active", 1.0),
+            question("inactive", 0.0),
+            question("unreported", 0.0),
+        ];
+        assert!(!to_markdown(&report).contains("Query vector stream"));
+
+        report.per_question[0].vector_stream_active = Some(true);
+        report.per_question[1].vector_stream_active = Some(false);
+        let json = serde_json::to_value(&report).unwrap();
+        assert_eq!(json["per_question"][0]["vector_stream_active"], true);
+        assert_eq!(json["per_question"][1]["vector_stream_active"], false);
+        assert!(
+            json["per_question"][2]
+                .get("vector_stream_active")
+                .is_none()
+        );
+        assert!(to_markdown(&report).contains("- active: 1\n- inactive: 1\n- unreported: 1"));
     }
 
     #[test]

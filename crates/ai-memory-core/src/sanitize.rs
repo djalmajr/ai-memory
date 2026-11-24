@@ -1955,6 +1955,7 @@ mod tests {
             body: "see /home/user/.ssh/id_ed25519".into(),
             importance: 5,
             file_path: None,
+            trust_class: None,
         };
         let scrubbed = Sanitized::new(raw, &s()).into_inner();
         assert!(scrubbed.title.contains("[REDACTED:"));
@@ -1978,6 +1979,7 @@ mod tests {
             body: String::new(),
             importance: 5,
             file_path: Some(file_path.into()),
+            trust_class: None,
         };
         let longest = "a".repeat(crate::FILE_PATH_MAX_CHARS);
         for kept in ["src/lib.rs", "docs/a b.md", longest.as_str()] {
@@ -2020,6 +2022,7 @@ mod tests {
             ),
             importance: 8,
             file_path: None,
+            trust_class: None,
         };
         let scrubbed = Sanitized::new(raw, &s()).into_inner();
         assert!(scrubbed.body.len() <= OBSERVATION_BODY_MAX_BYTES);
@@ -2057,6 +2060,7 @@ mod tests {
             body: String::new(),
             importance: 5,
             file_path: None,
+            trust_class: None,
         };
         let scrubbed = Sanitized::new(raw, &sanitizer).into_inner();
         assert!(

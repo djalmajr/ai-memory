@@ -843,6 +843,78 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn input_budget_skip_is_staged_once_without_a_provider_retry() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let wiki = Wiki::new(tmp.path(), store.writer.clone()).unwrap();
+        let ws = store
+            .writer
+            .get_or_create_workspace("default")
+            .await
+            .unwrap();
+        let proj = store
+            .writer
+            .get_or_create_project(ws, "budget", None)
+            .await
+            .unwrap();
+        initialize_auto_improve_scheduler_scopes(&store.reader, &store.writer)
+            .await
+            .unwrap();
+        let session_id = seed_reviewable_session(&store, ws, proj).await;
+        let llms = LlmProviders {
+            default: Some(Arc::new(PanicLlm)),
+            ..Default::default()
+        };
+        let settings = ScheduledAutoImproveSettings {
+            require_approval_prefixes: Vec::new(),
+            review: AutoImproveReviewConfig {
+                min_observations: 3,
+                min_session_duration_secs: 0,
+                max_input_tokens: 1_000,
+                ..AutoImproveReviewConfig::default()
+            },
+            require_approval: true,
+            min_session_age_secs: 0,
+            max_sessions_per_tick: 10,
+            experience: None,
+        };
+        let first =
+            run_auto_improve_scheduler_tick(&store.reader, &store.writer, &wiki, &llms, &settings)
+                .await
+                .unwrap();
+        assert_eq!(first.reviewed, 1);
+        assert_eq!(first.errors, 0);
+        let second =
+            run_auto_improve_scheduler_tick(&store.reader, &store.writer, &wiki, &llms, &settings)
+                .await
+                .unwrap();
+        assert_eq!(
+            second.reviewed, 0,
+            "a budget skip advances past the session"
+        );
+        assert_eq!(second.errors, 0);
+        let conn = rusqlite::Connection::open(store.db_path()).unwrap();
+        let (provider, summary, rejected): (String, String, String) = conn
+            .query_row(
+                "SELECT provider, summary, rejected_candidates_json FROM auto_improve_runs \
+             WHERE session_id = ?1",
+                [session_id.as_bytes()],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(provider, "none");
+        assert_eq!(summary, "session skipped by input budget");
+        let rejected: serde_json::Value = serde_json::from_str(&rejected).unwrap();
+        assert!(
+            rejected
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|candidate| { candidate["reason"] == "input_budget_too_small" })
+        );
+    }
+
     /// A provider that rejects the scheduled review with a private body:
     /// the claim's persisted `last_error` and the tick warnings must carry
     /// class/status only, never the body.
@@ -1153,6 +1225,7 @@ mod tests {
                     agent_kind: ai_memory_core::AgentKind::OpenCode,
                     cwd: None,
                     actor_user: None,
+                    origin: None,
                 })
                 .await
                 .unwrap();
@@ -1170,6 +1243,7 @@ mod tests {
                 author_id: None,
                 actor: ActorContext::anonymous(),
                 evidence: Vec::new(),
+                trust_class: None,
             })
             .await
             .unwrap();
@@ -1702,6 +1776,7 @@ mod tests {
                     agent_kind: AgentKind::OpenCode,
                     cwd: None,
                     actor_user: None,
+                    origin: None,
                 })
                 .await
                 .unwrap();
@@ -1733,6 +1808,7 @@ mod tests {
                     agent_kind: AgentKind::OpenCode,
                     cwd: None,
                     actor_user: None,
+                    origin: None,
                 })
                 .await
                 .unwrap();
@@ -1875,6 +1951,7 @@ mod tests {
                     agent_kind: ai_memory_core::AgentKind::OpenCode,
                     cwd: None,
                     actor_user: None,
+                    origin: None,
                 })
                 .await
                 .unwrap();
@@ -1892,6 +1969,7 @@ mod tests {
                 author_id: None,
                 actor: ActorContext::anonymous(),
                 evidence: Vec::new(),
+                trust_class: None,
             })
             .await
             .unwrap();
@@ -1930,6 +2008,38 @@ mod tests {
             .into(),
             ..Default::default()
         };
+        let mut tiny_budget = settings.clone();
+        tiny_budget.review.max_input_tokens = 128;
+        let skipped = run_auto_improve_scheduler_tick(
+            &store.reader,
+            &store.writer,
+            &wiki,
+            &LlmProviders {
+                overrides: [(
+                    LlmWorkload::Experience,
+                    Arc::new(PanicLlm) as Arc<dyn LlmProvider>,
+                )]
+                .into(),
+                ..Default::default()
+            },
+            &tiny_budget,
+        )
+        .await
+        .unwrap();
+        assert_eq!(skipped.experience_runs, 0, "{skipped:?}");
+        assert_eq!(skipped.errors, 0, "{skipped:?}");
+        assert!(
+            store
+                .reader
+                .list_auto_improve_proposals(ws, project, None, 10)
+                .await
+                .unwrap()
+                .is_empty(),
+            "an input-budget skip must not stage a run"
+        );
+
+        // Raising the budget retries the same completed sessions: the skipped
+        // pass must not advance the scheduler's cadence anchor.
         let outcome =
             run_auto_improve_scheduler_tick(&store.reader, &store.writer, &wiki, &llms, &settings)
                 .await
@@ -2017,6 +2127,7 @@ mod tests {
             store
                 .writer
                 .begin_session(NewSession {
+                    origin: None,
                     occurred_at: None,
                     id: session_id,
                     workspace_id: ws,
@@ -2029,6 +2140,7 @@ mod tests {
                 .unwrap();
             store.writer.end_session(session_id, None).await.unwrap();
             wiki.write_page(ai_memory_wiki::WritePageRequest {
+                trust_class: None,
                 workspace_id: ws,
                 project_id: project,
                 path: PagePath::new(format!("sessions/{session_id}.md")).unwrap(),
@@ -2128,6 +2240,7 @@ mod tests {
                 agent_kind: ai_memory_core::AgentKind::OpenCode,
                 cwd: None,
                 actor_user: None,
+                origin: None,
             })
             .await
             .unwrap();
@@ -2321,6 +2434,7 @@ mod tests {
                 agent_kind: AgentKind::Other,
                 cwd: None,
                 actor_user: None,
+                origin: None,
             })
             .await
             .unwrap();
@@ -2344,6 +2458,7 @@ mod tests {
                         body: "run the full gate before release".into(),
                         importance: 5,
                         file_path: None,
+                        trust_class: None,
                     },
                     &Sanitizer::builtin(),
                 ))
@@ -2371,6 +2486,7 @@ mod tests {
                 agent_kind: AgentKind::Other,
                 cwd: None,
                 actor_user: None,
+                origin: None,
             })
             .await
             .unwrap();
@@ -2394,6 +2510,7 @@ mod tests {
                         body: "run the full gate before release".into(),
                         importance: 5,
                         file_path: None,
+                        trust_class: None,
                     },
                     &Sanitizer::builtin(),
                 ))
@@ -2552,6 +2669,7 @@ mod tests {
             .unwrap();
         // The page the patch proposal targets.
         wiki.write_page(ai_memory_wiki::WritePageRequest {
+            trust_class: None,
             workspace_id: ws,
             project_id: proj,
             path: ai_memory_core::PagePath::new("_rules/existing.md").unwrap(),

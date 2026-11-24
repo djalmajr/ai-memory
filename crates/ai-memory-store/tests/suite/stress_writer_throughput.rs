@@ -44,6 +44,7 @@ async fn scope(store: &Store) -> (WorkspaceId, ProjectId, SessionId) {
             agent_kind: AgentKind::Codex,
             cwd: None,
             actor_user: None,
+            origin: None,
         })
         .await
         .unwrap();
@@ -69,6 +70,7 @@ fn observation(
             body: "ran a command and captured a bounded excerpt of its output".into(),
             importance: 5,
             file_path: None,
+            trust_class: None,
         },
         &Sanitizer::builtin(),
     )

@@ -19,21 +19,27 @@ Before these commands were added:
 
 ## 2. Target Matrix by Agent Harness
 
-| Harness | MCP Configuration | Skills (Global / Project) | Plugins / Extensions | Instructions / Rules |
+| Harness | Configuration | Skills (Global / Project) | Plugins / Extensions | Instructions / Rules |
 | :--- | :--- | :--- | :--- | :--- |
 | **Claude Code / Desktop** | `~/.claude.json`<br>`~/.claude/settings.json`<br>`claude_desktop_config.json` | `~/.claude/skills/`<br>`.claude/skills/` | `~/.claude/plugins/`<br>`Claude Extensions/` | `CLAUDE.md` |
-| **OpenAI Codex CLI** | `~/.codex/config.toml`<br>`~/.codex/mcp.json` | `~/.agents/skills/`<br>`.agents/skills/`<br>`~/.codex/skills/` | `~/.codex/plugins/` | `AGENTS.md` |
+| **OpenAI Codex CLI** | `~/.codex/config.toml`<br>`~/.codex/mcp.json`<br>`~/.codex/hooks.json` | `~/.agents/skills/`<br>`.agents/skills/`<br>`~/.codex/skills/` | `~/.codex/plugins/` | `AGENTS.md` |
 | **Antigravity CLI (`agy`) / Gemini** | `~/.gemini/settings.json`<br>`~/.gemini/config/mcp_config.json`<br>`antigravity-cli/mcp_config.json` | Antigravity: `~/.gemini/config/skills/`, `~/.gemini/antigravity-cli/skills/`, `.agents/skills/`<br>Gemini: `~/.gemini/skills/`, `.gemini/skills/` | `antigravity-cli/plugins/`<br>`~/.gemini/plugins/` | `GEMINI.md`<br>`AGENTS.md`<br>`rules/` |
 | **Qwen Code** | `~/.qwen/settings.json` | `~/.qwen/skills/`<br>`~/.agents/skills/` | — | `QWEN.md`<br>`AGENTS.md` |
 | **Qoder** | `~/.qoder/settings.json` | `~/.agents/skills/` | — | `AGENTS.md` |
 | **Cursor IDE** | `~/.cursor/mcp.json`<br>`.cursor/mcp.json` | — | VS Code / Cursor extensions | `.cursorrules`<br>`.cursor/rules/` |
 | **OpenCode (v1 / v2)** | `opencode.json`<br>`opencode.jsonc`<br>`~/.config/opencode/opencode.json` | `~/.config/opencode/skills/` | `~/.config/opencode/plugins/` | `AGENTS.md` |
-| **Devin CLI** | `~/.devin/config.json` | `~/.devin/skills/` | — | Devin instructions |
+| **Devin CLI** | `~/.config/devin/config.json`<br>`~/.config/devin/mcp_config.json` | `~/.config/devin/skills/`<br>`.devin/skills/` | — | Devin instructions |
 | **Grok Build CLI** | `~/.grok/config.toml` | `~/.grok/skills/` | — | Grok instructions |
+| **Kimi Code** | `~/.kimi-code/mcp.json`<br>`~/.kimi-code/config.toml` | `~/.kimi-code/skills/` | — | — |
 | **Kiro CLI (AWS)** | `~/.kiro/settings/mcp.json` | `~/.kiro/agents/*.json` | — | — |
 | **OpenClaw** | `~/.openclaw/config.json` | — | `~/.openclaw/extensions/` | — |
 | **GitHub Copilot CLI** | — (MCP and hooks are not archived) | `$COPILOT_HOME/skills/` (default `~/.copilot/skills/`)<br>`.github/skills/` | — | — |
 | **VS Code Copilot** | `.vscode/mcp.json` | — | Extensions | Copilot instructions |
+
+Codex files listed under `~/.codex` use `CODEX_HOME` when set. Archives keep
+portable `.codex/` paths so the files restore into the receiving machine's
+Codex home. Shared skills under `~/.agents/skills` stay under the user home.
+`hooks.json` uses the same default redaction as other configuration files.
 
 Copilot CLI also reads `~/.agents/skills`, `.agents/skills` and
 `.claude/skills`; those roots are archived once, under Codex and Claude Code.
@@ -45,6 +51,15 @@ Claude Desktop config paths use the same platform-aware resolver as
 `%USERPROFILE%\.config\opencode` on Windows too, as its
 [official troubleshooting guide](https://dev.opencode.ai/docs/troubleshooting/)
 documents.
+
+Kimi Code backups honor `KIMI_CODE_HOME` as described in the
+[Kimi Code CLI data layout](https://moonshotai.github.io/kimi-code/en/configuration/data-locations.html).
+On restore, entries recorded under `.kimi-code/` follow the destination machine's
+`KIMI_CODE_HOME` or default to `~/.kimi-code/`. Legacy `.kimi/` entries
+keep their recorded destination under the user's home.
+The active `config.toml` includes hook definitions and provider settings.
+The default redaction scrubs recognized credentials while preserving valid
+TOML. The separate Kimi Code `credentials/` directory stays outside the archive.
 
 ---
 
@@ -134,6 +149,8 @@ Stored in the root of the generated tarball:
    - Restoring rejects traversal and permits only allowlisted agent destinations. Claude Desktop uses the same platform-specific path resolver as `install-mcp`.
    - Archive entries are regular UTF-8 paths only, and entry count, manifest,
      per-file, and total expanded sizes are bounded before content is staged.
+   - Restore checks the gzip checksum and size trailer before applying any
+     assets. It accepts up to 1 MiB of padding after the tar end marker.
    - Every manifest entry must have exactly one body and a well-formed SHA-256;
      duplicate paths/destinations, missing bodies, unmanifested bodies, and
      checksum mismatches are refused. Checksums detect corruption or internal

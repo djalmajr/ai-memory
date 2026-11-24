@@ -2,7 +2,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, File};
-use std::io::{Read, Write};
+use std::io::{self, Read, Write};
 use std::path::{Component, Path, PathBuf};
 
 use ai_memory_core::agent_backup::{
@@ -24,6 +24,7 @@ const MAX_ARCHIVE_ENTRIES: usize = 20_000;
 const MAX_MANIFEST_BYTES: u64 = 4 * 1024 * 1024;
 const MAX_ASSET_BYTES: u64 = 128 * 1024 * 1024;
 const MAX_ARCHIVE_BYTES: u64 = 512 * 1024 * 1024;
+const MAX_TAR_PADDING_BYTES: u64 = 1024 * 1024;
 
 #[derive(Debug)]
 struct StagedAsset {
@@ -52,8 +53,8 @@ struct AppliedRestore {
 /// # Errors
 /// Returns an error when the archive is malformed, over budget, incomplete,
 /// inconsistent with its manifest, or cannot be restored safely.
-pub fn run(_config: &Config, args: RestoreAgentsArgs) -> Result<()> {
-    let i18n = &_config.i18n;
+pub fn run(config: &Config, args: RestoreAgentsArgs) -> Result<()> {
+    let i18n = &config.i18n;
     let home = home_dir().context(i18n.text("cli-backup-agents-locating-user-home-directory"))?;
     let cwd = std::env::current_dir()
         .context(i18n.text("cli-backup-agents-locating-current-working-directory"))?;
@@ -87,6 +88,7 @@ pub fn run(_config: &Config, args: RestoreAgentsArgs) -> Result<()> {
     }
 
     let claude_override = claude_config_dir(std::env::var_os("CLAUDE_CONFIG_DIR"));
+    let codex_override = agent_config_home(config.runtime_env.var_os("CODEX_HOME"));
     let copilot_override = agent_config_home(std::env::var_os("COPILOT_HOME"));
     let mut archive_paths = HashSet::with_capacity(manifest.entries.len());
     let mut target_paths = HashSet::with_capacity(manifest.entries.len());
@@ -153,6 +155,7 @@ pub fn run(_config: &Config, args: RestoreAgentsArgs) -> Result<()> {
 
         let overrides = TargetOverrides {
             claude: claude_override.as_deref(),
+            codex: codex_override.as_deref(),
             copilot: copilot_override.as_deref(),
         };
         let (base, target_path) = resolve_target(entry, &home, &cwd, overrides)?;
@@ -348,6 +351,17 @@ fn stage_archive(src: &Path, staging: &Path) -> Result<(Vec<u8>, HashMap<String,
         );
     }
 
+    // The tar reader stops at its first zero block. Read through the gzip
+    // trailer without allowing an unbounded expansion after that block.
+    let padding = io::copy(
+        &mut archive.into_inner().take(MAX_TAR_PADDING_BYTES + 1),
+        &mut io::sink(),
+    )
+    .with_context(|| format!("verifying gzip stream in {}", src.display()))?;
+    if padding > MAX_TAR_PADDING_BYTES {
+        bail!("archive has more than {MAX_TAR_PADDING_BYTES} bytes after the tar end marker");
+    }
+
     Ok((
         manifest_bytes
             .ok_or_else(|| anyhow!("archive at {} is missing manifest.json", src.display()))?,
@@ -360,6 +374,8 @@ fn stage_archive(src: &Path, staging: &Path) -> Result<(Vec<u8>, HashMap<String,
 struct TargetOverrides<'a> {
     /// `CLAUDE_CONFIG_DIR`.
     claude: Option<&'a Path>,
+    /// `CODEX_HOME`.
+    codex: Option<&'a Path>,
     /// `COPILOT_HOME`.
     copilot: Option<&'a Path>,
 }
@@ -387,6 +403,14 @@ fn resolve_target(
             .to_path_buf();
         return Ok((base, target));
     }
+    if entry.agent == AgentKind::KimiCode
+        && let Some(relative) = entry.target_relative.strip_prefix(".kimi-code/")
+        && let Some(custom_dir) = agent_config_home(std::env::var_os("KIMI_CODE_HOME"))
+    {
+        let base = cwd.join(custom_dir);
+        let target = base.join(relative);
+        return Ok((base, target));
+    }
     if entry.agent == AgentKind::OpenCode
         && let Some(relative) = entry.target_relative.strip_prefix(".config/opencode/")
     {
@@ -400,6 +424,12 @@ fn resolve_target(
     if entry.agent == AgentKind::ClaudeCode
         && let Some(custom_dir) = overrides.claude
         && let Some(relative) = entry.target_relative.strip_prefix(".claude/")
+    {
+        return Ok((custom_dir.to_path_buf(), custom_dir.join(relative)));
+    }
+    if entry.agent == AgentKind::Codex
+        && let Some(custom_dir) = overrides.codex
+        && let Some(relative) = entry.target_relative.strip_prefix(".codex/")
     {
         return Ok((custom_dir.to_path_buf(), custom_dir.join(relative)));
     }
@@ -724,18 +754,22 @@ fn validate_target_relative(scope: AgentAssetScope, rel_path: &str) -> Result<()
                 ".gemini/",
                 ".cursor/",
                 ".config/opencode/",
+                ".config/devin/",
                 ".devin/",
                 ".grok/",
                 ".kiro/",
                 ".openclaw/",
                 ".commandcode/",
                 ".kimi/",
+                ".kimi-code/skills/",
                 ".qwen/",
                 ".qoder/",
                 ".copilot/skills/",
             ];
-            let allowed = rel_path == ".claude.json"
-                || PREFIXES.iter().any(|prefix| rel_path.starts_with(prefix));
+            let allowed = matches!(
+                rel_path,
+                ".claude.json" | ".kimi-code/mcp.json" | ".kimi-code/config.toml"
+            ) || PREFIXES.iter().any(|prefix| rel_path.starts_with(prefix));
             if !allowed {
                 bail!(
                     "refusing to restore global asset to unauthorized path: {:?}",
@@ -781,6 +815,53 @@ fn validate_target_relative(scope: AgentAssetScope, rel_path: &str) -> Result<()
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stage_archive_checks_the_gzip_trailer() {
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("assets.tar.gz");
+        let manifest = b"{}";
+        let make_archive = |padding| {
+            let encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+            let mut archive = tar::Builder::new(encoder);
+            let mut header = tar::Header::new_gnu();
+            header.set_size(manifest.len() as u64);
+            header.set_mode(0o600);
+            header.set_cksum();
+            archive
+                .append_data(&mut header, "manifest.json", manifest.as_slice())
+                .unwrap();
+            let mut encoder = archive.into_inner().unwrap();
+            io::copy(&mut io::repeat(0).take(padding), &mut encoder).unwrap();
+            encoder.finish().unwrap()
+        };
+
+        let bytes = make_archive(0);
+        for valid in [&bytes, &make_archive(8 * 1024)] {
+            fs::write(&source, valid).unwrap();
+            let (staged_manifest, _) = stage_archive(&source, root.path()).unwrap();
+            assert_eq!(staged_manifest, manifest);
+        }
+
+        let trailer = bytes.len() - 8;
+        let mut invalid_crc = bytes.clone();
+        invalid_crc[trailer] ^= 1;
+        for invalid in [&bytes[..trailer], invalid_crc.as_slice()] {
+            fs::write(&source, invalid).unwrap();
+            let error = stage_archive(&source, root.path()).unwrap_err();
+            assert!(
+                error.to_string().contains("verifying gzip stream"),
+                "{error:#}"
+            );
+        }
+
+        fs::write(&source, make_archive(MAX_TAR_PADDING_BYTES)).unwrap();
+        let error = stage_archive(&source, root.path()).unwrap_err();
+        assert!(
+            error.to_string().contains("after the tar end marker"),
+            "{error:#}"
+        );
+    }
 
     #[test]
     fn rollback_removes_new_files_and_restores_overwrites() {

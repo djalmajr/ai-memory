@@ -331,6 +331,7 @@ async fn seed_sessions_for_reorg(store: &Store) -> (SessionId, SessionId) {
             agent_kind: AgentKind::ClaudeCode,
             cwd: Some(std::path::PathBuf::from("/home/user/alpha-repo")),
             actor_user: None,
+            origin: None,
         })
         .await
         .unwrap();
@@ -349,6 +350,7 @@ async fn seed_sessions_for_reorg(store: &Store) -> (SessionId, SessionId) {
                 body: "".into(),
                 importance: 5,
                 file_path: None,
+                trust_class: None,
             },
             &Sanitizer::builtin(),
         ))
@@ -366,6 +368,7 @@ async fn seed_sessions_for_reorg(store: &Store) -> (SessionId, SessionId) {
             agent_kind: AgentKind::ClaudeCode,
             cwd: Some(std::path::PathBuf::from("/home/user/beta-repo")),
             actor_user: None,
+            origin: None,
         })
         .await
         .unwrap();
@@ -384,6 +387,7 @@ async fn seed_sessions_for_reorg(store: &Store) -> (SessionId, SessionId) {
                 body: "".into(),
                 importance: 5,
                 file_path: None,
+                trust_class: None,
             },
             &Sanitizer::builtin(),
         ))
@@ -457,6 +461,7 @@ async fn reorg_never_targets_a_reserved_scope() {
                 agent_kind: AgentKind::ClaudeCode,
                 cwd: Some(std::path::PathBuf::from(dir)),
                 actor_user: None,
+                origin: None,
             })
             .await
             .unwrap();
@@ -549,6 +554,7 @@ async fn reorg_live_graveyards_only_default_workspace_pages() {
             expires_at: None,
             entities: Vec::new(),
             evidence: Vec::new(),
+            trust_class: None,
         })
         .await
         .unwrap();
@@ -579,6 +585,7 @@ async fn reorg_live_graveyards_only_default_workspace_pages() {
             expires_at: None,
             entities: Vec::new(),
             evidence: Vec::new(),
+            trust_class: None,
         })
         .await
         .unwrap();
@@ -660,6 +667,7 @@ async fn lint_dry_run_returns_lint_report_shape() {
             expires_at: None,
             entities: Vec::new(),
             evidence: Vec::new(),
+            trust_class: None,
         })
         .await
         .unwrap();
@@ -830,6 +838,7 @@ async fn embed_all_projects_rebuilds_workspace_projects() {
             author_id: None,
             actor: ai_memory_core::ActorContext::anonymous(),
             evidence: Vec::new(),
+            trust_class: None,
         })
         .await
         .unwrap();
@@ -848,6 +857,7 @@ async fn embed_all_projects_rebuilds_workspace_projects() {
             author_id: None,
             actor: ai_memory_core::ActorContext::anonymous(),
             evidence: Vec::new(),
+            trust_class: None,
         })
         .await
         .unwrap();
@@ -941,6 +951,7 @@ async fn commit_with_new_page_returns_committed_true_and_40char_oid() {
             author_id: None,
             actor: ai_memory_core::ActorContext::anonymous(),
             evidence: Vec::new(),
+            trust_class: None,
         })
         .await
         .unwrap();
@@ -992,6 +1003,7 @@ async fn checkpoints_list_and_restore_page_round_trip() {
             author_id: None,
             actor: ai_memory_core::ActorContext::anonymous(),
             evidence: Vec::new(),
+            trust_class: None,
         })
         .await
         .unwrap();
@@ -1012,6 +1024,7 @@ async fn checkpoints_list_and_restore_page_round_trip() {
             author_id: None,
             actor: ai_memory_core::ActorContext::anonymous(),
             evidence: Vec::new(),
+            trust_class: None,
         })
         .await
         .unwrap();
@@ -1081,6 +1094,204 @@ async fn checkpoints_list_and_restore_page_round_trip() {
     );
 }
 
+async fn check_restore_source_is_pinned_before_the_backup(source: &str) {
+    let tmp = TempDir::new().unwrap();
+    let (state, store) = make_state(&tmp).await;
+    let ws = store
+        .writer
+        .get_or_create_workspace("default")
+        .await
+        .unwrap();
+    let proj = store
+        .writer
+        .get_or_create_project(ws, "scratch", None)
+        .await
+        .unwrap();
+    let path = PagePath::new("notes/recover.md").unwrap();
+    let mut first_oid = None;
+    for (index, body) in [
+        "first checkpoint",
+        "second checkpoint",
+        "uncommitted content",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        state
+            .wiki
+            .write_page(WritePageRequest {
+                workspace_id: ws,
+                project_id: proj,
+                path: path.clone(),
+                frontmatter: json!({"title": "Recover", "tier": "semantic"}),
+                body: body.into(),
+                tier: Tier::Semantic,
+                pinned: false,
+                title: Some("Recover".into()),
+                admission_ctx: None,
+                author_id: None,
+                actor: ActorContext::anonymous(),
+                evidence: Vec::new(),
+                trust_class: None,
+            })
+            .await
+            .unwrap();
+        if index < 2 {
+            let oid = state.wiki.commit_all(body).unwrap().unwrap();
+            if index == 0 {
+                first_oid = Some(oid.to_string());
+            }
+        }
+    }
+    let rev = if source == "oid" {
+        first_oid.as_deref().unwrap()
+    } else {
+        source
+    };
+    let expected = if source == "HEAD" {
+        "second checkpoint"
+    } else {
+        "first checkpoint"
+    };
+    let response = post(
+        state.clone(),
+        "/admin/restore-page",
+        json!({
+            "workspace": "default", "project": "scratch", "path": path.as_str(), "rev": rev,
+        }),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let response = body_json(response).await;
+    assert_eq!(response["restored_from"], rev);
+    assert_eq!(
+        state.wiki.read_page(ws, proj, &path).unwrap().body,
+        expected,
+        "the pre-restore checkpoint must not change what {rev} restores"
+    );
+    assert_eq!(
+        store
+            .reader
+            .page_body_by_ids(ws, proj, path.as_str())
+            .await
+            .unwrap()
+            .unwrap()
+            .body,
+        expected
+    );
+    let backup = response["pre_checkpoint"]
+        .as_str()
+        .expect("dirty tree is backed up");
+    assert_eq!(
+        state
+            .wiki
+            .page_at_checkpoint(ws, proj, &path, backup)
+            .await
+            .unwrap()
+            .body,
+        "uncommitted content"
+    );
+    assert!(
+        response["checkpoint"].as_str().is_some(),
+        "restored content is checkpointed"
+    );
+}
+
+#[tokio::test]
+async fn restore_page_pins_head_before_the_pre_restore_checkpoint() {
+    check_restore_source_is_pinned_before_the_backup("HEAD").await;
+}
+
+#[tokio::test]
+async fn restore_page_pins_relative_rev_before_the_pre_restore_checkpoint() {
+    check_restore_source_is_pinned_before_the_backup("HEAD~1").await;
+}
+
+#[tokio::test]
+async fn restore_page_full_oid_keeps_the_requested_checkpoint() {
+    check_restore_source_is_pinned_before_the_backup("oid").await;
+}
+
+#[tokio::test]
+async fn restore_page_from_an_unknown_rev_is_404_and_writes_no_checkpoint() {
+    let tmp = TempDir::new().unwrap();
+    let (state, store) = make_state(&tmp).await;
+    let ws = store
+        .writer
+        .get_or_create_workspace("default")
+        .await
+        .unwrap();
+    let proj = store
+        .writer
+        .get_or_create_project(ws, "scratch", None)
+        .await
+        .unwrap();
+    let write = |path: &str, body: &str| WritePageRequest {
+        workspace_id: ws,
+        project_id: proj,
+        path: PagePath::new(path).unwrap(),
+        frontmatter: serde_json::json!({"title": "Recover", "tier": "semantic"}),
+        body: body.into(),
+        tier: Tier::Semantic,
+        pinned: false,
+        title: Some("Recover".into()),
+        admission_ctx: None,
+        author_id: None,
+        actor: ai_memory_core::ActorContext::anonymous(),
+        evidence: Vec::new(),
+        trust_class: None,
+    };
+    state
+        .wiki
+        .write_page(write("notes/recover.md", "old body"))
+        .await
+        .unwrap();
+    let old_oid = state.wiki.commit_all("old checkpoint").unwrap().unwrap();
+    state
+        .wiki
+        .write_page(write("notes/other.md", "uncommitted"))
+        .await
+        .unwrap();
+    let commits = state.wiki.git().commit_count();
+
+    for (path, rev) in [
+        ("notes/recover.md", "0000000".to_owned()),
+        ("notes/missing.md", old_oid.to_string()),
+        ("notes/recover.md", "HEAD^{tree}".to_owned()),
+        (
+            "notes/recover.md",
+            format!("HEAD:{ws}/{proj}/notes/recover.md"),
+        ),
+    ] {
+        let resp = post(
+            state.clone(),
+            "/admin/restore-page",
+            json!({"workspace": "default", "project": "scratch", "path": path, "rev": rev}),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND, "{path} at {rev}");
+    }
+    assert_eq!(
+        state.wiki.git().commit_count(),
+        commits,
+        "a refused restore must not write its pre-restore checkpoint"
+    );
+
+    let resp = post(
+        state.clone(),
+        "/admin/restore-page",
+        json!({
+            "workspace": "default",
+            "project": "scratch",
+            "path": "notes/recover.md",
+            "rev": format!(" {old_oid} "),
+        }),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(body_json(resp).await["restored_from"], old_oid.to_string());
+}
+
 #[derive(Clone, Copy)]
 enum SessionRestoreCase {
     PurgedSummary,
@@ -1113,6 +1324,7 @@ async fn check_session_restore(source: &str, case: SessionRestoreCase) {
             agent_kind: AgentKind::ClaudeCode,
             cwd: None,
             actor_user: None,
+            origin: None,
         })
         .await
         .unwrap();
@@ -1130,6 +1342,7 @@ async fn check_session_restore(source: &str, case: SessionRestoreCase) {
         author_id: None,
         actor: ActorContext::anonymous(),
         evidence: Vec::new(),
+        trust_class: None,
     };
     if matches!(
         case,

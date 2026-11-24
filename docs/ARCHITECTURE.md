@@ -204,6 +204,8 @@ from hook paths.
    fusion; it is limited to one call per query and four calls in flight, and any
    invalid, failed, timed-out, or saturated attempt preserves the local order.
    Global and supplemental global-preference results do not take this path.
+   `AI_MEMORY_RERANKER=decisions-choice` takes the same path with one direct
+   OpenAI Decisions Choice request instead of the generative provider.
    With `[retrieval] observation_stream` (on by default), project and `scopes`
    searches add one more RRF stream: full-text search over `observations_fts`
    in the same `(workspace, project)`, where each matching session votes once,
@@ -247,8 +249,9 @@ from hook paths.
    survive. A fourth pass, disabled unless `[decay] observation_retention_days`
    is positive, then deletes raw `observations` older than that age, but only
    for sessions already consolidated into a summary page whose path still has
-   a live head (a later rewrite of that page counts; an evicted or deleted
-   head does not), so raw capture is never removed while it is the last copy
+   a live head in the project holding those rows (a later rewrite of that page
+   counts; an evicted or deleted head, or a page only in another project, does
+   not), so raw capture is never removed while it is the last copy
    of that session's work, and never for a session that still has a `session_consolidation_jobs`
    row in `pending` or `running` — a queued (or lease-stale) consolidation
    still reads the raw capture — and never while the live observation count is
@@ -281,17 +284,18 @@ from hook paths.
    the store is only read, and a legacy `pages` row for a deleted ledger is left
    for `reclaim-ledger-versions`. A dry run reports the files and bytes it would
    delete (`ledgers_prunable`, `ledger_bytes_prunable`) and deletes nothing.
-   Scheduled sweep, rule-based lint, and opt-in embedding backfill ticks
-   enumerate every existing workspace/project scope before doing per-project
+   Scheduled sweep, rule-based lint, opt-in LLM lint, and opt-in embedding
+   backfill ticks enumerate every existing workspace/project scope before doing per-project
    work, matching the auto-improvement scheduler's store-wide scope model. A
    separate daily cleanup removes week-old project rows only when they contain
    no pages, sessions, observations, handoffs, managed workstreams, sent or
    received agent messages (including claimed/cancelled history), or
    auto-improvement data; managed continuity history therefore keeps its
    project scope alive even when no lifecycle-hook session has been captured.
-   The same scheduled sweep tick also runs one store-wide
-   `close_abandoned_sessions` batched `UPDATE`. A session with no activity
-   for 48 hours and no `SessionEnd` gets `ended_at` set from its own last
+   When `[sessions] idle_end_after_hours` is `0`, the scheduled sweep tick
+   also runs one store-wide `close_abandoned_sessions` batched `UPDATE`.
+   A session with no activity for 48 hours and no `SessionEnd` gets
+   `ended_at` set from its own last
    activity, with no summary page and no usage. This keeps
    `open_session_count` from growing on sessions nobody continues, and it is
    narrower than a real end (see the session-usage row below).
@@ -380,9 +384,11 @@ stays in the supersession chain). Pages it did not write, or whose body changed
 since it wrote them, are never rewritten; `profile_entry_ledger` keeps a removed
 entry removed until newer evidence arrives. With an LLM provider and
 `[profile] llm`, classification and the per-entry merge use JSON-schema
-structured calls and fall back to the zero-LLM path on any error. A private
-profile converges only its operator's own candidates from projects they can
-read; a shared profile on a multi-user server skips restricted projects.
+structured calls and fall back to the zero-LLM path on any error (a
+classification cut at the output budget is first halved and retried within
+the pass's call cap). A private profile converges only its operator's own
+candidates from projects they can read; a shared profile on a multi-user server
+skips restricted projects.
 `ai-memory profile apply` reads `GET /admin/profile/apply` (the digest's
 selection, capped at `apply_max_lines`, empty for a `consume = false` project)
 and writes it between `<!-- ai-memory:profile:start/end -->` delimiters in the
@@ -407,7 +413,10 @@ transcript normalizer excludes a marked packet if Claude persists and reads it
 back, preventing delivered history from recursively re-entering the ledger.
 An explicitly pending handoff is considered before the managed event range.
 By default their single-use delivery claims share one writer transaction after
-the complete startup response has been assembled. With server-wide
+the fallible startup reads complete. That transaction also captures the claimed
+handoff row: the hook renders this snapshot, so a delayed turn checkpoint that
+refreshes the row during admission is delivered without an additional read after
+the single-use claim commits. With server-wide
 `[handoff].claim_on_session_start = false`, SessionStart instead emits a
 metadata-only notice naming the exact handoff id and leaves the row open for
 an explicit `memory_handoff_accept`; the managed event range is still claimed.
@@ -515,8 +524,9 @@ names an existing absolute directory; a gateway's process cwd is wherever the
 gateway started. A multiplexing gateway exports only the default profile's
 `terminal.cwd`, so in a gateway (`_HERMES_GATEWAY=1`) the variable applies only
 to events whose `profile` is `default`. A gateway event of another profile
-routes by that profile's Hermes home (`<HERMES_HOME or ~/.hermes>/profiles/<name>`,
-the name checked against Hermes' profile-id pattern first) when that directory
+routes by that profile's Hermes home (`<Hermes home>/profiles/<name>`, where the
+home is `$HERMES_HOME`, else `%LOCALAPPDATA%\hermes` on Windows and `~/.hermes`
+elsewhere; the name is checked against Hermes' profile-id pattern first) when that directory
 holds its own `.ai-memory.toml`, and otherwise keeps the process cwd. Every
 Hermes event routes from there, and tool events can still move by their own
 locations.
@@ -557,7 +567,15 @@ backpressure, or single-writer SQLite actor.
 An external lifecycle producer can set `AI_MEMORY_CAPTURE_OWNER` on the harness
 process to suppress its installed native capture while retaining supported
 handoff/briefing delivery and MCP. The producer uses `extension`/`source_event`
-for provenance and stable, namespaced `ingest_key` values for retries. See the
+for provenance and stable, namespaced `ingest_key` values for retries. Because
+the owner's own interactive runs share the project with the captured harness,
+every hook bundle forwards `claim=0` on its handoff fetch under external
+capture — the native binary at all four of its delivery doors (SessionStart,
+Kimi's `UserPromptSubmit`, Hermes' `pre_llm_call`, Grok's `PostToolUse`), the
+POSIX shell and PowerShell bundles, and the generated TypeScript integrations.
+The server then delivers the baton in offer mode — naming the handoff id
+and leaving the row open for an explicit `memory_handoff_accept` — rather than
+consuming a pending handoff left for other work (#2148). See the
 [external capture contract](external-lifecycle.md) for batching, identity and
 the limits of this cooperative process-scoped mode.
 
@@ -596,7 +614,14 @@ limit. User prompts and post-compaction summaries are capped UTF-8-safely at
 and transport, and the server repeats it when parsing every request so direct
 and older clients cannot bypass it. The typed sanitizer boundary then applies a
 16 KiB backstop to every durable observation body after redaction. The
-separately gated Claude Code assistant/Stop excerpt remains capped at 2 KB.
+separately gated Claude Code, Codex and OpenCode assistant/Stop excerpt remains
+capped at 2 KB. Native clients scrub the complete admitted text before retaining
+both the beginning and ending of oversized user prompts and assistant excerpts,
+with an explicit omitted-byte marker between them. Assistant inputs over 64 KiB
+remain rejected. Notification and post-compaction selection is unchanged.
+This positional selection can omit an important middle passage and can retain
+private prose that does not match a sanitizer rule; it does not rank importance
+or recover text from earlier captures.
 
 An optional RFC 3339 `occurred_at` on the hook body lets a client supply the
 event's own original time. Currently only `ai-memory backfill` does this,
@@ -648,14 +673,14 @@ prunable rather than only after it ages in place.
 
 | Table | What |
 |---|---|
-| `workspaces`, `projects` | Top of the 3-tuple identity coordinate. `projects.identity` / `identity_source` (V70, #708) hold the repository identity a project routes by (an explicit marker `identity` or a normalised git remote, resolved client-side), unique per workspace when set; empty until a capture claims the project. Phase-5 clients explicitly send `IdentityStyle::Path` (#1033) for remote-backed projects, naming them from the full repository path without the host (`acme-api`), and send explicit `host_path` for the pre-v3 opt-out. Server-side omission remains `HostPath` because old clients omitted that historical default; no new wire field is needed. Creation or authorized capture promotion uses that canonical name only when no different hostful identity claims it; otherwise resolution falls back to the existing hostful/legacy-safe name. V76 stores indexed canonical and v2-basename keys derived from that full identity: reads are no-create/no-rename, while an authorized explicit write through the canonical name promotes only `projects.name` in the same resolve-or-create writer transaction and preserves the UUID. Project `_meta.md` carries the optional full identity/source plus derived keys; clean reindex validates them and rebuilds the same UUID/name/coordinate lookup, while older manifests without identity remain valid. Ambiguous cross-forge or multi-candidate keys fail closed. A local marker may additionally send up to 16 validated former names as one transient `aliases` JSON-array query value: lookup stays inside its selected workspace, requires the checkout's full hostful git-remote identity to equal the stored row, returns reads without rename, and lets capture perform only the same authorized UUID-preserving canonical promotion. Aliases are not stored and remain distinct in the hook routing cache. The exact operator-home marker may additionally define bounded `[routes.identity."host/path"]` and `[routes.path."absolute-or-tilde-path"]` blocks: an exact hostful remote match wins the longest component-wise lexical path match, any reachable non-home local settings marker wins both, malformed or ambiguous route maps fail closed, and selected fields reuse the existing marker wire without a server/schema change. `AI_MEMORY_HOME` is authoritative for native callers; portable clients use `HOME`/`USERPROFILE`, and Docker compares its forwarded host cwd. See `docs/marker-file.md#repository-identity`. `projects.access_mode` (V68; `open` default / `restricted`) decides whether any authenticated user or only root, the creator (`projects.created_by`, V69) and grant holders (`project_grants`, V68) reach it, decided by `ai_memory_store::authorize_project` (see `docs/users.md#per-project-access`). `projects.profile_contribute` / `profile_consume` (V74) record the marker's `[profile]` opt-outs, forwarded at session start; `profile_candidates`, `profile_harvest_marks` and `profile_entry_ledger` (V75) hold the profile pass's evidence, per-project read position and the entries it wrote. Reserved projects: `scratch`, `_global` (shared preferences; holds the single-user profile under `profile/`), `_profile` (a workspace profile) and `_profile.<user id>` (a private profile, always `restricted`); capture is never attributed to any of them (see `docs/cross-project-profile.md`). |
+| `workspaces`, `projects` | Top of the 3-tuple identity coordinate. `projects.identity` / `identity_source` (V70, #708) hold the repository identity a project routes by (an explicit marker `identity` or a normalised git remote, resolved client-side), unique per workspace when set; empty until a capture claims the project. Phase-5 clients explicitly send `IdentityStyle::Path` (#1033) for remote-backed projects, naming them from the full repository path without the host (`acme-api`), and send explicit `host_path` for the pre-v3 opt-out. Server-side omission remains `HostPath` because old clients omitted that historical default; no new wire field is needed. Creation or authorized capture promotion uses that canonical name only when no different hostful identity claims it; otherwise resolution falls back to the existing hostful/legacy-safe name. V76 stores indexed canonical and v2-basename keys derived from that full identity: reads are no-create/no-rename, while an authorized explicit write through the canonical name promotes only `projects.name` in the same resolve-or-create writer transaction and preserves the UUID. Project `_meta.md` carries the optional full identity/source plus derived keys; clean reindex validates them and rebuilds the same UUID/name/coordinate lookup, while older manifests without identity remain valid. Ambiguous cross-forge or multi-candidate keys fail closed. A local marker may additionally send up to 16 validated former names as one transient `aliases` JSON-array query value: lookup stays inside its selected workspace, requires the checkout's full hostful git-remote identity to equal the stored row, returns reads without rename, and lets capture perform only the same authorized UUID-preserving canonical promotion. Aliases are not stored and remain distinct in the hook routing cache. The exact operator-home marker may additionally define bounded `[routes.identity."host/path"]` and `[routes.path."absolute-or-tilde-path"]` blocks: an exact hostful remote match wins the longest component-wise lexical path match, any reachable non-home local settings marker wins both, malformed or ambiguous route maps fail closed, and selected fields reuse the existing marker wire without a server/schema change. `AI_MEMORY_HOME` is authoritative for native callers; portable clients use `HOME`/`USERPROFILE`, and Docker compares its forwarded host cwd. See `docs/marker-file.md#repository-identity`. `projects.access_mode` (V68; `open` default / `restricted`) decides whether any authenticated user or only root, the creator (`projects.created_by`, V69) and grant holders (`project_grants`, V68, for one project; `workspace_grants`, V115, #2444, for every project of a workspace) reach it, decided by `ai_memory_store::authorize_project` (see `docs/users.md#per-project-access`). `projects.profile_contribute` / `profile_consume` (V74) record the marker's `[profile]` opt-outs, forwarded at session start; `profile_candidates`, `profile_harvest_marks` and `profile_entry_ledger` (V75) hold the profile pass's evidence, per-project read position and the entries it wrote. `projects.default_result_limit` (V109, nullable `1..=100`) records the marker's `[retrieval] default_result_limit`, forwarded at session start; `memory_query` returns it for the project when a call gives no explicit `limit` (NULL inherits the global `[retrieval] default_result_limit`, then the built-in 10). `projects.min_relevance` (V110, nullable `0.0..=1.0`) records the marker's `[retrieval] min_relevance`, forwarded the same way; `memory_query` excludes hits scoring below it when a call gives no explicit `min_relevance` (NULL inherits the global `[retrieval] min_relevance`, then no floor), keying off the reranker's calibrated score only — a resolved floor with no reranker configured is rejected, not applied to the fusion rank. Reserved projects: `scratch`, `_global` (shared preferences; holds the single-user profile under `profile/`), `_profile` (a workspace profile) and `_profile.<user id>` (a private profile, always `restricted`); capture is never attributed to any of them (see `docs/cross-project-profile.md`). |
 | `pages` | Versioned wiki pages with `is_latest` + `supersedes` chain. M8 columns: `last_accessed_at`, `access_count`, and decay-only tombstone marker `superseded_at`. M9 cols: `embedding_provider`, `embedding_model`, `embedding_dim`. V36: `expires_at` (frontmatter TTL). V37: `salience` (NULL = `salience_default`; derived from `page_feedback`). |
 | `pages_fts` | FTS5 virtual table over `(title, body, path_search)` plus the `title_parts` / `body_parts` spellings that turn `-`/`_` into spaces (V100, #2013), so a hyphenated token and each of its words both match; auto-synced by triggers. |
-| `pages_cjk_fts` | Derived unigram/bigram FTS5 index over the CJK runs in page title, body, and path. The writer updates it in the page transaction; startup repairs missing rows after an upgrade. Queried only when the bounded query contains Han, Kana, or Hangul. |
+| `pages_cjk_fts` | Derived unigram/bigram FTS5 index over the CJK runs in page title, body, and path, plus their normalized Arabic-script runs (#2426). The writer updates it in the page transaction; startup repairs missing rows after an upgrade, and V114 drops the rows of Arabic text stored before #2426 so that repair rebuilds them with the Arabic terms (#2439). Queried only when the bounded query contains Han, Kana, Hangul, or Arabic script; quoted phrases and `AND`/`NOT`/`NEAR` queries stay on the primary FTS stream to preserve their constraints. |
 | `sessions`, `observations` | Sanitized, bounded lifecycle-hook projections. `sessions.ended_observation_count` is the stable generation watermark for resumed-session re-end eligibility; wall clocks are not used for that decision. They are an operational audit trail, not a complete native transcript. |
 | `session_consolidation_jobs` | Durable, observation-generation-idempotent queue for automatic LLM consolidation. PreCompact / PostCompaction checkpoint jobs are queued whether or not the session has ended (a resumed session keeps `ended_at`); opt-in SessionEnd jobs need an *ended* session, and observation generations order the two. One bounded server worker leases jobs, retries provider failures with backoff, and recovers expired leases after restart. The worker starts whenever a consolidator is configured; SessionEnd enqueue stays behind `AI_MEMORY_CONSOLIDATE_ON_SESSION_END`. A manual `memory_consolidate` writes its page out-of-band and then reconciles this table (flipping a `failed`/`pending`/`superseded` row for the session to `completed`, never touching a live `running` lease), so the operator does not see a `failed` job for a session that is in fact consolidated. |
 | `observations_fts` | FTS5 virtual table over raw observation `(title, body)` with the same `title_parts` / `body_parts` spellings (V100, #2013). Feeds the bounded `raw_hits` fallback and, through `[retrieval] observation_stream` (on by default), the observation-evidence RRF stream that votes for session pages. |
-| `observations_cjk_fts` | Derived unigram/bigram companion for unspaced CJK observation text. It follows the same transactional write, scope, owner-visibility, raw fallback, timeline, and session-vote boundaries as `observations_fts`. |
+| `observations_cjk_fts` | Derived unigram/bigram companion for unspaced CJK observation text and its normalized Arabic-script runs; V114 rebuilds the rows of Arabic text stored before #2426 (#2439). It follows the same transactional write, scope, owner-visibility, raw fallback, timeline, and session-vote boundaries as `observations_fts`. |
 | `workstreams`, `managed_runs`, `workstream_native_sessions` | Optional lease state plus per-harness native source and delivery cursors for `ai-memory run`. |
 | `workstream_events`, `workstream_events_fts` | Append-only normalized visible transcript events and full-text search; immutable sanitized source batches also live under `raw/workstreams/`. |
 | `links` | Wikilink / markdown cross-references. `to_page_id` (a global PageId) is nullable for unresolved forward links. `to_workspace` / `to_project` carry a cross-project scope (NULL = the source page's own project). |
@@ -663,8 +688,10 @@ prunable rather than only after it ages in place.
 | `page_embeddings` | Optional vector rows for latest pages, with `(provider, model, dim)` denormalised so hybrid search can ignore stale vectors after an embedding config change and report missing-embedding diagnostics. |
 | `page_feedback` | Append-only `memory_feedback` signals (`helpful` / `not_helpful` / `stale` / `wrong`) keyed by page *version*, with an optional sanitized reason and `salience_after`. Source of truth for the derived `pages.salience`; the lint pass reads unresolved stale/wrong rows joined against `is_latest = 1`, so a rewrite retires the finding. |
 | `query_page_signals` | Opt-in (`[retrieval] query_signal_weight > 0`) query-scoped ranking associations (V98): one row per `(workspace, project, normalized-query hash, page version)` with the sanitized query text (≤256 chars), a distinct-session `signal_count` and the last writing session. Written only for write-authorized, session-aware callers after a read or `helpful` of the preceding query's hit; `not_helpful` deletes the row, `purge_session` deletes rows the session wrote last, and the project and page FKs cascade. |
+| `retrieval_history`, `retrieval_history_hits` | Opt-in (`[retrieval] record_history = true`) per-session retrieval history (V111, #2038): one `retrieval_history` row per single-project `memory_query` call, keyed by `(workspace, project, session)`, with the scrubbed query, resolved `scope_kind`, active `source` streams, effective `result_limit`/`min_relevance`/`filters`, `duration_us`, `result_count` and any soft `notice`; one `retrieval_history_hits` row per returned hit (position, page path, page version, calibrated `relevance`, ranking `explanation`). Written best-effort through the writer actor, pruned to the newest `[retrieval] history_retention_per_session` per session; `session_id` is not a `sessions` FK (a query can precede `begin_session`), the project/workspace FKs and the hits FK cascade, and `purge_session` deletes a session's rows explicitly. Read-only, rendered by the `/web` dashboard behind the per-project authorization and session-owner filter. |
 | `page_access` | One row per latest page and qualified operator identity. Supplies the optional access-breadth retention term without changing the existing shared access counter. |
 | `page_evidence` | V63 append-only record of what produced or reaffirmed each page version: consolidation cites the `session` it ran on, written in the page-upsert transaction and cascaded on purge. Feeds a read-time, zero-LLM **belief-strength `confidence`** (`ai_memory_store::belief`, B1 / `docs/design-hindsight-borrowings.md` P2): a bounded `[0.0, 0.95]` function of distinct supporting sessions (breadth, not raw count), recency of the newest sighting, and live `contradicts` count. Exposed as `confidence` + `evidence_count` in `memory_query(explain=true)`, as `evidence_rows` in `memory_status`, and used to order the opt-in `settled_first` briefing, all **ranking-inert**. It folds into `PageAuthority` only behind `[retrieval] belief_authority_weight` (**default `0.0`/OFF, R2-gated**), as one bounded factor inside the `[0.55, 1.50]` clamp; a supersession always wins regardless of evidence (a superseded version is never boosted). |
+| `page_sources` | V112 record of the observations each page version was compiled from (#2164, `docs/design-memory-poisoning-provenance.md` step 1): `(workspace_id, project_id, page_id, observation_id)`, written in the page-upsert transaction from the session citation the write carries (`PageEvidence::observations`). Consolidation lists the observations whose text reached its prompt (`ProjectedObservations::source_ids`); `memory_write_page` with a `session_id` lists the session's observations in the target project. The store keeps only observations of the cited session inside the page's own workspace and project. Rows are per version (a new version starts from its own compile, an unchanged one accumulates), follow the page through `move-project`, `merge-project` and `move-session`, and cascade with a deleted version. `observation_id` is not a foreign key, so the id outlives a pruned observation. No backfill. Read through `ReaderPool::page_compiled_sources`; nothing ranks on it yet. Distinct from `page_evidence`, which counts supporting sessions for belief strength under opaque ids. |
 | `agent_messages` | V64 cross-project message inbox/queue (`docs/agent-messaging.md`), extended by V90 with optional epistemic nature/evidence. Directed, claim-once mail from a sender coordinate to a recipient coordinate; `pending`→`claimed` (popped exactly once, the handoff compare-and-set) or `pending`→`cancelled` (sender retracts). The one table that crosses per-project isolation, so reads are keyed by the recipient coordinate (inbox) or sender coordinate (outbox); `from_owner_user`/`claimed_by_user` are attribution only, never a read filter. Recipient inbox depth is capped. `ON DELETE CASCADE` on both coordinate pairs. |
 | `pages.compacted_at` | V65 nullable A2 tier-down marker (`docs/design-memory-aging.md` §A2). Set when the forget-sweep extractively compacts a cold episodic page (opt-in `[decay] compact_cold_episodic`) instead of evicting it; derived at the single page-upsert choke point from a `compacted: true` frontmatter mirror, so the marker and compacted body land in one transaction. Additive `ADD COLUMN`, no backfill; the sweep populates it lazily. The sweep and curator skip a marked page so it is never re-compacted, re-evicted, or re-reported as cold. Reversible: the full pre-compaction body stays in git + the supersession chain. |
 | `session_usage` | V91 one row per session: cumulative input/output/cache-write/cache-read tokens the harness's own transcript reported at `session-end` (for Claude Code, the session's transcript plus its subagents' under `<session>/subagents/`), plus the last-seen model name. Written client-side (`ai-memory-cli`'s `session_usage` module reads the transcript; `hook.rs` splices it into the session-end body as `_ai_memory_usage`; the writer upserts with `MAX(existing, reported)` per column). Cascades with its session on purge/delete. Surfaced on the /web project page's Tokens stat and Sessions table; `None` (not zero) for a session whose harness never reported usage. |
@@ -840,17 +867,17 @@ does not need to ride on the public protocol change.
 | `memory_query` | read-only | FTS5 + entity-match + graph RRF + optional vector RRF + observation-evidence stream (on by default) search, followed by bounded kind/tier/pinned/tag authority adjustment and raw fallback. Bumps access counters for page hits. Defaults to the current project; single-project calls (project implicit or named with `workspace`+`project`) also union the reserved `_global` preferences scope as `global_scope_hits`, and only an explicit multi-`scopes` set opts out (#930); `scopes` searches named sibling projects; `global=true` searches every project at once (each hit annotated with its workspace + project). With `AI_MEMORY_RERANKER=llm`, project/scopes candidate pools are fused before at most one final LLM relevance pass; query/title/snippet data is bounded and JSON-encoded, and any timeout, provider error, invalid/incomplete score set, or four-call concurrency saturation preserves the adjusted order. The distinct `global=true` FTS-only ranker and supplemental global-preference hits are not reranked. `explain=true` attaches per-hit `score_details` (per-stream ranks, matched entities, raw FTS/cosine/entity inverse-frequency scores, the matched observation ids when the observation stream voted, RRF contributions, graph provenance including the typed edge kind (`causes`/`fixes`/`contradicts`) a neighbour was reached by, the page's evidence count, authority multiplier, and optional rerank score) to project/scopes hits plus a top-level `streams_active` list and a `timings` object with each stream's wall time in milliseconds (`fts_ms`, `entity_ms`, `vector_ms` for the stored-vector scans, `graph_ms`, `observation_ms`, `rerank_ms`; a stream that did not run is left out, and `scopes` searches sum per stream). Timings are read only on an explained query; the normal path takes no clock reading for them. The global FTS-only ranker reports its active stream and `fts_ms` without per-hit details; `as_of` reports no timings. `include_expired=true` also returns TTL-expired pages. `include_superseded=true` also returns superseded (non-latest) page versions across the FTS/entity/vector/graph streams, each hit labelled `superseded: true` (the current version is never marked); default-off is byte-identical to the latest-only behaviour, and `global=true` / `as_of` are unaffected. `pin_first=true` prepends the project's bounded pinned latest pages (`ReaderPool::list_pinned_pages`, cap 10) ahead of the fused hits, deduped by page id (a pinned page that also matches appears once, marked `pinned: true`) and re-truncated to the requested limit; it applies to single-project searches (default or `workspace`+`project`), is ignored on `scopes`/`global`/`as_of`, and default-off is byte-identical. `answer=true` (opt-in, off by default) additionally synthesizes a cited natural-language answer over the top hits via the configured LLM provider (`complete_structured`, JSON-schema `{ answer, citations }`), attached as `answer: { text, citations }`. Citation paths must identify exactly one supplied page version, including supplemental preferences. Repeated citations are deduplicated in model order. An unknown path or a path shared by distinct page IDs withholds the whole answer and returns `answer_unavailable` with the unchanged retrieval hits; this includes same-path historical versions. Empty citations remain valid for abstention. This validates source identity, not the truth of generated claims. With no provider configured it returns the hits plus an `answer_unavailable` note instead of erroring, and with `answer` unset/`false` no provider is accessed and the response is byte-identical (invariant #13). It applies to the normal single-project/`scopes` path; `global`/`as_of` ignore it. Optional `[query_answer] max_context_tokens` bounds synthesis admission while preserving all retrieval hits. Each UTF-8 input byte counts as one estimated token; serialized schema bytes and a fixed 1024-unit provider-envelope allowance also count, and the reasoning tier's output allowance is reserved separately. This is a conservative admission contract, not a guarantee for every provider's tokenizer or framing. Answer admission gives known supersession successors priority over predecessors, and newer evidence priority within the same workspace/project and normalized exact title. A bounded metadata query reads only already-authorized hit IDs; canonical session pages use session start time rather than ingestion time. Unrelated evidence retains retrieval order. Whole snippets are admitted before any clipping. Otherwise-unused space may hold one final complete trailing sentence or statement, with ellipses marking removed text; a fragment with no complete boundary is omitted. The boundary rule recognizes sentence punctuation and code statement terminators and does not perform semantic inference. Empty and punctuation-only snippets are omitted. `answer_context` reports `admitted`, `omitted`, `clipped`, `estimated_input_tokens`, `reserved_output_tokens` and `max_context_tokens`; it appears only when admission runs. If fixed content or evidence cannot fit, the provider is not called and `answer_unavailable` accompanies the full hits. The question is never silently clipped. Citation validation uses only admitted sources. Superseded status is explicit in budgeted prompts. Clipping can remove a qualification or correction; callers should inspect the receipt and original hits. An explicit zero or undersized limit prevents synthesis; only omission disables admission. Omitted configuration preserves existing wire request and response bytes. Answer quality is not yet eval-validated. An optional `reasoning` tier (`minimal` (default) / `low` / `medium` / `high` / `max`) tunes the synthesis effort: `ChatRequest` carries no per-request reasoning field (the provider-level `reasoning_effort` is fixed at construction from config), so the tier maps to a per-tier max-token budget scaled off the path's base (answer base 2 000; `minimal` = 1x = byte-identical, `low` 1.5x, `medium` 2x, `high` 3x, `max` 4x). The tier is inert unless the `answer` LLM path runs (invariant #13); an unknown value is rejected by the schema (invariant #7). Optional `kind`, `tag`, `tier` and `path_prefix` filters narrow candidates before ranking, on every stream including the CJK substring search. |
 | `memory_recent` | read-only | Most-recently-updated `is_latest=1` pages. |
 | `memory_read_page` | read-only | Fetch the body of a single wiki page by `path` or by top FTS5 hit for a `query`; optional `workspace` + `project` targets a named sibling workspace/project. The body is capped by `max_chars` (default 12000, max 64000); responses include `truncated` and `total_chars`. Use when an agent needs more than the 24-word snippets from `memory_query`. `include_related=true` also walks the link graph outward from the page (bounded BFS reusing the `page_links` primitive per node: default 1 hop, hard cap 3, global visited set for dedup/cycle-safety, total-node cap 50, cross-project aware) and returns a `related` array of reachable pages, each labelled with its `depth` (hop distance) and `direction` (`link`/`backlink`); default-off adds no `related` field. The response carries the page's current version as `page_id`, the value compare-and-write calls pass back, plus at most 100 parsed Markdown headings with exact section SHA-256 tokens for `memory_patch_page` (`sections_truncated` reports overflow). Section hashes always cover the full body even when the returned body is truncated. Fenced-code headings are excluded. A page whose `expires_at` TTL has passed is still returned and carries `expired: true`; a live page's response has no such field. An exact read can name an existing project by stable `project_id` instead of `workspace` + `project`. |
-| `memory_patch_page` | destructive | Atomically append inside a parsed Markdown section or at EOF, add a unique level 2-6 section, or replace a section. It requires the current page id; replacement also requires the read-returned exact section hash. All edits resolve against one captured body, ambiguity/conflicts fail before writing, and the resulting full page goes through `Wiki::write_page_if`, preserving frontmatter and the normal sanitizer, admission, attribution, supersession, index, rollback and git-checkpoint boundaries. Existing-scope write authorization is fail-closed and cannot create a target. |
+| `memory_patch_page` | destructive | Atomically append inside a parsed Markdown section or at EOF, add a unique level 2-6 section, or replace a section. It requires the current page id; replacement also requires the read-returned exact section hash. All edits resolve against one captured body, ambiguity/conflicts fail before writing, and the resulting full page goes through `Wiki::write_page_if`, preserving frontmatter and the normal sanitizer, admission, attribution, supersession, index, rollback and git-checkpoint boundaries. Existing-scope write authorization is fail-closed and cannot create a target. `scope: "global"` targets the reserved global scope, like `memory_read_page` and `memory_write_page`. |
 | `memory_read_session_observations` | read-only | Page through ONE session's raw hook observations (`ObservationRecord` with full sanitized body, capped per row by `body_max_chars`), restricted to the rows that landed in the resolved scope and to sessions the caller may see; `total` and `elided_other_scope` report the in-scope count and the rows the session left in another project. `session_id` omitted reads the visible session with the newest captured work other than the caller's own, ended or cut off (`ReaderPool::recent_session_activity` over 30 days, preferring the caller session's cwd), else the latest completed visible session. `session_id: "current"` resolves to the caller's own hook session when the client forwards it (`X-Memory-Actor-Session-Id`) and is refused otherwise (#1983). |
 | `memory_status` | read-only | Counts, paths, version, plus the `scope` that answered: `workspace`, `project`, and `resolved_by` (`explicit`, `session`, `shared_slot`, `startup_seed`, `default`, `default_after_mismatch`). Unscoped reads resolved by `startup_seed` or `default_after_mismatch` also log a server warning. |
-| `memory_briefing` | read-only | Structured counts/activity/rules/slots/recent snapshot. Project-scoped snapshots also carry a bounded `pinned` list (up to 10) of the project's pinned latest pages (`pinned = 1`, newest first) as standing SessionStart hot-context, distinct from `slots`, which is keyed by the `_slots/` path prefix; empty and omitted from JSON when the project has no pins, so the default shape is unchanged. Opt-in `settled_first: true` leads with up to 8 of the project's highest-standing `rule`/`decision` pages, ordered by evidence count then recency; off by default. `scope` names the workspace/project briefed and `resolved_by` how it was chosen. `recent_sessions_limit` (1-50) sets how many recent sessions it lists. |
+| `memory_briefing` | read-only | Structured counts/activity/rules/slots/recent snapshot. Project-scoped snapshots also carry a bounded `pinned` list (up to 10) of the project's pinned latest pages (`pinned = 1`, newest first) as standing SessionStart hot-context, distinct from `slots`, which is keyed by the `_slots/` path prefix; empty and omitted from JSON when the project has no pins, so the default shape is unchanged. Opt-in `settled_first: true` leads with up to 8 of the project's highest-standing `rule`/`decision` pages, ordered by evidence count then recency; off by default. `scope` names the workspace/project briefed and `resolved_by` how it was chosen. `recent_sessions_limit` (1-50) sets how many recent sessions it lists. `lint`, present once a lint run has written `_lint/report.md` with its counts, gives the report's `warnings`, `findings`, `updated_at` and up to five `warning_pages`; the session-start context adds one count-only line when `warnings` is non-zero. |
 | `memory_explore` | read-only | LLM prose digest over the briefing snapshot, degrading to JSON without a provider. An optional `reasoning` tier (`minimal` (default) / `low` / `medium` / `high` / `max`) scales the digest's max-token budget off its base (16 000; same 1x/1.5x/2x/3x/4x mapping as `memory_query`); inert on the no-provider briefing-only path, and `minimal` is byte-identical. |
 | `memory_handoff_begin` | destructive | Open an owner-scoped handoff for the next agent; `shared=true` deliberately publishes it to the project. Optional `workspace` + `project` targets a named sibling workspace/project. |
 | `memory_handoff_list` | read-only | List open own/shared handoffs with inspectable body and identity fields; does not claim or expire. Root-only `any_owner=true` recovers across operators. Optional `workspace` + `project` targets a named sibling workspace/project. |
-| `memory_handoff_accept` | destructive | Fetch + ack an open own/shared handoff. Pass `handoff_id` from `memory_handoff_list` to claim that exact row; omitting it still claims the latest eligible open handoff (automatic handoffs are cwd-matched). Root-only `any_owner=true` recovers across operators. Optional `workspace` + `project` targets a named sibling workspace/project. Returns `handoff` plus `status`: `claimed` (this call won it), `consumed_by_hook` (the calling session's own SessionStart claimed it, so it is already in context; needs the session id the hook claimed under, i.e. a session-aware client), or `none_pending`. |
+| `memory_handoff_accept` | destructive | Fetch + ack an open own/shared handoff. Pass `handoff_id` from `memory_handoff_list` to claim that exact row; omitting it still claims the latest eligible open handoff (automatic handoffs are cwd-matched), and a blank `handoff_id` is refused rather than read as omitted. Root-only `any_owner=true` recovers across operators. Optional `workspace` + `project` targets a named sibling workspace/project. Returns `handoff` plus `status`: `claimed` (this call won it), `consumed_by_hook` (the calling session's own SessionStart claimed it, so it is already in context; needs the session id the hook claimed under, i.e. a session-aware client), or `none_pending`. |
 | `memory_handoff_cancel` | destructive | Mark an exact visible open handoff id expired when it was created by mistake; root-only `any_owner=true` recovers across operators. |
 | `memory_message_send` | destructive | Send a directed cross-project message into another project's inbox (V64/V90). Requires `to_workspace` + `to_project`; the recipient must already exist (fail-closed, never created). Body and optional evidence are secret-scrubbed and size-capped; a `measured` nature requires non-empty evidence. Refuses an inferred sender scope (static clients pass `from_workspace` + `from_project`). The one tool that crosses project isolation on purpose. Optional `to_agent` restricts the claim to one registered harness; `from_agent` records the sender's harness. |
-| `memory_message_list` | read-only | List pending mail for this project: `box="inbox"` (poppable, default) or `box="outbox"` (cancellable). Bodies are untrusted cross-project input. An inferred scope adds `resolved_scope` / `scope_source` / `hint`. |
+| `memory_message_list` | read-only | List pending mail for this project: `box="inbox"` (poppable, default) or `box="outbox"` (cancellable). Pass `after_id` with the last id from one page to read the next; an unknown or foreign id returns an empty page. Bodies are untrusted cross-project input. An inferred scope adds `resolved_scope` / `scope_source` / `hint`. |
 | `memory_message_pop` | destructive | Claim ONE inbox message exactly once (oldest, or a specific `message_id`); returns it fenced as untrusted input with sender provenance, or `null` when empty. Refuses an inferred scope. Optional `agent` claims only messages addressed to that harness, or to none. |
 | `memory_message_cancel` | destructive | Retract a pending sent message by `message_id`, or clear the whole outbox when omitted. Scoped to the sender project; refuses an inferred scope. |
 
@@ -863,10 +890,10 @@ long-lived entry there is expected policy behavior, not a fault.
 | `memory_consolidate` | destructive | LLM-driven page rewrite. `multi_page=true` for atomic fan-out; an update whose path names an existing pinned page is skipped (`_slots/` excepted). Omitting `session_id` (or sending a blank one) consolidates the latest completed session in the resolved project; the same omission on a project with none fails as `no completed session in <scope>`. Consolidation prompts append the target project's active reserved `_prompts/consolidation.md` body as sanitized, 2,000-character-capped, JSON-encoded, untrusted advisory preferences; TTL-expired pages are ignored and a per-call `instructions` argument overrides the page for one call. Both system prompts keep schema, evidence, disclosure, tool-use, and output rules authoritative. |
 | `memory_feedback` | write | Record a quality signal for one page by exact `path`: `helpful`/`not_helpful` step `pages.salience` for sweep-eligible episodic pages, while `stale`/`wrong` floor salience and surface any current page as a `feedback_flagged` lint finding. Never deletes; the path resolves to the current version in the transaction, so a later rewrite clears it. Retrieved content never authorizes feedback by itself. |
 | `memory_auto_improve` | write | Manually review a completed session and apply or stage validated wiki edits through the auto-improvement approval path. Without a session ID, selects the newest completed session with no persisted auto-improvement run so repeated calls advance through preflight skips; an explicit ID remains rerunnable. The server also schedules review for new sessions; `[auto_improve] require_approval = true` leaves proposals pending for manual review. |
-| `memory_write_page` | destructive | Write durable wiki knowledge when the user explicitly asks to remember/annotate it. `scope: "global"` writes into the reserved `_global` preferences scope and `scope: "profile"` into the caller's cross-project profile (path placed under `profile/`); optional `expires_at` sets an RFC3339 or date-only TTL; optional `session_id` cites a session of the same project as evidence, and on `sessions/<id>.md` stamps the session-page frontmatter and settles the queued consolidation job; optional `source_files` (up to 16 `{path, commit}` entries) names the repository files the page describes, which the server stores but never reads, so a client can compare them with its checkout and record `stale` feedback. Optional `expected_page_id` (the `page_id` a read returned) writes only if that is still the latest version, and `create_only: true` refuses to overwrite an existing page; a failed precondition writes nothing and returns `reason: "precondition_failed"` with the current version (see `docs/programmatic-memory.md`). Exact page reads and writes may select an existing project with `workspace` + stable `project_id`; this is mutually exclusive with the project name and never creates a scope. |
+| `memory_write_page` | destructive | Write durable wiki knowledge when the user explicitly asks to remember/annotate it. `scope: "global"` writes into the reserved `_global` preferences scope and `scope: "profile"` into the caller's cross-project profile (path placed under `profile/`); optional `expires_at` sets an RFC3339 or date-only TTL; optional `session_id` cites a session of the same project as evidence, and on `sessions/<id>.md` stamps the session-page frontmatter and settles the queued consolidation job; optional `source_files` (up to 16 `{path, commit}` entries) names the repository files the page describes, which the server stores but never reads, so a client can compare them with its checkout and record `stale` feedback. Optional `expected_page_id` (the `page_id` a read returned) writes only if that is still the latest version (a blank one is refused, not ignored), and `create_only: true` refuses to overwrite an existing page; a failed precondition writes nothing and returns `reason: "precondition_failed"` with the current version (see `docs/programmatic-memory.md`). Exact page reads and writes may select an existing project with `workspace` + stable `project_id`; this is mutually exclusive with the project name and never creates a scope. |
 | `memory_resolve_write_target` | read-only | Preflight an exact existing `workspace` + `project` or `project_id` with write authorization, no fallback/create/promotion, returning the canonical name and stable id. Bulk importers resolve every mapped destination before their first write so a bad mapping cannot fail only after earlier batches landed. |
 | `memory_write_pages_batch` | destructive | Write 1-100 complete page versions atomically into one existing project, selected by `workspace` + `project` or stable `project_id`. Every entry is conditional (`create_only` or `expected_page_id`), duplicate paths are refused, each body is capped at 1 MiB and the aggregate at 8 MiB. Admission, sanitization, attribution, index updates and rollback use the same `Wiki::apply_batch_if` boundary; one mismatch returns its request index/current id and writes nothing. Intended for bounded companion imports, not routine agent notes. |
-| `memory_delete_page` | destructive | Delete a single page by exact `path`; `scope: "profile"` deletes from the caller's cross-project profile. Fires the admission chain (op=delete); idempotent. Optional `expected_page_id` deletes only if that is still the latest version; otherwise nothing is deleted and the call returns `reason: "precondition_failed"`. |
+| `memory_delete_page` | destructive | Delete a single page by exact `path`; `scope: "profile"` deletes from the caller's cross-project profile. Fires the admission chain (op=delete); idempotent. Optional `expected_page_id` deletes only if that is still the latest version (a blank one is refused, not ignored); otherwise nothing is deleted and the call returns `reason: "precondition_failed"`. |
 | `memory_restore_page` | destructive | Admin only, like `/admin/restore-page`. Without `rev`, list the git checkpoints that changed `path`. With `rev`, write that version (body and frontmatter metadata) back through the `memory_write_page` path (sanitizer, admission, slots, supersession), including a deleted page. Purged session summaries are refused before writing. Project pages only, not `scope: "profile"`. |
 | `memory_forget_sweep` | destructive | Retention pass: evict cold pages through the wiki layer, purge aged tombstone ancestry, and hard-delete TTL-expired pages. `dry_run=true` for preview. |
 | `memory_lint` | destructive | Rule-based + LLM contradiction findings → `wiki/_lint/`. Also runs a **zero-LLM similarity candidate detector** (design-memory-aging.md A5): cold semantic/procedural pages whose already-stored embeddings sit in the `contradiction_band_min`–`contradiction_band_max` cosine-similarity band (default 0.4–0.75; "same topic, not a near-duplicate"; at/above the max is A3 dedup, below the min unrelated) get an advisory `similarity_candidate` finding. Similarity alone never claims contradiction or supersession; explicit `contradicts` edges still emit `contradiction`. The scan is bounded (one embeddings load over the capped cold set, capped findings, deterministic), a clean no-op with no embedder configured, and advisory-only (never deletes/edits/supersedes a page and persists no edge, invariants #13, #16, #2), so it needs no migration. On a single-language or single-domain store, background similarity between unrelated pages can sit above the default floor; raise `contradiction_band_min` (`config.toml` or `AI_MEMORY_CONTRADICTION_BAND_MIN`) to trim that review queue. |
@@ -1048,7 +1075,9 @@ page content and scope names never reach it.
 and the worker's bounded error through the privacy strip). The session id is
 what a re-consolidation needs after the cause is fixed, so it belongs on the
 operator surface and not on the health panel, whose "counts and timestamps
-only" contract is unchanged (#1692).
+only" contract is unchanged (#1692). Both the `failed` count and the list leave
+out a failure that a newer generation of the same session has since completed:
+that newer page already covers the failed run's observations.
 
 ## CLI subcommand surface
 
@@ -1057,7 +1086,7 @@ init                        status               list-projects
 run                         show                 continue
 resume                      workstreams          rename-workstream
 workstream-search           audit-contamination  search recent
-read-page                   write-page           delete-page
+read-page                   write-page           delete-page call
 serve                       reset                backup
 restore                     reindex              install-hooks
 hook                        install-mcp          commit
@@ -1170,9 +1199,11 @@ that touch the relevant area.
    (`SessionAgents`) with no database round trip (#2023).
    (agentmemory #221 / #143.) The router's filesystem probes of an event's
    cwd (git discovery, canonicalization) never run on an async worker: they
-   go through `CwdProbes`, a blocking-pool path with four permits and a
-   2-second deadline, so a stuck `open()` (macOS privacy controls, a dead
-   network mount) fails that event instead of stalling the server (#1514).
+   go through `CwdProbes`, a blocking-pool path with four permits, one probe
+   per cwd at a time and a 2-second deadline, so a stuck `open()` (macOS
+   privacy controls, a dead network mount) fails that event instead of
+   stalling the server (#1514), and a directory that stays stuck pins one
+   permit however many events come from it (#2434).
 6. **Privacy strip is a typed boundary.** `Sanitized<NewObservation>`
    has no other constructor than `sanitize()`. (design-decisions §14.)
    The opt-in assistant/Stop excerpt (#196) enters through this same
@@ -1231,7 +1262,7 @@ language = "en"                    # human-facing terminal language: "en" or "pt
                                    # content keep their format (docs/localization.md)
 bind = "127.0.0.1:49374"
 log_level = "info"                 # default filter also pins `rmcp=warn` (the MCP SDK's
-                                   # per-request info logs) and drops the 30s reconcile
+                                   # per-request info logs) and drops the 300s reconcile
                                    # summary to debug (#894). Restore either via log_level
                                    # (e.g. "info,rmcp=info", "debug") or RUST_LOG;
                                    # `tracing_appender=warn` stays forced (feedback-loop guard)
@@ -1267,6 +1298,9 @@ run_autowire = true                # `ai-memory run <harness>` auto-installs tha
                                    # hooks + MCP on first launch if missing (idempotent,
                                    # one-time per harness+version+install location).
                                    # Also `--no-autowire`.
+pi_tool_exposure = "direct"        # how the generated Pi extension registers the MCP
+                                   # tools: "direct" (declared to the model) or
+                                   # "codemode" (reached through Pi's codemode tool).
 release_base_url = ""              # override the GitHub releases base URL that `ai-memory
                                    # upgrade` checks and downloads from (#801). Empty =
                                    # https://github.com/akitaonrails/ai-memory/releases.
@@ -1295,9 +1329,12 @@ enabled = true                     # master switch for the scheduled jobs below
 forget_sweep_interval_secs = 86400 # retention forget sweep; 0 disables. Cadence persists
                                    # across restarts; overdue work starts after a bounded delay
 lint_interval_secs = 86400         # rule-based wiki lint; 0 disables (same persistence)
+lint_llm_interval_secs = 0         # lint with the LLM contradiction pass; 0 = off (calls
+                                   # the lint provider; skipped with one warning without
+                                   # one). While on, the rule run keeps its findings.
 embedding_backfill_interval_secs = 0  # embedding backfill; 0 = off (may call a paid provider)
 reconcile_tombstones_deleted_pages = false
-                                   # opt-in (#929/#964): the 30s reconcile pass soft-tombstones
+                                   # opt-in (#929/#964): the 300s reconcile pass soft-tombstones
                                    # (is_latest=0 + superseded_at — never a filesystem write) an
                                    # OKF-imported content page whose file has been missing on
                                    # two consecutive passes, behind a circuit breaker and with
@@ -1369,6 +1406,7 @@ per_user = false                  # shared + own slots in agent context
 
 [handoff]                         # optional server-wide handoff policy
 claim_on_session_start = true     # false offers metadata; explicit accept claims
+deliver_on_session_start = true   # false skips the handoff and notice; a project marker overrides
 create_on_session_end = true      # false stops automatic handoffs at session end and OpenCode/Antigravity turn checkpoints
 
 [profile]                         # cross-project profile (docs/cross-project-profile.md)
@@ -1624,9 +1662,12 @@ stopwords or adding a ranking signal.
 **LLM provider env** (opt-in):
 ```
 AI_MEMORY_LLM_PROVIDER     anthropic | anthropic-oauth | openai | openai-oauth | codex | copilot |
-                           cursor | gemini | openai-compat | opencode
+                           cursor | gemini | openai-compat | opencode | vertex
 AI_MEMORY_LLM_MODEL        optional when the provider has a default; e.g. claude-haiku-4-5, gpt-5.4-mini
 ANTHROPIC_API_KEY / OPENAI_API_KEY / GEMINI_API_KEY / LLM_API_KEY
+AI_MEMORY_LLM_API_KEY_FILE openai-compat only: read the key from this file instead of
+                           LLM_API_KEY (`llm_api_key_file`); re-read once after a 401,
+                           so a rotated token reaches a running server
 AI_MEMORY_LLM_BASE_URL     required for openai-compat (Ollama, vLLM); optional override for
                            opencode (defaults to the Go endpoint, set
                            https://opencode.ai/zen/v1 for Zen's catalogue).
@@ -1647,7 +1688,8 @@ AI_MEMORY_LLM_COMPAT_STRICT true by default; false disables response_format=json
 AI_MEMORY_LLM_COMPAT_DISABLE_THINKING  openai-compat only, false by default; true sends
                            chat_template_kwargs:{"enable_thinking":false} on every
                            request (vLLM / SGLang thinking models). A structured
-                           response that stops with finish_reason=length, or a 2xx
+                           response that stops with finish_reason=length (or a
+                           relayed max_tokens), or a 2xx
                            with empty message.content, is a terminal error
                            (classes truncated-response / empty-content)
 AI_MEMORY_LLM_COMPAT_STREAM optional false to request non-streaming openai-compat JSON;
@@ -1660,6 +1702,12 @@ AI_MEMORY_LLM_TOKENIZER_PATH  local tokenizer.json path; required with the
                            ceiling. A capped fallback chain or `[llm.<task>]`
                            chain is rejected at startup because its models may
                            tokenize differently.
+AI_MEMORY_LLM_REQUEST_METADATA_HEADERS  openai-compat only, false by default; true adds
+                           x-ai-memory-workload to every chat attempt, plus
+                           x-ai-memory-workspace / x-ai-memory-project when the
+                           operation reads one scope and x-ai-memory-user when it
+                           acts for one username. Unknown values are omitted,
+                           never guessed; values are names, never page content
 AI_MEMORY_BOOTSTRAP_MAX_CONCURRENT  bootstrap runs in flight at once
                            (`bootstrap_max_concurrent`); 1 by default
 AI_MEMORY_LLM_REASONING_EFFORT  optional reasoning/thinking effort
@@ -1678,13 +1726,14 @@ AI_MEMORY_LLM_HEADERS      optional extra HTTP headers on every chat request, as
                            content-type, x-api-key, x-goog-api-key,
                            anthropic-version, anthropic-beta, openai-beta,
                            host, content-length) are refused at startup.
-                           `x-request-id` is additionally refused at
+                           `x-request-id` and the `x-ai-memory-*` request
+                           metadata names are additionally refused at
                            initialization for the `openai-compat` provider,
-                           which sends the operation's request id itself.
+                           which sends them itself.
                            Values are never logged. A header value cannot
                            contain a comma through the env var — use
                            `llm_headers = [...]` in config.toml for that.
-AI_MEMORY_RERANKER         optional `llm`; reranks project/scopes query candidates
+AI_MEMORY_RERANKER         optional `llm` or `decisions-choice`; reranks project/scopes query candidates
 AI_MEMORY_RERANK_TIMEOUT_SECS optional rerank budget in seconds (default 20, minimum 1)
 COPILOT_GITHUB_TOKEN       optional GitHub token for copilot
 AI_MEMORY_CODEX_EXECUTABLE optional Codex executable; defaults to codex on PATH
@@ -1843,6 +1892,11 @@ sees the host path read the same file. A configured file that is missing or
 blank leaves no bearer, and `serve` then refuses to start. Env:
 `AI_MEMORY_AUTH__BEARER_TOKEN_FILE`.
 
+`uninstall` keeps the server's configured token file when clearing hook and
+server-profile credentials. This also applies when `AI_MEMORY_AUTH_TOKEN`
+overrides the file for that command: a later server start still needs the
+configured file when the override is absent.
+
 `ai-memory init` mints the token (32 random bytes, hex, `0600` under a `0700`
 `auth-tokens/`) only on a fresh data dir: no config file and no database yet,
 and no bearer supplied another way. An existing install keeps the loopback
@@ -1896,8 +1950,10 @@ the server URL is loopback and no `default` server profile is registered.
   a concurrent write replaced stays visible (invariant #16). TTL expiry still
   applies: an expired version is neither listed nor readable by id, and a page
   whose live version expired shows no history, since the forget sweep deletes
-  every row at its path. The link graph is a circular SVG plus an edge table;
-  larger layouts and interactive clustering remain open. See
+  every row at its path. The link graph is a circular SVG plus an edge table.
+  Both graph views send `Cache-Control: private, no-store`, as the other
+  viewer-dependent HTML pages do.
+  Larger layouts and interactive clustering remain open. See
   [`docs/frontend-api.md`](frontend-api.md#10-known-gaps-and-deliberate-non-goals).
 * **Retrieval measurement gaps.** The LongMemEval-S harness ships in
   `evals/` (pipeline, component and decomposition modes; results in
@@ -1920,6 +1976,9 @@ the server URL is loopback and no `default` server profile is registered.
   [`research-ecc.md`](research-ecc.md),
   [`research-codebase-memory-mcp.md`](research-codebase-memory-mcp.md):
   prior art studied.
+* [`docs/research-anthropic-agent-memory.md`](research-anthropic-agent-memory.md):
+  Anthropic's memory-hierarchy and dreaming findings, Claude Code's native
+  memory, and how ai-memory maps onto both.
 * [`docs/auto-improvement-loop.md`](auto-improvement-loop.md):
   Hermes Agent-inspired learning-loop research and safety boundaries.
 * [`docs/issues-*.md`](.): concrete failure modes we've designed to

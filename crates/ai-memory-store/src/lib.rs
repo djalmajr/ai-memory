@@ -28,7 +28,12 @@ mod ops;
 pub mod password;
 mod profile;
 mod provenance;
-pub use provenance::{PageDisagreement, PageProvenance, PageSource};
+mod retrieval_criteria;
+mod retrieval_history;
+pub use provenance::{
+    CompiledSource, CompiledSourceObservation, MAX_COMPILED_SOURCES_PAGE, PageCompiledSources,
+    PageDisagreement, PageProvenance, PageSource,
+};
 mod project_authz;
 mod project_coordinates;
 pub mod query_signals;
@@ -49,9 +54,10 @@ pub use auto_improve::{
     ApproveAutoImproveProposalResult, AutoImproveProposalDetail, AutoImproveProposalEvent,
     AutoImproveProposalOperation, AutoImproveProposalStatus, AutoImproveProposalSummary,
     AutoImproveRejectionSummary, AutoImproveTelemetryAggregate, AutoImproveTelemetryCount,
-    FailAutoImproveProposal, NewAutoImproveProposal, OwnedAutoImproveProposalDetail,
-    PendingAutoImproveReview, PendingAutoImproveScope, RejectAutoImproveProposal, SkippedProposal,
-    StageAutoImproveRun, StagedAutoImproveRun, StagedAutoImproveRunReport, artifact_path_for,
+    FailAutoImproveProposal, INTERRUPTED_REVIEW_CLAIM_ERROR, InterruptedAutoImproveClaim,
+    NewAutoImproveProposal, OwnedAutoImproveProposalDetail, PendingAutoImproveReview,
+    PendingAutoImproveScope, RejectAutoImproveProposal, SkippedProposal, StageAutoImproveRun,
+    StagedAutoImproveRun, StagedAutoImproveRunReport, artifact_path_for,
 };
 pub use belief::{BeliefInputs, CONFIDENCE_CAP, confidence};
 pub use dashboard::{AgentUsage, RegisteredAgent};
@@ -63,7 +69,10 @@ pub use decay::{
 pub use error::{
     AmbiguousMatch, AmbiguousProjectHolder, AmbiguousProjectHolders, StoreError, StoreResult,
 };
-pub use grants::{GrantFilter, GrantListing, GrantOutcome, ProjectGrant};
+pub use grants::{
+    GrantFilter, GrantListing, GrantOutcome, ProjectGrant, WorkspaceGrantFilter,
+    WorkspaceGrantListing,
+};
 pub use maintenance::MaintenanceJob;
 pub use migrations::{SchemaStatus, schema_status};
 pub use ops::{
@@ -102,21 +111,27 @@ pub use reader::{
     DerivedIndexStatus, EmbeddingTripleCount, FTS_HIGHLIGHT_END, FTS_HIGHLIGHT_START,
     FeedbackFinding, FileSessionRef, GraphVia, HealthDetail, HealthPage, HybridSearch,
     HybridSearchOutcome, IdleOpenSession, InboxCount, InboxEntry, InterruptedSessionCandidate,
-    LinkGraph, LinkGraphEdge, LinkGraphNode, ObservationHit, ObservationOrder, ObservationPage,
-    ObservationPageResult, ObservationProjectionTotals, ObservationRecord, OpenSession, PAGE_KINDS,
-    PAGE_VERSIONS_MAX_LIMIT, PROJECT_LINK_GRAPH_MAX_NODES, PageAuthor, PageFilter, PageHit,
-    PageHitWithMeta, PageLinks, PageLinksPreview, PageMeta, PageSummary, PageVersion,
-    PageVersionBody, PageVersions, ProjectCoordinateCollisionReason, ProjectCoordinateDiagnostic,
-    ProjectCoordinateStatus, ProjectSummary, RELATED_WALK_MAX_DEPTH, RELATED_WALK_MAX_NODES,
-    ReaderPool, ReindexTargetStatus, RelatedNode, RelatedPage, RrfContributions,
-    SESSION_LINE_TITLE_CHARS, SUBSTANTIVE_OBSERVATION_KIND_SQL, ScopeRow, SearchExplain,
-    SessionActivity, SessionConsolidationQueue, SessionConsolidationSummary, SessionDependentRows,
-    SessionEndDisposition, SessionKindSummary, SessionLine, SessionObservationSnapshot,
-    SessionPromptTitles, SessionSummary, SessionToolTitles, SessionUsageView, SettledPage,
-    StatusCounts, StorageStatus, StoredEmbedding, StoredPageBody, StreamTimings, TokenCallOrder,
-    TokenCallQuery, TokenCallView, TokenUsageReport, VectorQuery, WorkspaceScopeRow,
-    WorkspaceSummary, f32_vec_to_bytes, highlighted_snippet_html, plain_snippet,
-    project_name_fold_key,
+    LinkGraph, LinkGraphEdge, LinkGraphNode, LintSummary, ObservationHit, ObservationOrder,
+    ObservationPage, ObservationPageResult, ObservationProjectionTotals, ObservationRecord,
+    OpenSession, PAGE_KINDS, PAGE_VERSIONS_MAX_LIMIT, PROJECT_LINK_GRAPH_MAX_NODES, PageAuthor,
+    PageFilter, PageHit, PageHitWithMeta, PageLinks, PageLinksPreview, PageMeta, PageSummary,
+    PageVersion, PageVersionBody, PageVersions, ProjectCoordinateCollisionReason,
+    ProjectCoordinateDiagnostic, ProjectCoordinateStatus, ProjectSummary, RELATED_WALK_MAX_DEPTH,
+    RELATED_WALK_MAX_NODES, ReaderPool, ReindexTargetStatus, RelatedNode, RelatedPage,
+    RrfContributions, SESSION_LINE_TITLE_CHARS, SUBSTANTIVE_OBSERVATION_KIND_SQL, ScopeRow,
+    SearchExplain, SessionActivity, SessionConsolidationQueue, SessionConsolidationSummary,
+    SessionDependentRows, SessionEndDisposition, SessionKindSummary, SessionLine,
+    SessionObservationSnapshot, SessionPromptTitles, SessionSummary, SessionToolTitles,
+    SessionUsageView, SettledPage, StatusCounts, StorageStatus, StoredEmbedding, StoredPageBody,
+    StreamTimings, TokenCallOrder, TokenCallQuery, TokenCallView, TokenUsageReport, VectorQuery,
+    WikiFileFingerprintRow, WorkspaceScopeRow, WorkspaceSummary, f32_vec_to_bytes,
+    highlighted_snippet_html, plain_snippet, project_name_fold_key,
+};
+pub use retrieval_criteria::{MAX_RESULT_LIMIT, RetrievalCriteria};
+pub use retrieval_history::{
+    DEFAULT_RETRIEVAL_HISTORY_RETENTION, NewRetrievalHistory, NewRetrievalHistoryHit,
+    RETRIEVAL_HISTORY_QUERY_MAX_CHARS, RetrievalHistoryHitRow, RetrievalHistoryPage,
+    RetrievalHistoryRow,
 };
 pub use retrieval_tuning::{RetrievalTuning, is_session_recall_query};
 pub use scope::{
@@ -128,16 +143,17 @@ pub use scope::{
     lookup_project_id_guarded, resolve_many_existing_scopes, resolve_many_existing_scopes_guarded,
 };
 pub use session_consolidation::{
-    SESSION_CONSOLIDATION_MAX_ATTEMPTS, SessionConsolidationJob, enqueue_in_tx,
+    SESSION_CONSOLIDATION_MAX_ATTEMPTS, SessionConsolidationJob, TRANSPORT_RECOVERY_MAX_ATTEMPTS,
+    TRANSPORT_UNREACHABLE_CONSOLIDATION_ERROR, enqueue_in_tx,
 };
 pub use users::{LoginUser, TOKEN_HASH_LEN, TOKEN_RAW_LEN, TokenPepper, hash_token};
 pub use web_sessions::{LiveWebSession, WebSession, hash_session_secret};
 pub use workstream::{
-    ClaudeSessionBoundary, FinishWorkstreamRun, FinishedWorkstreamRun,
+    FinishWorkstreamRun, FinishedWorkstreamRun, LegacyWorkstreamFingerprints,
     LinkManagedRunSessionInScope, LinkOrAdoptManagedRunSession, ManagedRunAuthority,
-    ManagedRunContext, ManagedRunHookIdentity, ManagedRunSessionLink, NativeSessionHolder,
-    OperationalWorkstreamSummary, PrepareWorkstreamRun, PreparedWorkstreamRun, RenameWorkstream,
-    RenamedWorkstream, StoredManagedRunStatus, StoredWorkstreamSummary,
+    ManagedRunContext, ManagedRunHookIdentity, ManagedRunSessionLink, ManagedSessionBoundary,
+    NativeSessionHolder, OperationalWorkstreamSummary, PrepareWorkstreamRun, PreparedWorkstreamRun,
+    RenameWorkstream, RenamedWorkstream, StoredManagedRunStatus, StoredWorkstreamSummary,
     WorkstreamOperationalStatus, WorkstreamSelection, WorkstreamSelector,
 };
 pub use writer::{StartupContextAcceptance, WriterHandle};
@@ -171,6 +187,23 @@ pub struct Store {
     /// Cloneable handle for read-only queries.
     pub reader: ReaderPool,
     db_path: PathBuf,
+}
+
+/// Per-connection SQLite page cache budget: 64 MiB (negative = KiB).
+const SQLITE_CACHE_SIZE_KIB: i64 = -65_536;
+/// Per-connection memory-mapped I/O window: 1 GiB on 64-bit, 256 MiB on 32-bit.
+#[cfg(target_pointer_width = "64")]
+const SQLITE_MMAP_SIZE_BYTES: i64 = 1_073_741_824;
+#[cfg(not(target_pointer_width = "64"))]
+const SQLITE_MMAP_SIZE_BYTES: i64 = 268_435_456;
+
+/// Apply performance and concurrency PRAGMAs shared by writer and reader connections.
+pub(crate) fn apply_connection_pragmas(conn: &Connection) -> StoreResult<()> {
+    conn.pragma_update(None, "busy_timeout", 5_000)?; // ms
+    conn.pragma_update(None, "cache_size", SQLITE_CACHE_SIZE_KIB)?;
+    conn.pragma_update(None, "mmap_size", SQLITE_MMAP_SIZE_BYTES)?;
+    conn.pragma_update(None, "temp_store", "MEMORY")?;
+    Ok(())
 }
 
 impl Store {
@@ -234,7 +267,7 @@ impl Store {
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "journal_size_limit", WAL_JOURNAL_SIZE_LIMIT_BYTES)?;
         conn.pragma_update(None, "synchronous", "NORMAL")?;
-        conn.pragma_update(None, "busy_timeout", 5_000)?; // ms
+        apply_connection_pragmas(&conn)?;
         // Writer transactions start IMMEDIATE: a deferred transaction that
         // has already read cannot wait through the busy handler when it
         // upgrades to write, so another process holding the write lock (an
@@ -250,6 +283,8 @@ impl Store {
         conn.pragma_update(None, "foreign_keys", "OFF")?;
         migrations::run(&mut conn)?;
         conn.pragma_update(None, "foreign_keys", "ON")?;
+        conn.pragma_update(None, "analysis_limit", 400)?;
+        conn.execute_batch("PRAGMA optimize;")?;
 
         // One-shot, idempotent entity-index backfill (docs/temporal.md).
         // Populates entities/entity_page_links from existing frontmatter
@@ -441,6 +476,7 @@ mod tests {
             expires_at: None,
             entities: Vec::new(),
             evidence: Vec::new(),
+            trust_class: None,
         }
     }
 
@@ -1009,6 +1045,7 @@ mod tests {
                 agent_kind: AgentKind::Codex,
                 cwd: None,
                 actor_user: None,
+                origin: None,
             })
             .await
             .unwrap();
@@ -1590,6 +1627,18 @@ mod tests {
                 .iter()
                 .any(|row| row.count == 2)
         );
+        assert_eq!(aggregate.eval_gate_rejections, 4);
+
+        let top_one = store
+            .reader
+            .auto_improve_telemetry_aggregate(ws, proj, 0, 1)
+            .await
+            .unwrap();
+        assert_eq!(top_one.rejections_by_reason.len(), 1);
+        assert_eq!(
+            top_one.eval_gate_rejections, 4,
+            "the eval-gate count must not depend on the top-N reason table"
+        );
 
         let other_aggregate = store
             .reader
@@ -1970,6 +2019,7 @@ mod tests {
                 agent_kind: AgentKind::OpenCode,
                 cwd: None,
                 actor_user: None,
+                origin: None,
             })
             .await
             .unwrap();
@@ -2367,6 +2417,7 @@ mod tests {
                 agent_kind: AgentKind::AntigravityCli,
                 cwd: None,
                 actor_user: None,
+                origin: None,
             })
             .await
             .unwrap();
@@ -3008,6 +3059,7 @@ mod tests {
                 agent_kind: AgentKind::ClaudeCode,
                 cwd: None,
                 actor_user: None,
+                origin: None,
             })
             .await
             .unwrap();
@@ -3026,6 +3078,7 @@ mod tests {
                     body: DIRECTORY_PATH_BODY.into(),
                     importance: 5,
                     file_path: None,
+                    trust_class: None,
                 },
                 &Sanitizer::builtin(),
             ))
@@ -3764,6 +3817,7 @@ mod tests {
         with_evidence.evidence = vec![PageEvidence {
             kind: PageEvidenceKind::Session,
             source_id: "session-1".into(),
+            observations: Default::default(),
         }];
         store
             .writer
@@ -3773,6 +3827,7 @@ mod tests {
         with_evidence.evidence = vec![PageEvidence {
             kind: PageEvidenceKind::Session,
             source_id: "session-2".into(),
+            observations: Default::default(),
         }];
         store.writer.upsert_page(with_evidence).await.unwrap();
 
@@ -3871,6 +3926,7 @@ mod tests {
                 agent_kind: AgentKind::OpenCode,
                 cwd: None,
                 actor_user: None,
+                origin: None,
             })
             .await
             .unwrap();
@@ -3889,6 +3945,7 @@ mod tests {
                     body: "the raw-only zebra detail lives here".into(),
                     importance: 5,
                     file_path: None,
+                    trust_class: None,
                 },
                 &Sanitizer::builtin(),
             ))
@@ -3934,6 +3991,7 @@ mod tests {
                 agent_kind: AgentKind::ClaudeCode,
                 cwd: None,
                 actor_user: None,
+                origin: None,
             })
             .await
             .unwrap();
@@ -3953,6 +4011,7 @@ mod tests {
                         .into(),
                     importance: 5,
                     file_path: None,
+                    trust_class: None,
                 },
                 &Sanitizer::builtin(),
             ))
@@ -4005,6 +4064,7 @@ mod tests {
                 agent_kind: AgentKind::ClaudeCode,
                 cwd: None,
                 actor_user: None,
+                origin: None,
             })
             .await
             .unwrap();
@@ -4022,6 +4082,7 @@ mod tests {
                     body: "tool_family: file".into(),
                     importance: 5,
                     file_path: Some("src/lib.rs".into()),
+                    trust_class: None,
                 },
                 &Sanitizer::builtin(),
             )
@@ -4102,6 +4163,7 @@ mod tests {
                     agent_kind: AgentKind::ClaudeCode,
                     cwd: None,
                     actor_user: None,
+                    origin: None,
                 })
                 .await
                 .unwrap();
@@ -4118,6 +4180,7 @@ mod tests {
             body: "hello".into(),
             importance: 5,
             file_path: None,
+            trust_class: None,
         };
 
         let first = store
@@ -4287,6 +4350,7 @@ mod tests {
                     agent_kind: AgentKind::OpenCode,
                     cwd: None,
                     actor_user: None,
+                    origin: None,
                 })
                 .await
                 .unwrap();
@@ -4333,6 +4397,7 @@ mod tests {
                 agent_kind: AgentKind::Codex,
                 cwd: None,
                 actor_user: Some("user:alice".into()),
+                origin: None,
             })
             .await
             .unwrap();
@@ -4444,6 +4509,7 @@ mod tests {
                 agent_kind: AgentKind::ClaudeCode,
                 cwd: None,
                 actor_user: None,
+                origin: None,
             })
             .await
             .unwrap();
@@ -4483,6 +4549,7 @@ mod tests {
                     body: "initial work".into(),
                     importance: 8,
                     file_path: None,
+                    trust_class: None,
                 },
                 &Sanitizer::builtin(),
             ))
@@ -4528,6 +4595,7 @@ mod tests {
                     body: "new work".into(),
                     importance: 7,
                     file_path: None,
+                    trust_class: None,
                 },
                 &Sanitizer::builtin(),
             ))
@@ -4587,6 +4655,7 @@ mod tests {
                 agent_kind: AgentKind::OpenCode,
                 cwd: None,
                 actor_user: None,
+                origin: None,
             })
             .await
             .unwrap();
@@ -4619,6 +4688,7 @@ mod tests {
                     agent_kind: AgentKind::OpenCode,
                     cwd: None,
                     actor_user: None,
+                    origin: None,
                 })
                 .await
                 .unwrap();
@@ -4695,6 +4765,7 @@ mod tests {
                 agent_kind: AgentKind::OpenCode,
                 cwd: None,
                 actor_user: None,
+                origin: None,
             })
             .await
             .unwrap();
@@ -4771,6 +4842,7 @@ mod tests {
                     agent_kind: AgentKind::OpenCode,
                     cwd: None,
                     actor_user: None,
+                    origin: None,
                 })
                 .await
                 .unwrap();
@@ -4799,6 +4871,7 @@ mod tests {
                     agent_kind: AgentKind::OpenCode,
                     cwd: None,
                     actor_user: None,
+                    origin: None,
                 })
                 .await
                 .unwrap();
@@ -4843,6 +4916,7 @@ mod tests {
                 agent_kind: AgentKind::OpenCode,
                 cwd: None,
                 actor_user: None,
+                origin: None,
             })
             .await
             .unwrap();
@@ -4891,6 +4965,7 @@ mod tests {
                     agent_kind: AgentKind::OpenCode,
                     cwd: None,
                     actor_user: None,
+                    origin: None,
                 })
                 .await
                 .unwrap();
@@ -4956,6 +5031,7 @@ mod tests {
                 agent_kind: AgentKind::OpenCode,
                 cwd: None,
                 actor_user: None,
+                origin: None,
             })
             .await
             .unwrap();
@@ -4979,6 +5055,7 @@ mod tests {
                         body: "durable work".into(),
                         importance: 5,
                         file_path: None,
+                        trust_class: None,
                     },
                     &Sanitizer::builtin(),
                 ))
@@ -5047,6 +5124,7 @@ mod tests {
                 agent_kind: AgentKind::OpenCode,
                 cwd: None,
                 actor_user: None,
+                origin: None,
             })
             .await
             .unwrap();
@@ -5139,6 +5217,7 @@ mod tests {
                     body: "more durable work".into(),
                     importance: 5,
                     file_path: None,
+                    trust_class: None,
                 },
                 &Sanitizer::builtin(),
             ))
@@ -5252,6 +5331,7 @@ mod tests {
                 agent_kind: AgentKind::OpenCode,
                 cwd: None,
                 actor_user: None,
+                origin: None,
             })
             .await
             .unwrap();
@@ -5300,6 +5380,7 @@ mod tests {
                     body: "more durable work".into(),
                     importance: 5,
                     file_path: None,
+                    trust_class: None,
                 },
                 &Sanitizer::builtin(),
             ))
@@ -5359,6 +5440,7 @@ mod tests {
                 agent_kind: AgentKind::OpenCode,
                 cwd: None,
                 actor_user: None,
+                origin: None,
             })
             .await
             .unwrap();
@@ -5462,6 +5544,7 @@ mod tests {
                 agent_kind: AgentKind::OpenCode,
                 cwd: None,
                 actor_user: None,
+                origin: None,
             })
             .await
             .unwrap();
@@ -5523,6 +5606,7 @@ mod tests {
                 agent_kind: AgentKind::OpenCode,
                 cwd: None,
                 actor_user: None,
+                origin: None,
             })
             .await
             .unwrap();
@@ -5664,6 +5748,7 @@ mod tests {
                 agent_kind: AgentKind::OpenCode,
                 cwd: None,
                 actor_user: None,
+                origin: None,
             })
             .await
             .unwrap();
@@ -5718,6 +5803,161 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn auto_improve_park_interrupted_claims_only_parks_orphaned_inflight_claims() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let ws = store
+            .writer
+            .get_or_create_workspace("default")
+            .await
+            .unwrap();
+        let proj = store
+            .writer
+            .get_or_create_project(ws, "ai-memory", None)
+            .await
+            .unwrap();
+        store
+            .writer
+            .ensure_auto_improve_scheduler_state(ws, proj)
+            .await
+            .unwrap();
+
+        tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+
+        let make_ended_session = || async {
+            let sid = SessionId::new();
+            store
+                .writer
+                .begin_session(NewSession {
+                    occurred_at: None,
+                    id: sid,
+                    workspace_id: ws,
+                    project_id: proj,
+                    agent_kind: AgentKind::OpenCode,
+                    cwd: None,
+                    actor_user: None,
+                    origin: None,
+                })
+                .await
+                .unwrap();
+            store.writer.end_session(sid, None).await.unwrap();
+            sid
+        };
+
+        // (a) Orphaned in-flight claim: claimed, no run row, last_failed_at IS NULL.
+        let orphaned_sid = make_ended_session().await;
+        // (b) Completed claim: claimed, matching auto_improve_runs row, last_failed_at IS NULL.
+        let completed_sid = make_ended_session().await;
+        // (c) Retryable failed claim: claimed then failed once (attempts = 1, last_failed_at IS NOT NULL).
+        let retryable_sid = make_ended_session().await;
+
+        let candidates = store
+            .reader
+            .auto_improve_candidate_sessions(ws, proj, 0, 10)
+            .await
+            .unwrap();
+        assert_eq!(candidates.len(), 3);
+        for candidate in &candidates {
+            assert!(
+                store
+                    .writer
+                    .claim_auto_improve_scheduler_session(
+                        ws,
+                        proj,
+                        candidate.session_id,
+                        candidate.ended_at,
+                    )
+                    .await
+                    .unwrap()
+            );
+        }
+
+        // Record a completed review run for (b).
+        let mut completed_run = stage_input(ws, proj, Vec::new());
+        completed_run.session_id = Some(completed_sid);
+        store
+            .writer
+            .stage_auto_improve_run(completed_run)
+            .await
+            .unwrap();
+
+        // Record one retryable failure for (c).
+        let retryable_attempts = store
+            .writer
+            .record_auto_improve_claim_failure(ws, proj, retryable_sid, "transient timeout")
+            .await
+            .unwrap();
+        assert_eq!(retryable_attempts, 1);
+
+        // Before startup recovery, (a) is hidden from both candidates and parked claims.
+        assert!(
+            store
+                .reader
+                .auto_improve_parked_claims(ws, proj)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+
+        let now = jiff::Timestamp::from_microsecond(1_700_000_000_000_000).unwrap();
+        let parked_now = store
+            .writer
+            .park_interrupted_auto_improve_claims(now)
+            .await
+            .unwrap();
+        assert_eq!(
+            parked_now,
+            vec![InterruptedAutoImproveClaim {
+                workspace_id: ws,
+                project_id: proj,
+                session_id: orphaned_sid,
+            }]
+        );
+
+        // Only (a) is surfaced in auto_improve_parked_claims with the interrupted error.
+        let parked = store
+            .reader
+            .auto_improve_parked_claims(ws, proj)
+            .await
+            .unwrap();
+        assert_eq!(parked.len(), 1);
+        assert_eq!(parked[0].session_id, orphaned_sid);
+        assert_eq!(parked[0].attempts, AUTO_IMPROVE_CLAIM_MAX_ATTEMPTS);
+        assert_eq!(
+            parked[0].last_error.as_deref(),
+            Some(INTERRUPTED_REVIEW_CLAIM_ERROR)
+        );
+        assert_eq!(parked[0].last_failed_at, Some(now.as_microsecond()));
+
+        // (c) remains a retryable candidate; (a) and (b) are not candidates.
+        let remaining_candidates = store
+            .reader
+            .auto_improve_candidate_sessions(ws, proj, 0, 10)
+            .await
+            .unwrap();
+        assert_eq!(remaining_candidates.len(), 1);
+        assert_eq!(remaining_candidates[0].session_id, retryable_sid);
+
+        // Second call is idempotent and returns no rows.
+        let parked_again = store
+            .writer
+            .park_interrupted_auto_improve_claims(
+                jiff::Timestamp::from_microsecond(1_700_000_005_000_000).unwrap(),
+            )
+            .await
+            .unwrap();
+        assert!(parked_again.is_empty());
+        // Timestamp on (a) was not overwritten by the idempotent second call.
+        let parked_after = store
+            .reader
+            .auto_improve_parked_claims(ws, proj)
+            .await
+            .unwrap();
+        assert_eq!(parked_after.len(), 1);
+        assert_eq!(parked_after[0].last_failed_at, Some(now.as_microsecond()));
+    }
+
+    #[tokio::test]
     async fn auto_improve_scheduler_claim_is_unique_across_store_instances() {
         let tmp = TempDir::new().unwrap();
         let store = Store::open(tmp.path()).unwrap();
@@ -5749,6 +5989,7 @@ mod tests {
                 agent_kind: AgentKind::OpenCode,
                 cwd: None,
                 actor_user: None,
+                origin: None,
             })
             .await
             .unwrap();
@@ -5836,6 +6077,7 @@ mod tests {
                     body: "upgrade observation survives".into(),
                     importance: 5,
                     file_path: None,
+                    trust_class: None,
                 },
             )
             .unwrap();
@@ -6200,6 +6442,88 @@ mod tests {
         );
     }
 
+    /// The `/web` namespace route asks this before it loads a listing, so an
+    /// unmatched path costs one indexed probe instead of a full project read.
+    /// The answer has to respect the scope, the TTL and `LIKE`
+    /// metacharacters in a path, and a foreign project or workspace must not
+    /// be able to satisfy it.
+    #[tokio::test]
+    async fn prefix_probe_is_scoped_ttl_aware_and_escapes_like() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let ws = store
+            .writer
+            .get_or_create_workspace("default")
+            .await
+            .unwrap();
+        let scratch = store
+            .writer
+            .get_or_create_project(ws, "scratch", None)
+            .await
+            .unwrap();
+        let other = store
+            .writer
+            .get_or_create_project(ws, "other", None)
+            .await
+            .unwrap();
+        let elsewhere = store
+            .writer
+            .get_or_create_workspace("elsewhere")
+            .await
+            .unwrap();
+        let elsewhere_scratch = store
+            .writer
+            .get_or_create_project(elsewhere, "scratch", None)
+            .await
+            .unwrap();
+        let now = jiff::Timestamp::now().as_second();
+        for (workspace, project, path) in [
+            (ws, scratch, "notes/a.md"),
+            (ws, scratch, "notes_deep/b.md"),
+            (ws, scratch, "notesX2026/z.md"),
+            (ws, other, "sibling/c.md"),
+            (elsewhere, elsewhere_scratch, "solo/d.md"),
+        ] {
+            store
+                .writer
+                .upsert_page(sample_page(workspace, project, path, "body"))
+                .await
+                .unwrap();
+        }
+        let mut expired = sample_page(ws, scratch, "stale/e.md", "body");
+        expired.expires_at = Some(jiff::Timestamp::from_second(now - 60).unwrap());
+        store.writer.upsert_page(expired).await.unwrap();
+
+        let probe = |project: &'static str, prefix: &'static str| {
+            store
+                .reader
+                .has_unexpired_page_under_prefix("default", project, prefix)
+        };
+        // Control: the namespace the route is about to list.
+        assert!(
+            probe("scratch", "notes/").await.unwrap(),
+            "notes/ holds a live page"
+        );
+        // An unmatched path answers without a listing.
+        assert!(!probe("scratch", "missing/").await.unwrap());
+        // A namespace whose only page expired is not a namespace.
+        assert!(!probe("scratch", "stale/").await.unwrap());
+        // A sibling namespace answers for itself, not for `notes/`.
+        assert!(probe("scratch", "notes_deep/").await.unwrap());
+        // `_` is a LIKE wildcard, so an unescaped pattern would treat
+        // `notes_2026/` as a match for `notesX2026/z.md`.
+        assert!(
+            !probe("scratch", "notes_2026/").await.unwrap(),
+            "the underscore in a namespace name is a literal, not a wildcard"
+        );
+        // Another project's namespace does not answer for this one, and the
+        // owning project still does.
+        assert!(!probe("scratch", "sibling/").await.unwrap());
+        assert!(probe("other", "sibling/").await.unwrap());
+        // Same project name, different workspace.
+        assert!(!probe("scratch", "solo/").await.unwrap());
+    }
+
     #[tokio::test]
     async fn reader_page_kinds_follow_canonical_paths_across_surfaces() {
         const CASES: [(&str, &str); 9] = [
@@ -6395,10 +6719,12 @@ mod tests {
             PageEvidence {
                 kind: PageEvidenceKind::Session,
                 source_id: "session-1".into(),
+                observations: Default::default(),
             },
             PageEvidence {
                 kind: PageEvidenceKind::Session,
                 source_id: "session-2".into(),
+                observations: Default::default(),
             },
         ];
         store.writer.upsert_page(decision_a).await.unwrap();
@@ -6504,6 +6830,7 @@ mod tests {
             expires_at: None,
             entities: Vec::new(),
             evidence: Vec::new(),
+            trust_class: None,
         };
         store.writer.upsert_page(page).await.unwrap();
 
@@ -7663,7 +7990,7 @@ mod tests {
             native_session_id: "native-session".into(),
             owner_user: None,
             session_start: true,
-            claude_boundary: ClaudeSessionBoundary::Other,
+            session_boundary: ManagedSessionBoundary::Other,
         };
 
         set_managed_run_lease(store.db_path(), run.run_id, 1);
@@ -7691,7 +8018,7 @@ mod tests {
                     native_session_id: "native-session".into(),
                     owner_user: None,
                     session_start: true,
-                    claude_boundary: ClaudeSessionBoundary::Other,
+                    session_boundary: ManagedSessionBoundary::Other,
                 })
                 .await
                 .unwrap(),
@@ -8064,6 +8391,79 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn startup_context_snapshot_failure_rolls_back_both_claims() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let (ws, proj) = open_managed_scope(&store, "startup-snapshot-failure").await;
+        let run = store
+            .writer
+            .prepare_workstream_run(managed_prepare_input(ws, proj, "test:1"))
+            .await
+            .unwrap();
+        let id = store
+            .writer
+            .insert_handoff(NewHandoff {
+                workspace_id: ws,
+                project_id: proj,
+                from_session_id: None,
+                from_agent: AgentKind::ClaudeCode,
+                to_agent: None,
+                cwd: None,
+                summary: "continue".into(),
+                open_questions: Vec::new(),
+                next_steps: Vec::new(),
+                files_touched: Vec::new(),
+                owner_user: None,
+            })
+            .await
+            .unwrap();
+        let conn = rusqlite::Connection::open(store.db_path()).unwrap();
+        conn.execute(
+            "UPDATE handoffs SET next_steps = 'invalid-json' WHERE id = ?1",
+            rusqlite::params![id.as_bytes()],
+        )
+        .unwrap();
+        let result = store
+            .writer
+            .accept_startup_context(
+                Some(HandoffAcceptance {
+                    handoff_id: id,
+                    workspace_id: ws,
+                    project_id: proj,
+                    accepting_agent: AgentKind::Codex,
+                    accepting_session: None,
+                    accepting_user: None,
+                    owner_filter: ai_memory_core::OwnerFilter::Any,
+                    receiving_cwd: None,
+                }),
+                Some(run.run_id),
+                None,
+                jiff::Timestamp::now(),
+            )
+            .await;
+        assert!(
+            result.is_err(),
+            "an unreadable snapshot must refuse the whole claim"
+        );
+        let state: String = conn
+            .query_row(
+                "SELECT state FROM handoffs WHERE id = ?1",
+                rusqlite::params![id.as_bytes()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(state, "open", "snapshot decoding must precede the commit");
+        assert!(
+            store
+                .writer
+                .accept_managed_run_context(run.run_id)
+                .await
+                .unwrap(),
+            "the failed snapshot must leave the managed packet claimable too"
+        );
+    }
+
+    #[tokio::test]
     async fn startup_context_claim_is_atomic_and_single_use() {
         let tmp = TempDir::new().unwrap();
         let store = Store::open(tmp.path()).unwrap();
@@ -8108,13 +8508,13 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(
-            accepted,
-            StartupContextAcceptance {
-                handoff_accepted: true,
-                managed_context_accepted: true,
-            }
-        );
+        assert!(accepted.handoff_accepted);
+        assert!(accepted.managed_context_accepted);
+        let snapshot = accepted.handoff.unwrap();
+        assert_eq!(snapshot.scope.id, first_handoff);
+        assert_eq!(snapshot.lifecycle.state, HandoffState::Accepted);
+        assert_eq!(snapshot.lifecycle.accepted_by, Some(AgentKind::Codex));
+        assert!(snapshot.lifecycle.accepted_at.is_some());
         assert!(
             store
                 .reader
@@ -8135,11 +8535,11 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(
-            rejected,
-            StartupContextAcceptance::default(),
+        assert!(
+            !rejected.handoff_accepted && !rejected.managed_context_accepted,
             "an already-delivered managed packet must reject the whole claim"
         );
+        assert!(rejected.handoff.is_none());
         assert_eq!(
             store
                 .reader
@@ -8168,6 +8568,7 @@ mod tests {
                     agent_kind: AgentKind::ClaudeCode,
                     cwd: Some(cwd.into()),
                     actor_user: None,
+                    origin: None,
                 })
                 .await
                 .unwrap();
@@ -8203,7 +8604,8 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(rejected_auto, StartupContextAcceptance::default());
+        assert!(!rejected_auto.handoff_accepted && !rejected_auto.managed_context_accepted);
+        assert!(rejected_auto.handoff.is_none());
         for handoff_id in [stale_auto, selected_auto] {
             assert_eq!(
                 store
@@ -9152,6 +9554,302 @@ mod tests {
                 "name {bad:?} should be rejected, got {failure:?}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn legacy_workstream_fingerprints_migrate_on_select_list_and_rename() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let (ws, proj) = open_managed_scope(&store, "managed-legacy-migration").await;
+
+        let legacy = || LegacyWorkstreamFingerprints {
+            repo_fingerprint: "legacy-repo".into(),
+            worktree_fingerprint: "legacy-tree".into(),
+        };
+        let prepare_on =
+            |repo: &str, tree: &str, selection: WorkstreamSelection| PrepareWorkstreamRun {
+                scope_by_id: false,
+                repo_fingerprint: repo.into(),
+                worktree_fingerprint: tree.into(),
+                selection,
+                ..managed_prepare_input(ws, proj, "test:1")
+            };
+
+        // 1. Seed a legacy workstream, then select it via Named on canonical fingerprints.
+        let legacy_named = store
+            .writer
+            .prepare_workstream_run(prepare_on(
+                "legacy-repo",
+                "legacy-tree",
+                WorkstreamSelection::New("feature-a".into()),
+            ))
+            .await
+            .unwrap();
+        store
+            .writer
+            .cancel_managed_run(legacy_named.run_id)
+            .await
+            .unwrap();
+
+        let migrated_named = store
+            .writer
+            .prepare_workstream_run_with_legacy(
+                prepare_on(
+                    "canonical-repo",
+                    "canonical-tree",
+                    WorkstreamSelection::Named("feature-a".into()),
+                ),
+                Some(legacy()),
+                None,
+                false,
+                false,
+            )
+            .await
+            .unwrap();
+        assert_eq!(migrated_named.workstream_id, legacy_named.workstream_id);
+        assert_eq!(migrated_named.workstream_name, "feature-a");
+        store
+            .writer
+            .cancel_managed_run(migrated_named.run_id)
+            .await
+            .unwrap();
+
+        // After migration, canonical queries without legacy aliases find it directly.
+        let canonical_list = store
+            .reader
+            .recent_workstreams(
+                ws,
+                proj,
+                "canonical-repo".into(),
+                "canonical-tree".into(),
+                10,
+            )
+            .await
+            .unwrap();
+        assert_eq!(canonical_list.len(), 1);
+        assert_eq!(canonical_list[0].workstream_id, legacy_named.workstream_id);
+
+        // 2. Seed another legacy workstream in a fresh checkout key, then migrate via Current.
+        let legacy_current = store
+            .writer
+            .prepare_workstream_run(prepare_on(
+                "legacy-repo-2",
+                "legacy-tree-2",
+                WorkstreamSelection::New("wip".into()),
+            ))
+            .await
+            .unwrap();
+        store
+            .writer
+            .cancel_managed_run(legacy_current.run_id)
+            .await
+            .unwrap();
+
+        let migrated_current = store
+            .writer
+            .prepare_workstream_run_with_legacy(
+                prepare_on(
+                    "canonical-repo-2",
+                    "canonical-tree-2",
+                    WorkstreamSelection::Current,
+                ),
+                Some(LegacyWorkstreamFingerprints {
+                    repo_fingerprint: "legacy-repo-2".into(),
+                    worktree_fingerprint: "legacy-tree-2".into(),
+                }),
+                None,
+                false,
+                false,
+            )
+            .await
+            .unwrap();
+        assert_eq!(migrated_current.workstream_id, legacy_current.workstream_id);
+        assert_eq!(migrated_current.workstream_name, "wip");
+        store
+            .writer
+            .cancel_managed_run(migrated_current.run_id)
+            .await
+            .unwrap();
+
+        // 3. Seed a legacy workstream and migrate via list_recent_migrating.
+        let legacy_listed = store
+            .writer
+            .prepare_workstream_run(prepare_on(
+                "legacy-repo-3",
+                "legacy-tree-3",
+                WorkstreamSelection::New("listed".into()),
+            ))
+            .await
+            .unwrap();
+        store
+            .writer
+            .cancel_managed_run(legacy_listed.run_id)
+            .await
+            .unwrap();
+
+        let listed = store
+            .writer
+            .recent_workstreams_page_migrating(
+                ws,
+                proj,
+                "canonical-repo-3".into(),
+                "canonical-tree-3".into(),
+                Some(LegacyWorkstreamFingerprints {
+                    repo_fingerprint: "legacy-repo-3".into(),
+                    worktree_fingerprint: "legacy-tree-3".into(),
+                }),
+                10,
+                0,
+            )
+            .await
+            .unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].workstream_id, legacy_listed.workstream_id);
+        // Verify persisted under canonical coordinates.
+        let persisted = store
+            .reader
+            .recent_workstreams(
+                ws,
+                proj,
+                "canonical-repo-3".into(),
+                "canonical-tree-3".into(),
+                10,
+            )
+            .await
+            .unwrap();
+        assert_eq!(persisted.len(), 1);
+        assert_eq!(persisted[0].workstream_id, legacy_listed.workstream_id);
+
+        // 4. Seed a legacy workstream and migrate via rename_with_legacy.
+        let legacy_renamed = store
+            .writer
+            .prepare_workstream_run(prepare_on(
+                "legacy-repo-4",
+                "legacy-tree-4",
+                WorkstreamSelection::New("old-name".into()),
+            ))
+            .await
+            .unwrap();
+        store
+            .writer
+            .cancel_managed_run(legacy_renamed.run_id)
+            .await
+            .unwrap();
+
+        let renamed = store
+            .writer
+            .rename_workstream_with_legacy(
+                RenameWorkstream {
+                    workspace_id: ws,
+                    project_id: proj,
+                    repo_fingerprint: "canonical-repo-4".into(),
+                    worktree_fingerprint: "canonical-tree-4".into(),
+                    selector: WorkstreamSelector::Name("old-name".into()),
+                    new_name: "new-name".into(),
+                },
+                Some(LegacyWorkstreamFingerprints {
+                    repo_fingerprint: "legacy-repo-4".into(),
+                    worktree_fingerprint: "legacy-tree-4".into(),
+                }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(renamed.workstream_id, legacy_renamed.workstream_id);
+        assert_eq!(renamed.from, "old-name");
+        assert_eq!(renamed.to, "new-name");
+        let after_rename = store
+            .reader
+            .recent_workstreams(
+                ws,
+                proj,
+                "canonical-repo-4".into(),
+                "canonical-tree-4".into(),
+                10,
+            )
+            .await
+            .unwrap();
+        assert_eq!(after_rename.len(), 1);
+        assert_eq!(after_rename[0].name, "new-name");
+    }
+
+    #[tokio::test]
+    async fn legacy_workstream_migration_disambiguates_name_collisions() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let (ws, proj) = open_managed_scope(&store, "managed-legacy-collision").await;
+
+        let prepare_on =
+            |repo: &str, tree: &str, selection: WorkstreamSelection| PrepareWorkstreamRun {
+                scope_by_id: false,
+                repo_fingerprint: repo.into(),
+                worktree_fingerprint: tree.into(),
+                selection,
+                ..managed_prepare_input(ws, proj, "test:1")
+            };
+
+        let legacy_ws = store
+            .writer
+            .prepare_workstream_run(prepare_on(
+                "legacy-repo",
+                "legacy-tree",
+                WorkstreamSelection::New("default".into()),
+            ))
+            .await
+            .unwrap();
+        store
+            .writer
+            .cancel_managed_run(legacy_ws.run_id)
+            .await
+            .unwrap();
+
+        let canonical_ws = store
+            .writer
+            .prepare_workstream_run(prepare_on(
+                "canonical-repo",
+                "canonical-tree",
+                WorkstreamSelection::New("default".into()),
+            ))
+            .await
+            .unwrap();
+        store
+            .writer
+            .cancel_managed_run(canonical_ws.run_id)
+            .await
+            .unwrap();
+
+        let listed = store
+            .writer
+            .recent_workstreams_page_migrating(
+                ws,
+                proj,
+                "canonical-repo".into(),
+                "canonical-tree".into(),
+                Some(LegacyWorkstreamFingerprints {
+                    repo_fingerprint: "legacy-repo".into(),
+                    worktree_fingerprint: "legacy-tree".into(),
+                }),
+                10,
+                0,
+            )
+            .await
+            .unwrap();
+        assert_eq!(listed.len(), 2, "both colliding workstreams must be kept");
+
+        let kept_canonical = listed
+            .iter()
+            .find(|row| row.workstream_id == canonical_ws.workstream_id)
+            .expect("canonical workstream must remain intact");
+        assert_eq!(kept_canonical.name, "default");
+
+        let kept_legacy = listed
+            .iter()
+            .find(|row| row.workstream_id == legacy_ws.workstream_id)
+            .expect("legacy workstream must be preserved with disambiguated name");
+        assert!(
+            kept_legacy.name.starts_with("default-legacy-"),
+            "unexpected disambiguated name: {}",
+            kept_legacy.name
+        );
     }
 
     #[tokio::test]

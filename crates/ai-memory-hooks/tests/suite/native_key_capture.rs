@@ -131,6 +131,10 @@ async fn harness() -> (TempDir, Store, HookState) {
         session_consolidation_notify: None,
         profile_notify: None,
         capture_assistant_enabled: false,
+        assistant_excerpt_max_bytes: 2000,
+        deliver_handoff_on_session_start: true,
+        deliver_recovery_on_session_start: true,
+        project_briefs: Default::default(),
         claim_handoff_on_session_start: true,
         create_handoff_on_session_end: true,
         subagent_sessions: Arc::new(tokio::sync::Mutex::new(SubagentSessionSet::default())),
@@ -161,6 +165,7 @@ async fn begin(store: &Store, state: &HookState) -> SessionId {
     store
         .writer
         .begin_session(NewSession {
+            origin: None,
             id: sid,
             workspace_id: state.workspace_id,
             project_id: state.project_id,

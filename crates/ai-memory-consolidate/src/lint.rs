@@ -24,7 +24,7 @@ use ai_memory_llm::{
     ChatMessage, ChatRequest, LlmOperationId, LlmProvider, LlmWorkload, Role,
     complete_structured_with_operation_id,
 };
-use ai_memory_store::{DecayCandidate, ReaderPool};
+use ai_memory_store::{DecayCandidate, DecayParams, ReaderPool};
 use ai_memory_wiki::{AdmissionContext, AdmissionOp, Wiki, WritePageRequest};
 use jiff::Timestamp;
 use jiff::tz::TimeZone;
@@ -145,9 +145,11 @@ pub struct LintOptions {
     /// When `false`, the LLM contradiction pass is skipped even if a
     /// provider was supplied.
     pub use_llm: bool,
-    /// The operator's `[decay] lambda`. The stale threshold is derived from
-    /// it — see [`stale_days_for`].
-    pub decay_lambda: f64,
+    /// The operator's decay settings. The stale rule only flags episodic
+    /// pages, so its threshold comes from the episodic λ (the
+    /// `[decay.half_life_days] episodic` override when set, else
+    /// `[decay] lambda`) — see [`stale_days_for`].
+    pub decay: DecayParams,
     /// The running embedder's `(provider, model, dim)` triple, or `None` when
     /// no embedder is configured. It drives the zero-LLM contradiction
     /// detector (A5): the detector loads already-stored vectors under this
@@ -165,6 +167,12 @@ pub struct LintOptions {
     /// Upper edge (exclusive) of the A5 contradiction-similarity band. See
     /// [`DEFAULT_CONTRADICTION_SIM_HIGH`].
     pub contradiction_band_max: f32,
+    /// When the LLM contradiction pass does not run in this call, copy the
+    /// previous report's LLM findings into the new one instead of dropping
+    /// them. Set by the scheduled rule-based lint while the scheduled LLM
+    /// pass is on (#2021): both write the same `_lint/report.md`, and a
+    /// daily rule-only run must not erase a weekly contradiction pass.
+    pub keep_llm_findings: bool,
 }
 
 impl Default for LintOptions {
@@ -172,10 +180,11 @@ impl Default for LintOptions {
         Self {
             dry_run: false,
             use_llm: true,
-            decay_lambda: 0.02,
+            decay: DecayParams::default(),
             embedding: None,
             contradiction_band_min: DEFAULT_CONTRADICTION_SIM_LOW,
             contradiction_band_max: DEFAULT_CONTRADICTION_SIM_HIGH,
+            keep_llm_findings: false,
         }
     }
 }
@@ -184,8 +193,8 @@ impl Default for LintOptions {
 ///
 /// * `llm` — when `Some`, the contradiction pass runs; otherwise the
 ///   report contains only rule-based findings.
-/// * `decay_lambda` — the operator's `[decay] lambda`; the stale
-///   threshold is derived from it (see [`stale_days_for`]).
+/// * `decay` — the operator's decay settings; the stale threshold is
+///   derived from the episodic λ (see [`stale_days_for`]).
 /// * `dry_run` — when `true`, no file is written.
 /// * `use_llm` — when `false`, the contradiction pass is skipped even
 ///   if a provider is present. Lets operators run rule-based-only lint
@@ -204,13 +213,17 @@ pub async fn run_lint(
     let LintOptions {
         dry_run,
         use_llm,
-        decay_lambda,
+        decay,
         embedding,
         contradiction_band_min,
         contradiction_band_max,
+        keep_llm_findings,
     } = options;
     let candidates = reader.decay_candidates(workspace_id, project_id).await?;
-    let mut findings = rule_based_findings(&candidates, stale_days_for(decay_lambda));
+    let mut findings = rule_based_findings(
+        &candidates,
+        stale_days_for(decay.lambda_for(Tier::Episodic)),
+    );
 
     // Dangling cross-project links: a `[[project:path]]` dependency that does
     // not resolve. A broken inter-project edge is high-signal — surface it
@@ -335,6 +348,7 @@ pub async fn run_lint(
         Err(e) => warn!(error = %e, "lint detected-contradiction pass failed"),
     }
 
+    let mut llm_pass = None;
     if use_llm && let Some(provider) = llm {
         match contradiction_pass(
             provider.clone(),
@@ -342,12 +356,24 @@ pub async fn run_lint(
             workspace_id,
             project_id,
             &candidates,
+            crate::llm_subject::scope(reader, workspace_id, Some(project_id)).await,
         )
         .await
         {
-            Ok(mut extra) => findings.append(&mut extra),
+            Ok(extra) => {
+                llm_pass = Some(LlmPass {
+                    checked_at: Timestamp::now().to_string(),
+                    findings: extra,
+                });
+            }
             Err(e) => warn!(error = %e, "lint LLM contradiction pass failed"),
         }
+    }
+    if llm_pass.is_none() && keep_llm_findings {
+        llm_pass = previous_llm_pass(&candidates);
+    }
+    if let Some(pass) = &llm_pass {
+        findings.extend(pass.findings.iter().cloned());
     }
 
     let report = LintReport { findings };
@@ -359,7 +385,7 @@ pub async fn run_lint(
             // the kind of noise the lint exists to flag.
             remove_report_page(wiki, workspace_id, project_id, &candidates).await;
         } else {
-            write_report_page(wiki, workspace_id, project_id, &report).await?;
+            write_report_page(wiki, workspace_id, project_id, &report, llm_pass.as_ref()).await?;
         }
         // One report per project: the daily `_lint/<YYYY-MM-DD>.md`
         // pages the pre-2.0.1 lint accumulated (thousands across a
@@ -382,10 +408,21 @@ fn rule_based_findings(candidates: &[DecayCandidate], stale_days: f64) -> Vec<Li
         if candidate_is_expired(c, now_us) {
             continue;
         }
+        let frontmatter: Option<serde_json::Value> = serde_json::from_str(&c.frontmatter_json).ok();
         // Stale: episodic, older than the lambda-derived threshold, zero accesses.
+        // A pinned page and an A2 compacted residue never decay (the sweep and
+        // the curator's `cold_episodic` skip both), so they are never stale.
+        let never_decays = c.pinned
+            || c.compacted_at_us.is_some()
+            || frontmatter
+                .as_ref()
+                .and_then(|fm| fm.get("pinned"))
+                .and_then(serde_json::Value::as_bool)
+                == Some(true);
         #[allow(clippy::cast_precision_loss)]
         let age_days = (now_us - c.updated_at_us) as f64 / US_PER_DAY;
-        if c.tier == Tier::Episodic && age_days > stale_days && c.access_count == 0 {
+        if c.tier == Tier::Episodic && age_days > stale_days && c.access_count == 0 && !never_decays
+        {
             out.push(LintFinding {
                 kind: "stale".into(),
                 severity: "info".into(),
@@ -403,7 +440,6 @@ fn rule_based_findings(candidates: &[DecayCandidate], stale_days: f64) -> Vec<Li
         //      when it classifies an observation as a rule.
         //   2. Page path starts with `_rules/` — same routing
         //      target. Either signal suffices.
-        let frontmatter: Option<serde_json::Value> = serde_json::from_str(&c.frontmatter_json).ok();
         let kind_is_rule = frontmatter
             .as_ref()
             .and_then(|fm| fm.get("kind"))
@@ -435,8 +471,11 @@ fn rule_based_findings(candidates: &[DecayCandidate], stale_days: f64) -> Vec<Li
             && let Some(t) = fm.get("title").and_then(serde_json::Value::as_str)
             && !t.trim().is_empty()
         {
+            // Case-insensitive with whitespace collapsed: the key the
+            // consolidator's `title_collision_key` and the curator group by.
+            let key = t.split_whitespace().collect::<Vec<_>>().join(" ");
             titles
-                .entry(t.to_lowercase())
+                .entry(key.to_lowercase())
                 .or_default()
                 .push(c.path.as_str().to_string());
         }
@@ -655,6 +694,7 @@ async fn contradiction_pass(
     workspace_id: WorkspaceId,
     project_id: ProjectId,
     candidates: &[DecayCandidate],
+    subject: ai_memory_llm::LlmSubject,
 ) -> Result<Vec<LintFinding>, LintError> {
     // Focus on semantic / procedural pages — those are the ones the
     // user actually compounds knowledge on.
@@ -700,7 +740,7 @@ async fn contradiction_pass(
     let report: LintReport = complete_structured_with_operation_id(
         &*provider,
         request,
-        LlmOperationId::for_workload(LlmWorkload::Lint),
+        LlmOperationId::for_workload(LlmWorkload::Lint).with_subject(subject),
     )
     .await?;
     Ok(report.findings)
@@ -787,11 +827,80 @@ async fn prune_legacy_dated_reports(
     }
 }
 
+/// Most LLM findings a report keeps for the next rule-only run to carry.
+const LLM_FINDINGS_KEPT: usize = 50;
+/// Most warning page paths the report's frontmatter lists for
+/// `memory_briefing`.
+const WARNING_PAGES_LISTED: usize = 5;
+
+/// The LLM contradiction pass whose findings a report carries: from this
+/// call, or kept from the previous report (see
+/// [`LintOptions::keep_llm_findings`]).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct LlmPass {
+    checked_at: String,
+    findings: Vec<LintFinding>,
+}
+
+/// The LLM pass recorded in the previous `_lint/report.md` frontmatter, if
+/// any. A report written before #2021, or edited by hand into another shape,
+/// carries none.
+fn previous_llm_pass(candidates: &[DecayCandidate]) -> Option<LlmPass> {
+    let report = candidates.iter().find(|c| c.path.as_str() == REPORT_PATH)?;
+    let frontmatter: serde_json::Value = serde_json::from_str(&report.frontmatter_json).ok()?;
+    let mut pass: LlmPass = serde_json::from_value(serde_json::json!({
+        "checked_at": frontmatter.get("llm_checked_at")?,
+        "findings": frontmatter.get("llm_findings")?,
+    }))
+    .ok()?;
+    pass.findings.truncate(LLM_FINDINGS_KEPT);
+    Some(pass)
+}
+
+/// Frontmatter of `_lint/report.md`. The counts and the first warning pages
+/// feed `memory_briefing` and the session-start notice without re-reading the
+/// body; the LLM pass lets a later rule-only run keep its findings.
+fn report_frontmatter(
+    title: &str,
+    report: &LintReport,
+    llm_pass: Option<&LlmPass>,
+) -> serde_json::Value {
+    let warnings: Vec<&LintFinding> = report
+        .findings
+        .iter()
+        .filter(|f| f.severity == "warning")
+        .collect();
+    let mut warning_pages: Vec<&str> = Vec::new();
+    for page in warnings.iter().flat_map(|f| f.pages.iter()) {
+        if warning_pages.len() == WARNING_PAGES_LISTED {
+            break;
+        }
+        if !warning_pages.contains(&page.as_str()) {
+            warning_pages.push(page);
+        }
+    }
+    let mut frontmatter = serde_json::json!({
+        "title": title,
+        "tier": "semantic",
+        "kind": "lint-report",
+        "findings": report.findings.len(),
+        "warnings": warnings.len(),
+        "warning_pages": warning_pages,
+    });
+    if let Some(pass) = llm_pass {
+        frontmatter["llm_checked_at"] = serde_json::json!(pass.checked_at);
+        frontmatter["llm_findings"] =
+            serde_json::json!(&pass.findings[..pass.findings.len().min(LLM_FINDINGS_KEPT)]);
+    }
+    frontmatter
+}
+
 async fn write_report_page(
     wiki: &Wiki,
     workspace_id: WorkspaceId,
     project_id: ProjectId,
     report: &LintReport,
+    llm_pass: Option<&LlmPass>,
 ) -> Result<(), LintError> {
     let date = Timestamp::now()
         .to_zoned(TimeZone::UTC)
@@ -802,16 +911,12 @@ async fn write_report_page(
     // new page per day.
     let path = PagePath::new(REPORT_PATH)?;
     let title = format!("Lint report {date}");
-    let body = render_markdown(report);
+    let body = render_markdown(report, llm_pass.map(|pass| pass.checked_at.as_str()));
     wiki.write_page(WritePageRequest {
         workspace_id,
         project_id,
         path,
-        frontmatter: serde_json::json!({
-            "title": title.clone(),
-            "tier": "semantic",
-            "kind": "lint-report",
-        }),
+        frontmatter: report_frontmatter(&title, report, llm_pass),
         body,
         tier: Tier::Semantic,
         pinned: false,
@@ -823,12 +928,13 @@ async fn write_report_page(
         author_id: None,
         actor: ai_memory_core::ActorContext::anonymous(),
         evidence: Vec::new(),
+        trust_class: None,
     })
     .await?;
     Ok(())
 }
 
-fn render_markdown(report: &LintReport) -> String {
+fn render_markdown(report: &LintReport, llm_checked_at: Option<&str>) -> String {
     let mut buf = String::new();
     buf.push_str("# Lint findings\n\n");
     if report.findings.is_empty() {
@@ -836,6 +942,9 @@ fn render_markdown(report: &LintReport) -> String {
         return buf;
     }
     buf.push_str(&format!("{} finding(s).\n\n", report.findings.len()));
+    if let Some(at) = llm_checked_at {
+        buf.push_str(&format!("LLM contradiction pass: {at}.\n\n"));
+    }
     for (i, f) in report.findings.iter().enumerate() {
         buf.push_str(&format!("## {} — {} ({})\n\n", i + 1, f.kind, f.severity));
         buf.push_str(&format!("{}\n\n", f.message));
@@ -898,6 +1007,37 @@ mod tests {
                 "lambda {bad} must fall back to {STALE_DAYS}, got {days}"
             );
         }
+    }
+
+    /// The stale rule measures decay, and a pinned page or an A2 compacted
+    /// residue never decays: the sweep and the curator's `cold_episodic`
+    /// both skip them, so lint must not report them stale on every pass.
+    #[test]
+    fn pinned_and_compacted_pages_are_not_stale() {
+        let now_us = jiff::Timestamp::now().as_microsecond();
+        let sixty_days_ago = now_us - (60.0 * US_PER_DAY) as i64;
+        let candidate =
+            |path: &str, pinned: bool, frontmatter: &str, compacted: bool| DecayCandidate {
+                id: ai_memory_core::PageId::new(),
+                path: ai_memory_core::PagePath::new(path).unwrap(),
+                tier: Tier::Episodic,
+                pinned,
+                updated_at_us: sixty_days_ago,
+                access_count: 0,
+                last_accessed_at_us: None,
+                frontmatter_json: frontmatter.into(),
+                expires_at_us: None,
+                salience: None,
+                compacted_at_us: compacted.then_some(sixty_days_ago),
+            };
+        let candidates = [
+            candidate("sessions/pinned.md", true, "{}", false),
+            candidate("sessions/fm-pinned.md", false, r#"{"pinned": true}"#, false),
+            candidate("sessions/compacted.md", false, "{}", true),
+        ];
+        let findings = rule_based_findings(&candidates, STALE_DAYS);
+        let stale: Vec<_> = findings.iter().filter(|f| f.kind == "stale").collect();
+        assert!(stale.is_empty(), "{stale:?}");
     }
 
     /// End-to-end through the rule: a 60-day unread episodic page is stale
@@ -991,6 +1131,35 @@ mod tests {
         let findings = rule_based_findings(&[a, b], STALE_DAYS);
         let dupes: Vec<_> = findings.iter().filter(|f| f.kind == "duplicate").collect();
         assert_eq!(dupes.len(), 1);
+        assert_eq!(dupes[0].pages.len(), 2);
+    }
+
+    /// The consolidator's collision guard (`title_collision_key`) and the
+    /// curator group titles case-insensitively with whitespace collapsed, and
+    /// the guard relies on lint flagging exactly what it calls a collision.
+    #[test]
+    fn rule_pass_groups_duplicate_titles_across_whitespace() {
+        let a = DecayCandidate {
+            id: ai_memory_core::PageId::new(),
+            path: ai_memory_core::PagePath::new("concepts/a.md").unwrap(),
+            tier: Tier::Semantic,
+            pinned: false,
+            updated_at_us: Timestamp::now().as_microsecond(),
+            access_count: 0,
+            last_accessed_at_us: None,
+            frontmatter_json: r#"{"title": "Release  Notes"}"#.into(),
+            expires_at_us: None,
+            salience: None,
+            compacted_at_us: None,
+        };
+        let b = DecayCandidate {
+            path: ai_memory_core::PagePath::new("concepts/b.md").unwrap(),
+            frontmatter_json: r#"{"title": " release notes "}"#.into(),
+            ..a.clone()
+        };
+        let findings = rule_based_findings(&[a, b], STALE_DAYS);
+        let dupes: Vec<_> = findings.iter().filter(|f| f.kind == "duplicate").collect();
+        assert_eq!(dupes.len(), 1, "{findings:?}");
         assert_eq!(dupes[0].pages.len(), 2);
     }
 

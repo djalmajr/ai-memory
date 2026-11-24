@@ -82,6 +82,7 @@ async fn write_semantic(fx: &Fixture, path: &str, body: &str) -> PageId {
             author_id: None,
             actor: ActorContext::anonymous(),
             evidence: Vec::new(),
+            trust_class: None,
         })
         .await
         .unwrap()
@@ -144,10 +145,11 @@ fn options_with_band(
         dry_run: true,
         // No LLM in these tests — this is the zero-LLM detector.
         use_llm: false,
-        decay_lambda: 0.02,
+        decay: ai_memory_store::DecayParams::default(),
         embedding,
         contradiction_band_min: band_min,
         contradiction_band_max: band_max,
+        keep_llm_findings: false,
     }
 }
 
@@ -533,6 +535,7 @@ async fn seed_evidence_case(case: &EvidenceCase) -> Fixture {
             author_id: None,
             actor: ActorContext::anonymous(),
             evidence: Vec::new(),
+            trust_class: None,
         })
         .await
         .unwrap();

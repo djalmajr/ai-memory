@@ -333,10 +333,10 @@ mod tests {
     use ai_memory_core::{NewUser, UserId, UserRole};
     use rusqlite::{Connection, params};
 
-    fn open_to(version: u32) -> Connection {
+    fn open_to(version: i32) -> Connection {
         let mut conn = Connection::open_in_memory().unwrap();
         conn.pragma_update(None, "foreign_keys", "ON").unwrap();
-        crate::migrations::run_to(&mut conn, version).unwrap();
+        crate::migrations::run_to(&mut conn, u32::try_from(version).unwrap()).unwrap();
         conn
     }
 
@@ -470,7 +470,7 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(version, 101, "update the pin when adding a migration");
+        assert_eq!(version, 115, "update the pin when adding a migration");
         let cols: i64 = conn
             .query_row(
                 "SELECT COUNT(*) FROM pragma_table_info('users') \

@@ -141,6 +141,7 @@ fn page(ws: WorkspaceId, proj: ProjectId, path: &str, title: &str, body: &str) -
         expires_at: None,
         entities: Vec::new(),
         evidence: Vec::new(),
+        trust_class: None,
     }
 }
 
@@ -308,6 +309,7 @@ async fn memory_query_explain_reports_evidence_count() {
     with_evidence.evidence = vec![PageEvidence {
         kind: PageEvidenceKind::Session,
         source_id: "session-1".into(),
+        observations: Default::default(),
     }];
     h.store
         .writer
@@ -317,6 +319,7 @@ async fn memory_query_explain_reports_evidence_count() {
     with_evidence.evidence = vec![PageEvidence {
         kind: PageEvidenceKind::Session,
         source_id: "session-2".into(),
+        observations: Default::default(),
     }];
     h.store.writer.upsert_page(with_evidence).await.unwrap();
 
@@ -361,10 +364,12 @@ async fn memory_briefing_settled_first_orders_by_evidence_then_recency() {
         PageEvidence {
             kind: PageEvidenceKind::Session,
             source_id: "session-1".into(),
+            observations: Default::default(),
         },
         PageEvidence {
             kind: PageEvidenceKind::Session,
             source_id: "session-2".into(),
+            observations: Default::default(),
         },
     ];
     h.store.writer.upsert_page(decision_a).await.unwrap();
