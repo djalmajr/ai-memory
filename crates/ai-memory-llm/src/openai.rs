@@ -767,6 +767,9 @@ impl OpenAiProvider {
             // `provider_error` is the one reader of the provider's retry
             // hint; the typed rejections below only reclassify its result.
             let error = match provider_error(response).await {
+                // Exhausted quota needs the quota cooldown, with no delayed
+                // rate-limit replay, even when the provider reports it as 429.
+                error if error.is_quota_exhausted() => error,
                 LlmError::Provider {
                     body, retry_after, ..
                 } if status == reqwest::StatusCode::TOO_MANY_REQUESTS => LlmError::RateLimited {

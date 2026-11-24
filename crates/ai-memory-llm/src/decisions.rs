@@ -254,6 +254,12 @@ impl Reranker for DecisionsReranker {
         &self.model
     }
 
+    fn cancel_on_stage_timeout(&self) -> bool {
+        // This direct adapter has no shared LLM admission permit. Dropping
+        // the request records its timeout before the stage returns.
+        true
+    }
+
     async fn rerank(
         &self,
         query: &str,

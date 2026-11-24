@@ -336,7 +336,11 @@ impl LlmError {
     pub fn class(&self) -> &'static str {
         match self {
             Self::Http(_) => "http",
-            Self::Provider { .. } if self.is_quota_exhausted() => "quota-exhausted",
+            Self::Provider { .. } | Self::RateLimited { .. } | Self::Capacity { .. }
+                if self.is_quota_exhausted() =>
+            {
+                "quota-exhausted"
+            }
             Self::Provider { .. } => "provider",
             Self::RateLimited { .. } => "rate_limit",
             Self::Capacity { .. } => "capacity",

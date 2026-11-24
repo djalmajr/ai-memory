@@ -260,6 +260,7 @@ impl AdmittedLlmProvider {
         // local serialization guarantee.
         let permit = self.acquire().await?;
         let result = match action().await {
+            Err(error) if error.is_quota_exhausted() => Err(error),
             Err(error) if error.is_ambiguous_delivery() => {
                 let jitter = u64::from(uuid::Uuid::new_v4().as_bytes()[0] % self.jitter_max_secs);
                 let delay = self.ambiguous_cooldown + Duration::from_secs(jitter);
@@ -749,6 +750,24 @@ mod tests {
         let guard = AdmittedLlmProvider::new(inner.clone(), None, None).unwrap();
         guard.complete(ChatRequest::user_prompt("x")).await.unwrap();
         assert_eq!(inner.calls.load(Ordering::Acquire), 2);
+    }
+
+    #[tokio::test]
+    async fn exhausted_quota_does_not_replay_a_429_with_retry_after() {
+        let inner = Arc::new(ScriptedProvider::new(vec![
+            Err(LlmError::RateLimited {
+                body: r#"{"error":{"code":"insufficient_quota"}}"#.into(),
+                retry_after_secs: Some(0),
+            }),
+            response(),
+        ]));
+        let guard = AdmittedLlmProvider::new(inner.clone(), None, None).unwrap();
+        let error = guard
+            .complete(ChatRequest::user_prompt("x"))
+            .await
+            .unwrap_err();
+        assert_eq!(error.class(), "quota-exhausted");
+        assert_eq!(inner.calls.load(Ordering::Acquire), 1);
     }
 
     // Mutation captured: returning the second 502 directly lets an outer

@@ -133,7 +133,7 @@ async fn call(provider: &Arc<dyn LlmProvider>) -> Result<String, LlmError> {
 
 fn assert_status(result: Result<String, LlmError>, expected: u16) {
     match result {
-        Err(LlmError::Provider { status, .. }) if status == expected => {}
+        Err(error) if error.http_status() == Some(expected) => {}
         other => panic!("expected the gateway's {expected}, got {other:?}"),
     }
 }
