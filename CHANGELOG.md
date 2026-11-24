@@ -12,6 +12,11 @@ version in [`docs/changelog/`](docs/changelog/):
 ## [Unreleased]
 
 ### Added
+- Added `ai-memory backfill-session-summaries` and its admin endpoint to
+  preview and repair ended sessions missing a summary, so observation
+  retention can prune their old capture after the rule-based page is saved.
+  Pass the returned `next_cursor` to `--after` to continue past a full batch,
+  including batches of lifecycle-only sessions.
 - Added `[auto_improve] require_approval_prefixes`, which holds auto-improve
   proposals for matching page paths for review while the rest are still approved
   automatically. `require_approval = true` still holds everything. (#25)
