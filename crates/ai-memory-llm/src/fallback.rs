@@ -9,8 +9,8 @@
 //! immediately without trying the rest of the chain. Exhausted credit or quota
 //! also advances and opens a longer cooldown.
 //!
-//! A transient failure keeps its candidate out for [`CIRCUIT_COOLDOWN`] (or
-//! the provider's retry hint); exhausted credit or quota keeps it out for the
+//! A fast-retryable failure or retry hint opens a circuit for at least
+//! [`CIRCUIT_COOLDOWN`]; exhausted credit or quota keeps the candidate out for the
 //! longer quota cooldown ([`DEFAULT_QUOTA_COOLDOWN`] unless configured). When
 //! the cooldown ends, the next real call probes that candidate first again,
 //! so a topped-up primary takes over without a restart and without any
@@ -131,28 +131,26 @@ impl FallbackLlmProvider {
         self
     }
 
-    /// The circuit cooldown a failure earns, or `None` when it does not
-    /// advance the chain. A transient failure gets [`CIRCUIT_COOLDOWN`],
-    /// stretched by a provider retry hint up to one hour. Exhausted quota
+    /// The circuit cooldown a failure earns, if any. A fast-retryable
+    /// failure or a provider retry hint opens the circuit for 30 seconds
+    /// to one hour, depending on the hint. Exhausted quota
     /// gets the quota cooldown, stretched by a longer hint (a quota reset
     /// time) up to one hour or the quota cooldown, whichever is longer.
     fn cooldown_for(&self, err: &LlmError) -> Option<(FailoverClass, Duration)> {
         match err.failover_class() {
-            FailoverClass::Transient if err.is_fast_retryable() || err.retry_after().is_some() => {
-                Some((
-                    FailoverClass::Transient,
-                    err.retry_after()
-                        .unwrap_or(CIRCUIT_COOLDOWN)
-                        .max(CIRCUIT_COOLDOWN)
-                        .min(MAX_CIRCUIT_COOLDOWN),
-                ))
-            }
             FailoverClass::QuotaExhausted => Some((
                 FailoverClass::QuotaExhausted,
                 err.retry_after()
                     .unwrap_or(self.quota_cooldown)
                     .max(self.quota_cooldown)
                     .min(MAX_CIRCUIT_COOLDOWN.max(self.quota_cooldown)),
+            )),
+            class if err.is_fast_retryable() || err.retry_after().is_some() => Some((
+                class,
+                err.retry_after()
+                    .unwrap_or(CIRCUIT_COOLDOWN)
+                    .max(CIRCUIT_COOLDOWN)
+                    .min(MAX_CIRCUIT_COOLDOWN),
             )),
             _ => None,
         }

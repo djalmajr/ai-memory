@@ -191,8 +191,8 @@ an empty balance failed every consolidation and the configured fallback never
 ran.
 
 `LlmError::failover_class()` returns `Transient`, `QuotaExhausted` or
-`Permanent`, and `is_transient()`, `is_quota_exhausted()` and
-`should_fail_over()` all derive from it. The quota check lives in
+`Permanent`. `should_fail_over()` accepts exhausted quota and failures
+that are safe to retry immediately. The quota check lives in
 `crates/ai-memory-llm/src/quota.rs`. It reads only the bounded error body that
 `LlmError::Provider` already carries (at most 1 KiB, with secrets scrubbed),
 returns a boolean, and logs no part of the body.

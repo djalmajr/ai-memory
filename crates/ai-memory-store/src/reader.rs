@@ -5330,7 +5330,7 @@ impl ReaderPool {
             }
             let mut stmt = tx.prepare_cached(
                 "SELECT id, session_id, workspace_id, project_id, kind, extension, source_event, \
-                        title, body, importance, created_at \
+                        title, body, importance, created_at, trust_class \
                  FROM observations \
                  WHERE session_id = ?1 AND workspace_id = ?2 AND project_id = ?3 \
                  ORDER BY created_at ASC",

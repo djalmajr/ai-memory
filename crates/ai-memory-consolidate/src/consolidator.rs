@@ -9271,6 +9271,7 @@ mod tests {
         /// One-shot failure served on the FINAL stage only (the map and
         /// reduce stages succeed, then the run aborts at the final call).
         final_fail_once: std::sync::Mutex<Option<LlmError>>,
+        final_pause: Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>,
         map_calls: std::sync::atomic::AtomicUsize,
         reduce_calls: std::sync::atomic::AtomicUsize,
         final_calls: std::sync::atomic::AtomicUsize,
@@ -9290,6 +9291,7 @@ mod tests {
                 model: model.to_string(),
                 fail_next: std::sync::Mutex::new(VecDeque::new()),
                 final_fail_once: std::sync::Mutex::new(None),
+                final_pause: None,
                 map_calls: std::sync::atomic::AtomicUsize::new(0),
                 reduce_calls: std::sync::atomic::AtomicUsize::new(0),
                 final_calls: std::sync::atomic::AtomicUsize::new(0),
@@ -9492,6 +9494,10 @@ mod tests {
                     .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 if let Some(error) = self.final_fail_once.lock().unwrap().take() {
                     return Err(error);
+                }
+                if let Some((started, resume)) = &self.final_pause {
+                    started.notify_one();
+                    resume.notified().await;
                 }
                 if is_batch {
                     Ok(batch_reply(user))
@@ -10420,6 +10426,73 @@ mod tests {
         assert!(
             t.checkpoints(session).await.is_empty(),
             "the reconcile pruned the leftover checkpoints"
+        );
+    }
+
+    #[tokio::test]
+    async fn queued_chunked_consolidation_keeps_agent_page_written_during_final_call() {
+        let t = ChunkedTest::fresh().await;
+        let started = Arc::new(tokio::sync::Notify::new());
+        let resume = Arc::new(tokio::sync::Notify::new());
+        let mut llm = StagedLlm::new("m1");
+        llm.final_pause = Some((started.clone(), resume.clone()));
+        let llm = Arc::new(llm);
+        let consolidator = t.consolidator(llm.clone());
+        let session = SessionId::new();
+        t.seed_session(session, &[big_body()]).await;
+        let path = PagePath::new(format!("sessions/{session}.md")).unwrap();
+        let actor = ai_memory_core::ActorContext::anonymous();
+        let write_during_final_call = async {
+            started.notified().await;
+            let id = consolidator
+                .wiki
+                .write_page(WritePageRequest {
+                    workspace_id: t.ws,
+                    project_id: t.proj,
+                    path: path.clone(),
+                    frontmatter: serde_json::json!({"consolidated_by": "agent"}),
+                    body: "# Agent page\n\nWritten during the final call.".into(),
+                    tier: Tier::Episodic,
+                    pinned: false,
+                    title: Some("Agent page".into()),
+                    admission_ctx: None,
+                    author_id: None,
+                    actor: actor.clone(),
+                    evidence: Vec::new(),
+                    trust_class: None,
+                })
+                .await
+                .unwrap();
+            resume.notify_one();
+            id
+        };
+        let run = consolidator.consolidate_session_keeping_agent_page(session, actor.clone());
+        let (outcome, agent_page_id) = tokio::time::timeout(Duration::from_secs(30), async {
+            tokio::join!(run, write_during_final_call)
+        })
+        .await
+        .expect("the map-reduce call and concurrent agent write must settle");
+
+        assert!(matches!(
+            outcome.unwrap(),
+            SessionPageConsolidation::AgentPageKept
+        ));
+        assert_eq!(llm.calls().2, 1);
+        assert_eq!(
+            t.store
+                .reader
+                .latest_page_id_by_ids(t.ws, t.proj, path.to_string())
+                .await
+                .unwrap(),
+            Some(agent_page_id),
+        );
+        assert!(
+            consolidator
+                .wiki
+                .read_page(t.ws, t.proj, &path)
+                .unwrap()
+                .body
+                .contains("Written during the final call.")
         );
     }
 

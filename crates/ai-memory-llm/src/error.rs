@@ -146,16 +146,15 @@ pub enum LlmError {
 
 /// What a failed call means for retries and for an ordered fallback chain.
 ///
-/// Computed by [`LlmError::failover_class`], the single classification used
-/// by the in-process retry loops ([`LlmError::is_transient`]) and by
-/// `FallbackLlmProvider` ([`LlmError::should_fail_over`]). See
+/// Computed by [`LlmError::failover_class`] for health, durable retries and
+/// quota detection. The admission guard and fallback chain also distinguish
+/// delivery certainty via [`LlmError::is_fast_retryable`]. See
 /// `docs/llm-provider-fallback.md`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum FailoverClass {
-    /// A short, bounded retry on the same provider may succeed (`429` rate
-    /// limit, `5xx`, transport timeout or connect failure). The fallback
-    /// chain advances and opens a short circuit on this candidate.
+    /// A later attempt may succeed (`429` rate limit, `5xx`, transport
+    /// timeout or connect failure). Delivery may already have happened.
     Transient,
     /// The provider account is out of credit, quota or billing, or is
     /// disabled. Retrying the same provider is pointless until someone tops
@@ -249,8 +248,7 @@ impl LlmError {
     }
 
     /// Whether an ordered fallback chain should try its next candidate:
-    /// a transient failure or exhausted credit/quota, never a deterministic
-    /// one.
+    /// a pre-send connection failure, explicit capacity, or exhausted credit/quota.
     #[must_use]
     pub fn should_fail_over(&self) -> bool {
         self.is_quota_exhausted() || self.is_fast_retryable()

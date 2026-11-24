@@ -58,7 +58,7 @@ Defaults that come from a named constant or from another crate say so in the Def
 
 ## `[[llm_fallbacks]]`
 
-An array of tables. Each entry is tried in order after the primary provider, only when a call fails transiently or the provider reports exhausted credit, quota or billing (see [`llm-provider-fallback.md`](llm-provider-fallback.md#credit-and-quota-exhaustion)). The default is an empty list. Config load rejects an entry with no provider or model. The list has no environment form.
+An array of tables. Each entry is tried in order after the primary provider, after a connection failure before delivery, an explicit capacity response, or exhausted credit, quota or billing (see [`llm-provider-fallback.md`](llm-provider-fallback.md#credit-and-quota-exhaustion)). The default is an empty list. Config load rejects an entry with no provider or model. The list has no environment form.
 
 | Key | Default | Env equivalent | Purpose |
 | --- | --- | --- | --- |

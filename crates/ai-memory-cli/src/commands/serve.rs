@@ -6426,12 +6426,28 @@ mod tests {
             Duration::from_secs(240)
         );
 
-        for error in [&capacity, &connect] {
-            for attempts in 1..ai_memory_store::SESSION_CONSOLIDATION_MAX_ATTEMPTS {
+        for (error, transport_unreachable, max_attempts) in [
+            (
+                &capacity,
+                false,
+                ai_memory_store::SESSION_CONSOLIDATION_MAX_ATTEMPTS,
+            ),
+            (
+                &connect,
+                true,
+                ai_memory_store::TRANSPORT_RECOVERY_MAX_ATTEMPTS,
+            ),
+        ] {
+            assert_eq!(
+                is_transport_unreachable_session_consolidation_error(error),
+                transport_unreachable
+            );
+            for attempts in 1..max_attempts {
                 let now = jiff::Timestamp::now().as_microsecond();
                 let retry_at = session_consolidation_retry_at(attempts, error)
                     .expect("a safe pre-send failure must stay queued");
-                let expected = session_consolidation_retry_delay(attempts, false).as_micros();
+                let expected =
+                    session_consolidation_retry_delay(attempts, transport_unreachable).as_micros();
                 let delta =
                     u128::try_from(retry_at).unwrap_or(0) - u128::try_from(now).unwrap_or(0);
                 assert!(
@@ -6439,15 +6455,8 @@ mod tests {
                     "queue attempt {attempts} should retry in ~{expected}µs, got {delta}µs"
                 );
             }
-            // The cap still bounds the queue: the fifth claim is terminal
-            // even for a safe error — the old 3x5 product stays at most 3x5.
-            assert!(
-                session_consolidation_retry_at(
-                    ai_memory_store::SESSION_CONSOLIDATION_MAX_ATTEMPTS,
-                    error
-                )
-                .is_none()
-            );
+            // Only an unreachable transport can use the slow outage budget.
+            assert!(session_consolidation_retry_at(max_attempts, error).is_none());
         }
     }
     /// Hang detector around the worker's test-only `completed` notify.
