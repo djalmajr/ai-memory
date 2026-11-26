@@ -237,6 +237,10 @@ from hook paths.
    `memory_explore` (the pages it surfaces) bump the same counters through the
    same throttled, FTS-exempt path, so a page a human opens directly or the
    graph surfaces resists decay like a query hit (design-memory-aging.md C1).
+   An opt-in token call tool pass deletes tool references belonging to calls older
+   than `[decay] token_call_tool_retention_days` in closed sessions of the selected
+   scope, using observation-sized transactions. Calls and `session_usage` are
+   retained. Dry-run counts without deleting. Zero disables it.
 7. The forget sweep runs on demand and on the server's `[maintenance]`
    schedule: pages past their frontmatter `expires_at:` TTL are
    hard-deleted through the wiki layer (file + rows, pin or not);
@@ -1369,6 +1373,7 @@ cold_threshold = 0.20              # below this → remove file + retain tombsto
 hard_delete_after_days = 180
 breadth_weight = 0.0               # opt-in reward for distinct operators
 observation_retention_days = 0     # 0 = never prune raw observations
+token_call_tool_retention_days = 0      # 0 = never prune tools of closed-session calls
 observation_prune_batch = 5000     # rows per prune transaction
 ledger_retention_months = 0        # 0 = never delete hook event ledgers; N > 0 =
                                    # delete a log-YYYY-MM.md N whole months after

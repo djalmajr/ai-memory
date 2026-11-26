@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 
 use ai_memory_consolidate::{
     AutoImproveReviewConfig, ColdClusterDedup, Consolidator, LedgerRetention, ObservationRetention,
-    projection::cap_text_with_marker, run_auto_improve_review, run_lint, run_sweep_with_ledgers,
+    projection::cap_text_with_marker, run_auto_improve_review, run_lint,
 };
 use ai_memory_core::{
     ActiveProject, AgentKind, FeedbackKind, HandoffId, HandoffState, NewHandoff, PageId, PagePath,
@@ -575,7 +575,7 @@ should be proposed from a completed session, or at explicit wrap-up \
   old tombstones are purged, old raw observations are pruned, and \
   old hook event ledgers (log-YYYY-MM.md) are deleted — the last two \
   only when their opt-in retention is configured (decay \
-  `observation_retention_days` / `ledger_retention_months`), and the \
+  `observation_retention_days` / `token_call_tool_retention_days` / `ledger_retention_months`), and the \
   ledger pass never touches the current or previous month. \
   Idempotent; `dry_run=true` reports what every pass would delete \
   without deleting anything.\n\
@@ -708,6 +708,7 @@ pub struct AiMemoryServer {
     /// Opt-in bound on how long raw observations outlive their consolidation.
     /// Default is disabled, so `memory_forget_sweep` deletes no raw capture.
     observation_retention: ObservationRetention,
+    token_call_tool_retention_days: i64,
     /// Opt-in age bound for the hook event ledgers. Default is disabled, so
     /// `memory_forget_sweep` deletes no ledger file.
     ledger_retention: LedgerRetention,
@@ -2485,6 +2486,7 @@ impl AiMemoryServer {
             decay_params: DecayParams::default(),
             decay_breadth_weight: 0.0,
             observation_retention: ObservationRetention::default(),
+            token_call_tool_retention_days: 0,
             ledger_retention: LedgerRetention::default(),
             compact_cold_episodic: false,
             contradiction_band_min: ai_memory_consolidate::DEFAULT_CONTRADICTION_SIM_LOW,
@@ -3498,6 +3500,13 @@ impl AiMemoryServer {
     pub fn with_contradiction_band(mut self, min: f32, max: f32) -> Self {
         self.contradiction_band_min = min;
         self.contradiction_band_max = max;
+        self
+    }
+
+    /// Set the opt-in age for token call tools from closed sessions.
+    #[must_use]
+    pub fn with_token_call_tool_retention_days(mut self, days: i64) -> Self {
+        self.token_call_tool_retention_days = days;
         self
     }
 
@@ -4802,7 +4811,7 @@ impl AiMemoryServer {
             idempotent_hint = true,
             open_world_hint = false
         ),
-        description = "Run the retention sweep. FIVE passes, and they \
+        description = "Run the retention sweep. SIX passes, and they \
         differ on what they will delete. (1) TTL: pages whose frontmatter \
         expires_at is in the past are hard-deleted (file + rows) REGARDLESS \
         OF TIER OR PIN — an explicit expiry overrides a pin, so a pinned \
@@ -4825,7 +4834,10 @@ impl AiMemoryServer {
         from disk permanently (never the current or previous month, never a \
         file that does not open like a ledger). DISABLED by default \
         (ledger_retention_months = 0); when off, ledgers_pruned is 0. The \
-        report's expired / hard_deleted / observations_pruned counts come \
+        (6) Token call tools: tools of calls older than decay.token_call_tool_retention_days are removed for \
+        closed sessions only in bounded batches; disabled at 0 and session totals \
+        remain intact. The report includes token_call_tools_prunable and \
+        token_call_tools_pruned. The report's expired / hard_deleted / observations_pruned counts come \
         from passes 1, 3 and 4; ledgers_prunable / ledgers_pruned and their \
         byte counts from pass 5. Pass dry_run=true to preview."
     )]
@@ -4847,7 +4859,7 @@ impl AiMemoryServer {
                 Self::viewer_from_parts(Some(&parts)),
             )
             .await?;
-        let report = run_sweep_with_ledgers(
+        let report = ai_memory_consolidate::run_sweep_with_token_tool_retention(
             &self.reader,
             &self.writer,
             self.wiki.as_ref(),
@@ -4859,6 +4871,7 @@ impl AiMemoryServer {
             self.compact_cold_episodic,
             ColdClusterDedup::default(),
             self.ledger_retention,
+            self.token_call_tool_retention_days,
             args.dry_run.unwrap_or(false),
         )
         .await
