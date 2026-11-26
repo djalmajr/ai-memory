@@ -103,6 +103,7 @@ version in [`docs/changelog/`](docs/changelog/):
   that cannot be read only logs at debug and never blocks boot. (#31)
 
 ### Fixed
+- Fixed `reclaim-ledger-versions --drop-latest` reporting selected live heads as empty or as superseded versions.
 - Fixed `ai-memory restore` refusing the boot-time pre-migration backup
   package: the package tars the whole data dir, so its archive also carries
   the `pre-migration-backup.json` receipt at the root, the server's `logs/`
