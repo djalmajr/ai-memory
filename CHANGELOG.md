@@ -12,6 +12,7 @@ version in [`docs/changelog/`](docs/changelog/):
 ## [Unreleased]
 
 ### Added
+- Added opt-in age retention for tool references on closed-session token calls, preserving calls and session usage totals.
 - Added `ai-memory backfill-session-summaries` and its admin endpoint to
   preview and repair ended sessions missing a summary, so observation
   retention can prune their old capture after the rule-based page is saved.
