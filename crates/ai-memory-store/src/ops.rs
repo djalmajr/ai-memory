@@ -5727,7 +5727,7 @@ pub fn prune_token_call_tools(
         return Ok(0);
     }
     let tx = conn.transaction()?;
-    let n = tx.execute("DELETE FROM token_call_tools WHERE (session_id, call_id, tool_id, relation) IN (SELECT t.session_id, t.call_id, t.tool_id, t.relation FROM sessions s JOIN token_calls c ON c.session_id=s.id JOIN token_call_tools t ON t.session_id=c.session_id AND t.call_id=c.call_id WHERE s.workspace_id=?1 AND s.project_id=?2 AND s.ended_at IS NOT NULL AND c.observed_at < ?3 ORDER BY c.observed_at, t.session_id, t.call_id, t.tool_id, t.relation LIMIT ?4)", params![workspace_id.as_bytes(), project_id.as_bytes(), cutoff_us, i64::try_from(batch).unwrap_or(i64::MAX)])?;
+    let n = tx.execute("DELETE FROM token_call_tools WHERE (session_id, call_id, tool_id, relation) IN (SELECT t.session_id, t.call_id, t.tool_id, t.relation FROM sessions s JOIN token_calls c ON c.session_id=s.id JOIN token_call_tools t ON t.session_id=c.session_id AND t.call_id=c.call_id WHERE s.workspace_id=?1 AND s.project_id=?2 AND s.ended_at IS NOT NULL AND c.observed_at < ?3 LIMIT ?4)", params![workspace_id.as_bytes(), project_id.as_bytes(), cutoff_us, i64::try_from(batch).unwrap_or(i64::MAX)])?;
     tx.commit()?;
     Ok(n)
 }

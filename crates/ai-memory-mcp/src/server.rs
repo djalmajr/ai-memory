@@ -570,12 +570,14 @@ should be proposed from a completed session, or at explicit wrap-up \
 - `memory_lint` — when the user asks to audit the wiki for stale \
   pages, contradictions, or rule suggestions.\n\
 - `memory_forget_sweep` — when the user wants to prune old / cold \
-  pages. Five passes: expired pages are hard-deleted even when \
+  pages. Six passes: expired pages are hard-deleted even when \
   pinned, cold episodic pages decay to tombstones (pinned exempt), \
-  old tombstones are purged, old raw observations are pruned, and \
-  old hook event ledgers (log-YYYY-MM.md) are deleted — the last two \
-  only when their opt-in retention is configured (decay \
-  `observation_retention_days` / `token_call_tool_retention_days` / `ledger_retention_months`), and the \
+  old tombstones are purged, old raw observations are pruned, old \
+  hook event ledgers (log-YYYY-MM.md) are deleted, and the tool \
+  context of old token calls in closed sessions is deleted (the calls \
+  and session totals are kept) — the last three only when their opt-in \
+  retention is configured (decay `observation_retention_days` / \
+  `ledger_retention_months` / `token_call_tool_retention_days`), and the \
   ledger pass never touches the current or previous month. \
   Idempotent; `dry_run=true` reports what every pass would delete \
   without deleting anything.\n\
@@ -4833,11 +4835,13 @@ impl AiMemoryServer {
         at least decay.ledger_retention_months whole months ago are deleted \
         from disk permanently (never the current or previous month, never a \
         file that does not open like a ledger). DISABLED by default \
-        (ledger_retention_months = 0); when off, ledgers_pruned is 0. The \
-        (6) Token call tools: tools of calls older than decay.token_call_tool_retention_days are removed for \
-        closed sessions only in bounded batches; disabled at 0 and session totals \
-        remain intact. The report includes token_call_tools_prunable and \
-        token_call_tools_pruned. The report's expired / hard_deleted / observations_pruned counts come \
+        (ledger_retention_months = 0); when off, ledgers_pruned is 0. (6) Token \
+        call tools: the tool context rows of token calls older than \
+        decay.token_call_tool_retention_days are deleted permanently, in \
+        bounded batches, for closed sessions only; the calls themselves and \
+        the session token totals are kept. DISABLED by default \
+        (token_call_tool_retention_days = 0); when off, token_call_tools_pruned \
+        is 0. The report's expired / hard_deleted / observations_pruned counts come \
         from passes 1, 3 and 4; ledgers_prunable / ledgers_pruned and their \
         byte counts from pass 5. Pass dry_run=true to preview."
     )]
@@ -14958,6 +14962,13 @@ mod tests {
             "description must state that observation pruning is off by default; \
              got: {desc}"
         );
+        // The sixth pass deletes token call tool context; an agent must be
+        // able to tell that calls and session totals survive it.
+        assert!(
+            desc.contains("token_call_tool_retention_days")
+                && desc.contains("session token totals are kept"),
+            "description must name the token call tool pass and what it keeps; got: {desc}"
+        );
         assert!(
             !desc.contains("THREE passes"),
             "the three-pass wording must not come back now there are four; got: {desc}"
@@ -14985,6 +14996,12 @@ mod tests {
         assert!(
             MEMORY_INSTRUCTIONS.contains("dry_run=true"),
             "MEMORY_INSTRUCTIONS must say a dry run reports without deleting"
+        );
+        assert!(
+            MEMORY_INSTRUCTIONS.contains("token_call_tool_retention_days")
+                && MEMORY_INSTRUCTIONS.contains("Six passes")
+                && !MEMORY_INSTRUCTIONS.contains("Five passes"),
+            "MEMORY_INSTRUCTIONS must count and name the token call tool pass"
         );
         assert!(
             !MEMORY_INSTRUCTIONS.contains("Three passes"),
