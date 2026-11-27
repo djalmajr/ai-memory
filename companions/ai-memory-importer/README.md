@@ -203,6 +203,9 @@ start/end tags and self-closing tags produce the same separators.
 Paragraph tab-stop definitions are formatting and do not insert text.
 
 XLSX extraction reads the base cell text and omits pronunciation annotations.
+A blank cell that the workbook omitted stays in its column when the gap is
+at most 32 columns, so a later value remains under its header. A wider jump
+keeps a single separator and is not expanded into the empty rectangle.
 It accepts the Open XML SDK's unnumbered `xl/worksheets/sheet.xml` part
 alongside numbered worksheet parts.
 
@@ -240,7 +243,9 @@ character references retain their original spelling.
 - The OMC route maps only endpoint-supported metadata: `title`, `kind`, `tier`,
   `tags`, `pinned`, and `body`. Unknown frontmatter is ignored.
 - Manifests use randomized private temporary files in the destination directory,
-  sync their contents, and atomically replace the previous manifest.
+  sync their contents, and atomically replace the previous manifest. For
+  file-based imports, choose a manifest path separate from the source and
+  any mapping file.
 - Auth comes only from `AI_MEMORY_AUTH_TOKEN`; there is intentionally no CLI
   token argument.
 - External conversations are fully parsed, schema-checked, bounded, and

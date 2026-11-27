@@ -3873,9 +3873,9 @@ pub fn insert_observation(
 /// Ingest-keys older than this are swept opportunistically on every keyed
 /// insert. Ordinary keys only need to outlive the client spool (7 days + retry
 /// backoff); recovery keys remain tied to their stored session until it is purged.
-const INGEST_KEY_TTL_MICROS: i64 = 30 * 24 * 60 * 60 * 1_000_000;
+pub(crate) const INGEST_KEY_TTL_MICROS: i64 = 30 * 24 * 60 * 60 * 1_000_000;
 
-fn recovery_ingest_key(key: &str) -> bool {
+pub(crate) fn recovery_ingest_key(key: &str) -> bool {
     key.strip_prefix("recovery_").is_some_and(|digest| {
         digest.len() == 55 && digest.bytes().all(|byte| byte.is_ascii_hexdigit())
     })
@@ -4156,16 +4156,16 @@ pub fn admit_hook_session_event(
         agent_kind: session.agent_kind,
         owner,
     };
-    if session_end && ended_at.is_some() {
-        let count: u64 = tx.query_row(
-            "SELECT COUNT(*) FROM observations WHERE session_id = ?1",
-            params![session.id.as_bytes()],
-            |r| r.get(0),
-        )?;
-        if count <= ended_count {
-            tx.commit()?;
-            return Ok(HookSessionAdmission::AlreadyEnded { session: guard });
-        }
+    if session_end
+        && ended_at.is_some()
+        && !crate::reader::session_has_substantive_work_after_watermark(
+            &tx,
+            session.id,
+            ended_count,
+        )?
+    {
+        tx.commit()?;
+        return Ok(HookSessionAdmission::AlreadyEnded { session: guard });
     }
     let ingest = if let Some(key) = ingest_key {
         tx.execute(

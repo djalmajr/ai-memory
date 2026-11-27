@@ -1118,10 +1118,10 @@ fn launch_mode(harness: ManagedHarness, args: &[OsString]) -> LaunchMode {
         ]
         .as_slice(),
     };
-    let first = if matches!(harness, ManagedHarness::Kiro | ManagedHarness::KiroV3) {
-        kiro_root_subcommand(args)
-    } else {
-        args.first().and_then(|arg| arg.to_str())
+    let first = match harness {
+        ManagedHarness::Kiro | ManagedHarness::KiroV3 => kiro_root_subcommand(args),
+        ManagedHarness::Gemini => gemini_root_subcommand(args),
+        _ => args.first().and_then(|arg| arg.to_str()),
     };
     if first.is_some_and(|value| utility.contains(&value)) {
         LaunchMode::Passthrough
@@ -1207,10 +1207,14 @@ pub fn has_native_session_selector(harness: ManagedHarness, args: &[OsString]) -
                 "--fork-session",
             ],
         ),
-        // `--continue` / `-c` resumes the most recent conversation without
-        // naming one; that is still an explicit user choice, so nothing may be
-        // injected over it.
-        ManagedHarness::Antigravity => has_flag(args, &["--conversation", "--continue", "-c"]),
+        // `--resume` / `-r` are aliases for `--conversation` (Antigravity CLI
+        // 1.5.16+); `--continue` / `-c` resumes the most recent conversation
+        // without naming one. All are explicit user choices, so nothing may be
+        // injected over them.
+        ManagedHarness::Antigravity => has_flag(
+            args,
+            &["--conversation", "--resume", "-r", "--continue", "-c"],
+        ),
         // A bare `--resume` opens Copilot's session picker and `--connect`
         // attaches to a remote session; both are explicit user choices.
         ManagedHarness::Copilot => has_flag(
@@ -1252,7 +1256,7 @@ fn explicit_session_id(harness: ManagedHarness, args: &[OsString]) -> Option<Str
         ManagedHarness::Grok => flag_value(args, &["--resume", "-r", "--session-id", "-s"]),
         // A bare `--continue` names no conversation: the id is only known
         // after the fact, from the conversation store.
-        ManagedHarness::Antigravity => flag_value(args, &["--conversation"]),
+        ManagedHarness::Antigravity => flag_value(args, &["--conversation", "--resume", "-r"]),
         ManagedHarness::Copilot => flag_value(args, &["--resume", "-r", "--session-id"]),
         ManagedHarness::Gemini => flag_value(args, &["--resume", "-r", "--session-id"]),
     }
@@ -1297,6 +1301,29 @@ fn kiro_root_positional(args: &[OsString]) -> Option<usize> {
             continue;
         }
         return Some(index);
+    }
+    None
+}
+
+/// Gemini accepts its global debug option before a utility command. Leave
+/// session-only options untouched so their values cannot be read as commands.
+fn gemini_root_subcommand(mut args: &[OsString]) -> Option<&str> {
+    while let Some((arg, rest)) = args.split_first() {
+        let text = arg.to_str()?;
+        args = match text {
+            "--debug" | "-d" => {
+                if rest
+                    .first()
+                    .is_some_and(|value| value == "true" || value == "false")
+                {
+                    &rest[1..]
+                } else {
+                    rest
+                }
+            }
+            "--no-debug" | "--debug=true" | "--debug=false" | "-d=true" | "-d=false" => rest,
+            _ => return Some(text),
+        };
     }
     None
 }
@@ -4101,13 +4128,29 @@ mod tests {
 
     #[test]
     fn antigravity_explicit_selector_always_wins() {
-        for native in [
-            vec![OsString::from("--conversation"), OsString::from("chosen")],
-            vec![OsString::from("--conversation=chosen")],
+        for (native, expected_id) in [
+            (
+                vec![OsString::from("--conversation"), OsString::from("chosen")],
+                Some("chosen"),
+            ),
+            (
+                vec![OsString::from("--conversation=chosen")],
+                Some("chosen"),
+            ),
+            (
+                vec![OsString::from("--resume"), OsString::from("chosen")],
+                Some("chosen"),
+            ),
+            (vec![OsString::from("--resume=chosen")], Some("chosen")),
+            (
+                vec![OsString::from("-r"), OsString::from("chosen")],
+                Some("chosen"),
+            ),
+            (vec![OsString::from("-r=chosen")], Some("chosen")),
             // `--continue` names no conversation but is still the user's
             // explicit choice, so nothing may be injected over it.
-            vec![OsString::from("--continue")],
-            vec![OsString::from("-c")],
+            (vec![OsString::from("--continue")], None),
+            (vec![OsString::from("-c")], None),
         ] {
             let plan = build_launch_plan(
                 ManagedHarness::Antigravity,
@@ -4117,7 +4160,7 @@ mod tests {
             )
             .unwrap();
             assert_eq!(plan.args, native, "{native:?} must stay byte-identical");
-            assert_ne!(plan.expected_session_id.as_deref(), Some("linked"));
+            assert_eq!(plan.expected_session_id.as_deref(), expected_id);
         }
     }
 
@@ -4424,6 +4467,43 @@ mod tests {
             ManagedHarness::Gemini,
             &[OsString::from("-i"), OsString::from("summarize")]
         ));
+    }
+
+    #[test]
+    fn gemini_debug_options_keep_utility_launches_in_passthrough() {
+        let linked = "4c1ea47e-b134-4efe-a3d1-217a5d5c4e5d";
+        for debug in [
+            &["--debug"][..],
+            &["-d"],
+            &["--no-debug"],
+            &["--debug", "false"],
+            &["--debug=true"],
+        ] {
+            let args: Vec<_> = debug
+                .iter()
+                .copied()
+                .chain(["mcp", "list"])
+                .map(OsString::from)
+                .collect();
+            let plan = build_launch_plan(ManagedHarness::Gemini, None, args.clone(), Some(linked))
+                .unwrap();
+            assert_eq!(plan.mode, LaunchMode::Passthrough, "{args:?}");
+            assert_eq!(plan.args, args);
+        }
+
+        let args = ["--debug", "--prompt", "mcp"];
+        let plan = build_launch_plan(
+            ManagedHarness::Gemini,
+            None,
+            args.into_iter().map(OsString::from).collect(),
+            Some(linked),
+        )
+        .unwrap();
+        assert_eq!(plan.mode, LaunchMode::Session);
+        assert_eq!(
+            strings(&plan.args),
+            ["--debug", "--prompt", "mcp", "--resume", linked]
+        );
     }
 
     #[test]

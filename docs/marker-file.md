@@ -830,6 +830,19 @@ generated integrations match file-tool and shell paths without regard to case
 decomposed accent like the composed letter, as its filesystem does; other POSIX
 hosts compare case-sensitively, and Windows paths always ignore ASCII case.
 
+Claude Code 2.1.269 and later can also report the files a `Bash` command
+changed, in `tool_response.bashEditDiff` (its `changedFiles` and the
+`filePath` of each diff; see the Bash tool in
+[Claude Code's hooks reference](https://code.claude.com/docs/en/hooks)).
+Those paths are matched like file-tool paths, so a command that names no
+ignored path but rewrote one (`make gen`, `npm run codegen`) is **dropped**,
+with its output and the diff of the ignored file. A list that is not in that
+shape, or that names more than the 200 files Claude Code sends, makes the call
+**metadata-only** under an active policy. Claude Code writes the list only in
+some permission modes or with its `bashEditDiffEnabled` setting, leaves out
+files Git ignores, and calls it best effort, so a change it does not list is
+not matched.
+
 In a Windows session (the event's `cwd` is a drive or UNC path), a file-tool
 path, shell argument or `workdir` is read as the file Windows opens, so other
 spellings of an ignored file match its pattern too: Git Bash, MSYS2 and Cygwin
@@ -869,8 +882,9 @@ after leading whitespace as Codex reads them), every directory, file and
 path-like glob argument of a search/list tool (Grep, Glob, LS, `grep_search`,
 `glob`, `list_directory`, `search_file_content`, Hermes `search_files` with its
 `file_glob` filter, and the other agents' equivalents; a grep `pattern` is a
-regular expression and is not read), and every shell argument that spells a
-path (one with a separator, after `~/` expansion) plus the tool's `workdir`, the native hook and the
+regular expression and is not read), every shell argument that spells a
+path (one with a separator, after `~/` expansion) plus the tool's `workdir`,
+and every file a Claude Code shell call lists as changed, the native hook and the
 generated integrations find the marker that governs that location, by the
 same lexical walk as the event's own, and when it is another checkout's (or the
 event's directory has none) apply that marker's policy as well: `cat
@@ -1070,11 +1084,12 @@ The normal capture contract is intentionally narrow: supported Claude Code,
 OpenCode, Pi, OMP, and Antigravity tool events retain only canonical tool family,
 an agent-provided validated call ID when their documented schema proves one,
 and a PostToolUse outcome class. `PreToolUse` never retains commands,
-arguments, paths, input bodies, or arbitrary tool names. The one name kept is
-an MCP tool's: a call named `mcp__<server>__<tool>` (Claude Code, Codex, Hermes
-Agent) stays in the `unknown` family, with no input or output, and adds
-`mcp_server` and `mcp_tool` lines when the whole name is at most 64 ASCII
-letters, digits, `_` or `-`. `PostToolUse` appends
+arguments, paths, input bodies, or arbitrary tool names. MCP calls stay in the
+`unknown` family, with no input or output. They can retain `mcp_server` and
+`mcp_tool` when Claude Code, Codex, or Hermes Agent supplies
+`mcp__<server>__<tool>`, or when Antigravity CLI supplies `ServerName` and
+`ToolName` in its `call_mcp_tool` wrapper. The equivalent prefixed name
+must fit within 64 ASCII letters, digits, `_` or `-`. `PostToolUse` appends
 its existing tool-response/error excerpt and caps the complete rendered body at
 2,000 UTF-8-safe bytes. Antigravity's successful file-edit events fall back to
 the bounded replacement or written-content field in `toolCall.args` because its

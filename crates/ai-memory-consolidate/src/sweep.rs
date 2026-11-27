@@ -1647,6 +1647,7 @@ mod tests {
         let c = DecayCandidate {
             id: PageId::new(),
             path: ai_memory_core::PagePath::new("x.md").unwrap(),
+            title: String::new(),
             tier: Tier::Semantic,
             pinned: false,
             updated_at_us: 0,
@@ -1665,6 +1666,7 @@ mod tests {
         let c = DecayCandidate {
             id: PageId::new(),
             path: ai_memory_core::PagePath::new("x.md").unwrap(),
+            title: String::new(),
             tier: Tier::Episodic,
             pinned: true,
             updated_at_us: 0,
@@ -1683,6 +1685,7 @@ mod tests {
         let c = DecayCandidate {
             id: PageId::new(),
             path: ai_memory_core::PagePath::new("x.md").unwrap(),
+            title: String::new(),
             tier: Tier::Episodic,
             pinned: false,
             updated_at_us: 0,
@@ -1701,6 +1704,7 @@ mod tests {
         let c = DecayCandidate {
             id: PageId::new(),
             path: ai_memory_core::PagePath::new("x.md").unwrap(),
+            title: String::new(),
             tier: Tier::Episodic,
             pinned: false,
             updated_at_us: 0,

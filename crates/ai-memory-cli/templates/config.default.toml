@@ -333,7 +333,9 @@ log_level = "info"
 # enables on the next start), and existing pages are backfilled
 # automatically at startup. For non-English wikis, set embedding_model to
 # "intfloat/multilingual-e5-small" (or alias "multilingual-e5-small", ~470 MB,
-# 384-dim, automatic "query: " / "passage: " prefixes). See docs/local-embeddings.md.
+# 384-dim, automatic "query: " / "passage: " prefixes). With no provider set,
+# any other embedding_model is ignored with a startup warning and the default
+# model runs. See docs/local-embeddings.md.
 #   embedding_provider = "none"           # opt out (FTS + entity + graph only)
 #   embedding_provider = "openai"         # or voyage | google | gemini |
 #                                         # openai-compat | local | copilot | none
@@ -640,8 +642,8 @@ include_raw_fallback = false
 proposal_actor = "auto_improve"
 pending_path = "_pending/auto-improve"
 #
-# Also schedule a reviewer run on SessionEnd. Off by default so hooks stay
-# cheap and fire-and-forget.
+# Accepted for compatibility and has no effect: no review runs from the
+# SessionEnd hook. [auto_improve.scheduler] below reviews completed sessions.
 # on_session_end = false
 #
 # Wiki folder prefixes whose page bodies the reviewer may read. A project that

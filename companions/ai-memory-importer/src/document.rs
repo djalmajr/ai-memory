@@ -41,6 +41,10 @@ const MAX_PDF_STREAM_BYTES: usize = 16 * 1024 * 1024;
 const MAX_SHEETS: usize = 64;
 const MAX_SPREADSHEET_CELLS: usize = 100_000;
 const MAX_SHARED_STRINGS: usize = MAX_SPREADSHEET_CELLS;
+/// Blank cells omitted from the worksheet stay in place up to this gap.
+/// A wider jump, such as A to XFD, keeps one separator: expanding it would
+/// materialize the empty rectangle and blow the extraction budget.
+const MAX_XLSX_OMITTED_COLUMNS: u32 = 32;
 
 /// Extract one supported local document into one attributed wiki page.
 #[derive(Parser, Debug, Clone)]
@@ -228,6 +232,7 @@ pub(crate) async fn run(args: DocumentArgs) -> Result<()> {
         }
     }
 
+    crate::validate_manifest_destination(args.manifest_out.as_deref(), &[&args.file])?;
     let workspace = args
         .workspace
         .clone()
@@ -886,6 +891,102 @@ fn extract_xlsx_sheet(
     extract_xlsx_sheet_with_limit(xml, shared_strings, cells, output, MAX_WORKING_TEXT_BYTES)
 }
 
+/// Column index of an A1-style cell reference. `A` is 0 and `XFD` is 16383.
+fn xlsx_column_index(reference: &str) -> Option<u32> {
+    let mut index: u32 = 0;
+    let mut letters = 0u32;
+    for byte in reference.bytes() {
+        if !byte.is_ascii_alphabetic() {
+            break;
+        }
+        // Excel column names are at most three letters.
+        if letters == 3 {
+            return None;
+        }
+        letters += 1;
+        index = index
+            .checked_mul(26)?
+            .checked_add(u32::from(byte.to_ascii_uppercase() - b'A') + 1)?;
+    }
+    (letters > 0).then(|| index.checked_sub(1)).flatten()
+}
+
+fn xlsx_cell_meta(
+    tag: &quick_xml::events::BytesStart<'_>,
+) -> Result<(Option<String>, Option<u32>)> {
+    let mut kind = None;
+    let mut column = None;
+    for attribute in tag.attributes() {
+        let attribute = attribute.context("parse XLSX cell attribute")?;
+        match attribute.key.local_name().as_ref() {
+            "t" => {
+                kind = Some(
+                    attribute
+                        .normalized_value(quick_xml::XmlVersion::Implicit1_0)?
+                        .into_owned(),
+                );
+            }
+            "r" => {
+                let reference = attribute.normalized_value(quick_xml::XmlVersion::Implicit1_0)?;
+                column = xlsx_column_index(&reference);
+            }
+            _ => {}
+        }
+    }
+    Ok((kind, column))
+}
+
+/// How many omitted columns to emit before this cell.
+///
+/// Cells without a reference stay sequential. A backwards or duplicate
+/// reference emits nothing extra. A gap past [`MAX_XLSX_OMITTED_COLUMNS`]
+/// stays a single separator.
+fn xlsx_omitted_columns(previous: Option<u32>, column: Option<u32>) -> u32 {
+    let Some(column) = column else {
+        return 0;
+    };
+    let expected = previous.map_or(0, |seen| seen.saturating_add(1));
+    let Some(gap) = column.checked_sub(expected) else {
+        return 0;
+    };
+    if gap > MAX_XLSX_OMITTED_COLUMNS {
+        0
+    } else {
+        gap
+    }
+}
+
+fn push_xlsx_cell(
+    output: &mut String,
+    row_cells: &mut usize,
+    previous: &mut Option<u32>,
+    column: Option<u32>,
+    value: &str,
+    max_output_bytes: usize,
+) -> Result<()> {
+    let mut leading = *row_cells == 0;
+    for _ in 0..xlsx_omitted_columns(*previous, column) {
+        push_bounded_with_limit(
+            output,
+            if leading { "    " } else { "\t" },
+            max_output_bytes,
+        )?;
+        leading = false;
+        *row_cells += 1;
+    }
+    push_bounded_with_limit(
+        output,
+        if leading { "    " } else { "\t" },
+        max_output_bytes,
+    )?;
+    if !value.is_empty() {
+        push_bounded_with_limit(output, value, max_output_bytes)?;
+    }
+    *row_cells += 1;
+    *previous = column.or_else(|| previous.map(|seen| seen.saturating_add(1)));
+    Ok(())
+}
+
 fn extract_xlsx_sheet_with_limit(
     xml: &str,
     shared_strings: &[String],
@@ -895,7 +996,8 @@ fn extract_xlsx_sheet_with_limit(
 ) -> Result<()> {
     let mut reader = XmlReader::from_str(xml);
     let mut row_cells = None::<usize>;
-    let mut cell = None::<(Option<String>, String)>;
+    let mut previous_column = None::<u32>;
+    let mut cell = None::<(Option<String>, String, Option<u32>)>;
     let mut capture_value = false;
     // Inline strings use the same phonetic markup as shared strings.
     let mut phonetic_depth = 0_usize;
@@ -906,6 +1008,7 @@ fn extract_xlsx_sheet_with_limit(
                     bail!("nested XLSX row");
                 }
                 row_cells = Some(0);
+                previous_column = None;
             }
             Event::Start(tag) if tag.local_name().as_ref() == "c" => {
                 if cell.is_some() {
@@ -917,18 +1020,8 @@ fn extract_xlsx_sheet_with_limit(
                 if *cells > MAX_SPREADSHEET_CELLS {
                     bail!("XLSX exceeds the {MAX_SPREADSHEET_CELLS}-cell extraction limit");
                 }
-                let mut kind = None;
-                for attribute in tag.attributes() {
-                    let attribute = attribute.context("parse XLSX cell attribute")?;
-                    if attribute.key.local_name().as_ref() == "t" {
-                        kind = Some(
-                            attribute
-                                .normalized_value(quick_xml::XmlVersion::Implicit1_0)?
-                                .into_owned(),
-                        );
-                    }
-                }
-                cell = Some((kind, String::new()));
+                let (kind, column) = xlsx_cell_meta(&tag)?;
+                cell = Some((kind, String::new(), column));
             }
             Event::Empty(tag) if tag.local_name().as_ref() == "c" => {
                 *cells = cells
@@ -937,15 +1030,18 @@ fn extract_xlsx_sheet_with_limit(
                 if *cells > MAX_SPREADSHEET_CELLS {
                     bail!("XLSX exceeds the {MAX_SPREADSHEET_CELLS}-cell extraction limit");
                 }
+                let (_, column) = xlsx_cell_meta(&tag)?;
                 let row_cells = row_cells
                     .as_mut()
                     .ok_or_else(|| anyhow!("XLSX cell appears outside a row"))?;
-                push_bounded_with_limit(
+                push_xlsx_cell(
                     output,
-                    if *row_cells == 0 { "    " } else { "\t" },
+                    row_cells,
+                    &mut previous_column,
+                    column,
+                    "",
                     max_output_bytes,
                 )?;
-                *row_cells += 1;
             }
             Event::Start(tag) if tag.local_name().as_ref() == "rPh" => phonetic_depth += 1,
             Event::End(tag) if tag.local_name().as_ref() == "rPh" => phonetic_depth -= 1,
@@ -955,17 +1051,17 @@ fn extract_xlsx_sheet_with_limit(
                 capture_value = true;
             }
             Event::Text(text) if capture_value && phonetic_depth == 0 => {
-                if let Some((_, value)) = cell.as_mut() {
+                if let Some((_, value, _)) = cell.as_mut() {
                     push_bounded(value, &text.xml10_content())?;
                 }
             }
             Event::CData(text) if capture_value && phonetic_depth == 0 => {
-                if let Some((_, value)) = cell.as_mut() {
+                if let Some((_, value, _)) = cell.as_mut() {
                     push_bounded(value, &text.xml10_content())?;
                 }
             }
             Event::GeneralRef(reference) if capture_value => {
-                if let Some((_, value)) = cell.as_mut() {
+                if let Some((_, value, _)) = cell.as_mut() {
                     let decoded = xml_reference(&reference)?;
                     if phonetic_depth == 0 {
                         push_bounded(value, &decoded)?;
@@ -976,7 +1072,7 @@ fn extract_xlsx_sheet_with_limit(
                 capture_value = false;
             }
             Event::End(tag) if tag.local_name().as_ref() == "c" => {
-                let (kind, raw) = cell
+                let (kind, raw, column) = cell
                     .take()
                     .ok_or_else(|| anyhow!("XLSX cell ended without a start"))?;
                 let value: Cow<'_, str> = if kind.as_deref() == Some("s") {
@@ -997,13 +1093,14 @@ fn extract_xlsx_sheet_with_limit(
                 let row_cells = row_cells
                     .as_mut()
                     .ok_or_else(|| anyhow!("XLSX cell appears outside a row"))?;
-                push_bounded_with_limit(
+                push_xlsx_cell(
                     output,
-                    if *row_cells == 0 { "    " } else { "\t" },
+                    row_cells,
+                    &mut previous_column,
+                    column,
+                    &value,
                     max_output_bytes,
                 )?;
-                push_bounded_with_limit(output, &value, max_output_bytes)?;
-                *row_cells += 1;
             }
             Event::End(tag) if tag.local_name().as_ref() == "row" => {
                 let cells_in_row = row_cells
@@ -1835,6 +1932,51 @@ mod tests {
         assert!(!plan.body.contains("トウキョウ"));
         assert!(!plan.body.contains("オオサカ"));
         assert!(plan.body.contains("Item\t42"), "{}", plan.body);
+        assert!(
+            !plan.body.contains("Item\t\t"),
+            "a jump from A to XFD must not expand the empty rectangle: {}",
+            plan.body
+        );
+    }
+
+    #[test]
+    fn xlsx_keeps_omitted_blank_cells_in_their_columns() {
+        let sheet = r#"<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
+          <sheetData>
+            <row r="1">
+              <c r="A1" t="inlineStr"><is><t>Item</t></is></c>
+              <c r="B1" t="inlineStr"><is><t>Cost</t></is></c>
+              <c r="C1" t="inlineStr"><is><t>Owner</t></is></c>
+            </row>
+            <row r="2">
+              <c r="A2" t="inlineStr"><is><t>Widget</t></is></c>
+              <c r="C2" t="inlineStr"><is><t>Pat</t></is></c>
+            </row>
+            <row r="3">
+              <c r="B3"><v>44</v></c>
+              <c r="C3" t="inlineStr"><is><t>Chris</t></is></c>
+            </row>
+            <row r="4">
+              <c r="A4" t="inlineStr"><is><t>Near</t></is></c>
+              <c r="AZ4" t="inlineStr"><is><t>Far</t></is></c>
+            </row>
+          </sheetData>
+        </worksheet>"#;
+        let mut output = String::new();
+        extract_xlsx_sheet(sheet, &[], &mut 0, &mut output).unwrap();
+        assert_eq!(
+            output,
+            "    Item\tCost\tOwner\n    Widget\t\tPat\n    \t44\tChris\n    Near\tFar\n"
+        );
+    }
+
+    #[test]
+    fn xlsx_column_index_reads_a1_references() {
+        assert_eq!(xlsx_column_index("A1"), Some(0));
+        assert_eq!(xlsx_column_index("C2"), Some(2));
+        assert_eq!(xlsx_column_index("AA10"), Some(26));
+        assert_eq!(xlsx_column_index("XFD1048576"), Some(16_383));
+        assert_eq!(xlsx_column_index("42"), None);
     }
 
     #[test]
@@ -2313,6 +2455,38 @@ mod tests {
         write_zip(&file, &[("word/document.xml", &"x".repeat(65))]);
         let bytes = fs::read(file).unwrap();
         assert!(preflight_zip_with_limits(&bytes, 10, 64, 128).is_err());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn manifest_cannot_replace_the_source_document() {
+        let temp = TempDir::new().unwrap();
+        let source_dir = temp.path().join("input");
+        fs::create_dir(&source_dir).unwrap();
+        let file = source_dir.join("report.txt");
+        let original = b"Original research notes.\n";
+        fs::write(&file, original).unwrap();
+        let alias_dir = temp.path().join("alias");
+        std::os::unix::fs::symlink(&source_dir, &alias_dir).unwrap();
+
+        let server = MockServer::start(&[("w", "p")]);
+        for (manifest, apply) in [(&file, false), (&alias_dir.join("report.txt"), true)] {
+            let mut args = apply_args(&file, &server.url, manifest);
+            args.apply = apply;
+            let error = run(args).await.unwrap_err();
+            assert!(error.to_string().contains("--manifest-out"), "{error:#}");
+            assert_eq!(fs::read(&file).unwrap(), original);
+        }
+        assert!(server.state().requests.is_empty());
+
+        let manifest = temp.path().join("manifest.json");
+        let mut args = apply_args(&file, &server.url, &manifest);
+        args.apply = false;
+        run(args).await.unwrap();
+        let recorded: serde_json::Value =
+            serde_json::from_slice(&fs::read(&manifest).unwrap()).unwrap();
+        assert_eq!(recorded["status"], "planned");
+        assert_eq!(fs::read(&file).unwrap(), original);
     }
 
     #[tokio::test]

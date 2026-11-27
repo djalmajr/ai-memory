@@ -160,6 +160,8 @@ pub(crate) struct McpToolName {
 /// characters OpenAI-compatible providers accept (`tools/mcp_tool_schema.py`,
 /// v0.22.2); a longer name is not a shape any documented harness sends.
 const MAX_MCP_TOOL_NAME_CHARS: usize = 64;
+const MCP_TOOL_PREFIX: &str = "mcp__";
+const MCP_TOOL_SEPARATOR: &str = "__";
 
 /// The server and tool of an `mcp__<server>__<tool>` tool name, the shape
 /// Claude Code (<https://code.claude.com/docs/en/hooks>, "Match MCP tools",
@@ -173,18 +175,38 @@ const MAX_MCP_TOOL_NAME_CHARS: usize = 64;
 /// when the whole name is at most 64 ASCII letters, digits, `_` or `-`: an
 /// identifier, never free text. The server ends at the first `__`.
 pub(crate) fn mcp_tool_name(name: &str) -> Option<McpToolName> {
-    if name.len() > MAX_MCP_TOOL_NAME_CHARS
-        || !name
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+    if name.len() > MAX_MCP_TOOL_NAME_CHARS {
+        return None;
+    }
+    let (server, tool) = name
+        .strip_prefix(MCP_TOOL_PREFIX)?
+        .split_once(MCP_TOOL_SEPARATOR)?;
+    mcp_tool_identifiers(server, tool)
+}
+
+fn mcp_tool_identifiers(server: &str, tool: &str) -> Option<McpToolName> {
+    // The separated form has the same total budget as the prefixed name.
+    let names_limit = MAX_MCP_TOOL_NAME_CHARS - MCP_TOOL_PREFIX.len() - MCP_TOOL_SEPARATOR.len();
+    if server.len().saturating_add(tool.len()) > names_limit
+        || !is_tool_identifier(server)
+        || !is_tool_identifier(tool)
     {
         return None;
     }
-    let (server, tool) = name.strip_prefix("mcp__")?.split_once("__")?;
-    (!server.is_empty() && !tool.is_empty()).then(|| McpToolName {
+    Some(McpToolName {
         server: server.to_owned(),
         tool: tool.to_owned(),
     })
+}
+
+/// Antigravity reports the tool through `toolCall` on both tool hook events.
+/// The `call_mcp_tool` wrapper carries these two identifiers in CLI 1.5.17
+/// (#2505). https://antigravity.google/docs/hooks/#pretooluse
+fn antigravity_mcp_tool_name(raw: &Value) -> Option<McpToolName> {
+    let args = raw.pointer("/toolCall/args")?;
+    let server = args.get("ServerName")?.as_str()?;
+    let tool = args.get("ToolName")?.as_str()?;
+    mcp_tool_identifiers(server, tool)
 }
 
 /// Longest harness tool name kept by `[ingest] record_tool_names`, the same
@@ -251,8 +273,11 @@ pub(crate) fn recorded_tool_name(agent: AgentKind, raw: &Value) -> Option<Record
 /// A harness tool name as `[ingest] record_tool_names` keeps it: an
 /// identifier, never free text.
 pub(crate) fn valid_tool_name(name: &str) -> bool {
+    name.len() <= MAX_TOOL_NAME_CHARS && is_tool_identifier(name)
+}
+
+fn is_tool_identifier(name: &str) -> bool {
     !name.is_empty()
-        && name.len() <= MAX_TOOL_NAME_CHARS
         && name
             .bytes()
             .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
@@ -482,10 +507,12 @@ pub(crate) fn tool_observation_metadata(
         ToolObservationMetadata {
             tool_family,
             tool_call_id: id.filter(|id| valid_call_id(id)).map(str::to_owned),
-            mcp_tool: if tool_family == ToolFamily::Unknown {
-                mcp_tool_name(name)
-            } else {
-                None
+            mcp_tool: match (tool_family, agent, name) {
+                (ToolFamily::Unknown, AgentKind::AntigravityCli, "call_mcp_tool") => {
+                    antigravity_mcp_tool_name(raw)
+                }
+                (ToolFamily::Unknown, _, _) => mcp_tool_name(name),
+                _ => None,
             },
         }
     })
@@ -1047,6 +1074,22 @@ impl CapturePolicy {
                 _ => (CaptureDisposition::Keep, extracted.state),
             },
         };
+        // A file the command changed is as much the call's as one it names:
+        // an ignored one drops the call, and a list that cannot be read or
+        // matched proves nothing.
+        let edited = match (self.state, &extracted.edited) {
+            (PolicyState::Active, Some(Ok(paths))) => match self.match_paths(paths, cwd) {
+                Ok(true) => Some(CaptureDisposition::Drop),
+                Ok(false) => None,
+                Err(()) => Some(CaptureDisposition::MetadataOnly),
+            },
+            (PolicyState::Active, Some(Err(()))) => Some(CaptureDisposition::MetadataOnly),
+            _ => None,
+        };
+        let disposition = match (disposition, edited) {
+            (CaptureDisposition::Drop, _) | (_, None) => disposition,
+            (_, Some(edited)) => edited,
+        };
         CaptureDecision {
             protocol: CaptureProtocol::new(
                 disposition,
@@ -1357,6 +1400,9 @@ struct Extracted<'a> {
     powershell: bool,
     /// A non-file tool whose input is program source ([`INLINE_CODE_TOOL_NAMES`]).
     inline_code: bool,
+    /// The files Claude Code says the call changed ([`bash_edit_diff_paths`]);
+    /// `Err` when its list cannot be read.
+    edited: Option<Result<Vec<String>, ()>>,
     call_id: Option<String>,
     state: ExtractionState,
 }
@@ -1556,9 +1602,53 @@ fn extract(agent: AgentKind, raw: &Value) -> Extracted<'_> {
         powershell: name.eq_ignore_ascii_case("powershell") || name.eq_ignore_ascii_case("pwsh"),
         inline_code: family == ToolFamily::NonFile
             && INLINE_CODE_TOOL_NAMES.contains(&name.to_ascii_lowercase().as_str()),
+        edited: (agent == AgentKind::ClaudeCode && family == ToolFamily::NonFile)
+            .then(|| bash_edit_diff_paths(object))
+            .flatten(),
         call_id,
         state,
     }
+}
+
+/// The most files Claude Code lists as changed by one shell command.
+const MAX_BASH_EDIT_DIFF_FILES: usize = 200;
+
+/// The files a Claude Code shell command changed, from its PostToolUse
+/// `tool_response.bashEditDiff` (v2.1.269+, the Bash section of
+/// <https://code.claude.com/docs/en/hooks>): `changedFiles`, absolute paths
+/// of at most 200 files, and the `filePath` of each diff in `files`. A
+/// command that names no file on its command line (`make gen`) can still
+/// rewrite one, and the diff carries its old and new lines. `None` without a
+/// diff; `Err` for a list that is not that shape, or longer than Claude Code
+/// sends.
+fn bash_edit_diff_paths(object: &Map<String, Value>) -> Option<Result<Vec<String>, ()>> {
+    let diff = object.get("tool_response")?.get("bashEditDiff")?;
+    if diff.is_null() {
+        return None;
+    }
+    let read = || -> Option<Vec<String>> {
+        let diff = diff.as_object()?;
+        let listed = |key: &str| match diff.get(key) {
+            None => Some(&[][..]),
+            Some(value) => value.as_array().map(Vec::as_slice),
+        };
+        let mut paths: Vec<String> = Vec::new();
+        let changed = listed("changedFiles")?.iter().map(Value::as_str);
+        let diffed = listed("files")?
+            .iter()
+            .map(|file| file.get("filePath").and_then(Value::as_str));
+        for path in changed.chain(diffed) {
+            let path = path?;
+            if !paths.iter().any(|seen| seen == path) {
+                if paths.len() == MAX_BASH_EDIT_DIFF_FILES {
+                    return None;
+                }
+                paths.push(path.to_owned());
+            }
+        }
+        Some(paths)
+    };
+    Some(read().ok_or(()))
 }
 
 /// [`family`] plus tool names only one agent is documented to use, so a
@@ -2063,7 +2153,8 @@ pub fn file_target(agent: AgentKind, raw: &Value) -> Option<FileTarget> {
 /// patch names), every directory, file and path-like glob argument of a
 /// search/list tool, and every shell argument that names a path (one with a
 /// separator, after `~/` expansion) resolved from the tool's `workdir` or the
-/// `cwd`, plus that directory itself.
+/// `cwd`, plus that directory itself, and every file Claude Code says the
+/// call changed (`bashEditDiff`).
 ///
 /// A checkout's `ignore_paths` protect its files wherever the call is made
 /// from, so a client applies the policy of each location's own marker as
@@ -2172,6 +2263,17 @@ pub fn capture_lookup_locations(
             }
         }
         _ => {}
+    }
+    // The files Claude Code says the call changed are looked up like a file
+    // tool's targets. A list it cannot read is left to the event's own
+    // policy: its shape may change, and calling every such lookup unprovable
+    // would strip the call wherever no marker asked for it.
+    if let Some(Ok(edited)) = &extracted.edited {
+        for path in edited {
+            for candidate in readings(path, cwd)?? {
+                push(Some(candidate), syntax)?;
+            }
+        }
     }
     Some(locations)
 }
@@ -7294,6 +7396,262 @@ mod tests {
         }
         let decision = policy.inspect(AgentKind::ClaudeCode, &bash("cat src/**/main.rs"), "/repo");
         assert_eq!(decision.protocol().disposition(), CaptureDisposition::Keep);
+    }
+
+    /// A Claude Code `Bash` PostToolUse whose `tool_response.bashEditDiff`
+    /// says what the command changed.
+    fn bash_edit_diff(command: &str, diff: Value) -> Value {
+        json!({
+            "tool_name": "Bash",
+            "tool_input": {"command": command},
+            "tool_use_id": "call-1",
+            "tool_response": {
+                "stdout": "generated\n",
+                "stderr": "",
+                "interrupted": false,
+                "bashEditDiff": diff,
+            },
+        })
+    }
+
+    /// Claude Code lists the files a shell command changed, with their diffs,
+    /// in `bashEditDiff` (v2.1.269+). Adversarial: a command that names no
+    /// ignored path but changed one, listed in `changedFiles` or only as a
+    /// diff's `filePath`, under the marker or `~/`, drops. Controls: the same
+    /// command changing other files, with no diff, with a skipped one, under
+    /// another agent, or with no policy keeps.
+    #[test]
+    fn claude_code_shell_call_that_changed_an_ignored_file_drops() {
+        let policy = shell_policy();
+        let decide = |agent, policy: &CapturePolicy, raw: &Value| {
+            policy.inspect(agent, raw, "/repo").protocol().disposition()
+        };
+        for diff in [
+            json!({"changedFiles": ["/repo/src/gen.rs", "/repo/docs/adr/0001.md"], "files": [], "moreFiles": 0}),
+            json!({"files": [{"filePath": "/repo/docs/adr/0001.md", "hunks": [{"lines": ["-old", "+new"]}]}]}),
+            json!({"changedFiles": ["/home/me/notes/today.md"], "moreFiles": 1}),
+            json!({"changedFiles": ["docs/adr/0002.md"]}),
+        ] {
+            let raw = bash_edit_diff("make gen", diff.clone());
+            assert_eq!(
+                decide(AgentKind::ClaudeCode, &policy, &raw),
+                CaptureDisposition::Drop,
+                "{diff}"
+            );
+        }
+        let other = json!({
+            "changedFiles": ["/repo/src/gen.rs"],
+            "files": [{"filePath": "/repo/src/gen.rs", "hunks": []}],
+            "moreFiles": 0,
+        });
+        let ignored = json!({"changedFiles": ["/repo/docs/adr/0001.md"]});
+        for (agent, policy, raw) in [
+            (
+                AgentKind::ClaudeCode,
+                &policy,
+                bash_edit_diff("make gen", other),
+            ),
+            (AgentKind::ClaudeCode, &policy, bash("make gen")),
+            (
+                AgentKind::ClaudeCode,
+                &policy,
+                bash_edit_diff("make gen", Value::Null),
+            ),
+            (
+                AgentKind::ClaudeCode,
+                &policy,
+                bash_edit_diff("git stash", json!({"skipped": true})),
+            ),
+            (
+                AgentKind::Codex,
+                &policy,
+                bash_edit_diff("make gen", ignored.clone()),
+            ),
+            (
+                AgentKind::ClaudeCode,
+                &CapturePolicy::resolve(CaptureSource::Absent, "/repo", None),
+                bash_edit_diff("make gen", ignored),
+            ),
+        ] {
+            assert_eq!(
+                decide(agent, policy, &raw),
+                CaptureDisposition::Keep,
+                "{agent:?} {raw}"
+            );
+        }
+    }
+
+    /// A `bashEditDiff` that does not list its files as Claude Code documents
+    /// them, or lists more than it sends, cannot show the command missed every
+    /// ignored file: metadata-only under an active policy. A command that
+    /// names an ignored path still drops, and with no policy the call is kept.
+    #[test]
+    fn claude_code_shell_call_with_an_unreadable_edit_list_keeps_only_metadata() {
+        let policy = shell_policy();
+        let too_many: Vec<String> = (0..=MAX_BASH_EDIT_DIFF_FILES)
+            .map(|n| format!("/repo/src/{n}.rs"))
+            .collect();
+        for diff in [
+            json!("docs/adr/0001.md"),
+            json!({"changedFiles": "docs/adr/0001.md"}),
+            json!({"changedFiles": [{"path": "docs/adr/0001.md"}]}),
+            json!({"files": [{"hunks": []}]}),
+            json!({"files": {"filePath": "docs/adr/0001.md"}}),
+            json!({"changedFiles": too_many}),
+        ] {
+            let raw = bash_edit_diff("make gen", diff.clone());
+            assert_eq!(
+                policy
+                    .inspect(AgentKind::ClaudeCode, &raw, "/repo")
+                    .protocol()
+                    .disposition(),
+                CaptureDisposition::MetadataOnly,
+                "{diff}"
+            );
+            let named = bash_edit_diff("cat docs/adr/0001.md", diff.clone());
+            assert_eq!(
+                policy
+                    .inspect(AgentKind::ClaudeCode, &named, "/repo")
+                    .protocol()
+                    .disposition(),
+                CaptureDisposition::Drop,
+                "{diff}"
+            );
+            assert_eq!(
+                CapturePolicy::resolve(CaptureSource::Absent, "/repo", None)
+                    .inspect(AgentKind::ClaudeCode, &raw, "/repo")
+                    .protocol()
+                    .disposition(),
+                CaptureDisposition::Keep,
+                "{diff}"
+            );
+        }
+        // At the cap, with each diffed file also in `changedFiles`, the list
+        // is whole.
+        let mut whole = too_many;
+        whole.pop();
+        let raw = bash_edit_diff(
+            "make gen",
+            json!({"changedFiles": whole, "files": [{"filePath": "/repo/src/0.rs", "hunks": []}]}),
+        );
+        assert_eq!(
+            policy
+                .inspect(AgentKind::ClaudeCode, &raw, "/repo")
+                .protocol()
+                .disposition(),
+            CaptureDisposition::Keep
+        );
+    }
+
+    /// A file a Claude Code shell call changed may sit in another checkout,
+    /// whose own `ignore_paths` then apply, so the lookup names it like a
+    /// file tool's target. Controls: another agent's payload, and a list
+    /// that does not fit Claude Code's documented shape, name only the
+    /// command's own locations.
+    #[test]
+    fn capture_lookup_locations_name_the_files_a_claude_code_call_changed() {
+        let raw = bash_edit_diff(
+            "make gen",
+            json!({
+                "changedFiles": ["/work/a/secrets.env", "/work/b/src/gen.rs"],
+                "files": [{"filePath": "/work/c/notes.md", "hunks": []}],
+            }),
+        );
+        let locations = |agent, raw: &Value| {
+            location_paths(capture_lookup_locations(agent, raw, "/work/b", None))
+        };
+        assert_eq!(
+            locations(AgentKind::ClaudeCode, &raw),
+            Some(vec![
+                "/work/b".to_owned(),
+                "/work/a/secrets.env".to_owned(),
+                "/work/b/src/gen.rs".to_owned(),
+                "/work/c/notes.md".to_owned(),
+            ])
+        );
+        assert_eq!(
+            locations(AgentKind::Codex, &raw),
+            Some(vec!["/work/b".to_owned()])
+        );
+        assert_eq!(
+            locations(
+                AgentKind::ClaudeCode,
+                &bash_edit_diff("make gen", json!({"changedFiles": [7]}))
+            ),
+            Some(vec!["/work/b".to_owned()])
+        );
+    }
+
+    /// `tool_response.bashEditDiff` is only defined for Claude Code shell
+    /// calls (`ToolFamily::NonFile`). Non-shell Claude Code tools (`File`,
+    /// `SearchList`, `Unknown`) carrying a malformed `bashEditDiff` must not
+    /// be downgraded to `MetadataOnly` (and `SearchList` must never emit an
+    /// illegal `(Active, SearchList, MetadataOnly)` protocol).
+    #[test]
+    fn claude_code_non_shell_tools_ignore_bash_edit_diff() {
+        let policy = shell_policy();
+        let malformed = json!({"changedFiles": "docs/adr/0001.md"});
+
+        let read = json!({
+            "tool_name": "Read",
+            "tool_input": {"file_path": "/repo/src/lib.rs"},
+            "tool_use_id": "call-read",
+            "tool_response": {"bashEditDiff": malformed},
+        });
+        let read_protocol = policy
+            .inspect(AgentKind::ClaudeCode, &read, "/repo")
+            .protocol()
+            .clone();
+        assert_eq!(read_protocol.tool_family(), ToolFamily::File);
+        assert_eq!(read_protocol.disposition(), CaptureDisposition::Keep);
+
+        let grep = json!({
+            "tool_name": "Grep",
+            "tool_input": {"pattern": "TODO", "path": "/repo/src"},
+            "tool_use_id": "call-grep",
+            "tool_response": {"bashEditDiff": malformed},
+        });
+        let grep_protocol = policy
+            .inspect(AgentKind::ClaudeCode, &grep, "/repo")
+            .protocol()
+            .clone();
+        assert_eq!(grep_protocol.tool_family(), ToolFamily::SearchList);
+        assert_eq!(grep_protocol.disposition(), CaptureDisposition::Drop);
+        assert_ne!(
+            grep_protocol.disposition(),
+            CaptureDisposition::MetadataOnly
+        );
+
+        let unknown = json!({
+            "tool_name": "mcp__srv__tool",
+            "tool_input": {"query": "status"},
+            "tool_use_id": "call-mcp",
+            "tool_response": {"bashEditDiff": malformed},
+        });
+        let unknown_protocol = policy
+            .inspect(AgentKind::ClaudeCode, &unknown, "/repo")
+            .protocol()
+            .clone();
+        assert_eq!(unknown_protocol.tool_family(), ToolFamily::Unknown);
+        assert_eq!(unknown_protocol.disposition(), CaptureDisposition::Keep);
+
+        let grep_with_diff = json!({
+            "tool_name": "Grep",
+            "tool_input": {"pattern": "TODO", "path": "/work/b/src"},
+            "tool_use_id": "call-grep-2",
+            "tool_response": {
+                "bashEditDiff": {"changedFiles": ["/work/a/secrets.env"]},
+            },
+        });
+        assert_eq!(
+            location_paths(capture_lookup_locations(
+                AgentKind::ClaudeCode,
+                &grep_with_diff,
+                "/work/b",
+                None,
+            )),
+            Some(vec!["/work/b/src".to_owned()])
+        );
     }
 
     /// The drop/keep tables live in the shared fixture so the generated

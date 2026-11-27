@@ -37,6 +37,8 @@ fn command_with_env(home: &Path, cwd: &Path) -> Command {
         .env_remove("CLAUDE_CONFIG_DIR")
         .env_remove("CODEX_HOME")
         .env_remove("COPILOT_HOME")
+        .env_remove("GEMINI_CLI_HOME")
+        .env_remove("GROK_HOME")
         .env_remove("KIMI_CODE_HOME")
         .env_remove("KIRO_HOME");
     #[cfg(windows)]
@@ -46,19 +48,19 @@ fn command_with_env(home: &Path, cwd: &Path) -> Command {
     command
 }
 
-fn claude_desktop_config_in(home: &Path) -> Option<PathBuf> {
+fn claude_desktop_config_in(home: &Path) -> PathBuf {
     #[cfg(target_os = "macos")]
     {
-        Some(home.join("Library/Application Support/Claude/claude_desktop_config.json"))
+        home.join("Library/Application Support/Claude/claude_desktop_config.json")
     }
     #[cfg(target_os = "windows")]
     {
-        Some(home.join("AppData/Roaming/Claude/claude_desktop_config.json"))
+        home.join("AppData/Roaming/Claude/claude_desktop_config.json")
     }
     #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     {
-        let _ = home;
-        None
+        // `command_with_env` points XDG_CONFIG_HOME at `home/.config`.
+        home.join(".config/Claude/claude_desktop_config.json")
     }
 }
 
@@ -144,10 +146,8 @@ fn backup_and_restore_agents_round_trip() {
     fs::write(&opencode_config, r#"{"mcp":{}}"#).unwrap();
 
     let desktop_config = claude_desktop_config_in(home.path());
-    if let Some(path) = &desktop_config {
-        fs::create_dir_all(path.parent().unwrap()).unwrap();
-        fs::write(path, r#"{"mcpServers":{"desktop":{}}}"#).unwrap();
-    }
+    fs::create_dir_all(desktop_config.parent().unwrap()).unwrap();
+    fs::write(&desktop_config, r#"{"mcpServers":{"desktop":{}}}"#).unwrap();
 
     // Antigravity / Gemini
     let agy_mcp = home.path().join(".gemini/config/mcp_config.json");
@@ -272,13 +272,10 @@ fn backup_and_restore_agents_round_trip() {
             .join(".config/opencode/opencode.json")
             .exists()
     );
-    if desktop_config.is_some() {
-        assert!(
-            claude_desktop_config_in(restore_home.path())
-                .unwrap()
-                .exists()
-        );
-    }
+    assert_eq!(
+        fs::read_to_string(claude_desktop_config_in(restore_home.path())).unwrap(),
+        r#"{"mcpServers":{"desktop":{}}}"#
+    );
 }
 
 #[test]
@@ -482,6 +479,271 @@ fn codex_assets_follow_codex_home_on_backup_and_restore() {
     assert!(!destination.join("skills/stale").exists());
 }
 
+#[test]
+fn gemini_assets_follow_gemini_cli_home_on_backup_and_restore() {
+    let _guard = cli_test_lock();
+    let home = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    let gemini_home = home.path().join("active Gemini home");
+    let settings = ".gemini/settings.json";
+    let skill = ".gemini/skills/example/SKILL.md";
+    let active_settings = r#"{"ui":{"theme":"Active profile"}}"#;
+    let stale_settings = r#"{"ui":{"theme":"Default profile"}}"#;
+    for (path, body) in [
+        (gemini_home.join(settings), active_settings),
+        (gemini_home.join(skill), "# Example Gemini skill"),
+        (home.path().join(settings), stale_settings),
+    ] {
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, body).unwrap();
+    }
+
+    let archive = project.path().join("gemini-home.tar.gz");
+    let backup = command_with_env(home.path(), project.path())
+        .env("GEMINI_CLI_HOME", &gemini_home)
+        .args(backup_agents_args(&archive, "gemini"))
+        .output()
+        .unwrap();
+    assert_success(&backup, "backup");
+
+    let restored_home = tempfile::tempdir().unwrap();
+    let destination = restored_home.path().join("destination Gemini home");
+    let restore = command_with_env(restored_home.path(), project.path())
+        .env("GEMINI_CLI_HOME", &destination)
+        .args(restore_agents_args(&archive, "gemini"))
+        .output()
+        .unwrap();
+    assert_success(&restore, "restore");
+    assert_eq!(
+        fs::read_to_string(destination.join(settings)).unwrap(),
+        active_settings
+    );
+    assert_eq!(
+        fs::read_to_string(destination.join(skill)).unwrap(),
+        "# Example Gemini skill"
+    );
+    assert!(!restored_home.path().join(".gemini").exists());
+}
+
+#[test]
+fn grok_assets_follow_grok_home_on_backup_and_restore() {
+    let _guard = cli_test_lock();
+    let home = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    let grok_home = home.path().join("active Grok home");
+    let fixtures = [
+        ("config.toml", "model = \"grok-code\"\n"),
+        ("skills/example/SKILL.md", "# Example Grok skill"),
+    ];
+    for (relative, body) in fixtures {
+        let path = grok_home.join(relative);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, body).unwrap();
+    }
+    let inactive_skill = home.path().join(".grok/skills/stale/SKILL.md");
+    fs::create_dir_all(inactive_skill.parent().unwrap()).unwrap();
+    fs::write(inactive_skill, "# Stale skill").unwrap();
+    let project_config = "model = \"grok-project\"\n";
+    let project_config_path = project.path().join(".grok/config.toml");
+    fs::create_dir_all(project_config_path.parent().unwrap()).unwrap();
+    fs::write(&project_config_path, project_config).unwrap();
+
+    let archive = project.path().join("grok-home.tar.gz");
+    let backup = command_with_env(home.path(), project.path())
+        .env("GROK_HOME", &grok_home)
+        .args(backup_agents_args(&archive, "grok"))
+        .output()
+        .unwrap();
+    assert_success(&backup, "backup");
+
+    let restored_home = tempfile::tempdir().unwrap();
+    let restored_project = tempfile::tempdir().unwrap();
+    let destination = restored_home.path().join("destination Grok home");
+    let restore = command_with_env(restored_home.path(), restored_project.path())
+        .env("GROK_HOME", &destination)
+        .args(restore_agents_args(&archive, "grok"))
+        .output()
+        .unwrap();
+    assert_success(&restore, "restore");
+
+    for (relative, body) in fixtures {
+        assert_eq!(
+            fs::read_to_string(destination.join(relative)).unwrap(),
+            body
+        );
+    }
+    assert_eq!(
+        fs::read_to_string(restored_project.path().join(".grok/config.toml")).unwrap(),
+        project_config,
+        "a project-scoped Grok config stays under the project"
+    );
+    assert!(!restored_home.path().join(".grok").exists());
+    assert!(!destination.join("skills/stale").exists());
+}
+
+#[test]
+fn kiro_cli_assets_follow_kiro_home_on_backup_and_restore() {
+    let _guard = cli_test_lock();
+    let home = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    let kiro_home = home.path().join("active Kiro home");
+    let fixtures = [
+        ("settings/mcp.json", r#"{"mcpServers":{}}"#),
+        ("agents/example.json", r#"{"name":"example"}"#),
+    ];
+    for (relative, body) in fixtures {
+        let path = kiro_home.join(relative);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, body).unwrap();
+    }
+    let inactive_agent = home.path().join(".kiro/agents/stale.json");
+    fs::create_dir_all(inactive_agent.parent().unwrap()).unwrap();
+    fs::write(inactive_agent, r#"{"name":"stale"}"#).unwrap();
+
+    let archive = project.path().join("kiro-home.tar.gz");
+    let backup = command_with_env(home.path(), project.path())
+        .env("KIRO_HOME", &kiro_home)
+        .args(backup_agents_args(&archive, "kiro-cli"))
+        .output()
+        .unwrap();
+    assert_success(&backup, "backup");
+
+    let restored_home = tempfile::tempdir().unwrap();
+    let destination = restored_home.path().join("destination Kiro home");
+    let restore = command_with_env(restored_home.path(), project.path())
+        .env("KIRO_HOME", &destination)
+        .args(restore_agents_args(&archive, "kiro-cli"))
+        .output()
+        .unwrap();
+    assert_success(&restore, "restore");
+
+    for (relative, body) in fixtures {
+        assert_eq!(
+            fs::read_to_string(destination.join(relative)).unwrap(),
+            body
+        );
+    }
+    assert!(!restored_home.path().join(".kiro").exists());
+    assert!(!destination.join("agents/stale.json").exists());
+}
+
+/// Devin reads its user config from `%APPDATA%\devin` on Windows
+/// (<https://docs.devin.ai/cli/reference/configuration/global-vs-local>), where
+/// `install-mcp`, `install-hooks` and `install-skills` write it.
+#[cfg(windows)]
+#[test]
+fn devin_assets_follow_appdata_on_windows_backup_and_restore() {
+    let _guard = cli_test_lock();
+    let home = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    // `command_with_env` points APPDATA at home/AppData/Roaming.
+    let devin = home.path().join("AppData/Roaming/devin");
+    let fixtures = [
+        ("config.json", r#"{"hooks":{}}"#),
+        ("mcp_config.json", r#"{"mcpServers":{}}"#),
+        ("skills/example/SKILL.md", "# Example Devin skill"),
+    ];
+    for (relative, body) in fixtures {
+        let path = devin.join(relative);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, body).unwrap();
+    }
+    let inactive_skill = home.path().join(".config/devin/skills/stale/SKILL.md");
+    fs::create_dir_all(inactive_skill.parent().unwrap()).unwrap();
+    fs::write(inactive_skill, "# Stale skill").unwrap();
+
+    let archive = project.path().join("devin-appdata.tar.gz");
+    let backup = command_with_env(home.path(), project.path())
+        .args(backup_agents_args(&archive, "devin"))
+        .output()
+        .unwrap();
+    assert_success(&backup, "backup");
+
+    let restored_home = tempfile::tempdir().unwrap();
+    let restored_project = tempfile::tempdir().unwrap();
+    let restore = command_with_env(restored_home.path(), restored_project.path())
+        .args(restore_agents_args(&archive, "devin"))
+        .output()
+        .unwrap();
+    assert_success(&restore, "restore");
+
+    let destination = restored_home.path().join("AppData/Roaming/devin");
+    for (relative, body) in fixtures {
+        assert_eq!(
+            fs::read_to_string(destination.join(relative)).unwrap(),
+            body
+        );
+    }
+    assert!(!restored_home.path().join(".config/devin").exists());
+    assert!(!destination.join("skills/stale").exists());
+}
+
+/// Gemini CLI reads project skills from `.gemini/skills` inside the repository,
+/// alongside the user-level `~/.gemini/skills` the installer writes.
+#[test]
+fn gemini_project_skills_round_trip_through_backup_and_restore() {
+    let _guard = cli_test_lock();
+    let home = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    let skill = ".gemini/skills/example/SKILL.md";
+    let body = "# Example Gemini project skill";
+    let source = project.path().join(skill);
+    fs::create_dir_all(source.parent().unwrap()).unwrap();
+    fs::write(&source, body).unwrap();
+
+    let archive = project.path().join("gemini-project.tar.gz");
+    let backup = command_with_env(home.path(), project.path())
+        .args(backup_agents_args(&archive, "gemini"))
+        .output()
+        .unwrap();
+    assert_success(&backup, "backup");
+
+    let restored_home = tempfile::tempdir().unwrap();
+    let restored_project = tempfile::tempdir().unwrap();
+    let restore = command_with_env(restored_home.path(), restored_project.path())
+        .args(restore_agents_args(&archive, "gemini"))
+        .output()
+        .unwrap();
+    assert_success(&restore, "restore");
+    assert_eq!(
+        fs::read_to_string(restored_project.path().join(skill)).unwrap(),
+        body
+    );
+    assert!(!restored_home.path().join(".gemini").exists());
+}
+
+/// Gemini CLI keeps global plugins under `~/.gemini/plugins`, the second plugin
+/// root the documented matrix lists in the Antigravity/Gemini row.
+#[test]
+fn gemini_global_plugins_round_trip_through_backup_and_restore() {
+    let _guard = cli_test_lock();
+    let home = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    let plugin = ".gemini/plugins/example/index.js";
+    let body = "export default { name: \"example\" };\n";
+    let source = home.path().join(plugin);
+    fs::create_dir_all(source.parent().unwrap()).unwrap();
+    fs::write(&source, body).unwrap();
+
+    let archive = project.path().join("gemini-plugins.tar.gz");
+    let backup = command_with_env(home.path(), project.path())
+        .args(backup_agents_args(&archive, "gemini"))
+        .output()
+        .unwrap();
+    assert_success(&backup, "backup");
+
+    let restored_home = tempfile::tempdir().unwrap();
+    let restore = command_with_env(restored_home.path(), project.path())
+        .args(restore_agents_args(&archive, "gemini"))
+        .output()
+        .unwrap();
+    assert_success(&restore, "restore");
+    assert_eq!(
+        fs::read_to_string(restored_home.path().join(plugin)).unwrap(),
+        body
+    );
+}
+
 /// Copilot CLI reads personal skills from `$COPILOT_HOME/skills` (default
 /// `~/.copilot/skills`) and repository skills from `.github/skills`, the
 /// roots `install-skills --agent copilot-cli` writes:
@@ -605,6 +867,49 @@ fn copilot_cli_skills_follow_copilot_home_on_backup_and_restore() {
     assert!(
         !restored_copilot_home.join("skills/ignored").exists(),
         "the default root is not collected while COPILOT_HOME points elsewhere"
+    );
+}
+
+#[test]
+fn opencode_global_skills_round_trip_through_backup_and_restore() {
+    let _guard = cli_test_lock();
+    let home = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    let config = r#"{"$schema":"https://opencode.ai/config.json"}"#;
+    let skill = "# Example OpenCode skill";
+    for (path, body) in [
+        (home.path().join(".config/opencode/opencode.json"), config),
+        (
+            home.path().join(".config/opencode/skills/example/SKILL.md"),
+            skill,
+        ),
+    ] {
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, body).unwrap();
+    }
+
+    let archive = project.path().join("opencode.tar.gz");
+    let backup = command_with_env(home.path(), project.path())
+        .args(backup_agents_args(&archive, "opencode"))
+        .output()
+        .unwrap();
+    assert_success(&backup, "backup");
+
+    let restored_home = tempfile::tempdir().unwrap();
+    let restore = command_with_env(restored_home.path(), project.path())
+        .args(restore_agents_args(&archive, "opencode"))
+        .output()
+        .unwrap();
+    assert_success(&restore, "restore");
+
+    let restored_root = restored_home.path().join(".config/opencode");
+    assert_eq!(
+        fs::read_to_string(restored_root.join("skills/example/SKILL.md")).unwrap(),
+        skill
+    );
+    assert_eq!(
+        fs::read_to_string(restored_root.join("opencode.json")).unwrap(),
+        config
     );
 }
 
@@ -1681,6 +1986,91 @@ fn restore_agents_rejects_a_symlinked_destination_parent() {
     }
 }
 
+/// A relocated Grok or Kiro home is the base the symlink check starts from:
+/// a symlinked directory inside `GROK_HOME` or `KIRO_HOME` still refuses the
+/// restore, and nothing reaches the directory it points to.
+#[cfg(unix)]
+#[test]
+fn restore_agents_rejects_a_symlinked_parent_inside_a_relocated_home() {
+    use std::os::unix::fs::symlink;
+
+    let _guard = cli_test_lock();
+    for (agent, variable, dir, linked, below) in [
+        ("grok", "GROK_HOME", ".grok", "skills", "demo/SKILL.md"),
+        ("kiro-cli", "KIRO_HOME", ".kiro", "agents", "demo.json"),
+    ] {
+        let source_home = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let asset = source_home.path().join(dir).join(linked).join(below);
+        fs::create_dir_all(asset.parent().unwrap()).unwrap();
+        fs::write(&asset, "{}").unwrap();
+        let archive = project.path().join("backup.tar.gz");
+        let backup = command_with_env(source_home.path(), project.path())
+            .args(backup_agents_args(&archive, agent))
+            .output()
+            .unwrap();
+        assert_success(&backup, "backup");
+
+        let restore_home = tempfile::tempdir().unwrap();
+        let relocated = restore_home.path().join("relocated home");
+        let outside = tempfile::tempdir().unwrap();
+        fs::create_dir_all(&relocated).unwrap();
+        symlink(outside.path(), relocated.join(linked)).unwrap();
+        let restore = command_with_env(restore_home.path(), project.path())
+            .env(variable, &relocated)
+            .args(restore_agents_args(&archive, agent))
+            .output()
+            .unwrap();
+
+        assert!(!restore.status.success());
+        assert!(String::from_utf8_lossy(&restore.stderr).contains("symlinked path"));
+        assert!(!outside.path().join(below).exists());
+    }
+}
+
+/// On Windows the restore's symlink check starts from `%APPDATA%\devin`, so a
+/// symlinked directory inside it must still refuse the restore.
+#[cfg(windows)]
+#[test]
+fn restore_agents_rejects_a_symlinked_parent_inside_the_windows_devin_root() {
+    let _guard = cli_test_lock();
+    let source_home = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    let asset = source_home
+        .path()
+        .join("AppData/Roaming/devin/skills/demo/SKILL.md");
+    fs::create_dir_all(asset.parent().unwrap()).unwrap();
+    fs::write(&asset, "# Devin skill").unwrap();
+    let archive = project.path().join("backup.tar.gz");
+    let backup = command_with_env(source_home.path(), project.path())
+        .args(backup_agents_args(&archive, "devin"))
+        .output()
+        .unwrap();
+    assert_success(&backup, "backup");
+
+    let restore_home = tempfile::tempdir().unwrap();
+    let devin = restore_home.path().join("AppData/Roaming/devin");
+    let outside = tempfile::tempdir().unwrap();
+    fs::create_dir_all(&devin).unwrap();
+    match std::os::windows::fs::symlink_dir(outside.path(), devin.join("skills")) {
+        Ok(()) => {}
+        // ERROR_PRIVILEGE_NOT_HELD: Windows policy denies symlink creation.
+        Err(error) if error.raw_os_error() == Some(1314) => {
+            eprintln!("skipping symlink restore assertion: Windows privilege unavailable");
+            return;
+        }
+        Err(error) => panic!("failed to create test directory link: {error}"),
+    }
+    let restore = command_with_env(restore_home.path(), project.path())
+        .args(restore_agents_args(&archive, "devin"))
+        .output()
+        .unwrap();
+
+    assert!(!restore.status.success());
+    assert!(String::from_utf8_lossy(&restore.stderr).contains("symlinked path"));
+    assert!(!outside.path().join("demo/SKILL.md").exists());
+}
+
 #[test]
 fn restore_agents_rejects_oversized_entries_from_the_header() {
     let _guard = cli_test_lock();
@@ -2221,4 +2611,115 @@ fn backup_agents_include_secrets_and_malformed_config_fallback() {
         fs::read_to_string(restore_home.path().join(".codex/config.toml")).unwrap(),
         raw_codex
     );
+}
+
+/// The documented matrix and `discover_assets` drifted twice: OpenCode global
+/// skills (#2469) and Gemini CLI project skills (#2472) were listed in
+/// `docs/design-backup-agent-assets.md` but never collected. Every root the
+/// matrix names must survive a real `backup-agents` and `restore-agents`.
+#[test]
+fn every_documented_skill_root_survives_a_backup_and_restore() {
+    let _guard = cli_test_lock();
+    let home = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    let agents = "claude,codex,antigravity,gemini,qwen,qoder,opencode,devin,grok,kimi-code,kiro-cli,copilot-cli";
+
+    // Section "2. Target Matrix by Agent Harness", Skills column: the
+    // (scope, root, file name) every supported harness documents.
+    let documented = [
+        ("global", ".claude/skills", "SKILL.md"),
+        ("global", ".agents/skills", "SKILL.md"),
+        ("global", ".codex/skills", "SKILL.md"),
+        ("global", ".gemini/config/skills", "SKILL.md"),
+        ("global", ".gemini/antigravity-cli/skills", "SKILL.md"),
+        ("global", ".gemini/skills", "SKILL.md"),
+        ("global", ".qwen/skills", "SKILL.md"),
+        ("global", ".config/opencode/skills", "SKILL.md"),
+        ("global", ".config/devin/skills", "SKILL.md"),
+        ("global", ".grok/skills", "SKILL.md"),
+        ("global", ".kimi-code/skills", "SKILL.md"),
+        ("global", ".copilot/skills", "SKILL.md"),
+        ("global", ".kiro/agents", "example.json"),
+        ("project", ".claude/skills", "SKILL.md"),
+        ("project", ".agents/skills", "SKILL.md"),
+        ("project", ".gemini/skills", "SKILL.md"),
+        ("project", ".github/skills", "SKILL.md"),
+        ("project", ".devin/skills", "SKILL.md"),
+        ("project", ".grok/skills", "SKILL.md"),
+    ];
+
+    let body_for = |root: &str, file_name: &str| {
+        if file_name != "SKILL.md" {
+            return "{}".to_string();
+        }
+
+        format!("# parity {root}")
+    };
+    let asset_path = |base: &Path, root: &str, file_name: &str| {
+        // Devin's user config lives in %APPDATA%\devin on Windows, which
+        // `command_with_env` points at home/AppData/Roaming.
+        let root = if cfg!(windows) && root == ".config/devin/skills" {
+            "AppData/Roaming/devin/skills"
+        } else {
+            root
+        };
+        let dir = base.join(root);
+        if file_name != "SKILL.md" {
+            return dir.join(file_name);
+        }
+
+        dir.join("example").join(file_name)
+    };
+
+    for (scope, root, file_name) in documented {
+        let base = match scope {
+            "global" => home.path(),
+            _ => project.path(),
+        };
+        let path = asset_path(base, root, file_name);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, body_for(root, file_name)).unwrap();
+    }
+
+    let archive = project.path().join("documented-skills.tar.gz");
+    let backup = command_with_env(home.path(), project.path())
+        .args(backup_agents_args(&archive, agents))
+        .output()
+        .unwrap();
+    assert_success(&backup, "backup");
+
+    let restored_home = tempfile::tempdir().unwrap();
+    let restored_project = tempfile::tempdir().unwrap();
+    let restore = command_with_env(restored_home.path(), restored_project.path())
+        .args(restore_agents_args(&archive, agents))
+        .output()
+        .unwrap();
+    assert_success(&restore, "restore");
+
+    for (scope, root, file_name) in documented {
+        let base = match scope {
+            "global" => restored_home.path(),
+            _ => restored_project.path(),
+        };
+        let path = asset_path(base, root, file_name);
+        assert!(
+            path.exists(),
+            "documented root {root} ({scope}) did not survive the round trip"
+        );
+        assert_eq!(
+            fs::read(&path).unwrap(),
+            body_for(root, file_name).into_bytes(),
+            "documented root {root} ({scope}) did not survive the round trip"
+        );
+    }
+
+    // Keep the table above honest: every root tested here must still appear in
+    // the design doc, so a renamed or removed matrix entry surfaces here.
+    let doc = include_str!("../../../../docs/design-backup-agent-assets.md");
+    for (_, root, _) in documented {
+        assert!(
+            doc.contains(root),
+            "documented root {root} is missing from docs/design-backup-agent-assets.md"
+        );
+    }
 }

@@ -20,7 +20,9 @@ use tracing::info;
 
 use crate::cli::{AgentBackupScope, BackupAgentsArgs, McpClient};
 use crate::commands::backup::human_bytes;
-use crate::commands::path_util::{agent_config_home, claude_config_dir, home_dir};
+use crate::commands::path_util::{
+    agent_config_home, claude_config_dir, devin_user_config_dir_in, home_dir,
+};
 use crate::config::{Config, RuntimeEnv};
 
 const MAX_BACKUP_ASSET_BYTES: u64 = 128 * 1024 * 1024;
@@ -265,20 +267,16 @@ pub fn discover_assets(
     // Reuse the installer path so platform-specific Claude Desktop configs
     // are backed up and restored at the same location.
     if filter_agent(AgentKind::ClaudeDesktop) && want_global {
-        #[cfg(any(target_os = "macos", target_os = "windows"))]
-        {
-            let desktop_cfg =
-                crate::commands::install_mcp::mcp_config_path(McpClient::ClaudeDesktop)?;
-            push_if_file(
-                &mut assets,
-                AgentKind::ClaudeDesktop,
-                AgentAssetKind::McpConfig,
-                AgentAssetScope::Global,
-                desktop_cfg,
-                ".claude/claude_desktop_config.json",
-                "claude-desktop/claude_desktop_config.json",
-            );
-        }
+        let desktop_cfg = crate::commands::install_mcp::mcp_config_path(McpClient::ClaudeDesktop)?;
+        push_if_file(
+            &mut assets,
+            AgentKind::ClaudeDesktop,
+            AgentAssetKind::McpConfig,
+            AgentAssetScope::Global,
+            desktop_cfg,
+            ".claude/claude_desktop_config.json",
+            "claude-desktop/claude_desktop_config.json",
+        );
     }
 
     // 2. OpenAI Codex CLI
@@ -434,8 +432,11 @@ pub fn discover_assets(
 
     // 4. Gemini CLI
     if filter_agent(AgentKind::GeminiCli) {
-        let gemini_dir = home.join(".gemini");
         if want_global {
+            let gemini_dir = agent_config_home(env.var_os("GEMINI_CLI_HOME"))
+                .as_deref()
+                .unwrap_or(home)
+                .join(".gemini");
             push_if_file(
                 &mut assets,
                 AgentKind::GeminiCli,
@@ -454,6 +455,15 @@ pub fn discover_assets(
                 ".gemini/skills",
                 "gemini/skills",
             )?;
+            collect_dir_assets(
+                &mut assets,
+                AgentKind::GeminiCli,
+                AgentAssetKind::Plugin,
+                AgentAssetScope::Global,
+                &gemini_dir.join("plugins"),
+                ".gemini/plugins",
+                "gemini/plugins",
+            )?;
         }
         if want_project {
             push_if_file(
@@ -465,6 +475,15 @@ pub fn discover_assets(
                 "GEMINI.md",
                 "project/GEMINI.md",
             );
+            collect_dir_assets(
+                &mut assets,
+                AgentKind::GeminiCli,
+                AgentAssetKind::Skill,
+                AgentAssetScope::Project,
+                &cwd.join(".gemini").join("skills"),
+                ".gemini/skills",
+                "project/gemini/skills",
+            )?;
         }
     }
 
@@ -648,6 +667,15 @@ pub fn discover_assets(
                 ".config/opencode/plugins",
                 "opencode/plugins",
             )?;
+            collect_dir_assets(
+                &mut assets,
+                AgentKind::OpenCode,
+                AgentAssetKind::Skill,
+                AgentAssetScope::Global,
+                &opencode_dir.join("skills"),
+                ".config/opencode/skills",
+                "opencode/skills",
+            )?;
         }
         if want_project {
             push_if_file(
@@ -674,7 +702,10 @@ pub fn discover_assets(
     // 6. Devin
     if filter_agent(AgentKind::Devin) {
         if want_global {
-            let devin_dir = home.join(".config").join("devin");
+            // Devin reads its user config from %APPDATA%\devin on Windows, where
+            // the installers write it; `.config/devin/` stays the archive path.
+            let devin_dir = devin_user_config_dir_in(env.var_os("APPDATA"), None, cfg!(windows))
+                .unwrap_or_else(|| home.join(".config").join("devin"));
             push_if_file(
                 &mut assets,
                 AgentKind::Devin,
@@ -719,7 +750,8 @@ pub fn discover_assets(
     // 7. Grok
     if filter_agent(AgentKind::Grok) {
         if want_global {
-            let grok_dir = home.join(".grok");
+            let grok_dir =
+                agent_config_home(env.var_os("GROK_HOME")).unwrap_or_else(|| home.join(".grok"));
             push_if_file(
                 &mut assets,
                 AgentKind::Grok,
@@ -763,7 +795,8 @@ pub fn discover_assets(
 
     // 8. Kiro CLI
     if filter_agent(AgentKind::KiroCli) && want_global {
-        let kiro_dir = home.join(".kiro");
+        let kiro_dir =
+            agent_config_home(env.var_os("KIRO_HOME")).unwrap_or_else(|| home.join(".kiro"));
         push_if_file(
             &mut assets,
             AgentKind::KiroCli,

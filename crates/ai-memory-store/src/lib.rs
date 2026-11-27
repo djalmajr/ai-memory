@@ -96,8 +96,9 @@ pub use profile::{
     ProjectProfileFlags,
 };
 pub use project_authz::{
-    AccessMode, GrantLevel, ProjectAccess, ProjectAuthz, ProjectPrincipal,
-    RESTRICTED_PROJECT_FORBIDDEN, authorize_project, resolve_project_authz,
+    AccessMode, GLOBAL_SCOPE_WRITE_FORBIDDEN, GrantLevel, ProjectAccess, ProjectAuthz,
+    ProjectPrincipal, RESTRICTED_PROJECT_FORBIDDEN, ScopeCaller, authorize_project,
+    resolve_project_authz,
 };
 pub use query_signals::{
     QUERY_SIGNAL_COUNT_CAP, QUERY_SIGNAL_TEXT_MAX_CHARS, QuerySignalRow, normalize_query,
@@ -138,10 +139,13 @@ pub use retrieval_tuning::{RetrievalTuning, is_session_recall_query};
 pub use scope::{
     PRIVATE_PROFILE_NEEDS_USER, ResolvedScope, ResolvedWriteScope, ScopeName, ScopeResolutionError,
     ScopeResolver, ScopeSource, WORKSPACE_PROJECT_PAIR_REQUIRED, authorize_scope_for,
-    create_explicit_scope, create_explicit_scope_guarded, create_global_scope,
-    create_profile_scope, lookup_existing_scope, lookup_existing_scope_guarded,
-    lookup_existing_workspace, lookup_global_scope, lookup_profile_scope,
-    lookup_project_id_guarded, resolve_many_existing_scopes, resolve_many_existing_scopes_guarded,
+    authorize_scope_for_caller, create_explicit_scope, create_explicit_scope_guarded,
+    create_explicit_scope_guarded_for_caller, create_global_scope, create_profile_scope,
+    create_profile_scope_for_caller, lookup_existing_scope, lookup_existing_scope_guarded,
+    lookup_existing_scope_guarded_for_caller, lookup_existing_workspace, lookup_global_scope,
+    lookup_profile_scope, lookup_project_id_guarded, lookup_project_id_guarded_for_caller,
+    resolve_many_existing_scopes, resolve_many_existing_scopes_guarded,
+    resolve_many_existing_scopes_guarded_for_caller,
 };
 pub use session_consolidation::{
     SESSION_CONSOLIDATION_MAX_ATTEMPTS, SessionConsolidationJob, TRANSPORT_RECOVERY_MAX_ATTEMPTS,
@@ -4202,11 +4206,40 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(pending, IngestObservationOutcome::ResumePending);
+        assert!(
+            !store
+                .reader
+                .ordinary_ingest_key_completed(
+                    ws,
+                    proj_a,
+                    session_a,
+                    AgentKind::ClaudeCode,
+                    &OwnerFilter::Unattributed,
+                    "entry-1",
+                )
+                .await
+                .unwrap(),
+            "an incomplete key must stay on the full replay path"
+        );
         store
             .writer
             .complete_observation_ingest(proj_a, "entry-1".into())
             .await
             .unwrap();
+        assert!(
+            store
+                .reader
+                .ordinary_ingest_key_completed(
+                    ws,
+                    proj_a,
+                    session_a,
+                    AgentKind::ClaudeCode,
+                    &OwnerFilter::Unattributed,
+                    "entry-1",
+                )
+                .await
+                .unwrap()
+        );
         let complete = store
             .writer
             .insert_observation_ingest(
@@ -4245,6 +4278,21 @@ mod tests {
         )
         .unwrap();
         drop(conn);
+        assert!(
+            !store
+                .reader
+                .ordinary_ingest_key_completed(
+                    ws,
+                    proj_a,
+                    session_a,
+                    AgentKind::ClaudeCode,
+                    &OwnerFilter::Unattributed,
+                    "entry-1",
+                )
+                .await
+                .unwrap(),
+            "an expired ordinary key must fall through to be swept and inserted"
+        );
         let reused = store
             .writer
             .insert_observation_ingest(
@@ -4273,6 +4321,21 @@ mod tests {
             .complete_observation_ingest(proj_a, recovery_key.clone())
             .await
             .unwrap();
+        assert!(
+            !store
+                .reader
+                .ordinary_ingest_key_completed(
+                    ws,
+                    proj_a,
+                    session_a,
+                    AgentKind::ClaudeCode,
+                    &OwnerFilter::Unattributed,
+                    &recovery_key,
+                )
+                .await
+                .unwrap(),
+            "a recovery key still has to compare event identity"
+        );
         let conn = Connection::open(store.db_path()).unwrap();
         conn.execute(
             "UPDATE ingest_keys SET seen_at = 1 WHERE project_id = ?1 AND key = ?2",
@@ -4626,6 +4689,360 @@ mod tests {
                 .unwrap(),
             SessionEndDisposition::AlreadyEnded,
             "stamping the new generation must make the re-end converge"
+        );
+    }
+
+    #[tokio::test]
+    async fn empty_resume_after_end_stays_already_ended_and_preserves_consolidation_generation() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let ws = store
+            .writer
+            .get_or_create_workspace("default")
+            .await
+            .unwrap();
+        let proj = store
+            .writer
+            .get_or_create_project(ws, "ai-memory", None)
+            .await
+            .unwrap();
+        let session_id = SessionId::new();
+        store
+            .writer
+            .begin_session(NewSession {
+                occurred_at: None,
+                id: session_id,
+                workspace_id: ws,
+                project_id: proj,
+                agent_kind: AgentKind::ClaudeCode,
+                cwd: None,
+                actor_user: None,
+                origin: None,
+            })
+            .await
+            .unwrap();
+        for (kind, title) in [
+            (ObservationKind::SessionStart, "start"),
+            (ObservationKind::UserPrompt, "initial work"),
+            (ObservationKind::SessionEnd, "end"),
+        ] {
+            store
+                .writer
+                .insert_observation(Sanitized::new(
+                    NewObservation {
+                        occurred_at: None,
+                        session_id,
+                        workspace_id: ws,
+                        project_id: proj,
+                        kind,
+                        extension: None,
+                        source_event: None,
+                        title: title.into(),
+                        body: String::new(),
+                        importance: 5,
+                        file_path: None,
+                        trust_class: None,
+                    },
+                    &Sanitizer::builtin(),
+                ))
+                .await
+                .unwrap();
+        }
+        store.writer.end_session(session_id, None).await.unwrap();
+        assert!(
+            store
+                .writer
+                .enqueue_session_consolidation(ws, proj, session_id)
+                .await
+                .unwrap(),
+            "first end enqueues generation 3"
+        );
+
+        // Empty resume appends only SessionStart (no prompt or tool call).
+        store
+            .writer
+            .insert_observation(Sanitized::new(
+                NewObservation {
+                    occurred_at: None,
+                    session_id,
+                    workspace_id: ws,
+                    project_id: proj,
+                    kind: ObservationKind::SessionStart,
+                    extension: None,
+                    source_event: None,
+                    title: "resume".into(),
+                    body: String::new(),
+                    importance: 5,
+                    file_path: None,
+                    trust_class: None,
+                },
+                &Sanitizer::builtin(),
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            store
+                .reader
+                .session_end_disposition(session_id, ws, proj, AgentKind::ClaudeCode)
+                .await
+                .unwrap(),
+            SessionEndDisposition::AlreadyEnded,
+            "a lifecycle-only resume must not classify as ReEndWithNewWork (#2504)"
+        );
+        assert!(
+            !store
+                .writer
+                .enqueue_session_consolidation(ws, proj, session_id)
+                .await
+                .unwrap(),
+            "AlreadyEnded recovery after an empty resume must not enqueue a duplicate job"
+        );
+        let conn = Connection::open(store.db_path()).unwrap();
+        let jobs: Vec<(u64, String)> = {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT generation, state FROM session_consolidation_jobs \
+                     WHERE session_id = ?1 ORDER BY generation ASC",
+                )
+                .unwrap();
+            stmt.query_map(params![session_id.as_bytes()], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap()
+        };
+        assert_eq!(
+            jobs,
+            vec![(3, "pending".to_string())],
+            "existing pending job must remain pending and not be superseded by SessionStart"
+        );
+
+        // Crash-recovery control: if no job existed for the ended generation,
+        // recovery enqueues generation = ended_observation_count (3), not live count (4).
+        conn.execute(
+            "DELETE FROM session_consolidation_jobs WHERE session_id = ?1",
+            params![session_id.as_bytes()],
+        )
+        .unwrap();
+        assert!(
+            store
+                .writer
+                .enqueue_session_consolidation(ws, proj, session_id)
+                .await
+                .unwrap(),
+            "crash recovery must still enqueue when the ended generation has no job"
+        );
+        let recovered_gen: u64 = conn
+            .query_row(
+                "SELECT generation FROM session_consolidation_jobs WHERE session_id = ?1",
+                params![session_id.as_bytes()],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            recovered_gen, 3,
+            "recovered job must use ended_observation_count, not live COUNT(*)"
+        );
+
+        // Later substantive work triggers ReEndWithNewWork and a new generation.
+        store
+            .writer
+            .insert_observation(Sanitized::new(
+                NewObservation {
+                    occurred_at: None,
+                    session_id,
+                    workspace_id: ws,
+                    project_id: proj,
+                    kind: ObservationKind::UserPrompt,
+                    extension: None,
+                    source_event: None,
+                    title: "follow-up".into(),
+                    body: "real work".into(),
+                    importance: 8,
+                    file_path: None,
+                    trust_class: None,
+                },
+                &Sanitizer::builtin(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            store
+                .reader
+                .session_end_disposition(session_id, ws, proj, AgentKind::ClaudeCode)
+                .await
+                .unwrap(),
+            SessionEndDisposition::ReEndWithNewWork
+        );
+        store.writer.end_session(session_id, None).await.unwrap();
+        assert!(
+            store
+                .writer
+                .enqueue_session_consolidation(ws, proj, session_id)
+                .await
+                .unwrap(),
+            "re-end with substantive work must enqueue the new generation"
+        );
+        let max_gen: u64 = conn
+            .query_row(
+                "SELECT MAX(generation) FROM session_consolidation_jobs WHERE session_id = ?1",
+                params![session_id.as_bytes()],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(max_gen, 5);
+    }
+
+    #[tokio::test]
+    async fn post_prune_empty_resume_stays_already_ended_while_new_work_re_ends() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let ws = store
+            .writer
+            .get_or_create_workspace("default")
+            .await
+            .unwrap();
+        let proj = store
+            .writer
+            .get_or_create_project(ws, "ai-memory", None)
+            .await
+            .unwrap();
+        let session_id = SessionId::new();
+        store
+            .writer
+            .begin_session(NewSession {
+                occurred_at: None,
+                id: session_id,
+                workspace_id: ws,
+                project_id: proj,
+                agent_kind: AgentKind::ClaudeCode,
+                cwd: None,
+                actor_user: None,
+                origin: None,
+            })
+            .await
+            .unwrap();
+        let old_ts = jiff::Timestamp::from_second(1_700_000_000).unwrap();
+        let recent_ts = jiff::Timestamp::from_second(1_750_000_000).unwrap();
+        for (kind, title, ts) in [
+            (ObservationKind::SessionStart, "start", old_ts),
+            (ObservationKind::UserPrompt, "old prompt", old_ts),
+            (ObservationKind::PostToolUse, "Edit", recent_ts),
+            (ObservationKind::SessionEnd, "end", recent_ts),
+        ] {
+            store
+                .writer
+                .insert_observation(Sanitized::new(
+                    NewObservation {
+                        occurred_at: Some(ts.as_microsecond()),
+                        session_id,
+                        workspace_id: ws,
+                        project_id: proj,
+                        kind,
+                        extension: None,
+                        source_event: None,
+                        title: title.into(),
+                        body: String::new(),
+                        importance: 5,
+                        file_path: None,
+                        trust_class: None,
+                    },
+                    &Sanitizer::builtin(),
+                ))
+                .await
+                .unwrap();
+        }
+        // Record a session page and link it via end_session so observation
+        // pruning considers the session eligible.
+        let page_id = store
+            .writer
+            .upsert_page(sample_page(
+                ws,
+                proj,
+                &format!("sessions/{session_id}.md"),
+                "Consolidated",
+            ))
+            .await
+            .unwrap();
+        store
+            .writer
+            .end_session(session_id, Some(page_id))
+            .await
+            .unwrap();
+
+        let cutoff_us = jiff::Timestamp::from_second(1_725_000_000)
+            .unwrap()
+            .as_microsecond();
+        let mut conn = Connection::open(store.db_path()).unwrap();
+        let outcome =
+            ops::prune_consolidated_observations(&mut conn, ws, proj, cutoff_us, 100).unwrap();
+        assert_eq!(outcome.deleted, 2, "prunes the two old observations");
+        assert_eq!(outcome.sessions_resynced, 1);
+
+        // Empty resume after pruning must still classify as AlreadyEnded.
+        store
+            .writer
+            .insert_observation(Sanitized::new(
+                NewObservation {
+                    occurred_at: None,
+                    session_id,
+                    workspace_id: ws,
+                    project_id: proj,
+                    kind: ObservationKind::SessionStart,
+                    extension: None,
+                    source_event: None,
+                    title: "empty resume".into(),
+                    body: String::new(),
+                    importance: 5,
+                    file_path: None,
+                    trust_class: None,
+                },
+                &Sanitizer::builtin(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            store
+                .reader
+                .session_end_disposition(session_id, ws, proj, AgentKind::ClaudeCode)
+                .await
+                .unwrap(),
+            SessionEndDisposition::AlreadyEnded,
+            "post-prune empty resume must stay AlreadyEnded"
+        );
+
+        // New substantive prompt after pruning must still trigger ReEndWithNewWork.
+        store
+            .writer
+            .insert_observation(Sanitized::new(
+                NewObservation {
+                    occurred_at: None,
+                    session_id,
+                    workspace_id: ws,
+                    project_id: proj,
+                    kind: ObservationKind::UserPrompt,
+                    extension: None,
+                    source_event: None,
+                    title: "new prompt after prune".into(),
+                    body: "real work".into(),
+                    importance: 8,
+                    file_path: None,
+                    trust_class: None,
+                },
+                &Sanitizer::builtin(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            store
+                .reader
+                .session_end_disposition(session_id, ws, proj, AgentKind::ClaudeCode)
+                .await
+                .unwrap(),
+            SessionEndDisposition::ReEndWithNewWork,
+            "post-prune substantive work must trigger ReEndWithNewWork"
         );
     }
 

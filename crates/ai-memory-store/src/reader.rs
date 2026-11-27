@@ -6739,6 +6739,95 @@ impl ReaderPool {
         .await
     }
 
+    /// Whether an ordinary ingest key in this project is already complete and
+    /// unexpired for the given live, unpurged session, owner, and agent.
+    ///
+    /// A replay can acknowledge that delivery without scrubbing its body again
+    /// only when the full admission invariants also hold:
+    /// - The key is an ordinary key (`recovery_retained = 0`), is marked
+    ///   complete (`completed_at IS NOT NULL`), and has not aged past the
+    ///   30-day [`crate::ops::INGEST_KEY_TTL_MICROS`] sweep window.
+    /// - The target session row exists, is not recorded in `purged_sessions`
+    ///   for `(session_id, workspace_id, project_id)`, has a valid owner
+    ///   admitted by `owner_filter`, and matches `agent_kind`.
+    ///
+    /// In any other case this returns `false` so the request falls through to
+    /// the full `admit_hook_session_event` path (which sweeps expired keys,
+    /// rejects collisions/mismatches/purged sessions, or handles recovery keys).
+    ///
+    /// # Errors
+    /// Propagates any SQL or pool error.
+    pub async fn ordinary_ingest_key_completed(
+        &self,
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+        session_id: SessionId,
+        agent_kind: AgentKind,
+        owner_filter: &OwnerFilter,
+        ingest_key: &str,
+    ) -> StoreResult<bool> {
+        if crate::ops::recovery_ingest_key(ingest_key) {
+            return Ok(false);
+        }
+        let key = ingest_key.to_owned();
+        let owner_filter = owner_filter.clone();
+        let cutoff = Timestamp::now().as_microsecond() - crate::ops::INGEST_KEY_TTL_MICROS;
+        self.with_conn(move |conn| {
+            let completed: bool = conn.query_row(
+                "SELECT EXISTS( \
+                     SELECT 1 FROM ingest_keys \
+                     WHERE project_id = ?1 \
+                       AND key = ?2 \
+                       AND recovery_retained = 0 \
+                       AND completed_at IS NOT NULL \
+                       AND seen_at >= ?3 \
+                 )",
+                params![project_id.as_bytes(), key, cutoff],
+                |row| row.get::<_, i64>(0),
+            )? == 1;
+            if !completed {
+                return Ok(false);
+            }
+            let purged: bool = conn.query_row(
+                "SELECT EXISTS( \
+                     SELECT 1 FROM purged_sessions \
+                     WHERE session_id = ?1 AND workspace_id = ?2 AND project_id = ?3 \
+                 )",
+                params![
+                    session_id.as_bytes(),
+                    workspace_id.as_bytes(),
+                    project_id.as_bytes(),
+                ],
+                |row| row.get::<_, i64>(0),
+            )? == 1;
+            if purged {
+                return Ok(false);
+            }
+            let existing: Option<(String, Option<String>)> = conn
+                .query_row(
+                    "SELECT agent_kind, actor_user FROM sessions WHERE id = ?1",
+                    params![session_id.as_bytes()],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .optional()?;
+            let Some((agent, owner)) = existing else {
+                return Ok(false);
+            };
+            if owner
+                .as_deref()
+                .is_some_and(|value| IdentityKey::from_storage_key(value).is_none())
+                || !owner_filter.admits(owner.as_deref())
+            {
+                return Ok(false);
+            }
+            if agent != agent_kind.as_str() {
+                return Ok(false);
+            }
+            Ok(true)
+        })
+        .await
+    }
+
     /// Scopes other than `(workspace_id, project_id)` that hold a LATEST
     /// `sessions/<session_id>.md` page row. These are the scopes a re-home
     /// (`move-session` of a session already rooted in the destination)
@@ -6927,12 +7016,11 @@ impl ReaderPool {
             if ended_at.is_none() {
                 return Ok(SessionEndDisposition::Open);
             }
-            let current_observation_count: u64 = conn.query_row(
-                "SELECT COUNT(*) FROM observations WHERE session_id = ?1",
-                params![session_id.as_bytes()],
-                |row| row.get(0),
-            )?;
-            if current_observation_count > ended_observation_count {
+            if session_has_substantive_work_after_watermark(
+                conn,
+                session_id,
+                ended_observation_count,
+            )? {
                 Ok(SessionEndDisposition::ReEndWithNewWork)
             } else {
                 Ok(SessionEndDisposition::AlreadyEnded)
@@ -7788,7 +7876,7 @@ impl ReaderPool {
         self.with_conn(move |conn| {
             let mut stmt = conn.prepare(
                 "SELECT id, path, tier, pinned, updated_at, access_count, last_accessed_at, \
-                        frontmatter_json, expires_at, salience, compacted_at \
+                        frontmatter_json, expires_at, salience, compacted_at, title \
                  FROM pages \
                  WHERE workspace_id = ?1 AND project_id = ?2 AND is_latest = 1",
             )?;
@@ -12351,7 +12439,8 @@ impl ReaderPool {
         &self,
         viewer: Option<UserId>,
     ) -> StoreResult<Vec<ProjectSummary>> {
-        self.list_projects_with_stats_filtered(None, viewer).await
+        self.list_projects_with_stats_filtered(None, None, viewer)
+            .await
     }
 
     /// Return one row per project within one workspace.
@@ -12366,13 +12455,36 @@ impl ReaderPool {
         workspace: String,
         viewer: Option<UserId>,
     ) -> StoreResult<Vec<ProjectSummary>> {
-        self.list_projects_with_stats_filtered(Some(workspace), viewer)
+        self.list_projects_with_stats_filtered(Some(workspace), None, viewer)
             .await
+    }
+
+    /// Return the summary for an exact workspace and project name pair.
+    ///
+    /// The counts and viewer filter match [`Self::list_projects_with_stats`].
+    ///
+    /// # Errors
+    /// Propagates any SQL or pool error.
+    pub async fn project_stats_by_name(
+        &self,
+        workspace: &str,
+        project: &str,
+        viewer: Option<UserId>,
+    ) -> StoreResult<Option<ProjectSummary>> {
+        let mut rows = self
+            .list_projects_with_stats_filtered(
+                Some(workspace.to_owned()),
+                Some(project.to_owned()),
+                viewer,
+            )
+            .await?;
+        Ok(rows.pop())
     }
 
     async fn list_projects_with_stats_filtered(
         &self,
         workspace: Option<String>,
+        project: Option<String>,
         viewer: Option<UserId>,
     ) -> StoreResult<Vec<ProjectSummary>> {
         self.with_conn(move |conn| {
@@ -12381,6 +12493,13 @@ impl ReaderPool {
             // project row, not only on the pages counted beside it.
             let visible = readable_repository_predicate("p.id", viewer);
             let ttl = not_expired("pg", "?2");
+            // Equality predicates let SQLite seek the unique project before
+            // it runs the aggregates, including on each dashboard refresh.
+            let scope = if project.is_some() {
+                "w.name = ?1 AND p.name = ?3"
+            } else {
+                "(?1 IS NULL OR w.name = ?1)"
+            };
             // A known observation need not be the newest activity. Aggregate
             // the three values so missing sources stay null, without a zero
             // fallback that would overtake a pre-epoch timestamp.
@@ -12401,12 +12520,16 @@ impl ReaderPool {
                  FROM workspaces w \
                  JOIN projects p ON p.workspace_id = w.id \
                  LEFT JOIN pages pg ON pg.workspace_id = w.id AND pg.project_id = p.id AND pg.is_latest = 1{ttl} \
-                 WHERE (?1 IS NULL OR w.name = ?1){visible} \
+                 WHERE {scope}{visible} \
                  GROUP BY w.id, p.id \
                  ORDER BY last_activity DESC NULLS LAST"
             ))?;
             let now = now_us();
-            let rows = stmt.query_map(params![workspace, now], |row| {
+            let mut bound: Vec<&dyn rusqlite::ToSql> = vec![&workspace, &now];
+            if let Some(project) = &project {
+                bound.push(project);
+            }
+            let rows = stmt.query_map(params_from_iter(bound), |row| {
                 let workspace_id: Vec<u8> = row.get(0)?;
                 let workspace_name: String = row.get(1)?;
                 let project_id: Vec<u8> = row.get(2)?;
@@ -15983,9 +16106,11 @@ pub struct SessionObservationSnapshot<'c> {
 }
 
 /// Counts and "last of a kind" markers for one session, from one aggregate
-/// pass. A `*_at` field is the newest `created_at` of that kind (microseconds
-/// since the epoch), which is enough to seek straight to the row with an
-/// indexed `created_at <= ?` range instead of walking the session.
+/// pass. Most `*_at` fields are the newest `created_at` of that kind
+/// (microseconds since the epoch), which is enough to seek straight to the row
+/// with an indexed `created_at <= ?` range instead of walking the session;
+/// `first_session_start_at` is the earliest `session-start` so compactions and
+/// resumes do not shift a session's start time forward.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SessionKindSummary {
     /// Every row of the session.
@@ -15995,8 +16120,8 @@ pub struct SessionKindSummary {
     /// At least one prompt or tool use: the positive "real work" predicate
     /// [`SUBSTANTIVE_OBSERVATION_KIND_SQL`] also gives the writer.
     pub substantive: bool,
-    /// Newest `session-start`.
-    pub last_session_start_at: Option<i64>,
+    /// Earliest `session-start`.
+    pub first_session_start_at: Option<i64>,
     /// Newest `session-end`.
     pub last_session_end_at: Option<i64>,
     /// Newest `stop`.
@@ -16095,6 +16220,44 @@ pub const SESSION_LINE_TITLE_CHARS: usize = 80;
 pub const SUBSTANTIVE_OBSERVATION_KIND_SQL: &str =
     "kind IN ('user-prompt', 'pre-tool-use', 'post-tool-use')";
 
+/// Whether `session_id` has recorded any substantive observation (user prompt
+/// or tool call) *after* the first `ended_observation_count` rows in insertion
+/// (`rowid ASC`) order.
+///
+/// Both [`ReaderPool::session_end_disposition`] and
+/// [`crate::ops::admit_hook_session`] share this predicate so an empty resume
+/// (`SessionStart` + `SessionEnd` with no prompt or tool call) stays
+/// `AlreadyEnded` instead of rewriting the session page, refreshing the
+/// auto-handoff, and enqueueing another LLM consolidation pass (#2504).
+/// Ordering by `rowid ASC` stays aligned after observation pruning lowers
+/// `ended_observation_count` to the surviving row count.
+pub(crate) fn session_has_substantive_work_after_watermark(
+    conn: &Connection,
+    session_id: SessionId,
+    ended_observation_count: u64,
+) -> StoreResult<bool> {
+    let sql = format!(
+        "SELECT EXISTS ( \
+             SELECT 1 FROM ( \
+                 SELECT kind FROM observations \
+                 WHERE session_id = ?1 \
+                 ORDER BY rowid ASC \
+                 LIMIT -1 OFFSET ?2 \
+             ) \
+             WHERE {SUBSTANTIVE_OBSERVATION_KIND_SQL} \
+         )"
+    );
+    let has_work: i64 = conn.query_row(
+        &sql,
+        params![
+            session_id.as_bytes(),
+            i64::try_from(ended_observation_count).unwrap_or(i64::MAX),
+        ],
+        |row| row.get(0),
+    )?;
+    Ok(has_work != 0)
+}
+
 impl SessionObservationSnapshot<'_> {
     /// Rows this snapshot has deserialized into an [`Observation`] or a
     /// [`SessionLine`] so far. Aggregates and the prompt-title queries (the
@@ -16115,7 +16278,7 @@ impl SessionObservationSnapshot<'_> {
             "SELECT COUNT(*), \
                     COALESCE(SUM(kind = ?2), 0), \
                     COALESCE(MAX({SUBSTANTIVE_OBSERVATION_KIND_SQL}), 0), \
-                    MAX(CASE WHEN kind = ?3 THEN created_at END), \
+                    MIN(CASE WHEN kind = ?3 THEN created_at END), \
                     MAX(CASE WHEN kind = ?4 THEN created_at END), \
                     MAX(CASE WHEN kind = ?5 THEN created_at END), \
                     MAX(CASE WHEN kind = ?5 AND body <> '' THEN created_at END), \
@@ -16145,7 +16308,7 @@ impl SessionObservationSnapshot<'_> {
                     total: usize::try_from(row.get::<_, i64>(0)?).unwrap_or(usize::MAX),
                     prompts: usize::try_from(row.get::<_, i64>(1)?).unwrap_or(usize::MAX),
                     substantive: row.get::<_, i64>(2)? != 0,
-                    last_session_start_at: row.get(3)?,
+                    first_session_start_at: row.get(3)?,
                     last_session_end_at: row.get(4)?,
                     last_stop_at: row.get(5)?,
                     last_stop_with_body_at: row.get(6)?,
@@ -16775,6 +16938,8 @@ pub struct DecayCandidate {
     pub id: PageId,
     /// Relative wiki path.
     pub path: PagePath,
+    /// The indexed page title, including a heading or path-stem fallback.
+    pub title: String,
     /// Tier (the sweep only considers `episodic`).
     pub tier: ai_memory_core::Tier,
     /// Pinned flag — true means "never decay".
@@ -16825,6 +16990,7 @@ fn row_to_decay_candidate(
     let expires_at_us: Option<i64> = row.get(8)?;
     let salience: Option<f64> = row.get(9)?;
     let compacted_at_us: Option<i64> = row.get(10)?;
+    let title: String = row.get(11)?;
     Ok(materialise_decay_candidate(
         id_bytes,
         path,
@@ -16837,6 +17003,7 @@ fn row_to_decay_candidate(
         expires_at_us,
         salience,
         compacted_at_us,
+        title,
     ))
 }
 
@@ -16853,10 +17020,12 @@ fn materialise_decay_candidate(
     expires_at_us: Option<i64>,
     salience: Option<f64>,
     compacted_at_us: Option<i64>,
+    title: String,
 ) -> StoreResult<DecayCandidate> {
     Ok(DecayCandidate {
         id: PageId::from_slice(&id_bytes)?,
         path: PagePath::new(path)?,
+        title,
         tier: tier_str
             .parse::<ai_memory_core::Tier>()
             .map_err(StoreError::from)?,
