@@ -48,7 +48,7 @@ Defaults that come from a named constant or from another crate say so in the Def
 | `llm_headers` | `[]` | `AI_MEMORY_LLM_HEADERS` | Extra HTTP headers on every LLM chat request, as `Name: Value` or `Name=Value` entries. |
 | `llm_quota_cooldown_secs` | `900` (`ai_memory_llm::DEFAULT_QUOTA_COOLDOWN`) | `AI_MEMORY_LLM_QUOTA_COOLDOWN_SECS` | How long a fallback chain (`[[llm_fallbacks]]` or a task's `[[llm.<task>.fallbacks]]`) skips a candidate that reported exhausted credit, quota or billing before the next call tries it again. Accepted range 30 to 86400. |
 | `embedding_provider` | unset (in-process local embeddings) | `AI_MEMORY_EMBEDDING_PROVIDER` | Embedding provider: `none`, `openai`, `voyage`, `google` or `gemini`, or `openai-compat`. |
-| `embedding_model` | unset | `AI_MEMORY_EMBEDDING_MODEL` | Provider-specific embedding model override. For `local`, accepts `all-MiniLM-L6-v2` (default) or `intfloat/multilingual-e5-small` (alias `multilingual-e5-small`). |
+| `embedding_model` | unset | `AI_MEMORY_EMBEDDING_MODEL` | Provider-specific embedding model override. For `local`, accepts `all-MiniLM-L6-v2` (default) or `intfloat/multilingual-e5-small` (alias `multilingual-e5-small`). With no `embedding_provider` set, any other name is ignored with a startup warning and the default local model runs. |
 | `embedding_dim` | unset | `AI_MEMORY_EMBEDDING_DIM` | Embedding dimension override. It must match the model. |
 | `embedding_base_url` | unset | `AI_MEMORY_EMBEDDING_BASE_URL` | Embedding endpoint override. Required when `embedding_provider` is `openai-compat`. |
 | `embedding_query_prefix` | unset | `AI_MEMORY_EMBEDDING_QUERY_PREFIX` | Text prepended to every embedding query for the `openai` and `openai-compat` embedders. Kept verbatim. |
@@ -241,7 +241,7 @@ The defaults named `DEFAULT_AUTO_IMPROVE_*` are constants in `ai-memory-consolid
 | --- | --- | --- | --- |
 | `require_approval` | `false` | `AI_MEMORY_AUTO_IMPROVE__REQUIRE_APPROVAL` | Keep proposals pending until an admin approves them. |
 | `require_approval_prefixes` | `[]` | `AI_MEMORY_AUTO_IMPROVE__REQUIRE_APPROVAL_PREFIXES` (JSON array, e.g. `["_rules/"]`; a bare string or comma list is refused at load) | Path prefixes whose proposals stay pending even with `require_approval` false; the rest are approved. Entries must end with `/` and not start with `/` (refused at load); blank entries are ignored. |
-| `on_session_end` | `false` | `AI_MEMORY_AUTO_IMPROVE__ON_SESSION_END` | Schedule a reviewer run on SessionEnd. |
+| `on_session_end` | `false` | `AI_MEMORY_AUTO_IMPROVE__ON_SESSION_END` | Has no effect; accepted so existing configs keep loading. `[auto_improve.scheduler]` reviews completed sessions. |
 | `min_observations` | `8` (`DEFAULT_AUTO_IMPROVE_MIN_OBSERVATIONS`) | `AI_MEMORY_AUTO_IMPROVE__MIN_OBSERVATIONS` | Observations a session needs before it is reviewed. |
 | `min_session_duration_secs` | `120` (`DEFAULT_AUTO_IMPROVE_MIN_SESSION_DURATION_SECS`) | `AI_MEMORY_AUTO_IMPROVE__MIN_SESSION_DURATION_SECS` | Minimum span between first and last observation before review. |
 | `min_confidence` | `0.75` (`DEFAULT_AUTO_IMPROVE_MIN_CONFIDENCE`) | `AI_MEMORY_AUTO_IMPROVE__MIN_CONFIDENCE` | Lowest model confidence validation accepts. |

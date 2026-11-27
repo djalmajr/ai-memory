@@ -703,6 +703,13 @@ fn powershell_wrapper_forwards_every_supported_provider_api_key() {
         "AI_MEMORY_COPILOT_CLIENT_ID",
         "AI_MEMORY_WORKSTREAM_ID",
         "CLAUDE_CONFIG_DIR",
+        "CODEX_HOME",
+        "COPILOT_HOME",
+        "GEMINI_CLI_HOME",
+        "GROK_HOME",
+        "KIMI_CODE_HOME",
+        "KIRO_HOME",
+        "HERMES_HOME",
     ] {
         assert!(
             allowlist
@@ -836,34 +843,29 @@ fn github_actions_are_pinned_to_full_commits() {
 }
 
 #[test]
-fn workflows_keep_fixed_rust_jobs_on_the_fixed_toolchain() {
-    for (path, expected_fixed_jobs) in [
-        (".github/workflows/ci.yml", 2),
-        (".github/workflows/release.yml", 3),
-    ] {
+fn workflows_take_the_rust_toolchain_from_the_toolchain_file() {
+    // rust-toolchain.toml is the one place that names the toolchain. A step
+    // that names its own can drift from it: when the toolchain action moved to
+    // its generic `stable` commit, the fixed jobs kept asking for 1.95 only
+    // because each one was given the version by hand (#339).
+    for path in [".github/workflows/ci.yml", ".github/workflows/release.yml"] {
         let workflow = read_repo(path);
-        let lines = workflow.lines().collect::<Vec<_>>();
-        let mut fixed_jobs = 0;
-        for (index, line) in lines.iter().enumerate().filter(|(_, line)| {
-            line.contains("uses: dtolnay/rust-toolchain@") && line.ends_with("# 1.95")
-        }) {
-            fixed_jobs += 1;
-            assert_eq!(
-                lines.get(index + 1).map(|line| line.trim()),
-                Some("with:"),
-                "{path} must configure the fixed toolchain after: {line}"
+        let mut installs = 0;
+        for line in workflow.lines().map(str::trim) {
+            assert!(
+                !line.contains("rust-toolchain@"),
+                "{path} must not pick a toolchain through an action: {line}"
             );
-            assert_eq!(
-                lines.get(index + 2).map(|line| line.trim()),
-                Some("toolchain: \"1.95\""),
-                "{path} must keep its # 1.95 job on Rust 1.95"
-            );
+            if line.contains("rustup toolchain install") {
+                installs += 1;
+                assert!(
+                    line.ends_with("rustup toolchain install --no-self-update"),
+                    "{path} must install what rust-toolchain.toml names: {line}"
+                );
+            }
         }
 
-        assert_eq!(
-            fixed_jobs, expected_fixed_jobs,
-            "{path} has an unexpected number of fixed Rust jobs"
-        );
+        assert!(installs > 0, "{path} no longer installs the toolchain");
     }
 }
 
@@ -1280,6 +1282,13 @@ fn run_wrapper_with_fake_docker_env(
         .env("HOME", shell_path(tmp.path()))
         .env_remove("AI_MEMORY_SERVER_URL")
         .env_remove("CLAUDE_CONFIG_DIR")
+        .env_remove("CODEX_HOME")
+        .env_remove("COPILOT_HOME")
+        .env_remove("GEMINI_CLI_HOME")
+        .env_remove("GROK_HOME")
+        .env_remove("KIMI_CODE_HOME")
+        .env_remove("KIRO_HOME")
+        .env_remove("HERMES_HOME")
         .env_remove("AI_MEMORY_LLM_COMPAT_STREAM")
         // Guarantees the "unset" case in
         // `posix_wrapper_forwards_embedding_prefixes_by_presence_not_non_emptiness`
@@ -3409,6 +3418,52 @@ mod slow {
 
     #[cfg(unix)]
     #[test]
+    fn wrapper_forwards_agent_config_homes_to_helper_container() {
+        let agent_homes = [
+            ("CODEX_HOME", "/home/alice/.config/codex"),
+            ("COPILOT_HOME", "/home/alice/.config/copilot"),
+            ("GEMINI_CLI_HOME", "/home/alice/.config/gemini"),
+            ("GROK_HOME", "/home/alice/.config/grok"),
+            ("KIMI_CODE_HOME", "/home/alice/.config/kimi"),
+            ("KIRO_HOME", "/home/alice/.config/kiro"),
+            ("HERMES_HOME", "/home/alice/.config/hermes"),
+        ];
+
+        for subcommand in ["backup-agents", "restore-agents"] {
+            let args_with_env = run_wrapper_with_fake_docker_env(
+                &[subcommand],
+                FakeInfo::Docker("[name=seccomp,profile=default]"),
+                None,
+                None,
+                None,
+                &agent_homes,
+            );
+            for (var, _) in agent_homes {
+                assert!(
+                    args_with_env.contains(&format!("-e\n{var}")),
+                    "wrapper must forward {var} for {subcommand}; got {args_with_env}"
+                );
+            }
+
+            let args_unset = run_wrapper_with_fake_docker_env(
+                &[subcommand],
+                FakeInfo::Docker("[name=seccomp,profile=default]"),
+                None,
+                None,
+                None,
+                &[],
+            );
+            for (var, _) in agent_homes {
+                assert!(
+                    !args_unset.contains(&format!("-e\n{var}")),
+                    "wrapper must omit unset {var} for {subcommand}; got {args_unset}"
+                );
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn rootless_docker_uses_root_uid_only_for_host_config_commands() {
         let rootless_info = "[name=apparmor name=seccomp,profile=default name=rootless]";
 
@@ -3424,6 +3479,8 @@ mod slow {
             "uninstall",
             "backup",
             "restore",
+            "backup-agents",
+            "restore-agents",
         ] {
             let args = run_wrapper_with_fake_docker(&[subcommand], rootless_info);
             assert!(
@@ -3500,6 +3557,8 @@ mod slow {
             "uninstall",
             "backup",
             "restore",
+            "backup-agents",
+            "restore-agents",
         ] {
             let args = run_wrapper_with_fake_selinux(&[subcommand], selinux_info, "Enforcing");
             assert!(
@@ -3977,6 +4036,8 @@ mod slow {
             "uninstall",
             "backup",
             "restore",
+            "backup-agents",
+            "restore-agents",
         ] {
             let args = run_wrapper_with_fake_podman(&[subcommand], true, true, "Enforcing");
             assert!(

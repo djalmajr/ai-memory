@@ -275,7 +275,7 @@ pub struct SessionDigest {
     first_lines: Vec<SessionLine>,
     /// The last lines, only for a session longer than the cap.
     last_lines: Vec<SessionLine>,
-    /// When the newest `SessionStart` happened.
+    /// When the earliest `SessionStart` happened.
     start_at: Option<Timestamp>,
     /// The newest `SessionEnd`.
     end: Option<SessionEndFact>,
@@ -474,7 +474,7 @@ fn build_digest(
     };
 
     let start_at = summary
-        .last_session_start_at
+        .first_session_start_at
         .map(micros_to_timestamp)
         .transpose()?;
     let end = match summary.last_session_end_at {
@@ -1108,7 +1108,10 @@ impl SessionDigest {
             }),
             first_lines,
             last_lines,
-            start_at: last_of(ObservationKind::SessionStart).map(|o| o.created_at),
+            start_at: observations
+                .iter()
+                .find(|o| o.kind == ObservationKind::SessionStart)
+                .map(|o| o.created_at),
             end: last_of(ObservationKind::SessionEnd).map(|o| SessionEndFact {
                 created_at: o.created_at,
                 body: o.body.clone(),
@@ -1723,6 +1726,10 @@ mod tests {
         let obs = vec![
             obs(
                 ObservationKind::UserPrompt,
+                "<agent-message from=\"worker-1\">\n[Subagent hand-back] finished",
+            ),
+            obs(
+                ObservationKind::UserPrompt,
                 "<teammate-message teammate_id=\"team-lead\" summary=\"heads up\">rollout note",
             ),
             obs(ObservationKind::UserPrompt, "fix the auth bug"),
@@ -1749,6 +1756,10 @@ mod tests {
             .next()
             .unwrap();
         assert_eq!(prompts.trim(), "1. fix the auth bug");
+        assert!(
+            body.contains("<agent-message"),
+            "subagent hand-backs remain in raw session history"
+        );
     }
 
     #[test]
